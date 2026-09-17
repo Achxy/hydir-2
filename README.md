@@ -116,5 +116,6 @@ remain open.
   it refuses to overwrite an existing binary or differing artifact.
 
 See [capabilities](docs/CAPABILITIES.md), [evidence](docs/EVIDENCE.md),
+[release gates](docs/RELEASE_GATES.md),
 [provenance](PROVENANCE.md), and the [decision records](docs/adr/0001-native-first-slice.md). HydIR is licensed under
 AGPL-3.0-only (see `LICENSE`); no IRENE-3 code is copied into this checkout.
