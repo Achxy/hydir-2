@@ -4,8 +4,8 @@
 use eframe::egui::{self, Color32, RichText};
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
-    ArtifactRequest, DiscoverRequest, FunctionRequest, JobReply, JobRequest, ProjectRequest,
-    StartLiftJobRequest, hydir_client::HydirClient,
+    ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobReply, JobRequest,
+    ProjectRequest, StartLiftJobRequest, UploadBinaryRequest, hydir_client::HydirClient,
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_core::{FunctionCfg, FunctionSpec, ProgramSpec};
@@ -36,6 +36,17 @@ enum Task {
         token_file: PathBuf,
         project_id: String,
     },
+    CreateRemoteProject {
+        endpoint: String,
+        token_file: PathBuf,
+        name: String,
+    },
+    UploadRemote {
+        endpoint: String,
+        token_file: PathBuf,
+        project_id: String,
+        path: PathBuf,
+    },
     Select(String),
     Analyze,
     StartLiftJob {
@@ -53,6 +64,7 @@ enum Event {
         remote: bool,
         spec: ProgramSpec,
     },
+    RemoteProjectCreated(String),
     Selected {
         symbol: String,
         cfg: Result<FunctionCfg, String>,
@@ -194,6 +206,94 @@ async fn open_remote(
         .map_err(|e| format!("Invalid remote program model: {e}"))?;
     if spec.binary_sha256 != project.binary_sha256 {
         return Err("Remote project binary hash changed during inspection.".to_owned());
+    }
+    Ok((access, spec))
+}
+
+async fn create_remote_project(
+    endpoint: String,
+    token_file: PathBuf,
+    name: String,
+) -> Result<String, String> {
+    validate_endpoint(&endpoint)?;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err("Project name must contain 1..=128 characters.".to_owned());
+    }
+    let access = RemoteAccess {
+        endpoint,
+        token: read_credential(&token_file)?,
+        project_id: String::new(),
+        revision: 0,
+    };
+    let mut client = remote_client(&access).await?;
+    let created = client
+        .create_project(authorized(
+            CreateProjectRequest {
+                name: name.to_owned(),
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not create remote project: {error}"))?
+        .into_inner();
+    Ok(created.project_id)
+}
+
+async fn upload_remote(
+    endpoint: String,
+    token_file: PathBuf,
+    project_id: String,
+    path: PathBuf,
+) -> Result<(RemoteAccess, ProgramSpec), String> {
+    validate_endpoint(&endpoint)?;
+    if project_id.is_empty() {
+        return Err("Enter the destination remote project ID.".to_owned());
+    }
+    let content = bounded_read(&path)?;
+    let digest = format!("{:x}", Sha256::digest(&content));
+    let access = RemoteAccess {
+        endpoint: endpoint.clone(),
+        token: read_credential(&token_file)?,
+        project_id: project_id.clone(),
+        revision: 0,
+    };
+    let mut client = remote_client(&access).await?;
+    let project = client
+        .get_project(authorized(
+            ProjectRequest {
+                project_id: project_id.clone(),
+                expected_revision: 0,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Cannot find destination project: {error}"))?
+        .into_inner();
+    let uploaded = client
+        .upload_binary(authorized(
+            UploadBinaryRequest {
+                project_id: project_id.clone(),
+                expected_revision: project.revision,
+                content_sha256: digest.clone(),
+                content,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| {
+            format!("Remote upload failed: {error}. Refresh the project revision and retry.")
+        })?
+        .into_inner();
+    if uploaded.binary_sha256 != digest
+        || Some(uploaded.revision) != project.revision.checked_add(1)
+    {
+        return Err("Remote upload returned an unexpected digest or revision.".to_owned());
+    }
+    let (access, spec) = open_remote(endpoint, token_file, project_id).await?;
+    if spec.binary_sha256 != digest || access.revision != uploaded.revision {
+        return Err("Remote project changed after upload; reopen it before analysis.".to_owned());
     }
     Ok((access, spec))
 }
@@ -380,6 +480,34 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 }
                 Err(error) => Event::Failed(error),
             },
+            Task::CreateRemoteProject {
+                endpoint,
+                token_file,
+                name,
+            } => match runtime.block_on(create_remote_project(endpoint, token_file, name)) {
+                Ok(project_id) => Event::RemoteProjectCreated(project_id),
+                Err(error) => Event::Failed(error),
+            },
+            Task::UploadRemote {
+                endpoint,
+                token_file,
+                project_id,
+                path,
+            } => match runtime.block_on(upload_remote(endpoint, token_file, project_id, path)) {
+                Ok((access, spec)) => {
+                    let label = format!(
+                        "{} · {} · revision {}",
+                        access.endpoint, access.project_id, access.revision
+                    );
+                    source = Source::Remote(access);
+                    Event::Imported {
+                        source: label,
+                        remote: true,
+                        spec,
+                    }
+                }
+                Err(error) => Event::Failed(error),
+            },
             Task::Select(symbol) => match &source {
                 Source::Local(bytes) => Event::Selected {
                     cfg: recover_symbol_cfg(bytes, &symbol).map_err(|e| e.to_string()),
@@ -453,6 +581,8 @@ struct AnalystApp {
     remote_endpoint: String,
     remote_token_file: String,
     remote_project_id: String,
+    remote_project_name: String,
+    remote_upload_path: String,
     search: String,
     source_label: Option<String>,
     remote: bool,
@@ -497,6 +627,8 @@ impl AnalystApp {
             remote_endpoint: "http://127.0.0.1:50051".to_owned(),
             remote_token_file: String::new(),
             remote_project_id: String::new(),
+            remote_project_name: String::new(),
+            remote_upload_path: String::new(),
             search: String::new(),
             source_label: None,
             remote: false,
@@ -551,6 +683,14 @@ impl AnalystApp {
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
+                    self.failure = None;
+                }
+                Event::RemoteProjectCreated(project_id) => {
+                    self.remote_project_id = project_id.clone();
+                    self.status = format!(
+                        "Created remote project {project_id}; select an ELF to upload explicitly"
+                    );
+                    self.history.push(self.status.clone());
                     self.failure = None;
                 }
                 Event::Selected { symbol, cfg, ir } => {
@@ -721,24 +861,40 @@ impl AnalystApp {
             );
         }
         ui.separator();
-        egui::CollapsingHeader::new("Existing remote project")
+        egui::CollapsingHeader::new("Remote project · explicit transfer")
             .id_salt("remote_project")
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "No binary upload. Selecting a function requests analysis and may save IR on the service.",
+                        "Opening does not upload. Create or choose a project, then upload only by pressing the labelled transfer button. Analysis may save IR on the service.",
                     )
                     .size(11.0)
                     .color(MUTED),
                 );
+                ui.label(RichText::new("SERVICE ENDPOINT").size(10.0).color(MUTED));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.remote_endpoint)
                         .hint_text("http://127.0.0.1:50051"),
                 );
+                ui.label(RichText::new("PRIVATE CREDENTIAL FILE").size(10.0).color(MUTED));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.remote_token_file)
                         .hint_text("Private credential file path"),
                 );
+                ui.label(RichText::new("NEW PROJECT NAME").size(10.0).color(MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.remote_project_name).hint_text("Analysis project"));
+                let create = ui.add_enabled(
+                    !self.busy && !self.remote_token_file.trim().is_empty() && !self.remote_project_name.trim().is_empty(),
+                    egui::Button::new("Create remote project"),
+                );
+                if create.clicked() {
+                    self.enqueue(Task::CreateRemoteProject {
+                        endpoint: self.remote_endpoint.trim().to_owned(),
+                        token_file: PathBuf::from(self.remote_token_file.trim()),
+                        name: self.remote_project_name.trim().to_owned(),
+                    }, "Creating authenticated remote project…");
+                }
+                ui.label(RichText::new("PROJECT ID").size(10.0).color(MUTED));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.remote_project_id).hint_text("Project ID"),
                 );
@@ -757,6 +913,25 @@ impl AnalystApp {
                         },
                         "Connecting to authenticated HydIR service…",
                     );
+                }
+                ui.separator();
+                ui.label(RichText::new("LOCAL ELF TO UPLOAD").size(10.0).color(MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.remote_upload_path).hint_text("/absolute/path/to/program.elf"));
+                ui.label(RichText::new("Upload creates a new immutable binary revision and sends the selected bytes to this service.").size(11.0).color(MUTED));
+                let upload = ui.add_enabled(
+                    !self.busy
+                        && !self.remote_token_file.trim().is_empty()
+                        && !self.remote_project_id.trim().is_empty()
+                        && !self.remote_upload_path.trim().is_empty(),
+                    egui::Button::new("Upload ELF to remote project"),
+                );
+                if upload.clicked() {
+                    self.enqueue(Task::UploadRemote {
+                        endpoint: self.remote_endpoint.trim().to_owned(),
+                        token_file: PathBuf::from(self.remote_token_file.trim()),
+                        project_id: self.remote_project_id.trim().to_owned(),
+                        path: PathBuf::from(self.remote_upload_path.trim()),
+                    }, "Uploading selected ELF to remote project…");
                 }
             });
         ui.separator();
@@ -1237,6 +1412,42 @@ impl eframe::App for AnalystApp {
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [probe, endpoint, token_file, binary] = arguments.as_slice()
+        && probe == "--probe-create-upload"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                PathBuf::from(token_file),
+                "GUI transfer probe".to_owned(),
+            )
+            .await?;
+            let (access, spec) = upload_remote(
+                endpoint.clone(),
+                PathBuf::from(token_file),
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            Ok::<_, String>((access.project_id, access.revision, spec.functions.len()))
+        });
+        match result {
+            Ok((project_id, revision, functions)) => {
+                println!(
+                    "HydIR GUI transfer operations passed: project {project_id}, revision {revision}, {functions} functions"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI transfer probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, endpoint, token_file, project_id, symbol] = arguments.as_slice()
         && probe == "--probe-remote"
     {
@@ -1299,7 +1510,9 @@ fn main() -> eframe::Result<()> {
         }
     }
     if !arguments.is_empty() {
-        eprintln!("Usage: hydir [--probe-remote <endpoint> <token-file> <project-id> <symbol>]");
+        eprintln!(
+            "Usage: hydir [--probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf>]"
+        );
         std::process::exit(2);
     }
     let options = eframe::NativeOptions {
