@@ -1,0 +1,15 @@
+[package]
+name = "hydir-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hydirctl"
+path = "src/main.rs"
+
+[dependencies]
+hydir-backend = { path = "../hydir-backend" }
+serde_json.workspace = true
+tempfile = "3.23"
