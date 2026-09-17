@@ -2,6 +2,17 @@
 
 ## Twenty-function scalar corpus checkpoint — 2026-09-17
 
+The macOS `cargo run --locked --bin hydir` launch compiled and opened a real
+desktop window. Its initial empty state was visually inspected: dark-first
+three-pane layout, explicit local ELF entry, labelled remote-transfer section,
+disabled analysis/job actions, and a visible “No project open” diagnostic.
+The GUI canvas did not expose addressable controls to the available
+accessibility interface; an attempted click did not reliably target the
+program input, so file-open and function-selection interaction were **not**
+visually verified. Automation was stopped, the app was closed, and temporary
+screen captures containing unrelated desktop content were removed. The
+existing headless GUI probes remain the functional UI-path evidence.
+
 The final `bash scripts/demo-linux-docker.sh` exited 0 with the new corpus
 gate integrated. Rust 1.96.0 ran **27 passing unit tests**, workspace Clippy
 passed with `-D warnings`, and pinned Clang/LLVM 14.0.6 handled every LLVM
