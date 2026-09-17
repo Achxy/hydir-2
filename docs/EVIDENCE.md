@@ -164,3 +164,30 @@ benchmark timing or memory measurements were recorded. The next blocking
 product task is durable, cancellable, resource-constrained jobs and a complete
 typed local/remote operation surface; semantic expansion needs explicit
 memory and call models before broader lifting or rebuilding claims.
+
+## Durable lift-job expansion (partial M2)
+
+`cargo fmt --all`, `cargo test --locked --workspace`, `bash -n
+scripts/demo-linux-docker.sh scripts/demo-remote.sh`, and `git diff --check`
+passed on the macOS host. The workspace suite passed **21 tests**: 10 backend,
+1 core, 2 GUI, and 8 server. `bash scripts/demo-linux-docker.sh` exited 0
+on Linux x86-64 in the pinned Rust 1.96.0 / Clang and LLVM 14.0.6 image.
+There, all 21 tests and `cargo clippy --locked --workspace --all-targets --
+-D warnings` passed. The five function variants in
+`target/demo-local/run.NwwiES/` again produced **5,040/5,040 matches**,
+with LLVM verification and the unsupported `push` rejection.
+
+The separate-process remote demonstration exited 0 and left evidence in
+`target/demo-remote/run.hA905k/`. It exercised idempotent lift-job creation,
+queued-to-succeeded events, retrieval and exact replay after service restart,
+an unsupported lift job ending failed or cancelled, owner-scoped job denial,
+and the prior binary-transfer/revision/artifact/token-rotation checks. Server
+unit tests cover v1-to-v2 schema migration, idempotence, event replay,
+cross-identity isolation, cancellation, and restart
+interruption. The demo does not prove cancellation of a long-running hostile
+process tree or persistence of an active worker across restart.
+
+M2 remains partial: the desktop lacks a live jobs panel, remote binary upload,
+and saved layout; service authorization is owner-only rather than per-role and
+the worker has no OS sandbox. M3–M5 and the broad M0 licensing/backend audit
+remain open. Do not infer release readiness from this job-slice result.

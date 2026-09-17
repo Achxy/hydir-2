@@ -28,7 +28,8 @@ machine bytes, and LLVM IR. Its remote path does not upload binaries. A
 desktop smoke run was attempted on macOS; automated visual/interaction QA is
 still outstanding. The `hydird` gRPC service supports authenticated loopback discovery,
 idempotent project creation, immutable binary uploads, project inspection,
-symbol-scoped CFG/lift, and artifact retrieval. It does not support remote
-execution, jobs, cancellation, TLS/non-loopback clients, or full authorization
+symbol-scoped CFG/lift, owner-scoped durable lift jobs with event replay and
+cancellation, and artifact retrieval. It does not support remote
+execution, TLS/non-loopback clients, or full authorization
 roles. There is no Python SDK, Ghidra adapter,
 interprocedural analysis, decompiler, or executable rebuild yet.

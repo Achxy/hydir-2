@@ -66,7 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "clang": clang_version,
                     "ghidra_required": false,
                     "remote_api": true,
-                    "remote_scope": "authenticated loopback discovery/project/upload/inspect/cfg/lift/artifact subset",
+                    "remote_scope": "authenticated loopback project/upload/inspect/cfg/lift/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
                     "c_output": false,

@@ -2,31 +2,38 @@
 
 use hydir_api::v1::{
     ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
-    FunctionRequest, JsonReply, ProjectReply, ProjectRequest, UploadBinaryRequest,
+    FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, ProjectReply,
+    ProjectRequest, StartLiftJobRequest, UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+#[cfg(not(test))]
+use std::process::Stdio;
 use std::{
+    collections::HashMap,
     env,
     error::Error,
     io::{Read, Write},
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
-#[cfg(not(test))]
-use std::{process::Stdio, time::Duration};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 #[cfg(not(test))]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
 use uuid::Uuid;
 
 const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
+const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
 #[cfg(not(test))]
 const WORKER_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -66,8 +73,39 @@ PRAGMA user_version=1;
 COMMIT;
 ";
 
+const JOBS_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE jobs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    revision INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued','running','succeeded','failed','cancelled','interrupted')),
+    artifact_sha256 TEXT NOT NULL DEFAULT '',
+    diagnostic TEXT NOT NULL DEFAULT '',
+    created_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+    UNIQUE(project_id, idempotency_key)
+);
+CREATE INDEX jobs_project_state ON jobs(project_id, state);
+CREATE TABLE job_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    state TEXT NOT NULL,
+    message TEXT NOT NULL,
+    artifact_sha256 TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX job_events_job_sequence ON job_events(job_id, sequence);
+PRAGMA user_version=2;
+COMMIT;
+";
+
 #[derive(Clone)]
-struct Store(Arc<Mutex<Connection>>);
+struct Store {
+    db: Arc<Mutex<Connection>>,
+    workers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+}
 
 impl Store {
     fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
@@ -96,17 +134,29 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
             connection.execute_batch(SCHEMA)?;
         }
-        Ok(Self(Arc::new(Mutex::new(connection))))
+        if version <= 1 {
+            connection.execute_batch(JOBS_MIGRATION)?;
+        }
+        connection.execute_batch("BEGIN IMMEDIATE;
+          INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
+          FROM jobs WHERE state IN ('queued','running');
+          UPDATE jobs SET state='interrupted',diagnostic='server restarted before completion'
+          WHERE state IN ('queued','running');
+          COMMIT;")?;
+        Ok(Self {
+            db: Arc::new(Mutex::new(connection)),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, Status> {
-        self.0
+        self.db
             .lock()
             .map_err(|_| Status::internal("database lock poisoned"))
     }
@@ -124,7 +174,7 @@ impl Store {
         }
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let digest = sha256(token.as_bytes());
-        self.0
+        self.db
             .lock()
             .map_err(|_| "database lock poisoned")?
             .execute(
@@ -138,7 +188,7 @@ impl Store {
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let digest = sha256(token.as_bytes());
         let changed = self
-            .0
+            .db
             .lock()
             .map_err(|_| "database lock poisoned")?
             .execute(
@@ -211,6 +261,140 @@ impl Store {
             |row| row.get(0),
         ).map_err(internal)
     }
+
+    fn job(&self, principal: &str, project_id: &str, job_id: &str) -> Result<JobReply, Status> {
+        let row = self
+            .connection()?
+            .query_row(
+                "SELECT j.project_id,j.id,j.revision,j.kind,j.state,j.artifact_sha256,j.diagnostic \
+             FROM jobs j JOIN projects p ON p.id=j.project_id \
+             WHERE j.id=?1 AND j.project_id=?2 AND p.owner=?3",
+                params![job_id, project_id, principal],
+                |row| {
+                    Ok(JobReply {
+                        project_id: row.get(0)?,
+                        job_id: row.get(1)?,
+                        project_revision: row.get::<_, i64>(2)? as u64,
+                        kind: row.get(3)?,
+                        state: row.get(4)?,
+                        artifact_sha256: row.get(5)?,
+                        diagnostic: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(internal)?;
+        row.ok_or_else(|| Status::not_found("job not found"))
+    }
+
+    fn transition_job(
+        &self,
+        job_id: &str,
+        from: &str,
+        to: &str,
+        message: &str,
+    ) -> Result<bool, Status> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(internal)?;
+        let changed = tx
+            .execute(
+                "UPDATE jobs SET state=?1 WHERE id=?2 AND state=?3",
+                params![to, job_id, from],
+            )
+            .map_err(internal)?;
+        if changed == 1 {
+            insert_event(&tx, job_id, to, message, "")?;
+        }
+        tx.commit().map_err(internal)?;
+        Ok(changed == 1)
+    }
+
+    fn finish_lift_job(
+        &self,
+        job_id: &str,
+        project_id: &str,
+        revision: u64,
+        result: Result<Vec<u8>, Status>,
+    ) -> Result<(), Status> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(internal)?;
+        let state: Option<String> = tx
+            .query_row("SELECT state FROM jobs WHERE id=?1", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(internal)?;
+        if state.as_deref() != Some("running") {
+            tx.commit().map_err(internal)?;
+            return Ok(());
+        }
+        match result {
+            Ok(content) => {
+                let digest = sha256(&content);
+                tx.execute(
+                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,'text/x-llvm-ir',?4)",
+                    params![project_id, revision as i64, digest, content],
+                ).map_err(internal)?;
+                tx.execute(
+                    "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
+                    params![digest, job_id],
+                )
+                .map_err(internal)?;
+                insert_event(&tx, job_id, "succeeded", "LLVM IR artifact ready", &digest)?;
+            }
+            Err(error) => {
+                let diagnostic: String = error.message().chars().take(4096).collect();
+                tx.execute(
+                    "UPDATE jobs SET state='failed',diagnostic=?1 WHERE id=?2",
+                    params![diagnostic, job_id],
+                )
+                .map_err(internal)?;
+                insert_event(&tx, job_id, "failed", &diagnostic, "")?;
+            }
+        }
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
+    async fn execute_lift_job(
+        self,
+        job_id: String,
+        project_id: String,
+        revision: u64,
+        symbol: String,
+        bytes: Vec<u8>,
+    ) {
+        match self.transition_job(&job_id, "queued", "running", "worker started") {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("hydird job transition failed: {error}");
+                return;
+            }
+        }
+        let result = run_worker("lift", Some(&symbol), bytes).await;
+        if let Err(error) = self.finish_lift_job(&job_id, &project_id, revision, result) {
+            eprintln!("hydird job completion failed: {error}");
+        }
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.remove(&job_id);
+        }
+    }
+}
+
+fn insert_event(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    state: &str,
+    message: &str,
+    artifact_sha256: &str,
+) -> Result<(), Status> {
+    tx.execute(
+        "INSERT INTO job_events(job_id,state,message,artifact_sha256) VALUES(?1,?2,?3,?4)",
+        params![job_id, state, message, artifact_sha256],
+    )
+    .map_err(internal)?;
+    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -364,6 +548,9 @@ impl Hydir for Store {
             scalar_direct_cfg_lift: true,
             execution_validation: false,
             max_binary_bytes: MAX_BINARY_BYTES as u64,
+            durable_lift_jobs: true,
+            reconnectable_job_events: true,
+            job_cancellation: true,
         }))
     }
 
@@ -578,6 +765,278 @@ impl Hydir for Store {
             project_revision: revision as u64,
         }))
     }
+
+    async fn start_lift_job(
+        &self,
+        request: Request<StartLiftJobRequest>,
+    ) -> Result<Response<JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        valid_symbol(&input.function_symbol)?;
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "job idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        self.project(&principal, &input.project_id)?;
+        let prior: Option<(String, i64, String)> = self
+            .connection()?
+            .query_row(
+                "SELECT id,revision,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+                params![input.project_id, input.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some((id, revision, symbol)) = prior {
+            if revision != expected || symbol != input.function_symbol {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to a different lift request",
+                ));
+            }
+            return Ok(Response::new(self.job(
+                &principal,
+                &input.project_id,
+                &id,
+            )?));
+        }
+        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            let retry: Option<(String, i64, String)> = tx.query_row(
+                "SELECT id,revision,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+                params![input.project_id, input.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional().map_err(internal)?;
+            if let Some((existing, revision, symbol)) = retry {
+                drop(tx);
+                drop(conn);
+                if revision != expected || symbol != input.function_symbol {
+                    return Err(Status::already_exists(
+                        "idempotency key belongs to a different lift request",
+                    ));
+                }
+                return Ok(Response::new(self.job(
+                    &principal,
+                    &input.project_id,
+                    &existing,
+                )?));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
+                    params![input.project_id, principal],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            let active: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs j JOIN projects p ON p.id=j.project_id \
+                 WHERE p.owner=?1 AND j.state IN ('queued','running')",
+                    [principal.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if active >= MAX_ACTIVE_JOBS_PER_IDENTITY {
+                return Err(Status::resource_exhausted("identity has two active jobs"));
+            }
+            tx.execute(
+                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state) \
+                 VALUES(?1,?2,?3,'lift',?4,?5,'queued')",
+                params![
+                    id,
+                    input.project_id,
+                    expected,
+                    input.function_symbol,
+                    input.idempotency_key
+                ],
+            )
+            .map_err(internal)?;
+            insert_event(&tx, &id, "queued", "lift queued", "")?;
+            tx.commit().map_err(internal)?;
+        }
+        let (start_sender, start_receiver) = oneshot::channel();
+        let runner = self.clone();
+        let runner_id = id.clone();
+        let project_id = input.project_id.clone();
+        let symbol = input.function_symbol.clone();
+        let handle = tokio::spawn(async move {
+            if start_receiver.await.is_ok() {
+                runner
+                    .execute_lift_job(
+                        runner_id,
+                        project_id,
+                        input.expected_revision,
+                        symbol,
+                        bytes,
+                    )
+                    .await;
+            }
+        });
+        self.workers
+            .lock()
+            .map_err(|_| Status::internal("worker registry lock poisoned"))?
+            .insert(id.clone(), handle);
+        let _ = start_sender.send(());
+        Ok(Response::new(self.job(
+            &principal,
+            &input.project_id,
+            &id,
+        )?))
+    }
+
+    async fn get_job(&self, request: Request<JobRequest>) -> Result<Response<JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        Ok(Response::new(self.job(
+            &principal,
+            &input.project_id,
+            &input.job_id,
+        )?))
+    }
+
+    async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.job(&principal, &input.project_id, &input.job_id)?;
+        let changed = {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            let changed = tx
+                .execute(
+                    "UPDATE jobs SET state='cancelled',diagnostic='cancelled by user' \
+                 WHERE id=?1 AND project_id=?2 AND state IN ('queued','running')",
+                    params![input.job_id, input.project_id],
+                )
+                .map_err(internal)?;
+            if changed == 1 {
+                insert_event(&tx, &input.job_id, "cancelled", "cancelled by user", "")?;
+            }
+            tx.commit().map_err(internal)?;
+            changed == 1
+        };
+        let handle = if changed {
+            self.workers
+                .lock()
+                .map_err(|_| Status::internal("worker registry lock poisoned"))?
+                .remove(&input.job_id)
+        } else {
+            None
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .map_err(|_| Status::deadline_exceeded("worker cancellation was not confirmed"))?;
+        }
+        Ok(Response::new(self.job(
+            &principal,
+            &input.project_id,
+            &input.job_id,
+        )?))
+    }
+
+    type StreamJobEventsStream = ReceiverStream<Result<JobEvent, Status>>;
+
+    async fn stream_job_events(
+        &self,
+        request: Request<JobEventRequest>,
+    ) -> Result<Response<Self::StreamJobEventsStream>, Status> {
+        let principal = self.principal(&request)?;
+        let token = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("credential missing"))?;
+        let token_digest = sha256(token.strip_prefix("Bearer ").unwrap_or_default().as_bytes());
+        let input = request.into_inner();
+        self.job(&principal, &input.project_id, &input.job_id)?;
+        let mut cursor = i64::try_from(input.after_sequence)
+            .map_err(|_| Status::invalid_argument("event sequence too large"))?;
+        let store = self.clone();
+        let (sender, receiver) = mpsc::channel(32);
+        tokio::spawn(async move {
+            loop {
+                let snapshot: Result<(Vec<JobEvent>, bool), Status> = (|| {
+                    let conn = store.connection()?;
+                    let credential_valid: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1 AND token_sha256=?2)",
+                        params![principal, token_digest],
+                        |row| row.get(0),
+                    ).map_err(internal)?;
+                    if !credential_valid {
+                        return Err(Status::unauthenticated("credential was revoked"));
+                    }
+                    let state: String = conn
+                        .query_row(
+                            "SELECT j.state FROM jobs j JOIN projects p ON p.id=j.project_id \
+                         WHERE j.id=?1 AND j.project_id=?2 AND p.owner=?3",
+                            params![input.job_id, input.project_id, principal],
+                            |row| row.get(0),
+                        )
+                        .map_err(internal)?;
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT sequence,state,message,artifact_sha256 FROM job_events \
+                         WHERE job_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 32",
+                        )
+                        .map_err(internal)?;
+                    let events = statement
+                        .query_map(params![input.job_id, cursor], |row| {
+                            Ok(JobEvent {
+                                sequence: row.get::<_, i64>(0)? as u64,
+                                job_id: input.job_id.clone(),
+                                state: row.get(1)?,
+                                message: row.get(2)?,
+                                artifact_sha256: row.get(3)?,
+                            })
+                        })
+                        .map_err(internal)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(internal)?;
+                    let terminal = matches!(
+                        state.as_str(),
+                        "succeeded" | "failed" | "cancelled" | "interrupted"
+                    );
+                    Ok((events, terminal))
+                })();
+                let (events, terminal) = match snapshot {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+                let empty = events.is_empty();
+                for event in events {
+                    cursor = event.sequence as i64;
+                    if sender.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+                if terminal && empty {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
 }
 
 #[tokio::main]
@@ -789,10 +1248,241 @@ mod tests {
     fn newer_database_version_is_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("newer.sqlite");
+        drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=2;")
+            .execute_batch("PRAGMA user_version=3;")
             .unwrap();
-        assert!(Store::open(&path).is_err());
+        let error = Store::open(&path).err().unwrap().to_string();
+        assert!(error.contains("newer"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_one_database_migrates_without_losing_projects() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v1.sqlite");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO identities(principal,token_sha256) VALUES('alice','digest')",
+                [],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO projects(id,owner,name,idempotency_key) VALUES('p','alice','existing','key')", []).unwrap();
+        drop(connection);
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(store.project("alice", "p").unwrap().name, "existing");
+    }
+
+    #[tokio::test]
+    async fn lift_jobs_are_idempotent_replayable_and_isolated() {
+        use tokio_stream::StreamExt;
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "jobs".to_owned(),
+                    idempotency_key: "project-1".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let bytes = b"not an ELF";
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "INSERT INTO binaries(sha256,content) VALUES(?1,?2)",
+                params![sha256(bytes), bytes],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,1,?2)",
+                params![project.project_id, sha256(bytes)],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE projects SET current_revision=1 WHERE id=?1",
+                [&project.project_id],
+            )
+            .unwrap();
+        }
+        let request = StartLiftJobRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: 1,
+            function_symbol: "f".to_owned(),
+            assume_u64x2: true,
+            idempotency_key: "lift-1".to_owned(),
+        };
+        let job = store
+            .start_lift_job(authorized(request.clone(), &alice))
+            .await
+            .unwrap()
+            .into_inner();
+        let retry = store
+            .start_lift_job(authorized(request, &alice))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(job.job_id, retry.job_id);
+        let conflict = store
+            .start_lift_job(authorized(
+                StartLiftJobRequest {
+                    function_symbol: "other".to_owned(),
+                    ..StartLiftJobRequest {
+                        project_id: project.project_id.clone(),
+                        expected_revision: 1,
+                        function_symbol: "f".to_owned(),
+                        assume_u64x2: true,
+                        idempotency_key: "lift-1".to_owned(),
+                    }
+                },
+                &alice,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        let denied = store
+            .get_job(authorized(
+                JobRequest {
+                    project_id: project.project_id.clone(),
+                    job_id: job.job_id.clone(),
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+        let mut stream = store
+            .stream_job_events(authorized(
+                JobEventRequest {
+                    project_id: project.project_id.clone(),
+                    job_id: job.job_id.clone(),
+                    after_sequence: 0,
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut states = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+        {
+            states.push(event.unwrap().state);
+        }
+        assert_eq!(states.first().unwrap(), "queued");
+        assert_eq!(states.last().unwrap(), "failed");
+        let terminal = store
+            .get_job(authorized(
+                JobRequest {
+                    project_id: project.project_id.clone(),
+                    job_id: job.job_id.clone(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(terminal.state, "failed");
+        let replay = store
+            .stream_job_events(authorized(
+                JobEventRequest {
+                    project_id: project.project_id.clone(),
+                    job_id: job.job_id,
+                    after_sequence: 0,
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(replay.len(), states.len());
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_is_not_resurrected_and_restart_interrupts_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("jobs.sqlite");
+        let store = Store::open(&database).unwrap();
+        let token = store.create_identity("alice").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "recovery".to_owned(),
+                    idempotency_key: "recovery-1".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        {
+            let conn = store.connection().unwrap();
+            conn.execute("INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state) VALUES('cancel-me',?1,0,'lift','f','key-a','queued')", [&project.project_id]).unwrap();
+            conn.execute("INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state) VALUES('interrupt-me',?1,0,'lift','f','key-b','running')", [&project.project_id]).unwrap();
+        }
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let observer = handle.abort_handle();
+        store
+            .workers
+            .lock()
+            .unwrap()
+            .insert("cancel-me".to_owned(), handle);
+        let cancelled = store
+            .cancel_job(authorized(
+                JobRequest {
+                    project_id: project.project_id.clone(),
+                    job_id: "cancel-me".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(cancelled.state, "cancelled");
+        assert!(observer.is_finished());
+        assert!(
+            !store
+                .transition_job("cancel-me", "queued", "running", "late worker")
+                .unwrap()
+        );
+        drop(store);
+        let reopened = Store::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .job("alice", &project.project_id, "cancel-me")
+                .unwrap()
+                .state,
+            "cancelled"
+        );
+        assert_eq!(
+            reopened
+                .job("alice", &project.project_id, "interrupt-me")
+                .unwrap()
+                .state,
+            "interrupted"
+        );
     }
 }
