@@ -1220,6 +1220,8 @@ dependencies = [
  "hydir-analysis",
  "hydir-api",
  "hydir-backend",
+ "iced-x86",
+ "object",
  "serde_json",
  "sha2",
  "tempfile",

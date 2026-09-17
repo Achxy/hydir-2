@@ -1,8 +1,54 @@
-# M1 evidence — 2026-09-17
+# HydIR evidence — 2026-09-17
 
-The first section records the linear-slice checkpoint. The second section
-records the subsequent direct-CFG and analyst-entry expansion. Counts are
-fixture variants, not claims about arbitrary ELF programs.
+## Restricted local whole-program rebuild checkpoint — 2026-09-17
+
+`bash scripts/demo-linux-docker.sh` exited 0 after the whole-rebuild path was
+added. The pinned Linux x86-64 image ran Rust 1.96.0 and Debian Clang/LLVM
+14.0.6; **27 Rust unit tests** passed and workspace Clippy passed with
+`-D warnings`. The existing five function fixture variants again matched
+**5,040/5,040** seeded/boundary executions. The direct-call/global-effect
+analysis fixture, named LLVM-pass experiment (8 boundary matches), and
+separate-process remote demo also passed. Their final artifacts are under
+`target/demo-local/run.442o8y/`, `target/demo-analysis/run.1RCq7p/`,
+`target/demo-passes/run.rk7mAY/`, and `target/demo-remote/run.Kwjvqk/`.
+
+The new `scripts/demo-recompile.sh` gate in that run passed and left
+`target/demo-recompile/run.o2gyHw/`. It compiled three complete fixture
+programs to static ELFs, passed only those ELF bytes to `hydirctl rebuild`,
+verified each generated LLVM module with `opt`, linked three new executables,
+and compared stdout, stderr, and exit status for five controlled cases:
+`whole_hello` (empty input), `whole_choice` (`A`, `B`, EOF), and `whole_loop`
+(empty input). All five matched with exit status 0. These are **5 observed
+whole-program cases across 3 supported/rebuilt programs**, not 1,000-case
+equivalence evidence. The choice fixture exercises `.bss`; the loop fixture
+exercises a shared data counter and a direct helper call. Three further complete
+ELFs were deliberately unsupported: a `push` instruction, an uninitialized
+RAX read, a write to `.rodata`, an unmapped syscall buffer, and an unsupported
+syscall number were rejected with explicit diagnostics.
+An invocation without `--trusted-fixture` was also rejected. The three
+rebuilt files differ byte-for-byte from their originals; the source fixtures
+are read by the test harness, not the rebuilder.
+An initial `.bss`-only choice ELF failed under Docker's Apple Silicon x86-64
+emulation with `rosetta error: bss_size overflow` before its behavior could be
+compared. Adding a one-byte `.data` anchor produced a normal writable LOAD
+segment with `.bss`, after which both original and rebuilt fixtures passed.
+This is an emulation-specific observed failure, not evidence of native Linux
+support for that original BSS-only layout.
+
+| Corpus unit | Attempted | Supported | Lifted | IR-valid | Executable | Behaviorally matched | C-generated | Whole-program rebuilt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Complete-program ELFs | 8 | 3 | 3 | 3 | 3 | 3 (5 controlled cases) | 0 | 3 |
+
+This is a **restricted local M4 engineering gate**, not completion of the
+overall release milestone. The rebuild grammar is static, fully symbolized,
+freestanding x86-64; the guest stack must be unobserved and only read/write/
+exit are modeled. There is no hostile-binary sandbox, no remote/API/GUI rebuild,
+no C generation, and no patch workflow. M0 licensing/reference-lift closure,
+M2 full remote product/security, M3 C/patch workflow, and M5 release hardening
+remain open. No source release, public service, push, or deployment was made.
+
+The remaining sections below preserve earlier chronological checkpoints.
+Counts are fixture variants, not claims about arbitrary ELF programs.
 
 The checkout started at initial commit `b6228a3dd2753d91260d3f5868d6b576388a1742`
 with only a nine-byte README. No prior HydIR implementation was present here.

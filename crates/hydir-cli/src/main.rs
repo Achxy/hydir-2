@@ -3,6 +3,7 @@ use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
 mod passes;
+mod recompile;
 mod remote;
 use serde_json::json;
 use std::{
@@ -25,6 +26,7 @@ Usage:
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl transform <elf> <function-symbol> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory> [--opt <path>]
+  hydirctl rebuild <linked-elf> --trusted-fixture --output-dir <new-directory> [--clang <path>]
   hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl remote <operation> ...
@@ -34,6 +36,8 @@ analyst-supplied virtual entry and exact byte extent, and works on stripped
 linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
+Rebuild is local-only for a narrow freestanding static x86-64 ELF subset;
+it requires pinned Clang/LLVM 14.0.6 and is not a hostile-binary sandbox.
 Remote operations require HYDIR_ENDPOINT and a HYDIR_TOKEN_FILE containing a
 credential created by hydird. Remote upload is always an explicit command.
 ";
@@ -85,7 +89,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "remote_non_loopback": false,
                     "c_output": false,
                     "patching": false,
-                    "whole_executable_rebuild": false
+                    "whole_executable_rebuild": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.as_deref().is_some_and(|version| version.contains("14.0.6")),
+                    "whole_executable_rebuild_scope": "trusted freestanding static symbolized x86-64 ELF; direct calls/branches, bounded mapped data, read/write/exit only; local CLI only"
                 }))?
             );
         }
@@ -155,6 +160,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Some("transform") => passes::run(&args[1..])?,
+        Some("rebuild") => recompile::run(&args[1..])?,
         Some("validate") if args.len() >= 4 => validate(&args[1..], false)?,
         Some("validate-at") if args.len() >= 5 => validate(&args[1..], true)?,
         Some("remote") if args.len() >= 2 => {

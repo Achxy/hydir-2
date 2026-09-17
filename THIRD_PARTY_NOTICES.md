@@ -43,3 +43,7 @@ The trusted local pass experiment invokes Debian LLVM `opt` 14.0.6 from the
 development image. LLVM is a separate native tool, not statically linked into
 these Rust binaries. Its license and runtime redistribution obligations must
 be included if a future package bundles it.
+The restricted local rebuild path also invokes Clang and LLVM `opt` 14.0.6,
+and links a first-party C guest-memory/syscall runtime into generated ELF
+artifacts. No LLVM library is statically linked into `hydirctl`; generated
+artifacts and toolchain redistribution still need a distribution notice audit.
