@@ -39,6 +39,11 @@ class HydirStub:
                 request_serializer=hydir__pb2.DiscoverRequest.SerializeToString,
                 response_deserializer=hydir__pb2.DiscoverReply.FromString,
                 _registered_method=True)
+        self.GetSource = channel.unary_unary(
+                '/hydir.v1.Hydir/GetSource',
+                request_serializer=hydir__pb2.SourceRequest.SerializeToString,
+                response_deserializer=hydir__pb2.SourceReply.FromString,
+                _registered_method=True)
         self.CreateProject = channel.unary_unary(
                 '/hydir.v1.Hydir/CreateProject',
                 request_serializer=hydir__pb2.CreateProjectRequest.SerializeToString,
@@ -74,6 +79,11 @@ class HydirStub:
                 request_serializer=hydir__pb2.FunctionRequest.SerializeToString,
                 response_deserializer=hydir__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.Decompile = channel.unary_unary(
+                '/hydir.v1.Hydir/Decompile',
+                request_serializer=hydir__pb2.FunctionRequest.SerializeToString,
+                response_deserializer=hydir__pb2.ArtifactReply.FromString,
+                _registered_method=True)
         self.GetArtifact = channel.unary_unary(
                 '/hydir.v1.Hydir/GetArtifact',
                 request_serializer=hydir__pb2.ArtifactRequest.SerializeToString,
@@ -105,6 +115,12 @@ class HydirServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Discover(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSource(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -152,6 +168,12 @@ class HydirServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Decompile(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetArtifact(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -190,6 +212,11 @@ def add_HydirServicer_to_server(servicer, server):
                     request_deserializer=hydir__pb2.DiscoverRequest.FromString,
                     response_serializer=hydir__pb2.DiscoverReply.SerializeToString,
             ),
+            'GetSource': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSource,
+                    request_deserializer=hydir__pb2.SourceRequest.FromString,
+                    response_serializer=hydir__pb2.SourceReply.SerializeToString,
+            ),
             'CreateProject': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateProject,
                     request_deserializer=hydir__pb2.CreateProjectRequest.FromString,
@@ -222,6 +249,11 @@ def add_HydirServicer_to_server(servicer, server):
             ),
             'Lift': grpc.unary_unary_rpc_method_handler(
                     servicer.Lift,
+                    request_deserializer=hydir__pb2.FunctionRequest.FromString,
+                    response_serializer=hydir__pb2.ArtifactReply.SerializeToString,
+            ),
+            'Decompile': grpc.unary_unary_rpc_method_handler(
+                    servicer.Decompile,
                     request_deserializer=hydir__pb2.FunctionRequest.FromString,
                     response_serializer=hydir__pb2.ArtifactReply.SerializeToString,
             ),
@@ -278,6 +310,33 @@ class Hydir:
             '/hydir.v1.Hydir/Discover',
             hydir__pb2.DiscoverRequest.SerializeToString,
             hydir__pb2.DiscoverReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSource(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/GetSource',
+            hydir__pb2.SourceRequest.SerializeToString,
+            hydir__pb2.SourceReply.FromString,
             options,
             channel_credentials,
             insecure,
@@ -465,6 +524,33 @@ class Hydir:
             request,
             target,
             '/hydir.v1.Hydir/Lift',
+            hydir__pb2.FunctionRequest.SerializeToString,
+            hydir__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Decompile(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/Decompile',
             hydir__pb2.FunctionRequest.SerializeToString,
             hydir__pb2.ArtifactReply.FromString,
             options,

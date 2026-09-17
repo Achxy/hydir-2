@@ -3,6 +3,7 @@ package hydir.v1;
 
 service Hydir {
   rpc Discover (DiscoverRequest) returns (DiscoverReply);
+  rpc GetSource (SourceRequest) returns (SourceReply);
   rpc CreateProject (CreateProjectRequest) returns (ProjectReply);
   rpc GetProject (ProjectRequest) returns (ProjectReply);
   rpc UploadBinary (UploadBinaryRequest) returns (ProjectReply);
@@ -10,6 +11,7 @@ service Hydir {
   rpc Analyze (ProjectRequest) returns (JsonReply);
   rpc RecoverCfg (FunctionRequest) returns (JsonReply);
   rpc Lift (FunctionRequest) returns (ArtifactReply);
+  rpc Decompile (FunctionRequest) returns (ArtifactReply);
   rpc GetArtifact (ArtifactRequest) returns (ArtifactReply);
   rpc StartLiftJob (StartLiftJobRequest) returns (JobReply);
   rpc GetJob (JobRequest) returns (JobReply);
@@ -31,6 +33,15 @@ message DiscoverReply {
   bool reconnectable_job_events = 10;
   bool job_cancellation = 11;
   bool conservative_global_effect_analysis = 12;
+  bool scalar_c_output = 13;
+  string source_revision = 14;
+  string source_sha256 = 15;
+}
+message SourceRequest {}
+message SourceReply {
+  string revision = 1;
+  string sha256 = 2;
+  bytes content = 3;
 }
 message CreateProjectRequest {
   string name = 1;

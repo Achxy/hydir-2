@@ -8,6 +8,7 @@ use hydir_api::v1::{
     ProjectRequest, StartLiftJobRequest, UploadBinaryRequest, hydir_client::HydirClient,
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
+use hydir_c::emit_c;
 use hydir_core::{FunctionCfg, FunctionSpec, ProgramSpec};
 use sha2::{Digest, Sha256};
 use std::{
@@ -62,6 +63,7 @@ enum Event {
     Imported {
         source: String,
         remote: bool,
+        source_offer: Option<String>,
         spec: ProgramSpec,
     },
     RemoteProjectCreated(String),
@@ -69,6 +71,7 @@ enum Event {
         symbol: String,
         cfg: Result<FunctionCfg, String>,
         ir: Result<String, String>,
+        c: Result<String, String>,
     },
     Analyzed(Result<AnalysisReport, String>),
     JobUpdated(JobReply),
@@ -82,6 +85,7 @@ struct RemoteAccess {
     token: String,
     project_id: String,
     revision: u64,
+    source_offer: String,
 }
 
 enum Source {
@@ -158,6 +162,7 @@ async fn open_remote(
         token: read_credential(&token_file)?,
         project_id,
         revision: 0,
+        source_offer: String::new(),
     };
     let mut client = remote_client(&access).await?;
     let discovery = client
@@ -171,6 +176,15 @@ async fn open_remote(
             discovery.api_version
         ));
     }
+    let source_offer =
+        if discovery.source_revision.len() == 40 && discovery.source_sha256.len() == 64 {
+            format!(
+                "Revision {} · SHA-256 {} · hydirctl remote source --output <file.tar>",
+                discovery.source_revision, discovery.source_sha256,
+            )
+        } else {
+            discovery.source_status
+        };
     let project = client
         .get_project(authorized(
             ProjectRequest {
@@ -189,6 +203,7 @@ async fn open_remote(
     }
     let access = RemoteAccess {
         revision: project.revision,
+        source_offer,
         ..access
     };
     let reply = client
@@ -225,6 +240,7 @@ async fn create_remote_project(
         token: read_credential(&token_file)?,
         project_id: String::new(),
         revision: 0,
+        source_offer: String::new(),
     };
     let mut client = remote_client(&access).await?;
     let created = client
@@ -258,6 +274,7 @@ async fn upload_remote(
         token: read_credential(&token_file)?,
         project_id: project_id.clone(),
         revision: 0,
+        source_offer: String::new(),
     };
     let mut client = remote_client(&access).await?;
     let project = client
@@ -301,10 +318,14 @@ async fn upload_remote(
 async fn select_remote(
     access: &RemoteAccess,
     symbol: &str,
-) -> (Result<FunctionCfg, String>, Result<String, String>) {
+) -> (
+    Result<FunctionCfg, String>,
+    Result<String, String>,
+    Result<String, String>,
+) {
     let mut client = match remote_client(access).await {
         Ok(client) => client,
-        Err(error) => return (Err(error.clone()), Err(error)),
+        Err(error) => return (Err(error.clone()), Err(error.clone()), Err(error)),
     };
     let request = FunctionRequest {
         project_id: access.project_id.clone(),
@@ -324,7 +345,7 @@ async fn select_remote(
         .lift(authorized(
             FunctionRequest {
                 assume_u64x2: true,
-                ..request
+                ..request.clone()
             },
             &access.token,
         ))
@@ -339,7 +360,29 @@ async fn select_remote(
             }
             String::from_utf8(artifact.content).map_err(|e| format!("Invalid UTF-8 IR: {e}"))
         });
-    (cfg, ir)
+    let c = client
+        .decompile(authorized(
+            FunctionRequest {
+                assume_u64x2: true,
+                ..request
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|e| format!("Remote C recovery failed: {e}"))
+        .and_then(|reply| {
+            let artifact = reply.into_inner();
+            if artifact.project_revision != access.revision
+                || artifact.media_type != "text/x-csrc"
+                || format!("{:x}", Sha256::digest(&artifact.content)) != artifact.sha256
+            {
+                return Err(
+                    "Remote C artifact failed revision/digest/type verification.".to_owned(),
+                );
+            }
+            String::from_utf8(artifact.content).map_err(|e| format!("Invalid UTF-8 C: {e}"))
+        });
+    (cfg, ir, c)
 }
 
 async fn analyze_remote(access: &RemoteAccess) -> Result<AnalysisReport, String> {
@@ -456,6 +499,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     Event::Imported {
                         source: path.display().to_string(),
                         remote: false,
+                        source_offer: None,
                         spec,
                     }
                 }
@@ -471,10 +515,12 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         "{} · {} · revision {}",
                         access.endpoint, access.project_id, access.revision
                     );
+                    let source_offer = access.source_offer.clone();
                     source = Source::Remote(access);
                     Event::Imported {
                         source: label,
                         remote: true,
+                        source_offer: Some(source_offer),
                         spec,
                     }
                 }
@@ -499,24 +545,31 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         "{} · {} · revision {}",
                         access.endpoint, access.project_id, access.revision
                     );
+                    let source_offer = access.source_offer.clone();
                     source = Source::Remote(access);
                     Event::Imported {
                         source: label,
                         remote: true,
+                        source_offer: Some(source_offer),
                         spec,
                     }
                 }
                 Err(error) => Event::Failed(error),
             },
             Task::Select(symbol) => match &source {
-                Source::Local(bytes) => Event::Selected {
-                    cfg: recover_symbol_cfg(bytes, &symbol).map_err(|e| e.to_string()),
-                    ir: lift_symbol(bytes, &symbol).map_err(|e| e.to_string()),
-                    symbol,
-                },
+                Source::Local(bytes) => {
+                    let ir = lift_symbol(bytes, &symbol).map_err(|e| e.to_string());
+                    let c = ir.as_ref().map_err(Clone::clone).and_then(|ir| emit_c(ir));
+                    Event::Selected {
+                        cfg: recover_symbol_cfg(bytes, &symbol).map_err(|e| e.to_string()),
+                        ir,
+                        c,
+                        symbol,
+                    }
+                }
                 Source::Remote(access) => {
-                    let (cfg, ir) = runtime.block_on(select_remote(access, &symbol));
-                    Event::Selected { symbol, cfg, ir }
+                    let (cfg, ir, c) = runtime.block_on(select_remote(access, &symbol));
+                    Event::Selected { symbol, cfg, ir, c }
                 }
                 Source::None => {
                     Event::Failed("Open a local ELF or remote project first.".to_owned())
@@ -585,11 +638,14 @@ struct AnalystApp {
     remote_upload_path: String,
     search: String,
     source_label: Option<String>,
+    source_offer: Option<String>,
     remote: bool,
     spec: Option<ProgramSpec>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
     ir: Option<String>,
+    c: Option<String>,
+    c_error: Option<String>,
     analysis: Option<AnalysisReport>,
     job: Option<JobReply>,
     job_symbol: Option<String>,
@@ -631,11 +687,14 @@ impl AnalystApp {
             remote_upload_path: String::new(),
             search: String::new(),
             source_label: None,
+            source_offer: None,
             remote: false,
             spec: None,
             symbol: None,
             cfg: None,
             ir: None,
+            c: None,
+            c_error: None,
             analysis: None,
             job: None,
             job_symbol: None,
@@ -669,16 +728,20 @@ impl AnalystApp {
                 Event::Imported {
                     source,
                     remote,
+                    source_offer,
                     spec,
                 } => {
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.source_label = Some(source);
+                    self.source_offer = source_offer;
                     self.remote = remote;
                     self.spec = Some(spec);
                     self.symbol = None;
                     self.cfg = None;
                     self.ir = None;
+                    self.c = None;
+                    self.c_error = None;
                     self.analysis = None;
                     self.job = None;
                     self.job_symbol = None;
@@ -693,7 +756,7 @@ impl AnalystApp {
                     self.history.push(self.status.clone());
                     self.failure = None;
                 }
-                Event::Selected { symbol, cfg, ir } => {
+                Event::Selected { symbol, cfg, ir, c } => {
                     if self.symbol.as_deref() != Some(&symbol) {
                         continue;
                     }
@@ -708,6 +771,16 @@ impl AnalystApp {
                     };
                     self.cfg = cfg_value;
                     self.ir = ir_value;
+                    match c {
+                        Ok(value) => {
+                            self.c = Some(value);
+                            self.c_error = None;
+                        }
+                        Err(error) => {
+                            self.c = None;
+                            self.c_error = Some(error);
+                        }
+                    }
                     self.failure = ir_error.or(cfg_error);
                     self.status = if self.ir.is_some() {
                         format!(
@@ -791,6 +864,8 @@ impl AnalystApp {
         self.symbol = Some(name.clone());
         self.cfg = None;
         self.ir = None;
+        self.c = None;
+        self.c_error = None;
         self.selected_address = None;
         self.enqueue(
             Task::Select(name),
@@ -986,6 +1061,10 @@ impl AnalystApp {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Inspector").size(16.0));
         ui.separator();
+        if let Some(source_offer) = &self.source_offer {
+            field(ui, "SOURCE OFFER", source_offer);
+            ui.separator();
+        }
         let analyze = ui.add_enabled(
             !self.busy && self.spec.is_some(),
             egui::Button::new("Analyze global effects"),
@@ -1141,16 +1220,9 @@ impl AnalystApp {
                 (Tab::Analysis, "Global effects"),
                 (Tab::C, "C output"),
             ] {
-                let enabled = tab != Tab::C;
-                let response =
-                    ui.add_enabled(enabled, egui::Button::selectable(self.tab == tab, label));
+                let response = ui.add(egui::Button::selectable(self.tab == tab, label));
                 if response.clicked() {
                     self.tab = tab;
-                }
-                if !enabled {
-                    response.on_disabled_hover_text(
-                        "C generation is not implemented for this backend.",
-                    );
                 }
             }
         });
@@ -1160,9 +1232,7 @@ impl AnalystApp {
             Tab::Cfg => self.cfg_view(ui),
             Tab::Llvm => self.llvm_view(ui),
             Tab::Analysis => self.analysis_view(ui),
-            Tab::C => {
-                ui.label("C output is unavailable.");
-            }
+            Tab::C => self.c_view(ui),
         }
     }
 
@@ -1257,6 +1327,29 @@ impl AnalystApp {
             .show(ui, |ui| {
                 ui.code(ir);
             });
+    }
+
+    fn c_view(&mut self, ui: &mut egui::Ui) {
+        if let Some(c) = &self.c {
+            ui.label(
+                RichText::new("SCALAR LLVM-TO-C · EXPLICIT CFG / SSA COPIES")
+                    .size(11.0)
+                    .color(ACCENT),
+            );
+            egui::ScrollArea::both().id_salt("c_view").show(ui, |ui| {
+                ui.code(c);
+            });
+        } else if let Some(error) = &self.c_error {
+            ui.colored_label(BAD, error);
+            ui.label(
+                RichText::new("A C-generation failure does not discard a valid CFG or LLVM lift.")
+                    .color(MUTED),
+            );
+        } else {
+            ui.label(
+                RichText::new("Select a supported scalar function to generate C.").color(MUTED),
+            );
+        }
     }
 
     fn analysis_view(&mut self, ui: &mut egui::Ui) {
@@ -1462,9 +1555,15 @@ fn main() -> eframe::Result<()> {
                 project_id.clone(),
             )
             .await?;
-            let (cfg, ir) = select_remote(&access, symbol).await;
+            let (cfg, ir, c) = select_remote(&access, symbol).await;
             let cfg = cfg?;
             let ir = ir?;
+            let c = c?;
+            if !c.contains("uint64_t hydir_lifted(") {
+                return Err(
+                    "Remote C artifact did not contain the expected lifted function.".to_owned(),
+                );
+            }
             let analysis = analyze_remote(&access).await?;
             if analysis.binary_sha256 != spec.binary_sha256 {
                 return Err("Remote analysis model digest differs from open project.".to_owned());

@@ -1214,12 +1214,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydir-c"
+version = "0.1.0"
+
+[[package]]
 name = "hydir-cli"
 version = "0.1.0"
 dependencies = [
  "hydir-analysis",
  "hydir-api",
  "hydir-backend",
+ "hydir-c",
  "iced-x86",
  "object",
  "serde_json",
@@ -1245,6 +1250,7 @@ dependencies = [
  "hydir-analysis",
  "hydir-api",
  "hydir-backend",
+ "hydir-c",
  "hydir-core",
  "serde_json",
  "sha2",
@@ -1260,6 +1266,7 @@ dependencies = [
  "hydir-analysis",
  "hydir-api",
  "hydir-backend",
+ "hydir-c",
  "libc",
  "rusqlite",
  "serde_json",

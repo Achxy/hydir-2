@@ -4,10 +4,11 @@ use hydir_analysis::analyze_elf;
 use hydir_api::v1::{
     ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
     FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, ProjectReply,
-    ProjectRequest, StartLiftJobRequest, UploadBinaryRequest,
+    ProjectRequest, SourceReply, SourceRequest, StartLiftJobRequest, UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
+use hydir_c::emit_c;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 #[cfg(not(test))]
@@ -32,6 +33,8 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
 use uuid::Uuid;
+
+include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
 
 const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
@@ -431,6 +434,10 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("lift", Some(symbol)) => lift_symbol(bytes, symbol)
             .map(String::into_bytes)
             .map_err(|error| error.to_string()),
+        ("decompile", Some(symbol)) => lift_symbol(bytes, symbol)
+            .map_err(|error| error.to_string())
+            .and_then(|ir| emit_c(&ir))
+            .map(String::into_bytes),
         _ => Err("unsupported worker operation".to_owned()),
     }
 }
@@ -570,8 +577,13 @@ impl Hydir for Store {
             api_version: 1,
             hydir_version: env!("CARGO_PKG_VERSION").to_owned(),
             license: "AGPL-3.0-only".to_owned(),
-            source_status: "Local source checkout only; no public release or remote source offer"
-                .to_owned(),
+            source_status: if SOURCE_ARCHIVE.is_empty() {
+                "No matching source archive embedded in this development build".to_owned()
+            } else {
+                format!(
+                    "Matching committed source archive available via GetSource for revision {SOURCE_REVISION}"
+                )
+            },
             native_elf_import: true,
             scalar_direct_cfg_lift: true,
             execution_validation: false,
@@ -580,6 +592,30 @@ impl Hydir for Store {
             reconnectable_job_events: true,
             job_cancellation: true,
             conservative_global_effect_analysis: true,
+            scalar_c_output: true,
+            source_revision: SOURCE_REVISION.to_owned(),
+            source_sha256: if SOURCE_ARCHIVE.is_empty() {
+                String::new()
+            } else {
+                sha256(SOURCE_ARCHIVE)
+            },
+        }))
+    }
+
+    async fn get_source(
+        &self,
+        request: Request<SourceRequest>,
+    ) -> Result<Response<SourceReply>, Status> {
+        self.principal(&request)?;
+        if SOURCE_ARCHIVE.is_empty() {
+            return Err(Status::unavailable(
+                "this development build has no embedded source archive",
+            ));
+        }
+        Ok(Response::new(SourceReply {
+            revision: SOURCE_REVISION.to_owned(),
+            sha256: sha256(SOURCE_ARCHIVE),
+            content: SOURCE_ARCHIVE.to_vec(),
         }))
     }
 
@@ -771,6 +807,33 @@ impl Hydir for Store {
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-llvm-ir".to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn decompile(
+        &self,
+        request: Request<FunctionRequest>,
+    ) -> Result<Response<ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let content = run_worker("decompile", Some(&input.function_symbol), bytes).await?;
+        let digest = sha256(&content);
+        self.connection()?.execute(
+            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
+            params![input.project_id, input.expected_revision as i64, digest, "text/x-csrc", content],
+        ).map_err(internal)?;
+        Ok(Response::new(ArtifactReply {
+            sha256: digest,
+            media_type: "text/x-csrc".to_owned(),
             content,
             project_revision: input.expected_revision,
         }))

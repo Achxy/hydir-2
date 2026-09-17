@@ -3,8 +3,8 @@
 use super::{read_binary, write_new_or_identical};
 use hydir_api::v1::{
     ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobEventRequest,
-    JobReply, JobRequest, ProjectReply, ProjectRequest, StartLiftJobRequest, UploadBinaryRequest,
-    hydir_client::HydirClient,
+    JobReply, JobRequest, ProjectReply, ProjectRequest, SourceRequest, StartLiftJobRequest,
+    UploadBinaryRequest, hydir_client::HydirClient,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -13,6 +13,7 @@ use tonic::{Request, metadata::MetadataValue, transport::Channel};
 
 const HELP: &str = "Remote commands:
   hydirctl remote discover
+  hydirctl remote source --output <new-file.tar>
   hydirctl remote create <name> <idempotency-key>
   hydirctl remote project <project-id>
   hydirctl remote upload <project-id> <expected-revision> <elf>
@@ -20,6 +21,7 @@ const HELP: &str = "Remote commands:
   hydirctl remote analyze <project-id> <revision>
   hydirctl remote cfg <project-id> <revision> <function-symbol>
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
+  hydirctl remote decompile <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.c>
   hydirctl remote artifact <project-id> <sha256> --output <file>
   hydirctl remote job-start-lift <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2
   hydirctl remote job <project-id> <job-id>
@@ -120,6 +122,37 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "reconnectable_job_events": result.reconnectable_job_events,
                     "job_cancellation": result.job_cancellation,
                     "conservative_global_effect_analysis": result.conservative_global_effect_analysis,
+                    "scalar_c_output": result.scalar_c_output,
+                    "source_revision": result.source_revision,
+                    "source_sha256": result.source_sha256,
+                }))?
+            );
+        }
+        [command, output, file] if command == "source" && output == "--output" => {
+            let discovery = client
+                .discover(authorized(DiscoverRequest {}, &credential))
+                .await?
+                .into_inner();
+            if discovery.source_revision.len() != 40 || discovery.source_sha256.len() != 64 {
+                return Err("service has no matching source archive offer".into());
+            }
+            let result = client
+                .get_source(authorized(SourceRequest {}, &credential))
+                .await?
+                .into_inner();
+            if result.revision != discovery.source_revision
+                || result.sha256 != discovery.source_sha256
+            {
+                return Err("source offer changed between discovery and retrieval".into());
+            }
+            check_artifact(&result.content, &result.sha256)?;
+            write_new_or_identical(file, &result.content)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "revision": result.revision,
+                    "sha256": result.sha256,
+                    "output": file,
                 }))?
             );
         }
@@ -208,20 +241,24 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             println!("{}", result.json);
         }
         [command, id, expected, symbol, assume, output, file]
-            if command == "lift" && assume == "--assume-u64x2" && output == "--output" =>
+            if (command == "lift" || command == "decompile")
+                && assume == "--assume-u64x2"
+                && output == "--output" =>
         {
-            let result = client
-                .lift(authorized(
-                    FunctionRequest {
-                        project_id: id.clone(),
-                        expected_revision: revision(expected)?,
-                        function_symbol: symbol.clone(),
-                        assume_u64x2: true,
-                    },
-                    &credential,
-                ))
-                .await?
-                .into_inner();
+            let request = authorized(
+                FunctionRequest {
+                    project_id: id.clone(),
+                    expected_revision: revision(expected)?,
+                    function_symbol: symbol.clone(),
+                    assume_u64x2: true,
+                },
+                &credential,
+            );
+            let result = if command == "lift" {
+                client.lift(request).await?.into_inner()
+            } else {
+                client.decompile(request).await?.into_inner()
+            };
             check_artifact(&result.content, &result.sha256)?;
             write_new_or_identical(file, &result.content)?;
             println!(

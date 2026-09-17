@@ -14,7 +14,7 @@ functions=(
   identity_a identity_b sub_ab sub_ba add3 twice_a twice_b
   min_u min_s equal not_equal less_u less_s bit_overlap repeat3 repeat4
 )
-printf 'function\tattempted\tmatched\tmismatched\n' > "$run_dir/ledger.tsv"
+printf 'function\tllvm_attempted\tllvm_matched\tc_attempted\tc_matched\n' > "$run_dir/ledger.tsv"
 for function in "${functions[@]}"; do
   symbol="hydir_$function"
   clang -O0 -no-pie -DHYDIR_FUNCTION="$symbol" \
@@ -29,7 +29,15 @@ for function in "${functions[@]}"; do
   grep -q '"cases_attempted": 1008' "$run_dir/$function.report.json"
   grep -q '"cases_matched": 1008' "$run_dir/$function.report.json"
   grep -q '"cases_mismatched": 0' "$run_dir/$function.report.json"
-  printf '%s\t1008\t1008\t0\n' "$symbol" >> "$run_dir/ledger.tsv"
-  echo "matched $symbol: 1008/1008"
+  "${CARGO_TARGET_DIR:-target}/debug/hydirctl" decompile "$run_dir/$function-original" "$symbol" \
+    --assume-u64x2 --output "$run_dir/$function.c"
+  "${CARGO_TARGET_DIR:-target}/debug/hydirctl" validate-c "$run_dir/$function-original" "$symbol" \
+    --assume-u64x2 --trusted-fixture --clang clang \
+    > "$run_dir/$function.c.report.json"
+  grep -q '"cases_attempted": 1008' "$run_dir/$function.c.report.json"
+  grep -q '"cases_matched": 1008' "$run_dir/$function.c.report.json"
+  grep -q '"cases_mismatched": 0' "$run_dir/$function.c.report.json"
+  printf '%s\t1008\t1008\t1008\t1008\n' "$symbol" >> "$run_dir/ledger.tsv"
+  echo "matched $symbol: LLVM 1008/1008; C 1008/1008"
 done
-echo "scalar corpus gate passed: 16 new functions, 16128/16128 cases; $run_dir"
+echo "scalar corpus gate passed: 16 new functions, LLVM 16128/16128 and C 16128/16128 cases; $run_dir"

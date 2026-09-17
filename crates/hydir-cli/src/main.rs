@@ -2,6 +2,7 @@ use hydir_analysis::analyze_elf;
 use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
+use hydir_c::emit_c;
 mod passes;
 mod recompile;
 mod remote;
@@ -25,10 +26,14 @@ Usage:
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
+  hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
+  hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl transform <elf> <function-symbol> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory> [--opt <path>]
   hydirctl rebuild <linked-elf> --trusted-fixture --output-dir <new-directory> [--clang <path>]
   hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl validate-c <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl validate-c-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl remote <operation> ...
 
 Symbol mode requires a non-stripped function symbol. Address mode requires an
@@ -84,10 +89,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
                     "remote_api": true,
-                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/artifact and durable lift-job subset",
+                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
-                    "c_output": false,
+                    "c_output": true,
+                    "c_output_scope": "raw lifted scalar LLVM-to-C, explicit CFG/goto and parallel SSA edge copies; u64(u64,u64) only",
                     "patching": false,
                     "whole_executable_rebuild": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.as_deref().is_some_and(|version| version.contains("14.0.6")),
                     "whole_executable_rebuild_scope": "trusted freestanding static symbolized x86-64 ELF; direct calls/branches, bounded mapped data, read/write/exit only; local CLI only"
@@ -159,10 +165,57 @@ fn run() -> Result<(), Box<dyn Error>> {
                 print!("{ir}");
             }
         }
+        Some("decompile") if args.len() == 4 || args.len() == 6 => {
+            if args[3] != "--assume-u64x2" {
+                return Err(
+                    "decompile requires explicit --assume-u64x2 prototype assertion".into(),
+                );
+            }
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[1])?;
+            let c = emit_c(&lift_symbol(&bytes, &args[2])?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, c.as_bytes())?;
+            } else {
+                print!("{c}");
+            }
+        }
+        Some("decompile-at") if args.len() == 5 || args.len() == 7 => {
+            if args[4] != "--assume-u64x2" {
+                return Err(
+                    "decompile-at requires explicit --assume-u64x2 prototype assertion".into(),
+                );
+            }
+            let output = if args.len() == 7 {
+                if args[5] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[6].as_str())
+            } else {
+                None
+            };
+            let (address, size) = parse_address_extent(&args[2], &args[3])?;
+            let bytes = read_binary(&args[1])?;
+            let c = emit_c(&lift_at(&bytes, address, size)?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, c.as_bytes())?;
+            } else {
+                print!("{c}");
+            }
+        }
         Some("transform") => passes::run(&args[1..])?,
         Some("rebuild") => recompile::run(&args[1..])?,
-        Some("validate") if args.len() >= 4 => validate(&args[1..], false)?,
-        Some("validate-at") if args.len() >= 5 => validate(&args[1..], true)?,
+        Some("validate") if args.len() >= 4 => validate(&args[1..], false, false)?,
+        Some("validate-at") if args.len() >= 5 => validate(&args[1..], true, false)?,
+        Some("validate-c") if args.len() >= 4 => validate(&args[1..], false, true)?,
+        Some("validate-c-at") if args.len() >= 5 => validate(&args[1..], true, true)?,
         Some("remote") if args.len() >= 2 => {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -190,7 +243,7 @@ fn parse_address_extent(address: &str, size: &str) -> Result<(u64, u64), Box<dyn
     Ok((address, size))
 }
 
-fn validate(args: &[String], by_address: bool) -> Result<(), Box<dyn Error>> {
+fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Box<dyn Error>> {
     if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
         return Err(
             "validation executes only on Linux x86-64; import and lift are portable".into(),
@@ -252,19 +305,27 @@ fn validate(args: &[String], by_address: bool) -> Result<(), Box<dyn Error>> {
     };
     let directory = tempfile::tempdir()?;
     let ir_path = directory.path().join("lifted.ll");
+    let c_path = directory.path().join("lifted.c");
     let harness_path = directory.path().join("harness.c");
     let lifted_path = directory.path().join("lifted-runner");
-    fs::write(&ir_path, ir)?;
+    let source_path = if c_backend {
+        fs::write(&c_path, emit_c(&ir)?)?;
+        &c_path
+    } else {
+        fs::write(&ir_path, ir)?;
+        &ir_path
+    };
     fs::write(&harness_path, HARNESS)?;
     let compile = Command::new(clang)
         .args(["-O0", "-o"])
         .arg(&lifted_path)
-        .arg(&ir_path)
+        .arg(source_path)
         .arg(&harness_path)
         .output()?;
     if !compile.status.success() {
         return Err(format!(
-            "LLVM compilation failed: {}",
+            "lifted {} compilation failed: {}",
+            if c_backend { "C" } else { "LLVM" },
             String::from_utf8_lossy(&compile.stderr)
         )
         .into());
@@ -308,6 +369,7 @@ fn validate(args: &[String], by_address: bool) -> Result<(), Box<dyn Error>> {
     let matched = cases.len() - mismatch_count;
     let report = json!({
         "scope": "trusted two-u64 function fixture; stdout/stderr/exit status",
+        "backend": if c_backend { "HydIR scalar LLVM-to-C" } else { "raw LLVM" },
         "binary": binary,
         "function": label,
         "entry_assumption": address_extent.map(|(address, size)| json!({"virtual_address": format!("0x{address:016x}"), "size_bytes": size, "provenance": "analyst-supplied"})),

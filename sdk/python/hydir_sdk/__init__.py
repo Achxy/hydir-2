@@ -80,6 +80,19 @@ class HydirClient:
             raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
         return reply
 
+    def get_source(self) -> tuple[str, bytes]:
+        """Retrieve and hash-check the exact source archive advertised by this build."""
+        discovery = self.discover()
+        if len(discovery.source_revision) != 40 or len(discovery.source_sha256) != 64:
+            raise RuntimeError("Service has no matching source archive offer")
+        reply = self._call(self._stub.GetSource, proto.SourceRequest())
+        if reply.revision != discovery.source_revision or reply.sha256 != discovery.source_sha256:
+            raise RuntimeError("Source offer changed between discovery and retrieval")
+        actual = hashlib.sha256(reply.content).hexdigest()
+        if actual != reply.sha256:
+            raise RuntimeError("Source archive SHA-256 verification failed")
+        return reply.revision, reply.content
+
     def create_project(self, name: str, *, idempotency_key: str | None = None):
         return self._call(
             self._stub.CreateProject,
@@ -146,6 +159,21 @@ class HydirClient:
             raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
         reply = self._call(
             self._stub.Lift,
+            proto.FunctionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        return self._checked_artifact(reply, revision=revision)
+
+    def decompile(self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool) -> bytes:
+        """Return C emitted from the raw lifted scalar LLVM subset."""
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub.Decompile,
             proto.FunctionRequest(
                 project_id=project_id,
                 expected_revision=revision,
