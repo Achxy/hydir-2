@@ -1,3 +1,4 @@
+use hydir_analysis::analyze_elf;
 use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
@@ -17,6 +18,7 @@ const HELP: &str = "HydIR native x86-64 ELF vertical slice
 Usage:
   hydirctl doctor
   hydirctl inspect <elf>
+  hydirctl analyze <linked-elf>
   hydirctl cfg <elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
@@ -62,6 +64,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_elf_import": true,
                     "direct_cfg_scalar_llvm_lift": true,
                     "symbol_scoped_cfg_export": true,
+                    "conservative_global_effect_analysis": true,
                     "trusted_fixture_validation_available": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.is_some(),
                     "clang": clang_version,
                     "ghidra_required": false,
@@ -78,6 +81,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             let bytes = read_binary(&args[1])?;
             let spec = import_elf(&bytes)?;
             println!("{}", serde_json::to_string_pretty(&spec)?);
+        }
+        Some("analyze") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            let report = analyze_elf(&bytes)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Some("cfg") if args.len() == 3 => {
             let bytes = read_binary(&args[1])?;

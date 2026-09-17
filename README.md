@@ -13,8 +13,9 @@ The `hydir` egui desktop workbench opens local ELF files and explicitly
 connects to existing authenticated loopback projects. It shows function facts,
 reachable disassembly/CFG, LLVM IR, assumptions, and diagnostics in resizable
 panes. Opening a local binary never uploads it. GUI remote upload, saved
-layouts, remote job controls, passes, C output, and whole-program analysis are not yet
-implemented.
+layouts, passes, and C output are not yet implemented. It can start, monitor,
+cancel, and retrieve a remote lift job and display a conservative global-effect
+analysis. That analysis is not complete whole-program recovery.
 
 ## Build and inspect
 
@@ -27,6 +28,7 @@ cargo test --locked --workspace
 cargo run --locked --bin hydir
 cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
+cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
 ```
@@ -45,6 +47,8 @@ On Linux x86-64, `bash scripts/demo-remote.sh` runs the separate-process,
 authenticated service/client fixture, including durable lift jobs, event
 replay, restart, cancellation, and cross-project denial checks. See
 [remote operation and threat model](docs/REMOTE.md).
+`bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
+global write and conservative treatment of an indirect call in a linked ELF.
 
 The `validate` command runs the original binary and lifted runner **without a
 sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.

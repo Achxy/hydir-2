@@ -2,7 +2,11 @@
 //! native import, CFG recovery, and lifting operations used by the CLI.
 
 use eframe::egui::{self, Color32, RichText};
-use hydir_api::v1::{DiscoverRequest, FunctionRequest, ProjectRequest, hydir_client::HydirClient};
+use hydir_analysis::{AnalysisReport, analyze_elf};
+use hydir_api::v1::{
+    ArtifactRequest, DiscoverRequest, FunctionRequest, JobReply, JobRequest, ProjectRequest,
+    StartLiftJobRequest, hydir_client::HydirClient,
+};
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_core::{FunctionCfg, FunctionSpec, ProgramSpec};
 use sha2::{Digest, Sha256};
@@ -33,6 +37,14 @@ enum Task {
         project_id: String,
     },
     Select(String),
+    Analyze,
+    StartLiftJob {
+        symbol: String,
+        key: String,
+    },
+    RefreshJob(String),
+    CancelJob(String),
+    OpenJobArtifact(String),
 }
 
 enum Event {
@@ -46,6 +58,9 @@ enum Event {
         cfg: Result<FunctionCfg, String>,
         ir: Result<String, String>,
     },
+    Analyzed(Result<AnalysisReport, String>),
+    JobUpdated(JobReply),
+    JobArtifact(String),
     Failed(String),
 }
 
@@ -227,6 +242,85 @@ async fn select_remote(
     (cfg, ir)
 }
 
+async fn analyze_remote(access: &RemoteAccess) -> Result<AnalysisReport, String> {
+    let mut client = remote_client(access).await?;
+    let reply = client
+        .analyze(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote analysis failed: {error}"))?
+        .into_inner();
+    serde_json::from_str(&reply.json).map_err(|error| format!("Invalid remote analysis: {error}"))
+}
+
+async fn start_remote_job(
+    access: &RemoteAccess,
+    symbol: &str,
+    key: &str,
+) -> Result<JobReply, String> {
+    let mut client = remote_client(access).await?;
+    client
+        .start_lift_job(authorized(
+            StartLiftJobRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                function_symbol: symbol.to_owned(),
+                assume_u64x2: true,
+                idempotency_key: key.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map(|reply| reply.into_inner())
+        .map_err(|error| format!("Could not start lift job: {error}"))
+}
+
+async fn remote_job(access: &RemoteAccess, job_id: &str, cancel: bool) -> Result<JobReply, String> {
+    let mut client = remote_client(access).await?;
+    let request = authorized(
+        JobRequest {
+            project_id: access.project_id.clone(),
+            job_id: job_id.to_owned(),
+        },
+        &access.token,
+    );
+    let result = if cancel {
+        client.cancel_job(request).await
+    } else {
+        client.get_job(request).await
+    };
+    result
+        .map(|reply| reply.into_inner())
+        .map_err(|error| format!("Could not update lift job: {error}"))
+}
+
+async fn remote_job_artifact(access: &RemoteAccess, digest: &str) -> Result<String, String> {
+    let mut client = remote_client(access).await?;
+    let artifact = client
+        .get_artifact(authorized(
+            ArtifactRequest {
+                project_id: access.project_id.clone(),
+                sha256: digest.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not retrieve job artifact: {error}"))?
+        .into_inner();
+    if artifact.sha256 != digest
+        || artifact.project_revision != access.revision
+        || format!("{:x}", Sha256::digest(&artifact.content)) != digest
+    {
+        return Err("Job artifact failed revision/digest verification.".to_owned());
+    }
+    String::from_utf8(artifact.content).map_err(|error| format!("Job IR is not UTF-8: {error}"))
+}
+
 fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
     let metadata = fs::metadata(path).map_err(|e| format!("Cannot read binary metadata: {e}"))?;
     if metadata.len() > MAX_BINARY_BYTES as u64 {
@@ -300,6 +394,41 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     Event::Failed("Open a local ELF or remote project first.".to_owned())
                 }
             },
+            Task::Analyze => Event::Analyzed(match &source {
+                Source::Local(bytes) => analyze_elf(bytes).map_err(|error| error.to_string()),
+                Source::Remote(access) => runtime.block_on(analyze_remote(access)),
+                Source::None => Err("Open a local ELF or remote project first.".to_owned()),
+            }),
+            Task::StartLiftJob { symbol, key } => match &source {
+                Source::Remote(access) => runtime
+                    .block_on(start_remote_job(access, &symbol, &key))
+                    .map(Event::JobUpdated)
+                    .unwrap_or_else(Event::Failed),
+                _ => Event::Failed("Lift jobs require an open remote project.".to_owned()),
+            },
+            Task::RefreshJob(job_id) => match &source {
+                Source::Remote(access) => runtime
+                    .block_on(remote_job(access, &job_id, false))
+                    .map(Event::JobUpdated)
+                    .unwrap_or_else(Event::Failed),
+                _ => Event::Failed("Open the owning remote project to refresh its job.".to_owned()),
+            },
+            Task::CancelJob(job_id) => match &source {
+                Source::Remote(access) => runtime
+                    .block_on(remote_job(access, &job_id, true))
+                    .map(Event::JobUpdated)
+                    .unwrap_or_else(Event::Failed),
+                _ => Event::Failed("Open the owning remote project to cancel its job.".to_owned()),
+            },
+            Task::OpenJobArtifact(digest) => match &source {
+                Source::Remote(access) => runtime
+                    .block_on(remote_job_artifact(access, &digest))
+                    .map(Event::JobArtifact)
+                    .unwrap_or_else(Event::Failed),
+                _ => Event::Failed(
+                    "Open the owning remote project to retrieve its artifact.".to_owned(),
+                ),
+            },
         };
         if events.send(event).is_err() {
             break;
@@ -314,6 +443,7 @@ enum Tab {
     Cfg,
     Llvm,
     C,
+    Analysis,
 }
 
 struct AnalystApp {
@@ -330,6 +460,10 @@ struct AnalystApp {
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
     ir: Option<String>,
+    analysis: Option<AnalysisReport>,
+    job: Option<JobReply>,
+    job_symbol: Option<String>,
+    last_job_poll: std::time::Instant,
     selected_address: Option<u64>,
     tab: Tab,
     busy: bool,
@@ -370,6 +504,10 @@ impl AnalystApp {
             symbol: None,
             cfg: None,
             ir: None,
+            analysis: None,
+            job: None,
+            job_symbol: None,
+            last_job_poll: std::time::Instant::now(),
             selected_address: None,
             tab: Tab::Bytes,
             busy: false,
@@ -409,6 +547,9 @@ impl AnalystApp {
                     self.symbol = None;
                     self.cfg = None;
                     self.ir = None;
+                    self.analysis = None;
+                    self.job = None;
+                    self.job_symbol = None;
                     self.selected_address = None;
                     self.failure = None;
                 }
@@ -448,6 +589,47 @@ impl AnalystApp {
                     self.failure = Some(error.clone());
                     self.status = "Operation failed".to_owned();
                     self.history.push(error);
+                }
+                Event::Analyzed(result) => match result {
+                    Ok(report) => {
+                        if self.spec.as_ref().map(|spec| &spec.binary_sha256)
+                            != Some(&report.binary_sha256)
+                        {
+                            self.failure = Some(
+                                "Analysis binary digest does not match the open project."
+                                    .to_owned(),
+                            );
+                        } else {
+                            self.status =
+                                format!("Analyzed {} bounded functions", report.functions.len());
+                            self.history.push(self.status.clone());
+                            self.analysis = Some(report);
+                            self.tab = Tab::Analysis;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.failure = Some(error.clone());
+                        self.status = "Global-effect analysis failed".to_owned();
+                        self.history.push(error);
+                    }
+                },
+                Event::JobUpdated(job) => {
+                    self.status = format!("Lift job {} · {}", job.job_id, job.state);
+                    if !job.diagnostic.is_empty() {
+                        self.failure = Some(job.diagnostic.clone());
+                    } else {
+                        self.failure = None;
+                    }
+                    self.history.push(self.status.clone());
+                    self.job = Some(job);
+                    self.last_job_poll = std::time::Instant::now();
+                }
+                Event::JobArtifact(ir) => {
+                    self.ir = Some(ir);
+                    self.tab = Tab::Llvm;
+                    self.status = "Opened verified lift-job IR artifact".to_owned();
+                    self.failure = None;
                 }
             }
             if self.history.len() > 40 {
@@ -629,6 +811,31 @@ impl AnalystApp {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Inspector").size(16.0));
         ui.separator();
+        let analyze = ui.add_enabled(
+            !self.busy && self.spec.is_some(),
+            egui::Button::new("Analyze global effects"),
+        );
+        if analyze.clicked() {
+            self.enqueue(
+                Task::Analyze,
+                "Tracing direct calls and mapped global effects…",
+            );
+        }
+        analyze.on_hover_text(
+            "Scans bounded linked-ELF symbols. Unknown calls and indirect memory remain conservative; no binary execution.",
+        );
+        if let Some(report) = &self.analysis {
+            field(
+                ui,
+                "ANALYSIS SCOPE",
+                &format!(
+                    "{} functions · {} skipped",
+                    report.functions.len(),
+                    report.skipped_functions.len()
+                ),
+            );
+        }
+        ui.separator();
         if let Some(function) = self.selected_function() {
             ui.label(RichText::new(&function.name).monospace().color(ACCENT));
             field(ui, "ENTRY", &format!("0x{:016x}", function.address.0));
@@ -650,6 +857,27 @@ impl AnalystApp {
                 );
             }
             field(ui, "MEMORY/CALLS", "Unsupported by this lift");
+            if let Some(summary) = self.analysis.as_ref().and_then(|report| {
+                report.functions.iter().find(|summary| {
+                    summary.name == function.name && summary.entry == function.address
+                })
+            }) {
+                field(ui, "DIRECT CALLS", &summary.direct_callees.join(", "));
+                field(
+                    ui,
+                    "POSSIBLE GLOBAL WRITES",
+                    &format!("{} mapped addresses", summary.possible_global_writes.len()),
+                );
+                field(
+                    ui,
+                    "UNKNOWN EFFECTS",
+                    if summary.unknown_global_effects {
+                        "Yes · enumerated addresses are incomplete"
+                    } else {
+                        "No within declared scope"
+                    },
+                );
+            }
         } else {
             ui.label(
                 RichText::new("Select a function to inspect its scope and assumptions.")
@@ -667,6 +895,59 @@ impl AnalystApp {
         ui.add_space(12.0);
         ui.separator();
         ui.heading(RichText::new("Jobs / activity").size(14.0));
+        let selected_symbol = self.symbol.clone();
+        let start = ui.add_enabled(
+            self.remote && !self.busy && selected_symbol.is_some(),
+            egui::Button::new("Start remote lift job"),
+        );
+        if start.clicked()
+            && let Some(symbol) = selected_symbol
+        {
+            self.job_symbol = Some(symbol.clone());
+            self.enqueue(
+                Task::StartLiftJob {
+                    symbol,
+                    key: uuid::Uuid::new_v4().to_string(),
+                },
+                "Starting owner-scoped lift job…",
+            );
+        }
+        start.on_disabled_hover_text("Open a remote project and select a function first.");
+        if let Some(job) = self.job.clone() {
+            field(ui, "JOB", &format!("{} · {}", job.job_id, job.state));
+            if let Some(symbol) = &self.job_symbol {
+                field(ui, "FUNCTION", symbol);
+            }
+            if !job.diagnostic.is_empty() {
+                ui.colored_label(BAD, &job.diagnostic);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Refresh job"))
+                    .clicked()
+                {
+                    self.enqueue(Task::RefreshJob(job.job_id.clone()), "Refreshing lift job…");
+                }
+                let active = job.state == "queued" || job.state == "running";
+                let cancel = ui.add_enabled(!self.busy && active, egui::Button::new("Cancel job"));
+                if cancel.clicked() {
+                    self.enqueue(Task::CancelJob(job.job_id.clone()), "Cancelling lift job…");
+                }
+                cancel.on_disabled_hover_text("Only queued or running jobs can be cancelled.");
+            });
+            if job.state == "succeeded" && !job.artifact_sha256.is_empty() {
+                field(ui, "ARTIFACT SHA-256", &job.artifact_sha256);
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Open verified job IR"))
+                    .clicked()
+                {
+                    self.enqueue(
+                        Task::OpenJobArtifact(job.artifact_sha256),
+                        "Retrieving lift-job IR artifact…",
+                    );
+                }
+            }
+        }
         egui::ScrollArea::vertical()
             .id_salt("job_list")
             .show(ui, |ui| {
@@ -682,6 +963,7 @@ impl AnalystApp {
                 (Tab::Bytes, "Disassembly"),
                 (Tab::Cfg, "CFG"),
                 (Tab::Llvm, "LLVM IR"),
+                (Tab::Analysis, "Global effects"),
                 (Tab::C, "C output"),
             ] {
                 let enabled = tab != Tab::C;
@@ -702,6 +984,7 @@ impl AnalystApp {
             Tab::Bytes => self.disassembly(ui),
             Tab::Cfg => self.cfg_view(ui),
             Tab::Llvm => self.llvm_view(ui),
+            Tab::Analysis => self.analysis_view(ui),
             Tab::C => {
                 ui.label("C output is unavailable.");
             }
@@ -800,6 +1083,94 @@ impl AnalystApp {
                 ui.code(ir);
             });
     }
+
+    fn analysis_view(&mut self, ui: &mut egui::Ui) {
+        let Some(report) = &self.analysis else {
+            ui.label(
+                RichText::new("Run global-effect analysis to see cross-function results.")
+                    .color(MUTED),
+            );
+            return;
+        };
+        ui.label(RichText::new(&report.scope).size(11.0).color(MUTED));
+        ui.label(RichText::new(&report.assumption).size(11.0).color(MUTED));
+        if !report.skipped_functions.is_empty() {
+            ui.colored_label(
+                BAD,
+                format!(
+                    "{} symbols skipped; this is not whole-program coverage",
+                    report.skipped_functions.len()
+                ),
+            );
+        }
+        ui.separator();
+        egui::ScrollArea::both()
+            .id_salt("analysis_view")
+            .show(ui, |ui| {
+                for summary in &report.functions {
+                    let selected = self.symbol.as_deref() == Some(&summary.name);
+                    let color = if summary.unknown_global_effects {
+                        BAD
+                    } else {
+                        GOOD
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if selected { "▸" } else { " " }).color(ACCENT));
+                        ui.label(
+                            RichText::new(format!("0x{:016x}  {}", summary.entry.0, summary.name))
+                                .monospace(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "SCC {} · {} calls · {} reads · {} writes",
+                                summary.scc_id,
+                                summary.direct_callees.len(),
+                                summary.possible_global_reads.len(),
+                                summary.possible_global_writes.len()
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        ui.label(
+                            RichText::new(if summary.unknown_global_effects {
+                                "UNKNOWN EFFECTS"
+                            } else {
+                                "BOUNDED"
+                            })
+                            .size(10.0)
+                            .color(color),
+                        );
+                    });
+                    if selected {
+                        ui.indent(("analysis", summary.entry.0), |ui| {
+                            field(ui, "CALLEES", &summary.direct_callees.join(", "));
+                            field(
+                                ui,
+                                "POSSIBLE WRITES",
+                                &summary
+                                    .possible_global_writes
+                                    .iter()
+                                    .map(|reference| {
+                                        format!("{}:0x{:x}", reference.section, reference.address.0)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            );
+                            field(
+                                ui,
+                                "UNRESOLVED TARGETS",
+                                &summary
+                                    .unresolved_targets
+                                    .iter()
+                                    .map(|address| format!("0x{:x}", address.0))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            );
+                        });
+                    }
+                }
+            });
+    }
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -828,6 +1199,13 @@ fn ir_slice(ir: &str, address: u64) -> Option<String> {
 impl eframe::App for AnalystApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        if !self.busy
+            && self.last_job_poll.elapsed() >= std::time::Duration::from_millis(750)
+            && let Some(job) = &self.job
+            && matches!(job.state.as_str(), "queued" | "running")
+        {
+            self.enqueue(Task::RefreshJob(job.job_id.clone()), "Refreshing lift job…");
+        }
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
         self.header(ui);
@@ -876,12 +1254,41 @@ fn main() -> eframe::Result<()> {
             let (cfg, ir) = select_remote(&access, symbol).await;
             let cfg = cfg?;
             let ir = ir?;
-            Ok::<_, String>((spec.functions.len(), cfg.blocks.len(), ir.len()))
+            let analysis = analyze_remote(&access).await?;
+            if analysis.binary_sha256 != spec.binary_sha256 {
+                return Err("Remote analysis model digest differs from open project.".to_owned());
+            }
+            let started =
+                start_remote_job(&access, symbol, &uuid::Uuid::new_v4().to_string()).await?;
+            let mut job = started;
+            for _ in 0..40 {
+                if !matches!(job.state.as_str(), "queued" | "running") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                job = remote_job(&access, &job.job_id, false).await?;
+            }
+            if job.state != "succeeded" {
+                return Err(format!(
+                    "Remote GUI lift job did not succeed: {} · {}",
+                    job.state, job.diagnostic
+                ));
+            }
+            let job_ir = remote_job_artifact(&access, &job.artifact_sha256).await?;
+            if job_ir != ir {
+                return Err("Remote GUI lift job IR differs from direct lift.".to_owned());
+            }
+            Ok::<_, String>((
+                spec.functions.len(),
+                cfg.blocks.len(),
+                ir.len(),
+                analysis.functions.len(),
+            ))
         });
         match result {
-            Ok((functions, blocks, ir_bytes)) => {
+            Ok((functions, blocks, ir_bytes, analyzed)) => {
                 println!(
-                    "HydIR GUI remote operations passed: {functions} functions, {blocks} selected blocks, {ir_bytes} IR bytes"
+                    "HydIR GUI remote operations passed: {functions} functions, {blocks} selected blocks, {ir_bytes} IR bytes, {analyzed} global-effect summaries, one completed lift job"
                 );
                 return Ok(());
             }

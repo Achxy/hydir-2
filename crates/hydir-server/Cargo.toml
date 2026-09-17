@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 hydir-api = { path = "../hydir-api" }
 hydir-backend = { path = "../hydir-backend" }
+hydir-analysis = { path = "../hydir-analysis" }
 tonic.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
