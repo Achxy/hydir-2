@@ -544,7 +544,7 @@ impl AnalystApp {
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "Read-only workbench access. Upload remains an explicit CLI operation.",
+                        "No binary upload. Selecting a function requests analysis and may save IR on the service.",
                     )
                     .size(11.0)
                     .color(MUTED),
