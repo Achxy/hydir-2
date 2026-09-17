@@ -141,7 +141,32 @@ pub struct AssumptionSpec {
     pub id: String,
     pub statement: String,
     pub scope: String,
+    /// Virtual address when an analyst assertion is site-specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<Address>,
     pub provenance: FactProvenance,
+}
+
+/// Analyst-authored project metadata. It is scoped to one immutable binary
+/// digest and the project revision that recorded it, never an ELF fact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnalystAnnotation {
+    pub id: String,
+    pub binary_sha256: String,
+    pub created_revision: u64,
+    pub kind: AnnotationKind,
+    pub address: Option<Address>,
+    pub value: String,
+    pub scope: String,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationKind {
+    Name,
+    Comment,
+    Assumption,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

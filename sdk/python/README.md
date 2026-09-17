@@ -27,6 +27,12 @@ explicit upload, named pass request, and no-overwrite artifact export.
 and a partial `ProgramSpec` with provenance-bearing call/reference sites
 through the typed `Analyze` and `AnalyzeSpec` operations. It needs two new,
 distinct output paths and does not claim complete control-flow recovery.
+`examples/annotate_program.py` explicitly uploads a trusted ELF, adds a
+revisioned, scoped analyst name/comment/assumption, checks its binary-bound
+ledger, and exports JSON to a new file. Analyst facts are unverified;
+assumptions appear in remote inspected/analyzed specifications but do not
+satisfy explicit prototype/trust flags for other operations. The SDK checks
+the returned project, revision, and binary identity.
 `rebuild(...)` requires an explicit trusted-fixture assertion. It creates a
 new immutable binary revision and returns digest-checked ELF/IR/report
 artifacts without executing the ELF. `examples/rebuild_program.py` shows

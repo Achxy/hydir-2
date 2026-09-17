@@ -4,13 +4,15 @@
 use eframe::egui::{self, Color32, RichText};
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
-    ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobReply, JobRequest,
-    PatchRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest, TransformRequest,
-    UploadBinaryRequest, hydir_client::HydirClient,
+    AnnotationRequest, ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest,
+    JobReply, JobRequest, PatchRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest,
+    TransformRequest, UploadBinaryRequest, hydir_client::HydirClient,
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
-use hydir_core::{FunctionCfg, FunctionSpec, ProgramSpec};
+use hydir_core::{
+    AnalystAnnotation, AnnotationKind, FactSource, FunctionCfg, FunctionSpec, ProgramSpec,
+};
 use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
@@ -56,6 +58,17 @@ enum Task {
     },
     Select(String),
     Analyze,
+    RefreshAnnotations {
+        binary_sha256: String,
+    },
+    AddAnnotation {
+        binary_sha256: String,
+        kind: AnnotationKind,
+        address: Option<u64>,
+        scope: String,
+        value: String,
+        key: String,
+    },
     StartLiftJob {
         symbol: String,
         key: String,
@@ -113,6 +126,16 @@ enum Event {
         c: Result<String, String>,
     },
     Analyzed(Result<AnalysisReport, String>),
+    AnnotationsLoaded {
+        binary_sha256: String,
+        annotations: Vec<AnalystAnnotation>,
+    },
+    AnnotationAdded {
+        source: String,
+        revision: u64,
+        spec: ProgramSpec,
+        annotations: Vec<AnalystAnnotation>,
+    },
     JobUpdated(JobReply),
     JobArtifact(String),
     Transformed {
@@ -495,6 +518,104 @@ async fn analyze_remote(access: &RemoteAccess) -> Result<AnalysisReport, String>
         .map_err(|error| format!("Remote analysis failed: {error}"))?
         .into_inner();
     serde_json::from_str(&reply.json).map_err(|error| format!("Invalid remote analysis: {error}"))
+}
+
+async fn list_remote_annotations(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+) -> Result<Vec<AnalystAnnotation>, String> {
+    let mut client = remote_client(access).await?;
+    let reply = client
+        .list_annotations(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote annotations unavailable: {error}"))?
+        .into_inner();
+    let ledger: serde_json::Value = serde_json::from_str(&reply.json)
+        .map_err(|error| format!("Invalid remote annotation ledger: {error}"))?;
+    if ledger["project_id"] != access.project_id
+        || ledger["revision"] != access.revision
+        || ledger["binary_sha256"] != binary_sha256
+    {
+        return Err("Remote annotation ledger identity differs from open project.".to_owned());
+    }
+    serde_json::from_value(ledger["annotations"].clone())
+        .map_err(|error| format!("Invalid remote annotation facts: {error}"))
+}
+
+async fn add_remote_annotation(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+    kind: AnnotationKind,
+    address: Option<u64>,
+    scope: &str,
+    value: &str,
+    key: &str,
+) -> Result<(u64, ProgramSpec, Vec<AnalystAnnotation>), String> {
+    let kind_label = match kind {
+        AnnotationKind::Name => "name",
+        AnnotationKind::Comment => "comment",
+        AnnotationKind::Assumption => "assumption",
+    };
+    let mut client = remote_client(access).await?;
+    let added = client
+        .add_annotation(authorized(
+            AnnotationRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                idempotency_key: key.to_owned(),
+                kind: kind_label.to_owned(),
+                address: address.map_or_else(String::new, |address| format!("0x{address:016x}")),
+                value: value.to_owned(),
+                scope: scope.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote annotation failed: {error}"))?
+        .into_inner();
+    if added.project_id != access.project_id
+        || added.revision != access.revision + 1
+        || added.binary_sha256 != binary_sha256
+    {
+        return Err("Remote annotation returned an unexpected revision or binary.".to_owned());
+    }
+    let updated = RemoteAccess {
+        revision: added.revision,
+        ..access.clone()
+    };
+    let inspected = client
+        .inspect(authorized(
+            ProjectRequest {
+                project_id: updated.project_id.clone(),
+                expected_revision: updated.revision,
+            },
+            &updated.token,
+        ))
+        .await
+        .map_err(|error| format!("Cannot reopen annotated revision: {error}"))?
+        .into_inner();
+    let spec: ProgramSpec = serde_json::from_str(&inspected.json)
+        .map_err(|error| format!("Invalid annotated program model: {error}"))?;
+    if spec.binary_sha256 != binary_sha256 {
+        return Err("Annotated program digest changed unexpectedly.".to_owned());
+    }
+    let annotations = list_remote_annotations(&updated, binary_sha256).await?;
+    if !annotations.iter().any(|annotation| {
+        annotation.created_revision == updated.revision
+            && annotation.kind == kind
+            && annotation.address.map(|address| address.0) == address
+            && annotation.value == value
+            && annotation.scope == scope
+    }) {
+        return Err("Saved annotation is absent from the returned ledger.".to_owned());
+    }
+    Ok((updated.revision, spec, annotations))
 }
 
 async fn start_remote_job(
@@ -1134,6 +1255,54 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::Remote(access) => runtime.block_on(analyze_remote(access)),
                 Source::None => Err("Open a local ELF or remote project first.".to_owned()),
             }),
+            Task::RefreshAnnotations { binary_sha256 } => match &source {
+                Source::Remote(access) => runtime
+                    .block_on(list_remote_annotations(access, &binary_sha256))
+                    .map(|annotations| Event::AnnotationsLoaded {
+                        binary_sha256,
+                        annotations,
+                    })
+                    .unwrap_or_else(Event::Failed),
+                _ => Event::Failed("Open a remote project to load annotations.".to_owned()),
+            },
+            Task::AddAnnotation {
+                binary_sha256,
+                kind,
+                address,
+                scope,
+                value,
+                key,
+            } => match &mut source {
+                Source::Remote(access) => match runtime.block_on(add_remote_annotation(
+                    access,
+                    &binary_sha256,
+                    kind,
+                    address,
+                    &scope,
+                    &value,
+                    &key,
+                )) {
+                    Ok((revision, spec, annotations)) => {
+                        access.revision = revision;
+                        Event::AnnotationAdded {
+                            source: format!(
+                                "{} · {} · revision {}",
+                                access.endpoint, access.project_id, revision
+                            ),
+                            revision,
+                            spec,
+                            annotations,
+                        }
+                    }
+                    Err(error) => {
+                        source = Source::None;
+                        Event::MutationUncertain(format!(
+                            "{error} Mutation key {key}. Reopen the remote project before another mutation; the request may have committed."
+                        ))
+                    }
+                },
+                _ => Event::Failed("Open a remote project to add an annotation.".to_owned()),
+            },
             Task::StartLiftJob { symbol, key } => match &source {
                 Source::Remote(access) => runtime
                     .block_on(start_remote_job(access, &symbol, &key))
@@ -1378,6 +1547,11 @@ struct AnalystApp {
     c: Option<String>,
     c_error: Option<String>,
     analysis: Option<AnalysisReport>,
+    annotations: Vec<AnalystAnnotation>,
+    annotation_kind: AnnotationKind,
+    annotation_value: String,
+    annotation_scope: String,
+    annotation_program_wide: bool,
     job: Option<JobReply>,
     job_symbol: Option<String>,
     last_job_poll: std::time::Instant,
@@ -1447,6 +1621,11 @@ impl AnalystApp {
             c: None,
             c_error: None,
             analysis: None,
+            annotations: Vec::new(),
+            annotation_kind: AnnotationKind::Comment,
+            annotation_value: String::new(),
+            annotation_scope: "analyst review of current binary".to_owned(),
+            annotation_program_wide: false,
             job: None,
             job_symbol: None,
             last_job_poll: std::time::Instant::now(),
@@ -1485,6 +1664,7 @@ impl AnalystApp {
                     source_offer,
                     spec,
                 } => {
+                    let binary_sha256 = spec.binary_sha256.clone();
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.source_label = Some(source);
@@ -1500,6 +1680,7 @@ impl AnalystApp {
                     self.c = None;
                     self.c_error = None;
                     self.analysis = None;
+                    self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
@@ -1517,6 +1698,12 @@ impl AnalystApp {
                     self.failure = None;
                     if let Some(symbol) = self.initial_symbol.take() {
                         self.select(symbol);
+                    }
+                    if remote {
+                        self.enqueue(
+                            Task::RefreshAnnotations { binary_sha256 },
+                            "Loading revisioned analyst annotations…",
+                        );
                     }
                 }
                 Event::RemoteProjectCreated(project_id) => {
@@ -1598,6 +1785,45 @@ impl AnalystApp {
                         self.history.push(error);
                     }
                 },
+                Event::AnnotationsLoaded {
+                    binary_sha256,
+                    annotations,
+                } => {
+                    if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
+                        == Some(binary_sha256.as_str())
+                    {
+                        self.status = format!("Loaded {} analyst annotations", annotations.len());
+                        self.annotations = annotations;
+                        self.failure = None;
+                    }
+                }
+                Event::AnnotationAdded {
+                    source,
+                    revision,
+                    spec,
+                    annotations,
+                } => {
+                    self.source_label = Some(source);
+                    self.project_revision = Some(revision);
+                    self.spec = Some(spec);
+                    self.annotations = annotations;
+                    self.analysis = None;
+                    self.cfg = None;
+                    self.ir = None;
+                    self.c = None;
+                    self.c_error = None;
+                    self.job = None;
+                    self.job_symbol = None;
+                    self.transform_before = None;
+                    self.transform_after = None;
+                    self.transform_report = None;
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.annotation_value.clear();
+                    self.status = format!("Saved analyst annotation in revision {revision}");
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
                 Event::JobUpdated(job) => {
                     self.status = format!("Lift job {} · {}", job.job_id, job.state);
                     if !job.diagnostic.is_empty() {
@@ -1700,6 +1926,7 @@ impl AnalystApp {
                     self.c = None;
                     self.c_error = None;
                     self.analysis = None;
+                    self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
@@ -1738,6 +1965,7 @@ impl AnalystApp {
                     self.c = None;
                     self.c_error = None;
                     self.analysis = None;
+                    self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
@@ -1775,6 +2003,7 @@ impl AnalystApp {
                     self.c = None;
                     self.c_error = None;
                     self.analysis = None;
+                    self.annotations.clear();
                     self.transform_before = None;
                     self.transform_after = None;
                     self.transform_report = None;
@@ -1808,6 +2037,7 @@ impl AnalystApp {
                     self.c = None;
                     self.c_error = None;
                     self.analysis = None;
+                    self.annotations.clear();
                     self.transform_before = None;
                     self.transform_after = None;
                     self.transform_report = None;
@@ -1848,6 +2078,7 @@ impl AnalystApp {
                     self.ir = None;
                     self.c = None;
                     self.analysis = None;
+                    self.annotations.clear();
                     self.rebuilt_binary_sha256 = None;
                     self.rebuilt_exported_path = None;
                     self.patch_digest = None;
@@ -2111,6 +2342,121 @@ impl AnalystApp {
                 ),
             );
         }
+        ui.separator();
+        egui::CollapsingHeader::new("Analyst annotations · unverified")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Names, comments, and assumptions are analyst assertions, not recovered ELF facts. Saving creates a new project revision; a changed binary will not reuse them.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                field(
+                    ui,
+                    "CURRENT BINARY LEDGER",
+                    &format!("{} facts", self.annotations.len()),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("analyst_annotations")
+                    .max_height(160.0)
+                    .show_rows(ui, 38.0, self.annotations.len(), |ui, range| {
+                        for index in range {
+                            let annotation = &self.annotations[index];
+                            let kind = match annotation.kind {
+                                AnnotationKind::Name => "NAME",
+                                AnnotationKind::Comment => "COMMENT",
+                                AnnotationKind::Assumption => "ASSUMPTION",
+                            };
+                            let address = annotation.address.map_or_else(
+                                || "program".to_owned(),
+                                |address| format!("0x{:016x}", address.0),
+                            );
+                            let preview: String = annotation.value.chars().take(80).collect();
+                            ui.label(
+                                RichText::new(format!(
+                                    "{kind} · {address} · r{}",
+                                    annotation.created_revision
+                                ))
+                                .size(10.0)
+                                .color(ACCENT),
+                            );
+                            ui.label(RichText::new(preview).size(11.0).color(TEXT))
+                                .on_hover_text(format!(
+                                    "{}\nScope: {}\nProvenance: analyst assertion",
+                                    annotation.value, annotation.scope
+                                ));
+                        }
+                    });
+                if !self.remote {
+                    ui.label(
+                        RichText::new("Open an authenticated remote project to save annotations.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+                egui::ComboBox::from_id_salt("annotation_kind")
+                    .selected_text(match self.annotation_kind {
+                        AnnotationKind::Name => "Name",
+                        AnnotationKind::Comment => "Comment",
+                        AnnotationKind::Assumption => "Assumption",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.annotation_kind, AnnotationKind::Name, "Name");
+                        ui.selectable_value(&mut self.annotation_kind, AnnotationKind::Comment, "Comment");
+                        ui.selectable_value(&mut self.annotation_kind, AnnotationKind::Assumption, "Assumption");
+                    });
+                ui.checkbox(&mut self.annotation_program_wide, "Program-wide (no address)");
+                let address = if self.annotation_program_wide {
+                    None
+                } else {
+                    self.selected_address
+                        .or_else(|| self.selected_function().map(|function| function.address.0))
+                };
+                field(
+                    ui,
+                    "ADDRESS",
+                    &address.map_or_else(|| "program-wide".to_owned(), |value| format!("0x{value:016x}")),
+                );
+                ui.label(RichText::new("SCOPE").size(10.0).color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.annotation_scope)
+                        .hint_text("Where this assertion applies"),
+                );
+                ui.label(RichText::new("VALUE").size(10.0).color(MUTED));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.annotation_value)
+                        .desired_rows(2)
+                        .hint_text("Analyst-authored name, comment, or assumption"),
+                );
+                let can_save = self.remote
+                    && self.spec.is_some()
+                    && !self.busy
+                    && (address.is_some() || self.annotation_program_wide)
+                    && (self.annotation_kind != AnnotationKind::Name || address.is_some())
+                    && !self.annotation_scope.trim().is_empty()
+                    && !self.annotation_value.trim().is_empty();
+                let save = ui.add_enabled(can_save, egui::Button::new("Save analyst annotation"));
+                if save.clicked()
+                    && let Some(spec) = &self.spec
+                {
+                    self.enqueue(
+                        Task::AddAnnotation {
+                            binary_sha256: spec.binary_sha256.clone(),
+                            kind: self.annotation_kind,
+                            address,
+                            scope: self.annotation_scope.trim().to_owned(),
+                            value: self.annotation_value.trim().to_owned(),
+                            key: uuid::Uuid::new_v4().to_string(),
+                        },
+                        "Saving analyst annotation as an immutable revision…",
+                    );
+                }
+                save.on_disabled_hover_text(
+                    "Requires an open remote project, a scope and value, and a selected address unless program-wide is chosen. Names always require an address.",
+                );
+            });
         ui.separator();
         egui::CollapsingHeader::new("Build & patch · trusted fixtures")
             .default_open(false)
@@ -2874,6 +3220,73 @@ impl eframe::App for AnalystApp {
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [probe, endpoint, token_file, binary] = arguments.as_slice()
+        && probe == "--probe-annotation"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let token_file = PathBuf::from(token_file);
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                token_file.clone(),
+                "GUI annotation probe".to_owned(),
+            )
+            .await?;
+            let (access, spec) = upload_remote(
+                endpoint.clone(),
+                token_file,
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            let statement = "GUI analyst assertion; not independently validated";
+            let (revision, annotated_spec, annotations) = add_remote_annotation(
+                &access,
+                &spec.binary_sha256,
+                AnnotationKind::Assumption,
+                None,
+                "trusted fixture only",
+                statement,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await?;
+            if revision != access.revision + 1
+                || annotated_spec.binary_sha256 != spec.binary_sha256
+                || !annotated_spec.assumptions.iter().any(|assumption| {
+                    assumption.statement == statement
+                        && assumption.provenance.source == FactSource::AnalystAssertion
+                })
+                || annotations.len() != 1
+            {
+                return Err("GUI annotation probe returned inconsistent analyst facts.".to_owned());
+            }
+            let mut reopened = access;
+            reopened.revision = revision;
+            let persisted = list_remote_annotations(&reopened, &spec.binary_sha256).await?;
+            if persisted.len() != annotations.len()
+                || persisted[0].id != annotations[0].id
+                || persisted[0].value != annotations[0].value
+            {
+                return Err("GUI annotation probe ledger changed after reopening.".to_owned());
+            }
+            Ok::<_, String>(revision)
+        });
+        match result {
+            Ok(revision) => {
+                println!(
+                    "HydIR GUI annotation operations passed: immutable revision {revision}, one persistent analyst fact"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI annotation probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, binary, symbol, replacement, output] = arguments.as_slice()
         && probe == "--probe-local-patch"
     {
@@ -3215,7 +3628,7 @@ fn main() -> eframe::Result<()> {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };

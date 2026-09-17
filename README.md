@@ -23,6 +23,10 @@ fixtures. Local pass and rebuild actions require pinned Linux LLVM/Clang tools
 and new output directories; remote rebuild exports only to a new file. A
 separate scalar patch v1 editor supports explicit local/remote whole-function
 replacement with entry-only and trusted-fixture assertions.
+Remote projects can save revisioned analyst names, comments, and scoped
+assumptions. The Inspector labels them unverified; only assumptions are
+overlaid into remote inspected/analyzed specifications. Local ELF mode has no
+durable annotation store yet.
 The analysis is not complete whole-program
 recovery.
 
@@ -69,6 +73,8 @@ authenticated service/client fixture, including durable lift jobs, event
 replay, restart, cancellation, GUI create/upload logic, and cross-project
 denial checks. See
 [remote operation and threat model](docs/REMOTE.md).
+The remote CLI also has `annotations` and `annotate` commands for an
+owner-scoped, revisioned ledger of explicitly unverified analyst facts.
 `bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
 global write, conservative treatment of an indirect call, and a partial
 `ProgramSpec` with provenance-bearing call/reference instruction sites.

@@ -74,6 +74,16 @@ class HydirStub:
                 request_serializer=hydir__pb2.ProjectRequest.SerializeToString,
                 response_deserializer=hydir__pb2.JsonReply.FromString,
                 _registered_method=True)
+        self.ListAnnotations = channel.unary_unary(
+                '/hydir.v1.Hydir/ListAnnotations',
+                request_serializer=hydir__pb2.ProjectRequest.SerializeToString,
+                response_deserializer=hydir__pb2.JsonReply.FromString,
+                _registered_method=True)
+        self.AddAnnotation = channel.unary_unary(
+                '/hydir.v1.Hydir/AddAnnotation',
+                request_serializer=hydir__pb2.AnnotationRequest.SerializeToString,
+                response_deserializer=hydir__pb2.ProjectReply.FromString,
+                _registered_method=True)
         self.RecoverCfg = channel.unary_unary(
                 '/hydir.v1.Hydir/RecoverCfg',
                 request_serializer=hydir__pb2.FunctionRequest.SerializeToString,
@@ -177,6 +187,18 @@ class HydirServicer:
         raise NotImplementedError('Method not implemented!')
 
     def AnalyzeSpec(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListAnnotations(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AddAnnotation(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -290,6 +312,16 @@ def add_HydirServicer_to_server(servicer, server):
                     servicer.AnalyzeSpec,
                     request_deserializer=hydir__pb2.ProjectRequest.FromString,
                     response_serializer=hydir__pb2.JsonReply.SerializeToString,
+            ),
+            'ListAnnotations': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListAnnotations,
+                    request_deserializer=hydir__pb2.ProjectRequest.FromString,
+                    response_serializer=hydir__pb2.JsonReply.SerializeToString,
+            ),
+            'AddAnnotation': grpc.unary_unary_rpc_method_handler(
+                    servicer.AddAnnotation,
+                    request_deserializer=hydir__pb2.AnnotationRequest.FromString,
+                    response_serializer=hydir__pb2.ProjectReply.SerializeToString,
             ),
             'RecoverCfg': grpc.unary_unary_rpc_method_handler(
                     servicer.RecoverCfg,
@@ -563,6 +595,60 @@ class Hydir:
             '/hydir.v1.Hydir/AnalyzeSpec',
             hydir__pb2.ProjectRequest.SerializeToString,
             hydir__pb2.JsonReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListAnnotations(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/ListAnnotations',
+            hydir__pb2.ProjectRequest.SerializeToString,
+            hydir__pb2.JsonReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AddAnnotation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/AddAnnotation',
+            hydir__pb2.AnnotationRequest.SerializeToString,
+            hydir__pb2.ProjectReply.FromString,
             options,
             channel_credentials,
             insecure,

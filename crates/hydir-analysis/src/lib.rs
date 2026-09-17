@@ -211,6 +211,7 @@ pub fn analyze_spec_elf(bytes: &[u8]) -> Result<ProgramSpec, HydirError> {
         id: format!("sha256:{}:analysis-contract:1", spec.binary_sha256),
         statement: report.assumption,
         scope: report.scope,
+        address: None,
         provenance: FactProvenance {
             source: FactSource::NativeAnalysis,
             scope: "HydIR bounded global-effects analysis contract".to_owned(),

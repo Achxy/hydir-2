@@ -10,6 +10,8 @@ service Hydir {
   rpc Inspect (ProjectRequest) returns (JsonReply);
   rpc Analyze (ProjectRequest) returns (JsonReply);
   rpc AnalyzeSpec (ProjectRequest) returns (JsonReply);
+  rpc ListAnnotations (ProjectRequest) returns (JsonReply);
+  rpc AddAnnotation (AnnotationRequest) returns (ProjectReply);
   rpc RecoverCfg (FunctionRequest) returns (JsonReply);
   rpc Lift (FunctionRequest) returns (ArtifactReply);
   rpc Decompile (FunctionRequest) returns (ArtifactReply);
@@ -44,6 +46,7 @@ message DiscoverReply {
   bool scalar_patch_v1 = 17;
   bool whole_rebuild = 18;
   bool analyzed_program_spec = 19;
+  bool revisioned_annotations = 20;
 }
 message SourceRequest {}
 message SourceReply {
@@ -58,6 +61,15 @@ message CreateProjectRequest {
 message ProjectRequest {
   string project_id = 1;
   uint64 expected_revision = 2;
+}
+message AnnotationRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+  string kind = 4;
+  string address = 5;
+  string value = 6;
+  string scope = 7;
 }
 message ProjectReply {
   string project_id = 1;
