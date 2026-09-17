@@ -4,7 +4,7 @@ FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b
 # hostile binaries. The application itself has no container dependency.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       clang-14=1:14.0.6-12 llvm-14=1:14.0.6-12 \
+       clang-14=1:14.0.6-12 llvm-14=1:14.0.6-12 git=1:2.39.5-0+deb12u3 \
     && ln -s /usr/bin/clang-14 /usr/local/bin/clang \
     && ln -s /usr/bin/opt-14 /usr/local/bin/opt \
     && rm -rf /var/lib/apt/lists/*
