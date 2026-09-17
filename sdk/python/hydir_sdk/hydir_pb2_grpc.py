@@ -84,6 +84,16 @@ class HydirStub:
                 request_serializer=hydir__pb2.FunctionRequest.SerializeToString,
                 response_deserializer=hydir__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.Transform = channel.unary_unary(
+                '/hydir.v1.Hydir/Transform',
+                request_serializer=hydir__pb2.TransformRequest.SerializeToString,
+                response_deserializer=hydir__pb2.TransformReply.FromString,
+                _registered_method=True)
+        self.ApplyPatch = channel.unary_unary(
+                '/hydir.v1.Hydir/ApplyPatch',
+                request_serializer=hydir__pb2.PatchRequest.SerializeToString,
+                response_deserializer=hydir__pb2.PatchReply.FromString,
+                _registered_method=True)
         self.GetArtifact = channel.unary_unary(
                 '/hydir.v1.Hydir/GetArtifact',
                 request_serializer=hydir__pb2.ArtifactRequest.SerializeToString,
@@ -174,6 +184,18 @@ class HydirServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Transform(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ApplyPatch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetArtifact(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -256,6 +278,16 @@ def add_HydirServicer_to_server(servicer, server):
                     servicer.Decompile,
                     request_deserializer=hydir__pb2.FunctionRequest.FromString,
                     response_serializer=hydir__pb2.ArtifactReply.SerializeToString,
+            ),
+            'Transform': grpc.unary_unary_rpc_method_handler(
+                    servicer.Transform,
+                    request_deserializer=hydir__pb2.TransformRequest.FromString,
+                    response_serializer=hydir__pb2.TransformReply.SerializeToString,
+            ),
+            'ApplyPatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.ApplyPatch,
+                    request_deserializer=hydir__pb2.PatchRequest.FromString,
+                    response_serializer=hydir__pb2.PatchReply.SerializeToString,
             ),
             'GetArtifact': grpc.unary_unary_rpc_method_handler(
                     servicer.GetArtifact,
@@ -553,6 +585,60 @@ class Hydir:
             '/hydir.v1.Hydir/Decompile',
             hydir__pb2.FunctionRequest.SerializeToString,
             hydir__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Transform(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/Transform',
+            hydir__pb2.TransformRequest.SerializeToString,
+            hydir__pb2.TransformReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ApplyPatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/ApplyPatch',
+            hydir__pb2.PatchRequest.SerializeToString,
+            hydir__pb2.PatchReply.FromString,
             options,
             channel_credentials,
             insecure,

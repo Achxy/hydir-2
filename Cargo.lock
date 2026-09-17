@@ -1225,6 +1225,8 @@ dependencies = [
  "hydir-api",
  "hydir-backend",
  "hydir-c",
+ "hydir-patch",
+ "hydir-transform",
  "iced-x86",
  "object",
  "serde_json",
@@ -1260,6 +1262,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydir-patch"
+version = "0.1.0"
+dependencies = [
+ "hydir-backend",
+ "object",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hydir-server"
 version = "0.1.0"
 dependencies = [
@@ -1267,6 +1280,8 @@ dependencies = [
  "hydir-api",
  "hydir-backend",
  "hydir-c",
+ "hydir-patch",
+ "hydir-transform",
  "libc",
  "rusqlite",
  "serde_json",
@@ -1276,6 +1291,13 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "uuid",
+]
+
+[[package]]
+name = "hydir-transform"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

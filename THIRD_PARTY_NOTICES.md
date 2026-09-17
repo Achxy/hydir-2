@@ -30,8 +30,15 @@ IRENE-3, Anvill, Remill, Rellic, MLIR, and Ghidra are not linked, bundled, or
 invoked by the current build. Their licensing and version compatibility remain
 research inputs, not current binary dependencies. The AGPLv3 text in
 `LICENSE` governs HydIR's first-party code. No release package or remote
-corresponding-source offer has been prepared yet. The current service is a
+public corresponding-source offer has been made. A clean-revision archive can
+be embedded and hash-served by a development service; its third-party notice
+sufficiency has not been reviewed. The current service is a
 development-only authenticated loopback slice; it is not release-ready.
+
+The C11 emitter and restricted C-like patch parser/encoder in this checkout
+are first-party code. They were not copied or translated from IRENE-3,
+Rellic, or the separate older HydIR checkout. Their upstream-inspired scope
+is recorded in `PROVENANCE.md` and the patching contract.
 
 The development Python SDK uses `grpcio` 1.84.0 (Apache-2.0), `protobuf`
 7.36.1 (BSD-3-Clause), and `typing-extensions` 4.16.0 (PSF-2.0), with
@@ -47,3 +54,7 @@ The restricted local rebuild path also invokes Clang and LLVM `opt` 14.0.6,
 and links a first-party C guest-memory/syscall runtime into generated ELF
 artifacts. No LLVM library is statically linked into `hydirctl`; generated
 artifacts and toolchain redistribution still need a distribution notice audit.
+The development Docker image additionally installs Debian Git
+`1:2.39.5-0+deb12u3` for clean-revision source-archive verification. This
+tool is not embedded in the HydIR executables; distributing the development
+image would require its own package/license review.

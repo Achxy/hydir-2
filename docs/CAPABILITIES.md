@@ -1,4 +1,4 @@
-# Capability matrix — 2026-09-17
+# Capability matrix — 2026-09-18
 
 Legend: **yes** means implemented and tested in this checkout; **partial**
 means a restricted contract; **no** means absent. Import never implies safe
@@ -6,7 +6,7 @@ lifting or rebuilding.
 
 | Target / operation | Import | Global analysis | Function lift | C output | Patching | Whole-executable rebuild | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| x86-64 little-endian linked ELF, symbolized, Linux SysV | yes | partial: bounded symbol call graph and conservative mapped-global effects | partial: symbol-bounded scalar two-argument functions with direct branches/loops | partial: compilable C11 with explicit CFG/gotos and SSA copies for the same scalar subset | no | partial: only the freestanding subset below | `hydirctl inspect/analyze/cfg/lift/decompile/rebuild`, LLVM verification, 20 distinct trusted scalar functions |
+| x86-64 little-endian linked ELF, symbolized, Linux SysV | yes | partial: bounded symbol call graph and conservative mapped-global effects | partial: symbol-bounded scalar two-argument functions with direct branches/loops | partial: compilable C11 with explicit CFG/gotos and SSA copies for the same scalar subset | partial: trusted whole-function scalar return-expression replacement with size/hash/entry-only checks | partial: only the freestanding subset below | `hydirctl inspect/analyze/cfg/lift/decompile/patch/rebuild`, LLVM verification, 20 distinct trusted scalar functions |
 | x86-64 linked ELF, stripped | partial: sections; analyst entry/size required | no: symbol scope unavailable | partial: same scalar CFG subset with explicit entry/size | partial: same subset with supplied entry/size | no | no | `cfg-at/lift-at/decompile-at/validate-c-at` on stripped max fixture, 1,008 C matches |
 | x86-64 ELF with calls or memory effects | yes | partial: direct-call propagation and unknown-effect flag | no | no | no | no | `demo-analysis.sh` global write and indirect-call fixture; lift rejects unsupported semantics |
 | Freestanding static symbolized Linux x86-64 ELF, complete `.text` symbol coverage, direct control flow, bounded mapped data, read/write/exit | yes | partial | separate stateful complete-program LLVM lift; not the `u64(u64,u64)` function API | no | no | **yes, restricted/local-only** | `demo-recompile.sh`: three whole programs, five controlled behavior matches, five semantic-rejection cases |
@@ -23,6 +23,16 @@ revisions, but those are not yet integrated into `ProgramSpec`. These are
 versioned starting models, not the complete contract in the implementation
 plan.
 
+The scalar patch v1 operation accepts a versioned JSON document with a
+source-located C-like `return` expression, an exact input hash, and the
+asserted `u64(u64,u64)` prototype. It emits a new ELF only when its byte
+replacement fits in the original symbol extent and no relocations occur
+there. The analyst must assert that no control flow enters the function
+interior. Remote patching makes an owner-scoped new binary revision and is
+idempotent; neither local nor remote patching runs arbitrary samples. This
+does not cover general C edits, patch regions, or the upstream PatchLang.
+See [patching](PATCHING.md).
+
 The scalar C operation consumes the raw HydIR LLVM lift and rejects syntax
 outside its exact grammar. It is not a general C decompiler or a Rellic
 integration; the emitted C retains labels/gotos. Across 21 supported scalar
@@ -30,11 +40,12 @@ variants (20 distinct functions plus a stripped variant), compiled C matched
 native execution on 21,168/21,168 tested input pairs. This is fixture evidence,
 not equivalence proof or evidence for memory/call-heavy functions.
 
-The local CLI supports an explicit, allowlisted LLVM 14.0.6 pass sequence:
+The local and authenticated remote CLIs support an explicit, allowlisted LLVM 14.0.6 pass sequence:
 `instcombine`, `sccp`, `simplifycfg`, and `dce`. It saves raw, canonical
 before, and after IR snapshots plus SHA-256 diagnostics in a new experiment
-directory. This is tested on a trusted scalar function fixture, not on
-arbitrary binaries and not through the current remote API or GUI.
+directory. The remote API stores those snapshots and a report as owner-scoped
+artifacts under a new immutable project revision retaining the same ELF. It is tested on a trusted scalar
+function fixture, not on arbitrary binaries; there is no GUI pass editor.
 
 `hydirctl rebuild` is a separate, fail-closed complete-program path. It
 requires an entry at a sized `_start` symbol, non-overlapping sized symbols
@@ -60,7 +71,7 @@ desktop smoke run was attempted on macOS; automated visual/interaction QA is
 still outstanding. The `hydird` gRPC service supports authenticated loopback discovery,
 idempotent project creation, immutable binary uploads, project inspection,
 symbol-scoped CFG/lift/C, conservative global-effect analysis, owner-scoped durable lift jobs with event replay and
-cancellation, artifact retrieval, and optional matching-source retrieval. It does not support remote
+cancellation, named pass execution, scalar patching as a new revision, artifact retrieval, and optional matching-source retrieval. It does not support remote
 execution, TLS/non-loopback clients, or full authorization
 roles. There is a Python SDK for the implemented API subset, but no Ghidra
 adapter or general C decompiler. The effect analysis is a tested interprocedural subset, not full

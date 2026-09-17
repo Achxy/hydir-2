@@ -14,12 +14,15 @@ On Linux x86-64 with the pinned Rust toolchain and Clang:
 bash scripts/demo-remote.sh
 ```
 
-The script creates a private temporary development database and two random
-credentials, starts `hydird` on loopback, uploads a fixture binary, inspects
-it, recovers its CFG, lifts it, generates compiled scalar C, downloads both
-artifacts, restarts the server, retrieves the same artifacts, starts an idempotent background lift,
-replays its event stream after restart, and checks that the second identity
-cannot read the first identity's project, job, LLVM artifact, or C artifact. It leaves artifacts in
+The script creates a private development database and two credentials,
+starts `hydird` on loopback, uploads a fixture binary, inspects it, recovers
+its CFG, lifts it, and compiles scalar C. It runs an allowlisted LLVM pass
+experiment, verifies the after-IR, and confirms the new project revision
+retains the same binary hash. It also applies a bounded scalar patch into a new revision and
+starts an idempotent background lift. After restart it retrieves the same
+artifacts, replays the patch and lift events, and checks that the second
+identity cannot read or transform the first identity's project or artifacts.
+It leaves artifacts in
 `target/demo-remote/run.*` for inspection. The credential files and database
 are mode-restricted by `umask 077`; do not publish that directory.
 
@@ -48,12 +51,24 @@ source archive, its revision and digest, and the explicit CLI download command.
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is
 recorded. A revision precondition is required for upload, inspect, analyze, CFG, and
-lift. Project creation uses an idempotency key. Lifted IR is a SHA-256-addressed
+lift. Patch v1 additionally requires an exact input hash, explicit
+trusted-fixture/prototype/entry-only assertions, and an idempotency key. It
+creates a new immutable binary revision and an owner-scoped ELF artifact;
+retrying the same key and patch returns that revision after restart. Project
+creation uses an idempotency key. Lifted IR is a SHA-256-addressed
 artifact scoped to a project revision. Artifact retrieval rechecks ownership;
 remote commands verify the returned digest and refuse to overwrite differing
 local files. The database schema version is checked on startup; unknown newer
 versions are rejected rather than silently changed. On Unix the database must
 be a regular, owner-private file; newly created files use mode 0600.
+
+`remote transform` requires a current revision, an idempotency key, explicit trusted-fixture and
+prototype assertions, and 1–4 distinct passes from `instcombine,sccp,simplifycfg,dce`.
+The worker invokes fixed `/usr/bin/opt-14` and refuses other LLVM versions;
+it saves raw, canonical before, after, and JSON report artifacts under a new
+immutable project revision with the same binary hash. An exact retry returns
+that revision after restart; a changed request with the same key is denied.
+LLVM verification does not establish behavioral equivalence.
 
 `job-start-lift` requires the project revision, an explicit prototype
 assertion, and an idempotency key. At most two jobs may be queued/running per
@@ -69,8 +84,9 @@ The Python client in `sdk/python/` uses the same `.proto` contract and
 loopback/credential rules. `scripts/demo-sdk.sh` runs its unit tests and a
 separate-client integration smoke test against a locally started `hydird`,
 given a trusted x86-64 ELF containing `hydir_max2`. It does not provide
-pass/patch/rebuild/execute calls because the service does not expose those
-operations yet. It does expose scalar C and an optional source-archive retrieval.
+rebuild/execute calls because the service does not expose those
+operations yet. It does expose the named pass experiment, scalar C, patch v1,
+and optional source retrieval.
 
 ## Matching-source development build
 

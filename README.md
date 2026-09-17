@@ -17,8 +17,8 @@ panes. Opening a local binary never uploads it; sending a binary requires the
 separate, labelled remote-upload action and creates a new immutable revision.
 Saved layouts and high-level structured C recovery are not yet implemented. It can start, monitor,
 cancel, and retrieve a remote lift job and display a conservative global-effect
-analysis. The local CLI has a named LLVM pass experiment for trusted fixtures;
-there is no GUI/remote pass editor. The analysis is not complete whole-program
+analysis. The local and authenticated remote CLIs have a named LLVM pass experiment for trusted fixtures;
+there is no GUI pass editor. The analysis is not complete whole-program
 recovery.
 
 ## Build and inspect
@@ -36,6 +36,7 @@ cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
 cargo run --locked --bin hydirctl -- decompile /path/to/program.elf function_name --assume-u64x2 --output lifted.c
+cargo run --locked --bin hydirctl -- patch /path/to/trusted.elf /path/to/patch-v1.json --trusted-fixture --assume-u64x2 --assume-entry-only --output /path/to/new.elf
 cargo run --locked --bin hydirctl -- transform /path/to/program.elf function_name --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce --output-dir /path/to/new-experiment --opt opt
 cargo run --locked --bin hydirctl -- rebuild /path/to/trusted-static-program.elf --trusted-fixture --output-dir /path/to/new-rebuild
 ```
@@ -67,6 +68,10 @@ global write and conservative treatment of an indirect call in a linked ELF.
 it verifies the named pipeline with pinned LLVM `opt` 14.0.6 and compares a
 transformed trusted fixture on eight boundary inputs. An IR change and a
 verifier pass are not, by themselves, a behavioral proof.
+`hydirctl remote transform` runs the same allowlisted LLVM 14 pipeline in a
+limited service worker and returns owner-scoped, hash-addressed IR snapshots
+in a new immutable project revision that retains the same ELF bytes. It has
+no arbitrary plugin path.
 `bash scripts/demo-recompile.sh` lifts the complete decoded `.text` of three
 trusted, static freestanding ELFs to stateful LLVM IR, links a bounded guest
 memory/syscall bridge into new executables, verifies IR, and compares five
@@ -74,6 +79,11 @@ controlled executions (stdout, stderr, exit status). It includes direct
 calls, branches, a loop, shared globals, `.bss`, and input-dependent output.
 This is local-only and rejects code outside its declared instruction and OS
 subset; it is not general ELF recompilation or a remote feature.
+`bash scripts/demo-patch.sh` checks the separate scalar whole-function
+in-place patch subset: it produces a new ELF, validates four intentional
+behavior cases, and rejects size/hash/overwrite errors. The authenticated
+remote demo also applies that patch as an immutable project revision and
+checks idempotent replay after restart. See [patching contract](docs/PATCHING.md).
 The [Python SDK](sdk/python/README.md) wraps the same authenticated gRPC
 subset. With its pinned dependencies installed, `bash scripts/demo-sdk.sh
 /path/to/trusted-x86_64-elf-with-hydir_max2` exercises a separate Python

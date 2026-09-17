@@ -3,15 +3,28 @@
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback discovery, project creation,
 explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
-durable lift jobs and event streams, and verified artifact download. There
-is no remote pass, patch, rebuild, or execution endpoint yet; the SDK
-does not claim those operations exist.
+durable lift jobs and event streams, a named allowlisted LLVM 14 pass
+experiment, and verified artifact download. There is no remote rebuild or
+execution endpoint yet.
 
 `decompile(project_id, revision, symbol, assume_u64x2=True)` returns C11
 from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
 decompiler. `get_source()` retrieves the exact source tar advertised by a
 matching-source build and verifies its SHA-256. Ordinary development builds
 do not embed such an archive, so `get_source()` then fails explicitly.
+`apply_patch(...)` accepts the versioned [scalar patch v1](../../docs/PATCHING.md)
+document and requires three explicit assertions. It commits a new project
+revision and returns hash-checked ELF bytes; it does not execute them. The
+`examples/patch_scalar.py` script demonstrates an explicit trusted-fixture
+upload and patch, with a new output path.
+`transform(...)` requires explicit trusted-fixture and prototype assertions.
+It creates a new immutable project revision retaining the same ELF bytes,
+and returns a report plus hash-checked raw/before/after LLVM IR artifacts;
+LLVM verification is not
+behavioral equivalence. `examples/pass_experiment.py` demonstrates the
+explicit upload, named pass request, and no-overwrite artifact export.
+`examples/global_analysis.py` saves the conservative cross-function report
+through the typed `Analyze` operation.
 
 Install Python 3.10+ in a private virtual environment:
 

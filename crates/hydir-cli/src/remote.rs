@@ -3,12 +3,12 @@
 use super::{read_binary, write_new_or_identical};
 use hydir_api::v1::{
     ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobEventRequest,
-    JobReply, JobRequest, ProjectReply, ProjectRequest, SourceRequest, StartLiftJobRequest,
-    UploadBinaryRequest, hydir_client::HydirClient,
+    JobReply, JobRequest, PatchRequest, ProjectReply, ProjectRequest, SourceRequest,
+    StartLiftJobRequest, TransformRequest, UploadBinaryRequest, hydir_client::HydirClient,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{env, error::Error, fs, path::Path};
+use std::{env, error::Error, fs, io::Write, path::Path};
 use tonic::{Request, metadata::MetadataValue, transport::Channel};
 
 const HELP: &str = "Remote commands:
@@ -22,6 +22,8 @@ const HELP: &str = "Remote commands:
   hydirctl remote cfg <project-id> <revision> <function-symbol>
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
   hydirctl remote decompile <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.c>
+  hydirctl remote transform <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory>
+  hydirctl remote patch <project-id> <revision> <patch-v1.json> <idempotency-key> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
   hydirctl remote artifact <project-id> <sha256> --output <file>
   hydirctl remote job-start-lift <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2
   hydirctl remote job <project-id> <job-id>
@@ -70,6 +72,28 @@ fn check_artifact(content: &[u8], digest: &str) -> Result<(), Box<dyn Error>> {
     if actual != digest {
         return Err("received artifact SHA-256 mismatch".into());
     }
+    Ok(())
+}
+
+fn write_executable_new(path: &str, content: &[u8]) -> Result<(), Box<dyn Error>> {
+    let target = Path::new(path);
+    if target.exists() {
+        return Err("patched ELF output exists; refusing to overwrite it".into());
+    }
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    temporary.persist_noclobber(target)?;
     Ok(())
 }
 
@@ -125,6 +149,8 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "scalar_c_output": result.scalar_c_output,
                     "source_revision": result.source_revision,
                     "source_sha256": result.source_sha256,
+                    "named_pass_transform": result.named_pass_transform,
+                    "scalar_patch_v1": result.scalar_patch_v1,
                 }))?
             );
         }
@@ -266,6 +292,165 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&json!({
                     "sha256": result.sha256, "media_type": result.media_type,
                     "project_revision": result.project_revision, "output": file,
+                }))?
+            );
+        }
+        [
+            command,
+            id,
+            expected,
+            symbol,
+            key,
+            assume,
+            trusted,
+            passes_flag,
+            passes,
+            output_flag,
+            directory,
+        ] if command == "transform"
+            && assume == "--assume-u64x2"
+            && trusted == "--trusted-fixture"
+            && passes_flag == "--passes"
+            && output_flag == "--output-dir" =>
+        {
+            hydir_transform::parse_passes(passes)?;
+            if Path::new(directory).exists() {
+                return Err("transform output directory exists; refusing to overwrite".into());
+            }
+            let revision = revision(expected)?;
+            let next_revision = revision.checked_add(1).ok_or("project revision overflow")?;
+            let reply = client
+                .transform(authorized(
+                    TransformRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision,
+                        function_symbol: symbol.clone(),
+                        assume_u64x2: true,
+                        trusted_fixture: true,
+                        passes: passes.clone(),
+                        idempotency_key: key.clone(),
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            if reply.project_id != *id || reply.project_revision != next_revision {
+                return Err("transform returned unexpected project or revision".into());
+            }
+            let digests = [
+                reply.raw_sha256.clone(),
+                reply.before_sha256.clone(),
+                reply.after_sha256.clone(),
+                reply.report_sha256.clone(),
+            ];
+            let files = ["raw.ll", "before.ll", "after.ll", "report.json"];
+            let mut contents = Vec::with_capacity(4);
+            for digest in &digests {
+                let artifact = client
+                    .get_artifact(authorized(
+                        ArtifactRequest {
+                            project_id: id.clone(),
+                            sha256: digest.clone(),
+                        },
+                        &credential,
+                    ))
+                    .await?
+                    .into_inner();
+                if artifact.project_revision != reply.project_revision {
+                    return Err("transform artifact revision mismatch".into());
+                }
+                check_artifact(&artifact.content, digest)?;
+                contents.push(artifact.content);
+            }
+            if contents[3] != reply.report_json.as_bytes() {
+                return Err("transform report bytes differ from reply".into());
+            }
+            fs::create_dir(directory)?;
+            for (name, content) in files.iter().zip(contents) {
+                fs::write(Path::new(directory).join(name), content)?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "project_id": reply.project_id,
+                    "project_revision": reply.project_revision,
+                    "raw_sha256": reply.raw_sha256,
+                    "before_sha256": reply.before_sha256,
+                    "after_sha256": reply.after_sha256,
+                    "report_sha256": reply.report_sha256,
+                    "ir_text_changed": reply.ir_text_changed,
+                    "output_dir": directory,
+                }))?
+            );
+        }
+        [
+            command,
+            id,
+            expected,
+            patch_path,
+            key,
+            trusted,
+            assume,
+            entry,
+            output,
+            file,
+        ] if command == "patch"
+            && trusted == "--trusted-fixture"
+            && assume == "--assume-u64x2"
+            && entry == "--assume-entry-only"
+            && output == "--output" =>
+        {
+            if Path::new(file).exists() {
+                return Err(
+                    "patched ELF output exists; refusing to mutate the remote project".into(),
+                );
+            }
+            if fs::metadata(patch_path)?.len() > hydir_patch::MAX_PATCH_BYTES as u64 {
+                return Err("patch document exceeds 4096 bytes".into());
+            }
+            let patch_json = fs::read(patch_path)?;
+            hydir_patch::parse_patch_json(&patch_json)?;
+            let reply = client
+                .apply_patch(authorized(
+                    PatchRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                        patch_json,
+                        idempotency_key: key.clone(),
+                        trusted_fixture: true,
+                        assume_u64x2: true,
+                        assume_entry_only: true,
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            let artifact = client
+                .get_artifact(authorized(
+                    ArtifactRequest {
+                        project_id: id.clone(),
+                        sha256: reply.artifact_sha256.clone(),
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            if artifact.media_type != "application/x-elf"
+                || artifact.project_revision != reply.revision
+                || artifact.sha256 != reply.binary_sha256
+            {
+                return Err("patched ELF artifact metadata mismatch".into());
+            }
+            check_artifact(&artifact.content, &artifact.sha256)?;
+            write_executable_new(file, &artifact.content)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "project_id": reply.project_id,
+                    "revision": reply.revision,
+                    "binary_sha256": reply.binary_sha256,
+                    "artifact_sha256": reply.artifact_sha256,
+                    "output": file,
                 }))?
             );
         }

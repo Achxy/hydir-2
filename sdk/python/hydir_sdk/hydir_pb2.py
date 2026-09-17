@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bhydir.proto\x12\x08hydir.v1\"\x11\n\x0f\x44iscoverRequest\"\xa3\x03\n\rDiscoverReply\x12\x13\n\x0b\x61pi_version\x18\x01 \x01(\r\x12\x15\n\rhydir_version\x18\x02 \x01(\t\x12\x0f\n\x07license\x18\x03 \x01(\t\x12\x15\n\rsource_status\x18\x04 \x01(\t\x12\x19\n\x11native_elf_import\x18\x05 \x01(\x08\x12\x1e\n\x16scalar_direct_cfg_lift\x18\x06 \x01(\x08\x12\x1c\n\x14\x65xecution_validation\x18\x07 \x01(\x08\x12\x18\n\x10max_binary_bytes\x18\x08 \x01(\x04\x12\x19\n\x11\x64urable_lift_jobs\x18\t \x01(\x08\x12 \n\x18reconnectable_job_events\x18\n \x01(\x08\x12\x18\n\x10job_cancellation\x18\x0b \x01(\x08\x12+\n#conservative_global_effect_analysis\x18\x0c \x01(\x08\x12\x17\n\x0fscalar_c_output\x18\r \x01(\x08\x12\x17\n\x0fsource_revision\x18\x0e \x01(\t\x12\x15\n\rsource_sha256\x18\x0f \x01(\t\"\x0f\n\rSourceRequest\"@\n\x0bSourceReply\x12\x10\n\x08revision\x18\x01 \x01(\t\x12\x0e\n\x06sha256\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\"=\n\x14\x43reateProjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x02 \x01(\t\"?\n\x0eProjectRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\"Y\n\x0cProjectReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x10\n\x08revision\x18\x03 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x04 \x01(\t\"m\n\x13UploadBinaryRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x16\n\x0e\x63ontent_sha256\x18\x03 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x04 \x01(\x0c\"o\n\x0f\x46unctionRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\"\x19\n\tJsonReply\x12\x0c\n\x04json\x18\x01 \x01(\t\"5\n\x0f\x41rtifactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06sha256\x18\x02 \x01(\t\"^\n\rArtifactReply\x12\x0e\n\x06sha256\x18\x01 \x01(\t\x12\x12\n\nmedia_type\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x18\n\x10project_revision\x18\x04 \x01(\x04\"\x8c\x01\n\x13StartLiftJobRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\x12\x17\n\x0fidempotency_key\x18\x05 \x01(\t\"0\n\nJobRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\"\x92\x01\n\x08JobReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x18\n\x10project_revision\x18\x03 \x01(\x04\x12\x0c\n\x04kind\x18\x04 \x01(\t\x12\r\n\x05state\x18\x05 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x06 \x01(\t\x12\x12\n\ndiagnostic\x18\x07 \x01(\t\"M\n\x0fJobEventRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x16\n\x0e\x61\x66ter_sequence\x18\x03 \x01(\x04\"e\n\x08JobEvent\x12\x10\n\x08sequence\x18\x01 \x01(\x04\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\r\n\x05state\x18\x03 \x01(\t\x12\x0f\n\x07message\x18\x04 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x05 \x01(\t2\xb8\x07\n\x05Hydir\x12>\n\x08\x44iscover\x12\x19.hydir.v1.DiscoverRequest\x1a\x17.hydir.v1.DiscoverReply\x12;\n\tGetSource\x12\x17.hydir.v1.SourceRequest\x1a\x15.hydir.v1.SourceReply\x12G\n\rCreateProject\x12\x1e.hydir.v1.CreateProjectRequest\x1a\x16.hydir.v1.ProjectReply\x12>\n\nGetProject\x12\x18.hydir.v1.ProjectRequest\x1a\x16.hydir.v1.ProjectReply\x12\x45\n\x0cUploadBinary\x12\x1d.hydir.v1.UploadBinaryRequest\x1a\x16.hydir.v1.ProjectReply\x12\x38\n\x07Inspect\x12\x18.hydir.v1.ProjectRequest\x1a\x13.hydir.v1.JsonReply\x12\x38\n\x07\x41nalyze\x12\x18.hydir.v1.ProjectRequest\x1a\x13.hydir.v1.JsonReply\x12<\n\nRecoverCfg\x12\x19.hydir.v1.FunctionRequest\x1a\x13.hydir.v1.JsonReply\x12:\n\x04Lift\x12\x19.hydir.v1.FunctionRequest\x1a\x17.hydir.v1.ArtifactReply\x12?\n\tDecompile\x12\x19.hydir.v1.FunctionRequest\x1a\x17.hydir.v1.ArtifactReply\x12\x41\n\x0bGetArtifact\x12\x19.hydir.v1.ArtifactRequest\x1a\x17.hydir.v1.ArtifactReply\x12\x41\n\x0cStartLiftJob\x12\x1d.hydir.v1.StartLiftJobRequest\x1a\x12.hydir.v1.JobReply\x12\x32\n\x06GetJob\x12\x14.hydir.v1.JobRequest\x1a\x12.hydir.v1.JobReply\x12\x35\n\tCancelJob\x12\x14.hydir.v1.JobRequest\x1a\x12.hydir.v1.JobReply\x12\x42\n\x0fStreamJobEvents\x12\x19.hydir.v1.JobEventRequest\x1a\x12.hydir.v1.JobEvent0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bhydir.proto\x12\x08hydir.v1\"\x11\n\x0f\x44iscoverRequest\"\xda\x03\n\rDiscoverReply\x12\x13\n\x0b\x61pi_version\x18\x01 \x01(\r\x12\x15\n\rhydir_version\x18\x02 \x01(\t\x12\x0f\n\x07license\x18\x03 \x01(\t\x12\x15\n\rsource_status\x18\x04 \x01(\t\x12\x19\n\x11native_elf_import\x18\x05 \x01(\x08\x12\x1e\n\x16scalar_direct_cfg_lift\x18\x06 \x01(\x08\x12\x1c\n\x14\x65xecution_validation\x18\x07 \x01(\x08\x12\x18\n\x10max_binary_bytes\x18\x08 \x01(\x04\x12\x19\n\x11\x64urable_lift_jobs\x18\t \x01(\x08\x12 \n\x18reconnectable_job_events\x18\n \x01(\x08\x12\x18\n\x10job_cancellation\x18\x0b \x01(\x08\x12+\n#conservative_global_effect_analysis\x18\x0c \x01(\x08\x12\x17\n\x0fscalar_c_output\x18\r \x01(\x08\x12\x17\n\x0fsource_revision\x18\x0e \x01(\t\x12\x15\n\rsource_sha256\x18\x0f \x01(\t\x12\x1c\n\x14named_pass_transform\x18\x10 \x01(\x08\x12\x17\n\x0fscalar_patch_v1\x18\x11 \x01(\x08\"\x0f\n\rSourceRequest\"@\n\x0bSourceReply\x12\x10\n\x08revision\x18\x01 \x01(\t\x12\x0e\n\x06sha256\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\"=\n\x14\x43reateProjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x02 \x01(\t\"?\n\x0eProjectRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\"Y\n\x0cProjectReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x10\n\x08revision\x18\x03 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x04 \x01(\t\"m\n\x13UploadBinaryRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x16\n\x0e\x63ontent_sha256\x18\x03 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x04 \x01(\x0c\"o\n\x0f\x46unctionRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\"\xb4\x01\n\x0cPatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x12\n\npatch_json\x18\x03 \x01(\x0c\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\x12\x17\n\x0ftrusted_fixture\x18\x05 \x01(\x08\x12\x14\n\x0c\x61ssume_u64x2\x18\x06 \x01(\x08\x12\x19\n\x11\x61ssume_entry_only\x18\x07 \x01(\x08\"\xb2\x01\n\x10TransformRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\x12\x17\n\x0ftrusted_fixture\x18\x05 \x01(\x08\x12\x0e\n\x06passes\x18\x06 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x07 \x01(\t\"\xc4\x01\n\x0eTransformReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x18\n\x10project_revision\x18\x02 \x01(\x04\x12\x12\n\nraw_sha256\x18\x03 \x01(\t\x12\x15\n\rbefore_sha256\x18\x04 \x01(\t\x12\x14\n\x0c\x61\x66ter_sha256\x18\x05 \x01(\t\x12\x15\n\rreport_sha256\x18\x06 \x01(\t\x12\x17\n\x0fir_text_changed\x18\x07 \x01(\x08\x12\x13\n\x0breport_json\x18\x08 \x01(\t\"b\n\nPatchReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x03 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x04 \x01(\t\"\x19\n\tJsonReply\x12\x0c\n\x04json\x18\x01 \x01(\t\"5\n\x0f\x41rtifactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06sha256\x18\x02 \x01(\t\"^\n\rArtifactReply\x12\x0e\n\x06sha256\x18\x01 \x01(\t\x12\x12\n\nmedia_type\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x18\n\x10project_revision\x18\x04 \x01(\x04\"\x8c\x01\n\x13StartLiftJobRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\x12\x17\n\x0fidempotency_key\x18\x05 \x01(\t\"0\n\nJobRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\"\x92\x01\n\x08JobReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x18\n\x10project_revision\x18\x03 \x01(\x04\x12\x0c\n\x04kind\x18\x04 \x01(\t\x12\r\n\x05state\x18\x05 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x06 \x01(\t\x12\x12\n\ndiagnostic\x18\x07 \x01(\t\"M\n\x0fJobEventRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x16\n\x0e\x61\x66ter_sequence\x18\x03 \x01(\x04\"e\n\x08JobEvent\x12\x10\n\x08sequence\x18\x01 \x01(\x04\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\r\n\x05state\x18\x03 \x01(\t\x12\x0f\n\x07message\x18\x04 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x05 \x01(\t2\xb7\x08\n\x05Hydir\x12>\n\x08\x44iscover\x12\x19.hydir.v1.DiscoverRequest\x1a\x17.hydir.v1.DiscoverReply\x12;\n\tGetSource\x12\x17.hydir.v1.SourceRequest\x1a\x15.hydir.v1.SourceReply\x12G\n\rCreateProject\x12\x1e.hydir.v1.CreateProjectRequest\x1a\x16.hydir.v1.ProjectReply\x12>\n\nGetProject\x12\x18.hydir.v1.ProjectRequest\x1a\x16.hydir.v1.ProjectReply\x12\x45\n\x0cUploadBinary\x12\x1d.hydir.v1.UploadBinaryRequest\x1a\x16.hydir.v1.ProjectReply\x12\x38\n\x07Inspect\x12\x18.hydir.v1.ProjectRequest\x1a\x13.hydir.v1.JsonReply\x12\x38\n\x07\x41nalyze\x12\x18.hydir.v1.ProjectRequest\x1a\x13.hydir.v1.JsonReply\x12<\n\nRecoverCfg\x12\x19.hydir.v1.FunctionRequest\x1a\x13.hydir.v1.JsonReply\x12:\n\x04Lift\x12\x19.hydir.v1.FunctionRequest\x1a\x17.hydir.v1.ArtifactReply\x12?\n\tDecompile\x12\x19.hydir.v1.FunctionRequest\x1a\x17.hydir.v1.ArtifactReply\x12\x41\n\tTransform\x12\x1a.hydir.v1.TransformRequest\x1a\x18.hydir.v1.TransformReply\x12:\n\nApplyPatch\x12\x16.hydir.v1.PatchRequest\x1a\x14.hydir.v1.PatchReply\x12\x41\n\x0bGetArtifact\x12\x19.hydir.v1.ArtifactRequest\x1a\x17.hydir.v1.ArtifactReply\x12\x41\n\x0cStartLiftJob\x12\x1d.hydir.v1.StartLiftJobRequest\x1a\x12.hydir.v1.JobReply\x12\x32\n\x06GetJob\x12\x14.hydir.v1.JobRequest\x1a\x12.hydir.v1.JobReply\x12\x35\n\tCancelJob\x12\x14.hydir.v1.JobRequest\x1a\x12.hydir.v1.JobReply\x12\x42\n\x0fStreamJobEvents\x12\x19.hydir.v1.JobEventRequest\x1a\x12.hydir.v1.JobEvent0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,37 +34,45 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_DISCOVERREQUEST']._serialized_start=25
   _globals['_DISCOVERREQUEST']._serialized_end=42
   _globals['_DISCOVERREPLY']._serialized_start=45
-  _globals['_DISCOVERREPLY']._serialized_end=464
-  _globals['_SOURCEREQUEST']._serialized_start=466
-  _globals['_SOURCEREQUEST']._serialized_end=481
-  _globals['_SOURCEREPLY']._serialized_start=483
-  _globals['_SOURCEREPLY']._serialized_end=547
-  _globals['_CREATEPROJECTREQUEST']._serialized_start=549
-  _globals['_CREATEPROJECTREQUEST']._serialized_end=610
-  _globals['_PROJECTREQUEST']._serialized_start=612
-  _globals['_PROJECTREQUEST']._serialized_end=675
-  _globals['_PROJECTREPLY']._serialized_start=677
-  _globals['_PROJECTREPLY']._serialized_end=766
-  _globals['_UPLOADBINARYREQUEST']._serialized_start=768
-  _globals['_UPLOADBINARYREQUEST']._serialized_end=877
-  _globals['_FUNCTIONREQUEST']._serialized_start=879
-  _globals['_FUNCTIONREQUEST']._serialized_end=990
-  _globals['_JSONREPLY']._serialized_start=992
-  _globals['_JSONREPLY']._serialized_end=1017
-  _globals['_ARTIFACTREQUEST']._serialized_start=1019
-  _globals['_ARTIFACTREQUEST']._serialized_end=1072
-  _globals['_ARTIFACTREPLY']._serialized_start=1074
-  _globals['_ARTIFACTREPLY']._serialized_end=1168
-  _globals['_STARTLIFTJOBREQUEST']._serialized_start=1171
-  _globals['_STARTLIFTJOBREQUEST']._serialized_end=1311
-  _globals['_JOBREQUEST']._serialized_start=1313
-  _globals['_JOBREQUEST']._serialized_end=1361
-  _globals['_JOBREPLY']._serialized_start=1364
-  _globals['_JOBREPLY']._serialized_end=1510
-  _globals['_JOBEVENTREQUEST']._serialized_start=1512
-  _globals['_JOBEVENTREQUEST']._serialized_end=1589
-  _globals['_JOBEVENT']._serialized_start=1591
-  _globals['_JOBEVENT']._serialized_end=1692
-  _globals['_HYDIR']._serialized_start=1695
-  _globals['_HYDIR']._serialized_end=2647
+  _globals['_DISCOVERREPLY']._serialized_end=519
+  _globals['_SOURCEREQUEST']._serialized_start=521
+  _globals['_SOURCEREQUEST']._serialized_end=536
+  _globals['_SOURCEREPLY']._serialized_start=538
+  _globals['_SOURCEREPLY']._serialized_end=602
+  _globals['_CREATEPROJECTREQUEST']._serialized_start=604
+  _globals['_CREATEPROJECTREQUEST']._serialized_end=665
+  _globals['_PROJECTREQUEST']._serialized_start=667
+  _globals['_PROJECTREQUEST']._serialized_end=730
+  _globals['_PROJECTREPLY']._serialized_start=732
+  _globals['_PROJECTREPLY']._serialized_end=821
+  _globals['_UPLOADBINARYREQUEST']._serialized_start=823
+  _globals['_UPLOADBINARYREQUEST']._serialized_end=932
+  _globals['_FUNCTIONREQUEST']._serialized_start=934
+  _globals['_FUNCTIONREQUEST']._serialized_end=1045
+  _globals['_PATCHREQUEST']._serialized_start=1048
+  _globals['_PATCHREQUEST']._serialized_end=1228
+  _globals['_TRANSFORMREQUEST']._serialized_start=1231
+  _globals['_TRANSFORMREQUEST']._serialized_end=1409
+  _globals['_TRANSFORMREPLY']._serialized_start=1412
+  _globals['_TRANSFORMREPLY']._serialized_end=1608
+  _globals['_PATCHREPLY']._serialized_start=1610
+  _globals['_PATCHREPLY']._serialized_end=1708
+  _globals['_JSONREPLY']._serialized_start=1710
+  _globals['_JSONREPLY']._serialized_end=1735
+  _globals['_ARTIFACTREQUEST']._serialized_start=1737
+  _globals['_ARTIFACTREQUEST']._serialized_end=1790
+  _globals['_ARTIFACTREPLY']._serialized_start=1792
+  _globals['_ARTIFACTREPLY']._serialized_end=1886
+  _globals['_STARTLIFTJOBREQUEST']._serialized_start=1889
+  _globals['_STARTLIFTJOBREQUEST']._serialized_end=2029
+  _globals['_JOBREQUEST']._serialized_start=2031
+  _globals['_JOBREQUEST']._serialized_end=2079
+  _globals['_JOBREPLY']._serialized_start=2082
+  _globals['_JOBREPLY']._serialized_end=2228
+  _globals['_JOBEVENTREQUEST']._serialized_start=2230
+  _globals['_JOBEVENTREQUEST']._serialized_end=2307
+  _globals['_JOBEVENT']._serialized_start=2309
+  _globals['_JOBEVENT']._serialized_end=2410
+  _globals['_HYDIR']._serialized_start=2413
+  _globals['_HYDIR']._serialized_end=3492
 # @@protoc_insertion_point(module_scope)

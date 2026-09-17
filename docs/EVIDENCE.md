@@ -1,4 +1,77 @@
-# HydIR evidence — 2026-09-17
+# HydIR evidence — 2026-09-18
+
+## Revisioned remote pass and integrated checkpoint — 2026-09-18
+
+`bash scripts/demo-linux-docker.sh` exited 0 with pinned Rust 1.96.0 and
+Debian Clang/LLVM 14.0.6. The retained outputs are
+`target/demo-local/run.9uLItp/`, `target/demo-corpus/run.MmwQbR/`,
+`target/demo-analysis/run.QmNtdc/`, `target/demo-passes/run.WE3Dkw/`,
+`target/demo-patch/run.nr5jmq/`, `target/demo-remote/run.bYNYmw/`, and
+`target/demo-recompile/run.tjaZ3O/`. Across 20 distinct supported scalar
+functions and a stripped variant, the local/corpus gates again observed
+**21,168/21,168 compiled-C/native** and **21,168/21,168 raw-LLVM/native**
+matches. These are trusted-fixture tests, not an equivalence proof. The
+whole-program gate rebuilt three static freestanding ELFs and matched five
+controlled stdout/stderr/exit cases. The integrated cross-function,
+allowlisted pass, and scalar patch gates also exited 0.
+
+`bash scripts/demo-remote.sh` exited 0 again after the final service
+refactor in `target/demo-remote/run.XXNJQa/`. An authenticated owner created
+an LLVM pass result as revision 2 while retaining the uploaded ELF hash,
+verified the transformed IR, retrieved the artifact after service restart,
+replayed the same idempotency key without a third revision, and rejected a
+changed request using that key. A second identity was denied access. The
+same demo also verified remote C compilation, a deliberate scalar ELF patch,
+durable lift-job replay/cancellation, and owner isolation. `cargo test
+--locked --workspace` then passed **33 Rust tests** on Linux, workspace
+Clippy passed with `-D warnings`, and **6 Python SDK boundary tests** passed.
+The revised separate-process Python SDK smoke script has not yet been run;
+SDK transform integration is covered by the shared protocol/CLI demo and SDK
+boundary tests, not claimed as separately executed Python integration.
+
+Source-offer verification is tied to an exact clean commit and must be
+repeated for each new HEAD. The earlier clean-revision result below is
+historical; current source-offer results live under `target/demo-source/`.
+This checkpoint is not a public release or a hostile-input sandbox.
+
+## Scalar patch and matching-source checkpoint — 2026-09-17
+
+`bash scripts/demo-patch.sh` exited 0 in
+`target/demo-patch/run.EzQOzL/`. Its trusted source fixture was patched
+from addition to subtraction through the versioned C-like return-expression
+AST. Four declared patched outputs matched expected modular-u64 results;
+stderr stayed empty and exit status stayed zero for original and patched
+runners. The `cases.tsv` and per-case output files are retained. A first
+case explicitly differed from the original, as an intentional patch should.
+The gate also refused a replacement needing 11 bytes in a five-byte
+function, a wrong input hash, and an existing output path; it created no
+output for the first two refusals. This is not an equivalence proof or a
+general patch-region workflow.
+
+`bash scripts/demo-remote.sh` exited 0 in
+`target/demo-remote/run.tRzScz/` after the remote patch API was added. The
+owner uploaded `hydir_max2` at revision 1, applied a subtraction patch to
+create revision 2, observed the changed output for input `(9,4)`, recovered
+the patched ELF after server restart, replayed the idempotent request without
+creating revision 3, and denied a second identity's attempt to patch the
+first project. The server never executed either ELF. The patch output was
+only executed by the trusted demo client.
+
+For the pre-patch clean revision `ceb7eb42a04b19b3d431eb2c0d9a06bdccd29dee`,
+`bash scripts/demo-source-offer.sh` exited 0 in
+`target/demo-source/run.7KOWxM/`. The archive advertised and returned by
+the authenticated service was byte-identical to `git archive` for that
+revision, with SHA-256
+`3037a95bbf1f12dafc34fda01e52e6682e707a3ec1424d9470cb0594b17a4747`.
+This tests technical source matching, not license sufficiency or publication.
+After any patch/API or other tracked change, the source-offer gate must be
+rerun for the new clean commit before distribution.
+
+The latest Linux Docker `cargo test --locked --workspace` run passed **31
+Rust tests**, and workspace Clippy passed with `-D warnings`. Five Python
+SDK boundary tests passed. The remote patch demo was run before the final
+CLI output-existence preflight change; that change has compiled and passed
+workspace tests, and the integrated demo will be rerun before final handoff.
 
 ## Scalar C and remote C checkpoint — 2026-09-17
 
