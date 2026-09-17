@@ -1226,6 +1226,7 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-patch",
+ "hydir-recompile",
  "hydir-transform",
  "iced-x86",
  "object",
@@ -1254,6 +1255,9 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-patch",
+ "hydir-recompile",
+ "hydir-transform",
  "serde_json",
  "sha2",
  "tokio",
@@ -1273,6 +1277,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydir-recompile"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "object",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "hydir-server"
 version = "0.1.0"
 dependencies = [
@@ -1281,6 +1296,7 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-patch",
+ "hydir-recompile",
  "hydir-transform",
  "libc",
  "rusqlite",

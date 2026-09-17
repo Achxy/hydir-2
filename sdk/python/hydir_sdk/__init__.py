@@ -267,6 +267,44 @@ class HydirClient:
             artifact, expected_sha256=reply.binary_sha256, revision=reply.revision
         )
 
+    def rebuild(
+        self, project_id: str, revision: int, *, trusted_fixture: bool,
+        idempotency_key: str | None = None,
+    ) -> tuple[int, dict[str, bytes]]:
+        """Build a new complete-program ELF revision without executing it."""
+        if not trusted_fixture:
+            raise ValueError("Rebuild requires a trusted-fixture assertion")
+        reply = self._call(
+            self._stub.Rebuild,
+            proto.RebuildRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                trusted_fixture=True,
+                idempotency_key=idempotency_key or str(uuid4()),
+            ),
+        )
+        if reply.project_id != project_id or reply.revision != revision + 1:
+            raise RuntimeError("Rebuild returned an unexpected project or revision")
+        expected = {
+            "whole.ll": (reply.ir_sha256, "text/x-llvm-ir"),
+            "rebuilt": (reply.binary_sha256, "application/x-elf"),
+            "report.json": (reply.report_sha256, "application/json"),
+        }
+        artifacts: dict[str, bytes] = {}
+        for name, (digest, media_type) in expected.items():
+            artifact = self._call(
+                self._stub.GetArtifact,
+                proto.ArtifactRequest(project_id=project_id, sha256=digest),
+            )
+            if artifact.media_type != media_type:
+                raise RuntimeError("Rebuild artifact media type mismatch")
+            artifacts[name] = self._checked_artifact(
+                artifact, expected_sha256=digest, revision=reply.revision
+            )
+        if artifacts["report.json"] != reply.report_json.encode("utf-8"):
+            raise RuntimeError("Rebuild report bytes differ from reply")
+        return reply.revision, artifacts
+
     def get_artifact(self, project_id: str, sha256: str) -> bytes:
         reply = self._call(
             self._stub.GetArtifact,

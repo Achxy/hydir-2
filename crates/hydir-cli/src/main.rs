@@ -5,7 +5,7 @@ use hydir_backend::{
 use hydir_c::emit_c;
 mod passes;
 mod patch;
-mod recompile;
+use hydir_recompile as recompile;
 mod remote;
 use serde_json::json;
 use std::{
@@ -43,8 +43,9 @@ analyst-supplied virtual entry and exact byte extent, and works on stripped
 linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
-Rebuild is local-only for a narrow freestanding static x86-64 ELF subset;
-it requires pinned Clang/LLVM 14.0.6 and is not a hostile-binary sandbox.
+Rebuild supports local and authenticated-loopback operations for a narrow
+freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
+and is not a hostile-binary sandbox. The remote server never executes samples.
 Remote operations require HYDIR_ENDPOINT and a HYDIR_TOKEN_FILE containing a
 credential created by hydird. Remote upload is always an explicit command.
 ";
@@ -91,7 +92,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
                     "remote_api": true,
-                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/transform/patch/artifact and durable lift-job subset",
+                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/transform/rebuild/patch/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
                     "c_output": true,

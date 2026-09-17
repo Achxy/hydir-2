@@ -9,9 +9,10 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   exit 2
 fi
 mkdir -p target/demo-patch
-run_dir="$(mktemp -d target/demo-patch/run.XXXXXX)"
-cargo build --locked -q -p hydir-cli
+run_dir="$repo_dir/$(mktemp -d target/demo-patch/run.XXXXXX)"
+cargo build --locked -q -p hydir-cli -p hydir-gui
 client="${CARGO_TARGET_DIR:-target}/debug/hydirctl"
+gui="${CARGO_TARGET_DIR:-target}/debug/hydir"
 
 clang -O0 -no-pie -DHYDIR_FUNCTION=hydir_patch_target \
   tests/fixtures/patch_target.S tests/fixtures/scalar_main.c \
@@ -24,6 +25,10 @@ printf '{"schema_version":1,"binary_sha256":"%s","function_symbol":"hydir_patch_
   --output "$run_dir/patched" > "$run_dir/patch-report.json"
 test -x "$run_dir/patched"
 test "$(sha256sum "$run_dir/patched" | awk '{print $1}')" != "$digest"
+"$gui" --probe-local-patch "$run_dir/original" hydir_patch_target \
+  'return arg0 - arg1;' "$run_dir/gui-patched" > "$run_dir/gui-patch-probe.txt"
+grep -q 'patched ELF SHA-256' "$run_dir/gui-patch-probe.txt"
+test "$("$run_dir/gui-patched" 9 4)" = 5
 
 printf 'arg0\targ1\toriginal\texpected_patched\tobserved_patched\texit\tstderr_bytes\n' > "$run_dir/cases.tsv"
 case_index=0

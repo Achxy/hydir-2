@@ -1,0 +1,5 @@
+[
+  {"label": "A", "stdin_hex": "41"},
+  {"label": "B", "stdin_hex": "42"},
+  {"label": "EOF", "stdin_hex": ""}
+]

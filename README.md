@@ -2,7 +2,7 @@
 
 HydIR is an early, independently implemented binary-lifting workbench. This
 checkout contains a tested **M1 native vertical slice**, a **partial M2
-desktop and local-authenticated RPC slice**, bounded scalar C emission, and a narrowly tested local
+desktop and local-authenticated RPC slice**, bounded scalar C emission, and a narrowly tested
 whole-executable recompilation subset. It is not the complete remote/decompilation/
 recompilation product described in the project plan. It imports little-endian
 x86-64 ELF without Ghidra, lifts a deliberately small class of functions from
@@ -17,8 +17,13 @@ panes. Opening a local binary never uploads it; sending a binary requires the
 separate, labelled remote-upload action and creates a new immutable revision.
 Saved layouts and high-level structured C recovery are not yet implemented. It can start, monitor,
 cancel, and retrieve a remote lift job and display a conservative global-effect
-analysis. The local and authenticated remote CLIs have a named LLVM pass experiment for trusted fixtures;
-there is no GUI pass editor. The analysis is not complete whole-program
+analysis. The workbench also has local/remote named-pass editing with verified
+before/after IR and separately authorized local/remote rebuild flows for trusted
+fixtures. Local pass and rebuild actions require pinned Linux LLVM/Clang tools
+and new output directories; remote rebuild exports only to a new file. A
+separate scalar patch v1 editor supports explicit local/remote whole-function
+replacement with entry-only and trusted-fixture assertions.
+The analysis is not complete whole-program
 recovery.
 
 ## Build and inspect
@@ -77,8 +82,10 @@ trusted, static freestanding ELFs to stateful LLVM IR, links a bounded guest
 memory/syscall bridge into new executables, verifies IR, and compares five
 controlled executions (stdout, stderr, exit status). It includes direct
 calls, branches, a loop, shared globals, `.bss`, and input-dependent output.
-This is local-only and rejects code outside its declared instruction and OS
-subset; it is not general ELF recompilation or a remote feature.
+The same bounded rebuild is available through the authenticated loopback RPC,
+CLI, Python SDK, and egui workbench. It rejects code outside its declared
+instruction and OS subset; this is not general ELF recompilation or a
+hostile-input sandbox. No server-side binary execution is exposed.
 `bash scripts/demo-patch.sh` checks the separate scalar whole-function
 in-place patch subset: it produces a new ELF, validates four intentional
 behavior cases, and rejects size/hash/overwrite errors. The authenticated
@@ -86,9 +93,15 @@ remote demo also applies that patch as an immutable project revision and
 checks idempotent replay after restart. See [patching contract](docs/PATCHING.md).
 The [Python SDK](sdk/python/README.md) wraps the same authenticated gRPC
 subset. With its pinned dependencies installed, `bash scripts/demo-sdk.sh
-/path/to/trusted-x86_64-elf-with-hydir_max2` exercises a separate Python
+/path/to/trusted-x86_64-elf-with-hydir_max2 /path/to/trusted-freestanding-elf` exercises a separate Python
 client against `hydird`, including explicit upload, analysis, event replay,
-and digest-checked artifact export.
+digest-checked artifact export, and whole-executable rebuilding. On macOS with
+Docker Desktop, `bash scripts/demo-sdk-linux-docker.sh` builds the pinned
+Python/Clang test environment and runs that integration with repository
+fixtures. `sdk/python/examples/validate_program.py` separately compares
+trusted original/rebuilt ELFs in no-network, read-only, resource-controlled
+Docker runs and saves a per-case report; Docker is not a hostile-binary
+sandbox or an equivalence proof.
 
 The `validate` command runs the original binary and lifted runner **without a
 sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.
@@ -128,4 +141,5 @@ gate, not a release or completed redistribution-license review.
   it refuses to overwrite an existing binary or differing artifact.
 
 See [capabilities](docs/CAPABILITIES.md), [evidence](docs/EVIDENCE.md),
+[measured development evaluation](docs/EVALUATION.md),
 [release gates](docs/RELEASE_GATES.md),

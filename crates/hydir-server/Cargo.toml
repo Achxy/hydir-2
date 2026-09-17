@@ -15,6 +15,7 @@ hydir-backend = { path = "../hydir-backend" }
 hydir-c = { path = "../hydir-c" }
 hydir-patch = { path = "../hydir-patch" }
 hydir-transform = { path = "../hydir-transform" }
+hydir-recompile = { path = "../hydir-recompile" }
 hydir-analysis = { path = "../hydir-analysis" }
 tonic.workspace = true
 tokio.workspace = true

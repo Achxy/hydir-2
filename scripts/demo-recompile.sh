@@ -9,8 +9,8 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
 fi
 
 mkdir -p target/demo-recompile
-run_dir="$(mktemp -d target/demo-recompile/run.XXXXXX)"
-cargo build --locked -q -p hydir-cli
+run_dir="$repo_dir/$(mktemp -d target/demo-recompile/run.XXXXXX)"
+cargo build --locked -q -p hydir-cli -p hydir-gui
 for name in whole_hello whole_choice whole_loop; do
   clang -nostdlib -no-pie -Wl,--build-id=none -o "$run_dir/$name" "tests/fixtures/$name.S"
   "${CARGO_TARGET_DIR:-target}/debug/hydirctl" rebuild "$run_dir/$name" --trusted-fixture --output-dir "$run_dir/rebuilt-$name" > "$run_dir/$name.report.json"
@@ -40,6 +40,17 @@ compare_case whole_choice A a
 compare_case whole_choice B b
 compare_case whole_choice '' eof
 compare_case whole_loop '' empty
+
+"${CARGO_TARGET_DIR:-target}/debug/hydir" --probe-local-rebuild \
+  "$run_dir/whole_choice" "$run_dir/gui-rebuilt-choice" > "$run_dir/gui-rebuild-probe.txt"
+grep -q 'rebuilt ELF SHA-256' "$run_dir/gui-rebuild-probe.txt"
+opt -verify -disable-output "$run_dir/gui-rebuilt-choice/whole.ll"
+for choice in A B ''; do
+  printf '%s' "$choice" | timeout 5 "$run_dir/whole_choice" > "$run_dir/gui-choice.original.stdout" 2> "$run_dir/gui-choice.original.stderr"
+  printf '%s' "$choice" | timeout 5 "$run_dir/gui-rebuilt-choice/rebuilt" > "$run_dir/gui-choice.rebuilt.stdout" 2> "$run_dir/gui-choice.rebuilt.stderr"
+  cmp "$run_dir/gui-choice.original.stdout" "$run_dir/gui-choice.rebuilt.stdout"
+  cmp "$run_dir/gui-choice.original.stderr" "$run_dir/gui-choice.rebuilt.stderr"
+done
 
 if "${CARGO_TARGET_DIR:-target}/debug/hydirctl" rebuild "$run_dir/whole_hello" --output-dir "$run_dir/should-reject" > "$run_dir/no-trust.stdout" 2> "$run_dir/no-trust.stderr"; then
   echo 'rebuild accepted an untrusted invocation' >&2
