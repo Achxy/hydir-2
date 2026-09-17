@@ -13,6 +13,8 @@ path = "src/main.rs"
 hydir-backend = { path = "../hydir-backend" }
 hydir-analysis = { path = "../hydir-analysis" }
 hydir-api = { path = "../hydir-api" }
+object.workspace = true
+iced-x86.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tonic.workspace = true

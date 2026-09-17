@@ -1,8 +1,9 @@
 # HydIR
 
 HydIR is an early, independently implemented binary-lifting workbench. This
-checkout contains a tested **M1 native vertical slice** and a **partial M2
-desktop and local-authenticated RPC slice**, not the complete remote/decompilation/
+checkout contains a tested **M1 native vertical slice**, a **partial M2
+desktop and local-authenticated RPC slice**, and a narrowly tested local
+whole-executable recompilation subset. It is not the complete remote/decompilation/
 recompilation product described in the project plan. It imports little-endian
 x86-64 ELF without Ghidra, lifts a deliberately small class of functions from
 machine bytes to LLVM IR, differentially executes trusted fixtures on Linux
@@ -35,6 +36,7 @@ cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
 cargo run --locked --bin hydirctl -- transform /path/to/program.elf function_name --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce --output-dir /path/to/new-experiment --opt opt
+cargo run --locked --bin hydirctl -- rebuild /path/to/trusted-static-program.elf --trusted-fixture --output-dir /path/to/new-rebuild
 ```
 
 On a Linux x86-64 host with Clang, `bash scripts/demo-local.sh` builds four
@@ -58,6 +60,13 @@ global write and conservative treatment of an indirect call in a linked ELF.
 it verifies the named pipeline with pinned LLVM `opt` 14.0.6 and compares a
 transformed trusted fixture on eight boundary inputs. An IR change and a
 verifier pass are not, by themselves, a behavioral proof.
+`bash scripts/demo-recompile.sh` lifts the complete decoded `.text` of three
+trusted, static freestanding ELFs to stateful LLVM IR, links a bounded guest
+memory/syscall bridge into new executables, verifies IR, and compares five
+controlled executions (stdout, stderr, exit status). It includes direct
+calls, branches, a loop, shared globals, `.bss`, and input-dependent output.
+This is local-only and rejects code outside its declared instruction and OS
+subset; it is not general ELF recompilation or a remote feature.
 The [Python SDK](sdk/python/README.md) wraps the same authenticated gRPC
 subset. With its pinned dependencies installed, `bash scripts/demo-sdk.sh
 /path/to/trusted-x86_64-elf-with-hydir_max2` exercises a separate Python
