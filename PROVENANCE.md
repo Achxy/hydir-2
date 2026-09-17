@@ -16,6 +16,7 @@ Its submodule pointers were inspected but not fetched or built.
 | x86 decoder and direct CFG recovery | `iced-x86` 1.21.0 | `hydir-backend` | Newly implemented integration | Byte-pattern tests and CFG fixture exports |
 | Scalar LLVM IR emission with explicit register/flag joins | No copied upstream code | `hydir-backend` | Newly implemented, narrow subset | LLVM verifier and five differential fixture variants |
 | Conservative mapped-global effects and direct-call SCC fixed point | `iced-x86` 1.21.0 metadata; no copied upstream algorithm | `hydir-analysis` | Newly implemented, symbol-bounded subset | Three Rust tests and linked ELF local/remote demo |
+| Named LLVM pass experiment | LLVM `opt` 14.0.6 command line, separately installed in the pinned Linux image | `hydir-cli::passes` | Newly implemented allowlisted orchestration, not an LLVM port | LLVM verification and eight transformed trusted-fixture boundary cases |
 | Versioned gRPC schema and client/server | `tonic`/`prost` 0.14.6/0.14.4 | `hydir-api`, `hydir-cli`, `hydir-server` | Newly implemented integration; local-only subset | Separate-process remote demo and protocol unit tests |
 | Transactional project store | `rusqlite` 0.40.2 | `hydir-server` | Newly implemented subset | Restart, isolation, malformed-upload, rotation tests |
 | Desktop workbench | `eframe`/`egui` 0.36.2 | `hydir-gui` | Newly implemented local and explicit remote inspection subset | macOS compile/unit smoke; Linux unit build, visual QA pending |

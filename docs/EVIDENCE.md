@@ -222,3 +222,27 @@ is no named pass pipeline, C output, or patching. M2 remains partial due
 missing remote GUI upload, saved layouts, fine-grained roles, OS worker
 sandbox, and non-loopback TLS. M4 whole-executable rebuild and M5 release
 hardening are absent. No hostile binary or remote execution was attempted.
+
+## Named LLVM pass experiment (partial M3)
+
+`cargo fmt --all`, `cargo test --locked --workspace`, `bash -n
+scripts/demo-passes.sh scripts/demo-linux-docker.sh`, and `git diff --check`
+passed on the macOS host. The workspace had **25 passing tests**, including
+a pass allowlist test. The final `bash scripts/demo-linux-docker.sh` exited 0
+with all 25 tests and warning-free Clippy in the pinned Linux image. The
+five earlier function variants again matched **5,040/5,040** differential
+cases, and local analysis plus separate-process remote checks passed. This
+run wrote `target/demo-local/run.eqXstp/`,
+`target/demo-analysis/run.RLfSKF/`,
+`target/demo-passes/run.fPwks3/`, and
+`target/demo-remote/run.HqovHb/`.
+
+`scripts/demo-passes.sh` lifted the real `hydir_max2` bytes, saved raw,
+canonical-before, and after IR, ran allowlisted
+`instcombine,sccp,simplifycfg,dce` with LLVM `opt` 14.0.6 and verification,
+observed a text change in the IR, compiled the transformed function, and
+matched stdout/stderr/zero exit status against the original trusted fixture
+on eight boundary inputs. It did not validate arbitrary programs or prove
+the pass pipeline semantics universally. The command is opt-in and local-only
+because `opt` is not sandboxed for hostile inputs. Remote passes, a GUI pass
+editor, C generation, and patching remain M3 blockers.

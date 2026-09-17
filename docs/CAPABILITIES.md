@@ -22,6 +22,12 @@ revisions, but those are not yet integrated into `ProgramSpec`. These are
 versioned starting models, not the complete contract in the implementation
 plan.
 
+The local CLI supports an explicit, allowlisted LLVM 14.0.6 pass sequence:
+`instcombine`, `sccp`, `simplifycfg`, and `dce`. It saves raw, canonical
+before, and after IR snapshots plus SHA-256 diagnostics in a new experiment
+directory. This is tested on a trusted scalar function fixture, not on
+arbitrary binaries and not through the current remote API or GUI.
+
 The `hydir` egui app can open a local ELF or explicitly inspect an existing
 authenticated loopback project, then browse function facts, reachable CFG,
 machine bytes, and LLVM IR. Its remote path does not upload binaries. A

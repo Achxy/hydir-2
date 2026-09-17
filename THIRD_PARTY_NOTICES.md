@@ -31,3 +31,8 @@ research inputs, not current binary dependencies. The AGPLv3 text in
 `LICENSE` governs HydIR's first-party code. No release package or remote
 corresponding-source offer has been prepared yet. The current service is a
 development-only authenticated loopback slice; it is not release-ready.
+
+The trusted local pass experiment invokes Debian LLVM `opt` 14.0.6 from the
+development image. LLVM is a separate native tool, not statically linked into
+these Rust binaries. Its license and runtime redistribution obligations must
+be included if a future package bundles it.
