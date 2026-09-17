@@ -1295,6 +1295,7 @@ dependencies = [
  "hydir-api",
  "hydir-backend",
  "hydir-c",
+ "hydir-core",
  "hydir-patch",
  "hydir-recompile",
  "hydir-transform",

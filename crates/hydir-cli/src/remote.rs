@@ -2,9 +2,9 @@
 
 use super::{read_binary, write_new_or_identical};
 use hydir_api::v1::{
-    ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobEventRequest,
-    JobReply, JobRequest, PatchRequest, ProjectReply, ProjectRequest, RebuildRequest,
-    SourceRequest, StartLiftJobRequest, TransformRequest, UploadBinaryRequest,
+    AnnotationRequest, ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest,
+    JobEventRequest, JobReply, JobRequest, PatchRequest, ProjectReply, ProjectRequest,
+    RebuildRequest, SourceRequest, StartLiftJobRequest, TransformRequest, UploadBinaryRequest,
     hydir_client::HydirClient,
 };
 use serde_json::json;
@@ -21,6 +21,8 @@ const HELP: &str = "Remote commands:
   hydirctl remote inspect <project-id> <revision>
   hydirctl remote analyze <project-id> <revision>
   hydirctl remote analyze-spec <project-id> <revision>
+  hydirctl remote annotations <project-id> <revision>
+  hydirctl remote annotate <project-id> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value>
   hydirctl remote cfg <project-id> <revision> <function-symbol>
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
   hydirctl remote decompile <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.c>
@@ -156,6 +158,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "scalar_patch_v1": result.scalar_patch_v1,
                     "whole_rebuild": result.whole_rebuild,
                     "analyzed_program_spec": result.analyzed_program_spec,
+                    "revisioned_annotations": result.revisioned_annotations,
                 }))?
             );
         }
@@ -268,6 +271,41 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 .await?
                 .into_inner();
             println!("{}", result.json);
+        }
+        [command, id, expected] if command == "annotations" => {
+            let result = client
+                .list_annotations(authorized(
+                    ProjectRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            println!("{}", result.json);
+        }
+        [command, id, expected, key, kind, address, scope, value] if command == "annotate" => {
+            let result = client
+                .add_annotation(authorized(
+                    AnnotationRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                        idempotency_key: key.clone(),
+                        kind: kind.clone(),
+                        address: if address == "-" {
+                            String::new()
+                        } else {
+                            address.clone()
+                        },
+                        value: value.clone(),
+                        scope: scope.clone(),
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            println!("{}", serde_json::to_string_pretty(&project_json(result))?);
         }
         [command, id, expected, symbol] if command == "cfg" => {
             let result = client

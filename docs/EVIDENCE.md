@@ -1,5 +1,44 @@
 # HydIR evidence — 2026-09-18
 
+## Revisioned analyst facts — 2026-09-18
+
+The authenticated loopback service now persists binary-digest-bound analyst
+names, comments, and assumptions in SQLite schema version 6. Each new fact
+creates a project revision; exact retries are idempotent, conflicting keys
+fail, stale reads fail, and other identities cannot list or add facts.
+Remote `Inspect` and `AnalyzeSpec` carry assumption facts with
+`analyst_assertion` provenance, preserving a virtual address when supplied.
+Names/comments remain in a separate ledger. The CLI, Python SDK, and egui
+Inspector expose the typed operations. The UI's dark-first Inspector keeps
+these facts visibly labelled unverified; the headless GUI probe verifies the
+real operation functions, not pointer/keyboard interaction.
+
+On macOS, `cargo test --locked --offline --workspace` passed **42 Rust unit
+tests** and doc tests; the Python SDK suite passed **9 unit tests**.
+`cargo fmt --all`, `git diff --check`, and `bash -n` for the changed demo
+scripts passed. A separate-process `hydird` bound to authenticated loopback
+port 50559 and consumed the retained trusted `global-effects` x86-64 ELF.
+The GUI annotation probe created, uploaded, annotated, and reopened a
+project. The CLI independently verified upload, an exact annotation retry
+returning revision 2, ledger retrieval, analyzed-spec provenance, stale
+revision denial, changed-key denial, second-owner denial, and ledger/retry
+recovery after a server restart. The ignored SQLite test database and
+non-secret denial outputs are in `target/annotation-check.84cCRr/`. A fresh
+Python SDK live-client run in the same test environment explicitly uploaded
+the ELF twice, saved an addressed name and a program-wide assumption, checked
+their ledgers and assumption overlay, and wrote two JSON ledgers. A final
+CLI request added an addressed assumption and confirmed that its virtual
+address and provenance survived in `ProgramSpec`. Generated credential files
+were deleted after the service stopped.
+
+The modified Linux `demo-remote.sh` and `demo-sdk.sh` paths were syntax-
+checked but **not executed on this final tree**. Docker Desktop was not
+available for the prior attempt, and this macOS loopback run cannot verify
+Linux-only transformation, whole-ELF rebuild, or visual interaction. The
+current SDK identity checks were covered by Python unit tests and the
+fresh Python live-client run. No release-level hostile-input or full local/remote
+parity claim follows.
+
 ## Bounded analyzed-program overlay — 2026-09-18
 
 The `analyze-spec` operation joins symbol-bounded call and memory-reference

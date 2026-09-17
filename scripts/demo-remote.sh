@@ -141,6 +141,21 @@ grep -q '"unknown_global_effects":true' "$demo_dir/effects-analysis.json"
 grep -q '"call_recovery":"partial"' "$demo_dir/effects-analyzed-spec.json"
 grep -q '"reference_recovery":"partial"' "$demo_dir/effects-analyzed-spec.json"
 grep -q '"source":"native_analysis"' "$demo_dir/effects-analyzed-spec.json"
+"$client_bin" remote annotate "$effects_id" 1 effects-assumption-1 assumption - \
+  'trusted fixture only' 'entry follows the fixture caller contract' \
+  > "$demo_dir/effects-annotated.json"
+grep -q '"revision": 2' "$demo_dir/effects-annotated.json"
+"$client_bin" remote annotate "$effects_id" 1 effects-assumption-1 assumption - \
+  'trusted fixture only' 'entry follows the fixture caller contract' \
+  > "$demo_dir/effects-annotation-retry.json"
+cmp "$demo_dir/effects-annotated.json" "$demo_dir/effects-annotation-retry.json"
+"$client_bin" remote annotations "$effects_id" 2 > "$demo_dir/effects-annotations.json"
+grep -q '"source":"analyst_assertion"' "$demo_dir/effects-annotations.json"
+"$client_bin" remote analyze-spec "$effects_id" 2 > "$demo_dir/effects-analyzed-with-assumption.json"
+grep -q '"statement":"entry follows the fixture caller contract"' "$demo_dir/effects-analyzed-with-assumption.json"
+"$gui_bin" --probe-annotation "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" \
+  "$demo_dir/global-effects" > "$demo_dir/gui-annotation-probe.txt"
+grep -q 'one persistent analyst fact' "$demo_dir/gui-annotation-probe.txt"
 
 "$client_bin" remote create Alice-transform request-alice-transform-1 > "$demo_dir/transform-project.json"
 transform_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/transform-project.json")"
@@ -237,6 +252,8 @@ kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 server_pid=""
 start_server
+"$client_bin" remote annotations "$effects_id" 2 > "$demo_dir/effects-annotations-after-restart.json"
+cmp "$demo_dir/effects-annotations.json" "$demo_dir/effects-annotations-after-restart.json"
 "$client_bin" remote project "$alice_id" > "$demo_dir/reopened-project.json"
 grep -q '"revision": 2' "$demo_dir/reopened-project.json"
 "$client_bin" remote patch "$alice_id" 1 "$demo_dir/patch.json" alice-patch-1 \
@@ -319,6 +336,11 @@ if "$client_bin" remote analyze-spec "$effects_id" 1 > "$demo_dir/denied-spec.ou
   exit 1
 fi
 grep -q 'project not found' "$demo_dir/denied-spec.err"
+if "$client_bin" remote annotations "$effects_id" 2 > "$demo_dir/denied-annotations.out" 2> "$demo_dir/denied-annotations.err"; then
+  echo "Bob unexpectedly listed Alice's annotations" >&2
+  exit 1
+fi
+grep -q 'project not found' "$demo_dir/denied-annotations.err"
 if "$client_bin" remote transform "$transform_id" 1 hydir_max2 bob-denied-transform \
   --assume-u64x2 --trusted-fixture --passes dce \
   --output-dir "$demo_dir/denied-transform" \

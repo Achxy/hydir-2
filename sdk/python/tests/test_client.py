@@ -1,7 +1,9 @@
 import os
 import tempfile
 import unittest
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from hydir_sdk import HydirClient
 from hydir_sdk import hydir_pb2 as proto
@@ -66,6 +68,37 @@ class ClientBoundaryTests(unittest.TestCase):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):
                 client.rebuild("project", 1, trusted_fixture=False)
+
+    def test_annotation_rejects_bad_kind_scope_and_address_before_network_use(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.add_annotation("project", 1, kind="instruction", value="x", scope="binary")
+            with self.assertRaises(ValueError):
+                client.add_annotation("project", 1, kind="name", value="entry", scope="binary")
+            with self.assertRaises(ValueError):
+                client.add_annotation("project", 1, kind="comment", value="x", scope=" ")
+            with self.assertRaises(ValueError):
+                client.add_annotation(
+                    "project", 1, kind="assumption", value="x", scope="binary", address="0xZZ"
+                )
+            with self.assertRaises(ValueError):
+                client.add_annotation(
+                    "project", 1, kind="name", value="false\nverified", scope="binary", address="0x401000"
+                )
+
+    def test_annotation_client_rejects_mismatched_remote_identity(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            client._call = lambda *_: SimpleNamespace(json=json.dumps({
+                "project_id": "other", "revision": 2,
+                "binary_sha256": "a" * 64, "annotations": [],
+            }))
+            with self.assertRaises(RuntimeError):
+                client.list_annotations("project", 2)
+            client._call = lambda *_: proto.ProjectReply(
+                project_id="project", revision=9, binary_sha256="a" * 64,
+            )
+            with self.assertRaises(RuntimeError):
+                client.add_annotation("project", 1, kind="comment", value="note", scope="binary")
 
 
 if __name__ == "__main__":

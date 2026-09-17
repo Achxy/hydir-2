@@ -29,11 +29,14 @@ An ELF with generic System V OSABI is labelled `x86_64-unknown-elf` rather
 than asserting Linux from the OSABI alone. A separate, versioned
 `FunctionCfg` records reachable one-instruction blocks, original bytes,
 direct edges, and provenance for a selected symbol or supplied entry. The
-global model still lacks complete call/reference recovery and actual
-analyst-supplied assumption persistence. The separate service has SQLite project and immutable binary
-revisions, but those are not yet integrated into `ProgramSpec`. These are
-versioned starting models, not the complete contract in the implementation
-plan.
+global model still lacks complete call/reference recovery. The remote
+service now persists owner-scoped, digest-bound analyst names, comments, and
+assumptions as immutable project revisions. Remote `inspect` and
+`analyze-spec` overlay only the assumptions, with explicit analyst
+provenance and optional virtual address; names/comments remain in the
+separate ledger and do not change recovered semantics. Local ELF mode has no
+durable annotation store. These are versioned starting models, not the
+complete contract in the implementation plan.
 
 The scalar patch v1 operation accepts a versioned JSON document with a
 source-located C-like `return` expression, an exact input hash, and the

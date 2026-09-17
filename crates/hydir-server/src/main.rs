@@ -2,14 +2,19 @@
 
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_api::v1::{
-    ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
-    FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, PatchReply,
-    PatchRequest, ProjectReply, ProjectRequest, RebuildReply, RebuildRequest, SourceReply,
-    SourceRequest, StartLiftJobRequest, TransformReply, TransformRequest, UploadBinaryRequest,
+    AnnotationRequest, ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply,
+    DiscoverRequest, FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply,
+    PatchReply, PatchRequest, ProjectReply, ProjectRequest, RebuildReply, RebuildRequest,
+    SourceReply, SourceRequest, StartLiftJobRequest, TransformReply, TransformRequest,
+    UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
+use hydir_core::{
+    Address, AnalystAnnotation, AnnotationKind, AssumptionSpec, FactProvenance, FactSource,
+    ProgramSpec,
+};
 use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
@@ -185,6 +190,34 @@ PRAGMA user_version=5;
 COMMIT;
 ";
 
+const ANNOTATION_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE analyst_annotations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    created_revision INTEGER NOT NULL,
+    binary_sha256 TEXT NOT NULL REFERENCES binaries(sha256),
+    kind TEXT NOT NULL CHECK(kind IN ('name','comment','assumption')),
+    address TEXT,
+    value TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    UNIQUE(project_id, created_revision)
+);
+CREATE INDEX analyst_annotations_scope
+    ON analyst_annotations(project_id, binary_sha256, created_revision);
+CREATE TABLE annotation_requests (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    new_revision INTEGER NOT NULL,
+    annotation_id TEXT NOT NULL REFERENCES analyst_annotations(id),
+    PRIMARY KEY(project_id, idempotency_key)
+);
+PRAGMA user_version=6;
+COMMIT;
+";
+
 #[derive(Clone)]
 struct Store {
     db: Arc<Mutex<Connection>>,
@@ -218,7 +251,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 5 {
+        if version > 6 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -235,6 +268,9 @@ impl Store {
         }
         if version <= 4 {
             connection.execute_batch(REBUILD_MIGRATION)?;
+        }
+        if version <= 5 {
+            connection.execute_batch(ANNOTATION_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -507,6 +543,176 @@ fn valid_symbol(symbol: &str) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+fn annotation_kind(value: &str) -> Result<AnnotationKind, Status> {
+    match value {
+        "name" => Ok(AnnotationKind::Name),
+        "comment" => Ok(AnnotationKind::Comment),
+        "assumption" => Ok(AnnotationKind::Assumption),
+        _ => Err(Status::invalid_argument(
+            "annotation kind must be name, comment, or assumption",
+        )),
+    }
+}
+
+fn annotation_address(value: &str) -> Result<Option<Address>, Status> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let digits = value
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty() && digits.len() <= 16)
+        .ok_or_else(|| Status::invalid_argument("address must be 0x plus 1..=16 hex digits"))?;
+    u64::from_str_radix(digits, 16)
+        .map(Address)
+        .map(Some)
+        .map_err(|_| Status::invalid_argument("address must be hexadecimal"))
+}
+
+fn validate_annotation(
+    input: &AnnotationRequest,
+) -> Result<(AnnotationKind, Option<Address>), Status> {
+    if input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 128
+        || input.idempotency_key.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument(
+            "annotation idempotency key must be 1..=128 non-control bytes",
+        ));
+    }
+    let kind = annotation_kind(&input.kind)?;
+    let address = annotation_address(&input.address)?;
+    if kind == AnnotationKind::Name && address.is_none() {
+        return Err(Status::invalid_argument("name requires a virtual address"));
+    }
+    let max_value = match kind {
+        AnnotationKind::Name => 128,
+        AnnotationKind::Comment => 2048,
+        AnnotationKind::Assumption => 1024,
+    };
+    if input.value.trim().is_empty()
+        || input.value.len() > max_value
+        || input.value.chars().any(|character| character == '\0')
+        || (kind == AnnotationKind::Name && input.value.chars().any(char::is_control))
+    {
+        return Err(Status::invalid_argument(format!(
+            "annotation value must be 1..={max_value} bytes without forbidden control characters"
+        )));
+    }
+    if input.scope.trim().is_empty()
+        || input.scope.len() > 256
+        || input.scope.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument(
+            "annotation scope must be 1..=256 non-control bytes",
+        ));
+    }
+    Ok((kind, address))
+}
+
+fn analyst_provenance() -> FactProvenance {
+    FactProvenance {
+        source: FactSource::AnalystAssertion,
+        scope: "authenticated project annotation; not independently validated".to_owned(),
+    }
+}
+
+fn annotations_for(
+    conn: &Connection,
+    project_id: &str,
+    revision: u64,
+    binary_sha256: &str,
+) -> Result<Vec<AnalystAnnotation>, Status> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id,created_revision,kind,address,value,scope FROM analyst_annotations \
+             WHERE project_id=?1 AND binary_sha256=?2 AND created_revision<=?3 \
+             ORDER BY created_revision LIMIT 513",
+        )
+        .map_err(internal)?;
+    let rows = statement
+        .query_map(params![project_id, binary_sha256, revision as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(internal)?;
+    let mut annotations = Vec::new();
+    for row in rows {
+        let (id, created_revision, kind, address, value, scope) = row.map_err(internal)?;
+        let kind = annotation_kind(&kind)
+            .map_err(|_| Status::internal("invalid stored annotation kind"))?;
+        let address = annotation_address(address.as_deref().unwrap_or(""))
+            .map_err(|_| Status::internal("invalid stored annotation address"))?;
+        annotations.push(AnalystAnnotation {
+            id,
+            binary_sha256: binary_sha256.to_owned(),
+            created_revision: created_revision as u64,
+            kind,
+            address,
+            value,
+            scope,
+            provenance: analyst_provenance(),
+        });
+    }
+    if annotations.len() > 512 {
+        return Err(Status::resource_exhausted(
+            "annotation list exceeds 512 facts",
+        ));
+    }
+    Ok(annotations)
+}
+
+fn overlay_assumptions(spec: &mut ProgramSpec, annotations: &[AnalystAnnotation]) {
+    for annotation in annotations {
+        if annotation.kind == AnnotationKind::Assumption {
+            spec.assumptions.push(AssumptionSpec {
+                id: annotation.id.clone(),
+                statement: annotation.value.clone(),
+                scope: annotation.scope.clone(),
+                address: annotation.address,
+                provenance: annotation.provenance.clone(),
+            });
+        }
+    }
+}
+
+fn annotation_replay(
+    conn: &Connection,
+    project_id: &str,
+    key: &str,
+    expected: i64,
+    request_sha256: &str,
+) -> Result<Option<(u64, String)>, Status> {
+    let prior: Option<(i64, String, i64, String)> = conn
+        .query_row(
+            "SELECT a.expected_revision,a.request_sha256,a.new_revision,r.binary_sha256 \
+             FROM annotation_requests a JOIN project_revisions r \
+             ON r.project_id=a.project_id AND r.revision=a.new_revision \
+             WHERE a.project_id=?1 AND a.idempotency_key=?2",
+            params![project_id, key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    match prior {
+        Some((prior_expected, prior_digest, revision, binary_sha256)) => {
+            if prior_expected != expected || prior_digest != request_sha256 {
+                Err(Status::already_exists(
+                    "idempotency key belongs to a different annotation request",
+                ))
+            } else {
+                Ok(Some((revision as u64, binary_sha256)))
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 struct TransformRecord {
@@ -923,6 +1129,7 @@ impl Hydir for Store {
                 && Path::new("/usr/bin/opt-14").is_file()
                 && Path::new("/usr/bin/clang-14").is_file(),
             analyzed_program_spec: true,
+            revisioned_annotations: true,
         }))
     }
 
@@ -1073,11 +1280,19 @@ impl Hydir for Store {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
-        let spec = run_worker("inspect", None, bytes).await?;
-        Ok(Response::new(JsonReply {
-            json: String::from_utf8(spec)
-                .map_err(|_| Status::internal("worker returned non-UTF-8 program model"))?,
-        }))
+        let raw = run_worker("inspect", None, bytes).await?;
+        let mut spec: ProgramSpec = serde_json::from_slice(&raw)
+            .map_err(|_| Status::internal("worker returned invalid program model"))?;
+        let annotations = annotations_for(
+            &*self.connection()?,
+            &input.project_id,
+            input.expected_revision,
+            &spec.binary_sha256,
+        )?;
+        overlay_assumptions(&mut spec, &annotations);
+        let json = serde_json::to_string(&spec)
+            .map_err(|_| Status::internal("program model serialization failed"))?;
+        Ok(Response::new(JsonReply { json }))
     }
 
     async fn analyze(
@@ -1101,10 +1316,180 @@ impl Hydir for Store {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
-        let spec = run_worker("analyze-spec", None, bytes).await?;
-        Ok(Response::new(JsonReply {
-            json: String::from_utf8(spec)
-                .map_err(|_| Status::internal("worker returned non-UTF-8 analyzed model"))?,
+        let raw = run_worker("analyze-spec", None, bytes).await?;
+        let mut spec: ProgramSpec = serde_json::from_slice(&raw)
+            .map_err(|_| Status::internal("worker returned invalid analyzed model"))?;
+        let annotations = annotations_for(
+            &*self.connection()?,
+            &input.project_id,
+            input.expected_revision,
+            &spec.binary_sha256,
+        )?;
+        overlay_assumptions(&mut spec, &annotations);
+        let json = serde_json::to_string(&spec)
+            .map_err(|_| Status::internal("analyzed model serialization failed"))?;
+        Ok(Response::new(JsonReply { json }))
+    }
+
+    async fn list_annotations(
+        &self,
+        request: Request<ProjectRequest>,
+    ) -> Result<Response<JsonReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        let project = self.project(&principal, &input.project_id)?;
+        if project.revision != input.expected_revision {
+            return Err(Status::aborted("stale project revision"));
+        }
+        if project.binary_sha256.is_empty() {
+            return Err(Status::failed_precondition(
+                "project has no uploaded binary",
+            ));
+        }
+        let annotations = annotations_for(
+            &*self.connection()?,
+            &input.project_id,
+            project.revision,
+            &project.binary_sha256,
+        )?;
+        let json = serde_json::to_string(&json!({
+            "schema_version": 1,
+            "project_id": input.project_id,
+            "revision": project.revision,
+            "binary_sha256": project.binary_sha256,
+            "annotations": annotations,
+        }))
+        .map_err(|_| Status::internal("annotation serialization failed"))?;
+        Ok(Response::new(JsonReply { json }))
+    }
+
+    async fn add_annotation(
+        &self,
+        request: Request<AnnotationRequest>,
+    ) -> Result<Response<ProjectReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        let (kind, address) = validate_annotation(&input)?;
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        let request_json = serde_json::to_vec(&(
+            input.expected_revision,
+            &input.kind,
+            address.map(|address| address.0),
+            &input.value,
+            &input.scope,
+        ))
+        .map_err(|_| Status::internal("annotation request serialization failed"))?;
+        let request_sha256 = sha256(&request_json);
+        let project = self.project(&principal, &input.project_id)?;
+        if let Some((revision, binary_sha256)) = annotation_replay(
+            &*self.connection()?,
+            &input.project_id,
+            &input.idempotency_key,
+            expected,
+            &request_sha256,
+        )? {
+            return Ok(Response::new(ProjectReply {
+                project_id: input.project_id,
+                name: project.name,
+                revision,
+                binary_sha256,
+            }));
+        }
+        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        if let Some(address) = address {
+            let raw = run_worker("inspect", None, bytes).await?;
+            let spec: ProgramSpec = serde_json::from_slice(&raw)
+                .map_err(|_| Status::internal("worker returned invalid program model"))?;
+            if !spec.mapped_segments.iter().any(|segment| {
+                segment.virtual_address.0 <= address.0
+                    && segment
+                        .virtual_address
+                        .0
+                        .checked_add(segment.memory_size)
+                        .is_some_and(|end| address.0 < end)
+            }) {
+                return Err(Status::invalid_argument(
+                    "annotation address is outside linked ELF load mappings",
+                ));
+            }
+        }
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        let id = Uuid::new_v4().to_string();
+        let kind_label = match kind {
+            AnnotationKind::Name => "name",
+            AnnotationKind::Comment => "comment",
+            AnnotationKind::Assumption => "assumption",
+        };
+        let address_label = address.map(|address| format!("0x{:016x}", address.0));
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            if let Some((revision, binary_sha256)) = annotation_replay(
+                &tx,
+                &input.project_id,
+                &input.idempotency_key,
+                expected,
+                &request_sha256,
+            )? {
+                return Ok(Response::new(ProjectReply {
+                    project_id: input.project_id,
+                    name: project.name,
+                    revision,
+                    binary_sha256,
+                }));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
+                    params![input.project_id, principal],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            let count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM analyst_annotations WHERE project_id=?1 AND binary_sha256=?2",
+                    params![input.project_id, project.binary_sha256],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if count >= 512 {
+                return Err(Status::resource_exhausted(
+                    "project has reached 512 annotations for this binary",
+                ));
+            }
+            tx.execute(
+                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+                params![input.project_id, next, project.binary_sha256],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO analyst_annotations(id,project_id,created_revision,binary_sha256,kind,address,value,scope) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id, input.project_id, next, project.binary_sha256, kind_label, address_label, input.value, input.scope],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO annotation_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision,annotation_id) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![input.project_id, input.idempotency_key, expected, request_sha256, next, id],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "UPDATE projects SET current_revision=?1 WHERE id=?2",
+                params![next, input.project_id],
+            )
+            .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        }
+        Ok(Response::new(ProjectReply {
+            project_id: input.project_id,
+            name: project.name,
+            revision: next as u64,
+            binary_sha256: project.binary_sha256,
         }))
     }
 
@@ -1885,6 +2270,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn annotation_inputs_are_bounded_and_names_cannot_spoof_display_lines() {
+        let input = AnnotationRequest {
+            project_id: "project".to_owned(),
+            expected_revision: 1,
+            idempotency_key: "key".to_owned(),
+            kind: "name".to_owned(),
+            address: "0x401000".to_owned(),
+            value: "entry".to_owned(),
+            scope: "analyst review".to_owned(),
+        };
+        assert_eq!(
+            validate_annotation(&input).unwrap().1,
+            Some(Address(0x401000))
+        );
+        assert_eq!(
+            validate_annotation(&AnnotationRequest {
+                value: "entry\nverified".to_owned(),
+                ..input.clone()
+            })
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            validate_annotation(&AnnotationRequest {
+                value: "x".repeat(129),
+                ..input.clone()
+            })
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            validate_annotation(&AnnotationRequest {
+                address: "0x10000000000000000".to_owned(),
+                ..input
+            })
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
     fn authorized<T>(value: T, token: &str) -> Request<T> {
         let mut request = Request::new(value);
         request
@@ -1973,6 +2402,133 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(found.project_id, project.project_id);
+    }
+
+    #[tokio::test]
+    async fn annotations_are_revisioned_private_idempotent_and_recover_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("annotations.sqlite");
+        let store = Store::open(&database).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "notes".to_owned(),
+                    idempotency_key: "notes-project".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let fake_binary = b"test-binary";
+        let binary_sha256 = sha256(fake_binary);
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "INSERT INTO binaries(sha256,content) VALUES(?1,?2)",
+                params![binary_sha256, fake_binary],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,1,?2)",
+                params![project.project_id, binary_sha256],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE projects SET current_revision=1 WHERE id=?1",
+                [&project.project_id],
+            )
+            .unwrap();
+        }
+        let request = AnnotationRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: 1,
+            idempotency_key: "note-1".to_owned(),
+            kind: "assumption".to_owned(),
+            address: String::new(),
+            value: "The entry follows a trusted caller contract".to_owned(),
+            scope: "whole uploaded binary".to_owned(),
+        };
+        let created = store
+            .add_annotation(authorized(request.clone(), &alice))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(created.revision, 2);
+        assert_eq!(created.binary_sha256, binary_sha256);
+        let denied = store
+            .list_annotations(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 2,
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+        let stale = store
+            .list_annotations(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 1,
+                },
+                &alice,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::Aborted);
+        drop(store);
+        let reopened = Store::open(&database).unwrap();
+        let replay = reopened
+            .add_annotation(authorized(request.clone(), &alice))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.revision, 2);
+        let conflict = reopened
+            .add_annotation(authorized(
+                AnnotationRequest {
+                    value: "changed".to_owned(),
+                    ..request.clone()
+                },
+                &alice,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        let list = reopened
+            .list_annotations(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 2,
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let parsed: serde_json::Value = serde_json::from_str(&list.json).unwrap();
+        assert_eq!(parsed["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["annotations"][0]["kind"], "assumption");
+        assert_eq!(
+            parsed["annotations"][0]["provenance"]["source"],
+            "analyst_assertion"
+        );
+        let denied = reopened
+            .add_annotation(authorized(
+                AnnotationRequest {
+                    idempotency_key: "bob-note".to_owned(),
+                    expected_revision: 2,
+                    ..request
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -2181,7 +2737,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=6;")
+            .execute_batch("PRAGMA user_version=7;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -2215,7 +2771,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
     }
 

@@ -25,6 +25,9 @@ the same remote operations and export a verified ELF. It also applies a bounded 
 starts an idempotent background lift. After restart it retrieves the same
 artifacts, replays the patch and lift events, and checks that the second
 identity cannot read or transform the first identity's project or artifacts.
+It also saves a scoped analyst assumption, checks exact-key retry and
+analyzed-spec provenance, runs the GUI annotation operation probe, verifies
+the ledger after restart, and denies the second identity access to it.
 It leaves artifacts in
 `target/demo-remote/run.*` for inspection. The credential files and database
 are mode-restricted by `umask 077`; do not publish that directory.
@@ -39,6 +42,17 @@ linked ELF project. The latter returns a partial, provenance-bearing
 `ProgramSpec`; it does not claim all call or memory-reference sites.
 `hydird identity rotate` replaces a principal's
 credential and immediately revokes its predecessor.
+
+`hydirctl remote annotations <project-id> <revision>` lists the current
+binary's owner-scoped analyst ledger. `hydirctl remote annotate <project-id>
+<revision> <idempotency-key> <name|comment|assumption> <hex-address|->
+<scope> <value>` adds a bounded fact as a new immutable revision. `-` means
+program-wide; a name requires an address, and addressed facts must lie in a
+linked ELF load mapping. Exact-key retry returns the same revision; a
+changed request with the same key fails. Only assumptions are overlaid into
+remote `inspect` and `analyze-spec` with `analyst_assertion` provenance.
+Names/comments do not change machine facts. None of these facts substitute
+for the explicit trust or prototype assertions required by other operations.
 
 In `hydir`, expand **Remote project · explicit transfer**, enter the loopback
 endpoint and private credential-file path, then create a project or enter an
@@ -57,6 +71,9 @@ the selected function and requires both trusted-fixture and entry-only
 assertions. The resulting ELF has a new revision; remote export is digest-
 checked and new-file-only. The GUI probes cover both local and remote patch
 operation functions, not visual interaction.
+The Inspector includes an explicitly unverified analyst ledger and form for
+the selected virtual address or a program-wide fact. Saving uses the same
+revisioned API as the CLI. Local ELF mode cannot persist annotations yet.
 Credentials stay out of the displayed project label. The headless
 `--probe-create-upload`, `--probe-transform`, and `--probe-rebuild` paths
 exercise the same operation functions, but are not visual UI tests.

@@ -143,6 +143,73 @@ class HydirClient:
         )
         return json.loads(reply.json)
 
+    def list_annotations(self, project_id: str, revision: int) -> dict:
+        reply = self._call(
+            self._stub.ListAnnotations,
+            proto.ProjectRequest(project_id=project_id, expected_revision=revision),
+        )
+        ledger = json.loads(reply.json)
+        digest = ledger.get("binary_sha256")
+        if (
+            ledger.get("project_id") != project_id
+            or ledger.get("revision") != revision
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not isinstance(ledger.get("annotations"), list)
+        ):
+            raise RuntimeError("Annotation ledger identity or shape differs from request")
+        for annotation in ledger["annotations"]:
+            if not isinstance(annotation, dict) or annotation.get("binary_sha256") != digest:
+                raise RuntimeError("Annotation fact is not bound to the requested binary")
+        return ledger
+
+    def add_annotation(
+        self, project_id: str, revision: int, *, kind: str, value: str,
+        scope: str, address: str | None = None, idempotency_key: str | None = None,
+    ):
+        """Append a scoped analyst fact as a new immutable project revision."""
+        if kind not in {"name", "comment", "assumption"}:
+            raise ValueError("Annotation kind must be name, comment, or assumption")
+        if kind == "name" and not address:
+            raise ValueError("Name annotations require an address")
+        if not value.strip() or not scope.strip():
+            raise ValueError("Annotation value and scope are required")
+        max_value = {"name": 128, "comment": 2048, "assumption": 1024}[kind]
+        if (
+            len(value.encode("utf-8")) > max_value
+            or "\x00" in value
+            or (kind == "name" and any(character in "\r\n\t" for character in value))
+            or len(scope.encode("utf-8")) > 256
+            or any(ord(character) < 32 for character in scope)
+        ):
+            raise ValueError("Annotation value or scope exceeds the supported bounds")
+        if address is not None and (
+            not address.startswith("0x")
+            or not 1 <= len(address[2:]) <= 16
+            or any(character not in "0123456789abcdefABCDEF" for character in address[2:])
+        ):
+            raise ValueError("Address must be 0x plus 1..=16 hex digits")
+        reply = self._call(
+            self._stub.AddAnnotation,
+            proto.AnnotationRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=idempotency_key or str(uuid4()),
+                kind=kind,
+                address=address or "",
+                value=value,
+                scope=scope,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.revision != revision + 1
+            or len(reply.binary_sha256) != 64
+        ):
+            raise RuntimeError("Annotation revision or binary identity differs from request")
+        return reply
+
     def recover_cfg(self, project_id: str, revision: int, symbol: str) -> dict:
         reply = self._call(
             self._stub.RecoverCfg,

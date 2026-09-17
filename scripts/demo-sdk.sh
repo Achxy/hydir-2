@@ -60,6 +60,11 @@ PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/global_analysis.
 grep -q '"unknown_global_effects": true' "$demo_dir/analysis.json"
 grep -q '"call_recovery": "partial"' "$demo_dir/analyzed-spec.json"
 grep -q '"reference_recovery": "partial"' "$demo_dir/analyzed-spec.json"
+PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/annotate_program.py \
+  "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$demo_dir/global-effects" \
+  assumption - 'trusted fixture only' 'entry follows the fixture caller contract' \
+  "$demo_dir/annotations.json" > "$demo_dir/sdk-annotations.txt"
+grep -q '"source": "analyst_assertion"' "$demo_dir/annotations.json"
 if [[ -n "$rebuild_binary" ]]; then
   grep -q '"whole_rebuild": true' "$demo_dir/discover.json"
   PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/rebuild_program.py \
