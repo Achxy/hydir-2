@@ -1,9 +1,15 @@
-# M1 prototype evidence — 2026-09-17
+# M1 evidence — 2026-09-17
+
+The first section records the linear-slice checkpoint. The second section
+records the subsequent direct-CFG and analyst-entry expansion. Counts are
+fixture variants, not claims about arbitrary ELF programs.
 
 The checkout started at initial commit `b6228a3dd2753d91260d3f5868d6b576388a1742`
 with only a nine-byte README. No prior HydIR implementation was present here.
 
-## Executed checks
+## Initial linear-slice checkpoint
+
+### Executed checks
 
 - `cargo test --locked --workspace` on macOS arm64 with Rust 1.96.0: 7 unit
   tests passed (6 backend, 1 core); no ignored or failed tests.
@@ -34,7 +40,7 @@ container's Rust `PATH`; the script now uses a non-login shell. A subsequent
 run produced 1,008 matches but its outer script exited 2 because the script
 was edited while running. The final, unchanged run above exited 0.
 
-## Corpus ledger for this checkpoint
+### Corpus ledger for this checkpoint
 
 | Unit of evidence | Attempted | Supported | Lifted | IR-valid | Executable lifted form | Behaviorally matched | C-generated | Whole-program rebuilt |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -45,7 +51,7 @@ other upstream test ELF tried locally (`test-hello-elf-x64`, `main`) was also
 rejected at an unsupported `Push` (`0x1140`); it is not copied into this
 repository or included in the two-fixture ledger.
 
-## Status and blockers
+### Status at this checkpoint
 
 M0 is partial: upstream IRENE-3 source, build files, schemas, transforms,
 patch parser, tests, root and Ghidra licenses were inspected; Rust and the M1
@@ -61,6 +67,48 @@ release artifact or remote corresponding-source offer. Execution validation
 has **no sandbox** and is limited to explicitly trusted fixtures. No benchmark
 timings or memory measurements were recorded.
 
-The next blocking engineering task is stateful recovery/lifting of direct
-control flow and memory, with explicit machine-state and ABI effects and
-differential fixtures. Packaging or GUI work would not remove that blocker.
+At that checkpoint, the next engineering task was direct control flow and
+memory with explicit machine-state and ABI effects.
+
+## Direct-CFG and stripped-entry expansion
+
+Executed `cargo fmt --all`, `cargo test --locked --workspace`,
+`bash -n scripts/demo-local.sh`, `git diff --check`, and
+`bash scripts/demo-linux-docker.sh`. The final Docker run exited 0 with Rust
+1.96.0, Debian Clang/LLVM 14.0.6, 11 Rust unit tests, Clippy with
+`-D warnings`, and `opt -passes=verify` for all five emitted modules. The
+host Cargo test also passed; host Clippy was unavailable, so the pinned Linux
+container provided that gate.
+
+The final run's artifacts are under `target/demo-local/run.8yQbEY/`. Four
+symbolized function fixtures (`add2`, unsigned `max2`, signed `max2`, and
+`repeat16`) and one truly stripped copy of `max2` were each tested on eight
+boundary input pairs and 1,000 seeded pairs. All five reports recorded
+**1,008 attempted, 1,008 matched, 0 mismatched**; aggregate 5,040 attempts.
+The stripped variant used the analyst-supplied virtual entry
+`0x0000000000401138` and 16-byte extent obtained before stripping. `nm` on
+the stripped file did not find the function symbol. The native CFG export
+recorded five reachable instruction blocks and five edges in both the
+symbolized and stripped max cases. `repeat16` recorded six blocks and six
+edges. This does not prove equivalence outside the tested inputs or contract.
+
+| Unit of evidence | Attempted | Supported | Lifted | IR-valid | Executable lifted form | Behaviorally matched | C-generated | Whole-program rebuilt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Function fixture variants | 6 | 5 | 5 | 5 | 5 | 5 (5,040 input pairs) | 0 | 0 |
+
+The sixth variant is the deliberately unsupported `push` fixture, which was
+rejected rather than lifted. The unit suite also checks overlap rejection,
+uninitialized flags, and an uninitialized return value on one CFG path.
+
+M0 remains partial: a reference upstream lift, native dependency set, full
+per-file license review, and release notices are not complete. M1's narrow
+native import/lift/execute/differential gate passes, including direct branches
+and bounded loops, but calls, memory, complete ABI state, and the 20-function
+corpus remain. M2 through M5 are absent. In particular there is still no
+`hydir` GUI, `hydird` service, project persistence, remote API, C output,
+interprocedural analysis, patching, or whole-executable rebuild. Validation
+has **no sandbox** and must remain limited to trusted fixtures.
+
+The next blocking engineering task is memory and direct-call semantics with
+declared machine-state, ABI, and observable-memory contracts; remote/product
+gates will also require persistent projects and isolated workers.

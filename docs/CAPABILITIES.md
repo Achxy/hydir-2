@@ -6,17 +6,19 @@ lifting or rebuilding.
 
 | Target / operation | Import | Function lift | C output | Patching | Whole-executable rebuild | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
-| x86-64 little-endian ELF, symbolized, Linux SysV | yes | partial: linear scalar two-argument functions | no | no | no | `hydirctl inspect/lift`, LLVM verification, trusted fixture differential test |
-| x86-64 ELF, stripped | partial: sections only | no | no | no | no | Missing symbol rejected |
-| x86-64 ELF with branches/calls/memory | yes | no | no | no | no | Unsupported instruction diagnostic |
+| x86-64 little-endian ELF, symbolized, Linux SysV | yes | partial: symbol-bounded scalar two-argument functions with direct branches/loops | no | no | no | `hydirctl inspect/cfg/lift`, LLVM verification, four trusted function differential tests |
+| x86-64 linked ELF, stripped | partial: sections; analyst entry/size required | partial: same scalar CFG subset with explicit entry/size | no | no | no | `cfg-at/lift-at/validate-at` on stripped max fixture, 1,008 matches |
+| x86-64 ELF with calls or memory effects | yes | no | no | no | no | Unsupported instruction diagnostic |
 | Other ELF architectures or endian modes | no | no | no | no | no | Import rejection |
 | PE/Mach-O | no | no | no | no | no | Import rejection |
 
-The `ProgramSpec` currently records content hash, target, ABI assertion,
-file-derived sections, and ELF symbol facts. It does not yet have mapped
-segments, relocations, references, CFG, typed assumptions, instruction bytes
-in the serialized model, persistence, or revision histories. It is a versioned
-starting model, not the complete contract in the implementation plan.
+The initial `ProgramSpec` records content hash, target, ABI description,
+file-derived sections, and ELF symbol facts. A separate, versioned
+`FunctionCfg` records reachable one-instruction blocks, original bytes,
+direct edges, and provenance for a selected symbol or supplied entry. The
+global model still lacks mapped segments, relocations, references, typed
+assumptions, persistence, and revision histories. These are versioned starting
+models, not the complete contract in the implementation plan.
 
 There is no `hydir` egui executable, `hydird` service, Python SDK, Ghidra
 adapter, interprocedural analysis, decompiler, or executable rebuild yet.

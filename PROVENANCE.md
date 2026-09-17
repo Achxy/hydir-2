@@ -12,9 +12,9 @@ Its submodule pointers were inspected but not fetched or built.
 | LLVM/Anvill/Remill transformation passes | IRENE-3 `d97aee9`, `lib/Transforms` | none | Not ported | None |
 | Ghidra plugin and specifications | IRENE-3 `d97aee9`, `irene-ghidra`, `tests/specs` | none | Not ported | None |
 | Existing patch tests and CI scripts | IRENE-3 `d97aee9`, `tests`, `scripts/test-ci.py` | none | Reviewed as reference only | None |
-| Native ELF symbol reader | `object` 0.39.1 | `hydir-backend` | Newly implemented integration | Local inspect/lift demo |
-| x86 decoder | `iced-x86` 1.21.0 | `hydir-backend` | Newly implemented integration | Byte-pattern unit tests |
-| Scalar LLVM IR emission | No copied upstream code | `hydir-backend` | Newly implemented, narrow subset | LLVM verifier and differential fixture |
+| Native ELF symbol and bounded-address reader | `object` 0.39.1 | `hydir-backend` | Newly implemented integration | Symbolized and stripped local demos |
+| x86 decoder and direct CFG recovery | `iced-x86` 1.21.0 | `hydir-backend` | Newly implemented integration | Byte-pattern tests and CFG fixture exports |
+| Scalar LLVM IR emission with explicit register/flag joins | No copied upstream code | `hydir-backend` | Newly implemented, narrow subset | LLVM verifier and five differential fixture variants |
 
 IRENE-3 C++ code, generated sources, schemas, and tests are not vendored or
 translated here. Its root is AGPLv3; its `irene-ghidra/LICENSE` is Apache-2.0,

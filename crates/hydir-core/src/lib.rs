@@ -65,6 +65,45 @@ pub struct FunctionSpec {
     pub control_flow_status: String,
 }
 
+/// One-instruction blocks are the current native recovery granularity.
+/// Facts here describe reachable bytes in a selected, bounded ELF symbol,
+/// not a claim of complete whole-program recovery.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FunctionCfg {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub symbol_name: String,
+    pub entry: Address,
+    pub address_kind: AddressKind,
+    pub symbol_size: u64,
+    pub blocks: Vec<BlockSpec>,
+    pub edges: Vec<EdgeSpec>,
+    pub provenance: String,
+    pub recovery_scope: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockSpec {
+    pub address: Address,
+    pub bytes_hex: String,
+    pub mnemonic: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EdgeSpec {
+    pub source: Address,
+    pub target: Address,
+    pub kind: EdgeKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    Direct,
+    Taken,
+    Fallthrough,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AddressKind {
