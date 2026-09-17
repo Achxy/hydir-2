@@ -116,3 +116,4 @@ remain open.
   it refuses to overwrite an existing binary or differing artifact.
 
 See [capabilities](docs/CAPABILITIES.md), [evidence](docs/EVIDENCE.md),
+[release gates](docs/RELEASE_GATES.md),
