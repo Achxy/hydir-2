@@ -14,9 +14,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 revision="$(git rev-parse HEAD)"
 archive="$repo_dir/target/source-snapshot/hydir-source-$revision.tar"
-if [[ ! -f "$archive" ]]; then
-  bash scripts/package-source-snapshot.sh
-fi
+bash scripts/package-source-snapshot.sh
 test -f "$archive"
 export HYDIR_SOURCE_REVISION="$revision"
 export HYDIR_SOURCE_ARCHIVE="$archive"
@@ -61,5 +59,5 @@ cmp "$archive" "$demo_dir/offered-source.tar"
 expected_sha="$(sha256sum "$archive" | awk '{print $1}')"
 grep -q "\"sha256\": \"$expected_sha\"" "$demo_dir/source.json"
 grep -q "\"source_sha256\": \"$expected_sha\"" "$demo_dir/discover.json"
-tar -tf "$demo_dir/offered-source.tar" | grep -Fxq "hydir-source-$revision/crates/hydir-c/src/lib.rs"
+tar -tf "$demo_dir/offered-source.tar" | grep -Fx "hydir-source-$revision/crates/hydir-c/src/lib.rs" >/dev/null
 echo "matching embedded source archive offered: $revision · $expected_sha · $demo_dir"
