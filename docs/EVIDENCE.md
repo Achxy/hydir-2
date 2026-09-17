@@ -1,5 +1,39 @@
 # HydIR evidence — 2026-09-17
 
+## Scalar C and remote C checkpoint — 2026-09-17
+
+`hydir-c` emits C11 from the raw, machine-byte-derived scalar LLVM lift,
+with explicit CFG labels and parallel SSA phi edge copies. It is not
+Rellic, high-level structuring, or general LLVM-to-C. The Linux x86-64
+`demo-corpus.sh` run exited 0 in `target/demo-corpus/run.chVCwq/`:
+16/16 distinct functions produced LLVM and C, both compiled, and each
+matched the original on 1,008 controlled input pairs. Thus this new lane
+had **16,128/16,128 compiled-C/native matches** with no observed mismatch.
+`demo-local.sh` separately exited 0 in `target/demo-local/run.pGSnye/`:
+four symbolized functions plus one stripped-address variant each had
+**1,008/1,008 compiled-C/native matches**, adding 5,040 comparisons.
+Combined scalar C evidence is **21 supported variants and 21,168/21,168
+observed matches** across 20 distinct functions; the unsupported `push`
+variant remains rejected before C generation. The same inputs were tested
+for the raw LLVM path. All execution validation was unsandboxed and limited
+to trusted fixtures.
+
+The authenticated, separate-process `demo-remote.sh` run exited 0 in
+`target/demo-remote/run.mBvVaK/`: it generated a C artifact for
+`hydir_max2`, compiled and compared three inputs against the original,
+retrieved the same SHA-256-addressed C bytes after a service restart,
+and denied another identity access to that artifact. The SDK's four local
+boundary tests passed. Linux Docker `cargo test --locked --workspace`
+passed **29 Rust tests** and workspace Clippy passed with `-D warnings`.
+The GUI C view compiled and its remote headless probe passed; visual
+interaction with that view was not established. Source-offer embedding and
+retrieval are implemented but not counted as verified in this checkpoint
+until the clean-tree source-offer demo runs.
+
+| Corpus unit | Attempted | Supported | Lifted | IR-valid | Executable LLVM | LLVM matches | C-generated/compiled | C matches | Whole-program rebuilt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Scalar variants | 22 | 21 | 21 | 21 | 21 | 21,168 input pairs | 21 | 21,168 input pairs | 0 |
+
 ## Twenty-function scalar corpus checkpoint — 2026-09-17
 
 The macOS `cargo run --locked --bin hydir` launch compiled and opened a real

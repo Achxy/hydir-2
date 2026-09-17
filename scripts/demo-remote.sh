@@ -82,6 +82,21 @@ grep -q 'stale project revision' "$demo_dir/stale.err"
   > "$demo_dir/gui-remote-probe.txt"
 "$client_bin" remote lift "$alice_id" 1 hydir_max2 --assume-u64x2 \
   --output "$demo_dir/remote-lift.ll" > "$demo_dir/lift.json"
+"$client_bin" remote decompile "$alice_id" 1 hydir_max2 --assume-u64x2 \
+  --output "$demo_dir/remote-decompile.c" > "$demo_dir/decompile.json"
+c_sha="$(sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p' "$demo_dir/decompile.json")"
+test "${#c_sha}" -eq 64
+clang -std=c11 -O0 "$demo_dir/remote-decompile.c" tests/fixtures/scalar_main.c \
+  -DHYDIR_FUNCTION=hydir_lifted -o "$demo_dir/remote-c-runner" 2> "$demo_dir/remote-c-compile.err" || {
+    cat "$demo_dir/remote-c-compile.err" >&2
+    exit 1
+  }
+for input_pair in '0 0' '42 9' '18446744073709551615 1'; do
+  read -r input_a input_b <<< "$input_pair"
+  "$demo_dir/max2-original" "$input_a" "$input_b" > "$demo_dir/original-sample.out"
+  "$demo_dir/remote-c-runner" "$input_a" "$input_b" > "$demo_dir/c-sample.out"
+  cmp "$demo_dir/original-sample.out" "$demo_dir/c-sample.out"
+done
 artifact_sha="$(sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p' "$demo_dir/lift.json")"
 test "${#artifact_sha}" -eq 64
 grep -q '"kind":"taken"' "$demo_dir/cfg.json"
@@ -125,6 +140,9 @@ start_server
 "$client_bin" remote artifact "$alice_id" "$artifact_sha" \
   --output "$demo_dir/after-restart.ll" > "$demo_dir/artifact.json"
 cmp "$demo_dir/remote-lift.ll" "$demo_dir/after-restart.ll"
+"$client_bin" remote artifact "$alice_id" "$c_sha" \
+  --output "$demo_dir/after-restart.c" > "$demo_dir/c-artifact.json"
+cmp "$demo_dir/remote-decompile.c" "$demo_dir/after-restart.c"
 "$client_bin" remote job "$alice_id" "$alice_job_id" > "$demo_dir/alice-job-after-restart.json"
 grep -q '"state": "succeeded"' "$demo_dir/alice-job-after-restart.json"
 "$client_bin" remote job-events "$alice_id" "$alice_job_id" 0 > "$demo_dir/alice-job-events-replayed.jsonl"
@@ -169,8 +187,15 @@ if "$client_bin" remote artifact "$alice_id" "$artifact_sha" \
   echo "Bob unexpectedly accessed Alice's artifact" >&2
   exit 1
 fi
+if "$client_bin" remote artifact "$alice_id" "$c_sha" \
+  --output "$demo_dir/denied-c-artifact.c" \
+  > "$demo_dir/denied-c-artifact.out" 2> "$demo_dir/denied-c-artifact.err"; then
+  echo "Bob unexpectedly accessed Alice's C artifact" >&2
+  exit 1
+fi
 grep -q 'project not found' "$demo_dir/denied-project.err"
 grep -q 'artifact not found' "$demo_dir/denied-artifact.err"
+grep -q 'artifact not found' "$demo_dir/denied-c-artifact.err"
 
 "$server_bin" identity rotate "$demo_dir/projects.sqlite" alice \
   | awk '/new credential \(save securely/ {print $NF}' > "$demo_dir/alice-rotated.token"

@@ -6,8 +6,8 @@ lifting or rebuilding.
 
 | Target / operation | Import | Global analysis | Function lift | C output | Patching | Whole-executable rebuild | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| x86-64 little-endian linked ELF, symbolized, Linux SysV | yes | partial: bounded symbol call graph and conservative mapped-global effects | partial: symbol-bounded scalar two-argument functions with direct branches/loops | no | no | partial: only the freestanding subset below | `hydirctl inspect/analyze/cfg/lift/rebuild`, LLVM verification, 20 distinct trusted scalar functions |
-| x86-64 linked ELF, stripped | partial: sections; analyst entry/size required | no: symbol scope unavailable | partial: same scalar CFG subset with explicit entry/size | no | no | no | `cfg-at/lift-at/validate-at` on stripped max fixture, 1,008 matches |
+| x86-64 little-endian linked ELF, symbolized, Linux SysV | yes | partial: bounded symbol call graph and conservative mapped-global effects | partial: symbol-bounded scalar two-argument functions with direct branches/loops | partial: compilable C11 with explicit CFG/gotos and SSA copies for the same scalar subset | no | partial: only the freestanding subset below | `hydirctl inspect/analyze/cfg/lift/decompile/rebuild`, LLVM verification, 20 distinct trusted scalar functions |
+| x86-64 linked ELF, stripped | partial: sections; analyst entry/size required | no: symbol scope unavailable | partial: same scalar CFG subset with explicit entry/size | partial: same subset with supplied entry/size | no | no | `cfg-at/lift-at/decompile-at/validate-c-at` on stripped max fixture, 1,008 C matches |
 | x86-64 ELF with calls or memory effects | yes | partial: direct-call propagation and unknown-effect flag | no | no | no | no | `demo-analysis.sh` global write and indirect-call fixture; lift rejects unsupported semantics |
 | Freestanding static symbolized Linux x86-64 ELF, complete `.text` symbol coverage, direct control flow, bounded mapped data, read/write/exit | yes | partial | separate stateful complete-program LLVM lift; not the `u64(u64,u64)` function API | no | no | **yes, restricted/local-only** | `demo-recompile.sh`: three whole programs, five controlled behavior matches, five semantic-rejection cases |
 | Other ELF architectures or endian modes | no | no | no | no | no | no | Import rejection |
@@ -22,6 +22,13 @@ assumptions. The separate service has SQLite project and immutable binary
 revisions, but those are not yet integrated into `ProgramSpec`. These are
 versioned starting models, not the complete contract in the implementation
 plan.
+
+The scalar C operation consumes the raw HydIR LLVM lift and rejects syntax
+outside its exact grammar. It is not a general C decompiler or a Rellic
+integration; the emitted C retains labels/gotos. Across 21 supported scalar
+variants (20 distinct functions plus a stripped variant), compiled C matched
+native execution on 21,168/21,168 tested input pairs. This is fixture evidence,
+not equivalence proof or evidence for memory/call-heavy functions.
 
 The local CLI supports an explicit, allowlisted LLVM 14.0.6 pass sequence:
 `instcombine`, `sccp`, `simplifycfg`, and `dce`. It saves raw, canonical
@@ -47,14 +54,14 @@ not exposed by the GUI, remote API, or Python SDK yet.
 The `hydir` egui app can open a local ELF, create an authenticated loopback
 project, explicitly upload an ELF to it, or reopen an existing project, then
 browse function facts, reachable CFG,
-machine bytes, and LLVM IR. Only the separate labelled upload action transfers
+machine bytes, LLVM IR, and bounded scalar C. Only the separate labelled upload action transfers
 bytes. A
 desktop smoke run was attempted on macOS; automated visual/interaction QA is
 still outstanding. The `hydird` gRPC service supports authenticated loopback discovery,
 idempotent project creation, immutable binary uploads, project inspection,
-symbol-scoped CFG/lift, conservative global-effect analysis, owner-scoped durable lift jobs with event replay and
-cancellation, and artifact retrieval. It does not support remote
+symbol-scoped CFG/lift/C, conservative global-effect analysis, owner-scoped durable lift jobs with event replay and
+cancellation, artifact retrieval, and optional matching-source retrieval. It does not support remote
 execution, TLS/non-loopback clients, or full authorization
 roles. There is a Python SDK for the implemented API subset, but no Ghidra
-adapter or C decompiler. The effect analysis is a tested interprocedural subset, not full
+adapter or general C decompiler. The effect analysis is a tested interprocedural subset, not full
 M3 completion.

@@ -2,10 +2,16 @@
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback discovery, project creation,
-explicit ELF upload, inspect/CFG/lift, bounded global-effect analysis,
+explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
 durable lift jobs and event streams, and verified artifact download. There
-is no remote pass, C, patch, rebuild, or execution endpoint yet; the SDK
+is no remote pass, patch, rebuild, or execution endpoint yet; the SDK
 does not claim those operations exist.
+
+`decompile(project_id, revision, symbol, assume_u64x2=True)` returns C11
+from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
+decompiler. `get_source()` retrieves the exact source tar advertised by a
+matching-source build and verifies its SHA-256. Ordinary development builds
+do not embed such an archive, so `get_source()` then fails explicitly.
 
 Install Python 3.10+ in a private virtual environment:
 

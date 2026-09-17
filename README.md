@@ -2,7 +2,7 @@
 
 HydIR is an early, independently implemented binary-lifting workbench. This
 checkout contains a tested **M1 native vertical slice**, a **partial M2
-desktop and local-authenticated RPC slice**, and a narrowly tested local
+desktop and local-authenticated RPC slice**, bounded scalar C emission, and a narrowly tested local
 whole-executable recompilation subset. It is not the complete remote/decompilation/
 recompilation product described in the project plan. It imports little-endian
 x86-64 ELF without Ghidra, lifts a deliberately small class of functions from
@@ -12,10 +12,10 @@ service.
 
 The `hydir` egui desktop workbench opens local ELF files and can create or
 open authenticated loopback projects. It shows function facts,
-reachable disassembly/CFG, LLVM IR, assumptions, and diagnostics in resizable
+reachable disassembly/CFG, LLVM IR, scalar C, assumptions, and diagnostics in resizable
 panes. Opening a local binary never uploads it; sending a binary requires the
 separate, labelled remote-upload action and creates a new immutable revision.
-Saved layouts and C output are not yet implemented. It can start, monitor,
+Saved layouts and high-level structured C recovery are not yet implemented. It can start, monitor,
 cancel, and retrieve a remote lift job and display a conservative global-effect
 analysis. The local CLI has a named LLVM pass experiment for trusted fixtures;
 there is no GUI/remote pass editor. The analysis is not complete whole-program
@@ -35,23 +35,24 @@ cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
 cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
+cargo run --locked --bin hydirctl -- decompile /path/to/program.elf function_name --assume-u64x2 --output lifted.c
 cargo run --locked --bin hydirctl -- transform /path/to/program.elf function_name --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce --output-dir /path/to/new-experiment --opt opt
 cargo run --locked --bin hydirctl -- rebuild /path/to/trusted-static-program.elf --trusted-fixture --output-dir /path/to/new-rebuild
 ```
 
 On a Linux x86-64 host with Clang, `bash scripts/demo-local.sh` builds four
 trusted assembly functions, imports them, exports per-function CFG JSON,
-lifts them, verifies the IR if `opt` is installed, and compares 1,008
+lifts them, emits C, verifies the IR if `opt` is installed, and compares 1,008
 executions per function (eight boundary cases and 1,000 seeded cases). It
-also strips one fixture and repeats CFG, lift, IR verification, and 1,008
+also strips one fixture and repeats CFG, lift, C, IR verification, and 1,008
 comparisons using an explicitly supplied entry and byte extent. Artifacts
 are written to a fresh `target/demo-local/run.*` directory.
 `bash scripts/demo-corpus.sh` separately checks 16 more distinct scalar
 functions (identity, wrapping arithmetic, signed/unsigned comparison,
-bit test, bounded loops): each is lifted, LLVM-verified, and compared with
-native execution on 1,008 inputs. Together with the four distinct functions
+bit test, bounded loops): each is lifted, converted to C, LLVM-verified, and compared with
+native execution on 1,008 inputs for both LLVM and compiled C. Together with the four distinct functions
 in `demo-local.sh`, this makes 20 distinct supported scalar functions. It
-does not cover optimized compiler output, stack/buffer access, or C output.
+does not cover optimized compiler output, stack/buffer access, or high-level C structuring.
 
 On macOS with Docker Desktop, `bash scripts/demo-linux-docker.sh` builds the
 pinned Linux x86-64 development image and runs the tests plus demo there.
@@ -84,12 +85,13 @@ sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.
 There is no remote execution endpoint, and the current RPC service cannot
 bind outside loopback.
 
-For a local developer-only source snapshot of a clean committed tree, run
+For a local developer source snapshot of a clean committed tree, run
 `bash scripts/package-source-snapshot.sh`. It verifies that the archive
 contains the license, notices, lockfile, runtime, and protocol, and excludes
-local design context and project data. This is not a release or AGPL remote
-source offer; license/notice review and matching deployed-build verification
-remain open.
+local design context and project data. `bash scripts/demo-source-offer.sh`
+builds an opt-in `hydird` with that matching archive embedded, then checks
+discovery and hash-checked RPC retrieval. This is a technical source-delivery
+gate, not a release or completed redistribution-license review.
 
 ## Exact supported lift contract
 

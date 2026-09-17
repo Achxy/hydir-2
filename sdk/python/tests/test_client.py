@@ -36,6 +36,11 @@ class ClientBoundaryTests(unittest.TestCase):
             HydirClient.export_artifact(b"different", output)
         self.assertEqual(output.read_bytes(), b"IR")
 
+    def test_decompile_requires_explicit_prototype(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.decompile("project", 1, "symbol", assume_u64x2=False)
+
 
 if __name__ == "__main__":
     unittest.main()

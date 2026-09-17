@@ -16,7 +16,7 @@ if [[ -e "$archive" ]]; then
   exit 1
 fi
 git archive --format=tar --prefix="$prefix/" --output="$archive" HEAD
-for required in LICENSE Cargo.lock rust-toolchain.toml Dockerfile.m1 PROVENANCE.md THIRD_PARTY_NOTICES.md crates/hydir-api/proto/hydir.proto native/whole-runtime/runtime.c scripts/demo-recompile.sh; do
+for required in LICENSE Cargo.lock rust-toolchain.toml Dockerfile.m1 PROVENANCE.md THIRD_PARTY_NOTICES.md crates/hydir-api/proto/hydir.proto crates/hydir-c/src/lib.rs crates/hydir-server/build.rs native/whole-runtime/runtime.c scripts/demo-recompile.sh; do
   if ! tar -tf "$archive" | grep -Fxq "$prefix/$required"; then
     echo "archive missing required source: $required" >&2
     exit 1

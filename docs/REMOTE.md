@@ -16,10 +16,10 @@ bash scripts/demo-remote.sh
 
 The script creates a private temporary development database and two random
 credentials, starts `hydird` on loopback, uploads a fixture binary, inspects
-it, recovers its CFG, lifts it, downloads the LLVM artifact, restarts the
-server, retrieves the same artifact, starts an idempotent background lift,
+it, recovers its CFG, lifts it, generates compiled scalar C, downloads both
+artifacts, restarts the server, retrieves the same artifacts, starts an idempotent background lift,
 replays its event stream after restart, and checks that the second identity
-cannot read the first identity's project, job, or artifact. It leaves artifacts in
+cannot read the first identity's project, job, LLVM artifact, or C artifact. It leaves artifacts in
 `target/demo-remote/run.*` for inspection. The credential files and database
 are mode-restricted by `umask 077`; do not publish that directory.
 
@@ -37,11 +37,13 @@ endpoint and private credential-file path, then create a project or enter an
 existing project ID. Opening never uploads. To send bytes, enter an ELF path
 and press **Upload ELF to remote project**; this creates an immutable revision.
 The workbench checks discovery version, project revision, model hash,
-and returned IR artifact digest. It supports inspect/CFG/lift, a bounded
+and returned IR/C artifact digests. It supports inspect/CFG/lift/scalar-C, a bounded
 global-effect report, and lift-job start/monitor/cancel/artifact retrieval.
 Credentials stay out of the displayed project label. The headless
 `--probe-create-upload` path exercises the same transfer functions, but is not
 a visual UI test.
+The Inspector displays whether this service build offers a matching committed
+source archive, its revision and digest, and the explicit CLI download command.
 
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is
@@ -67,8 +69,21 @@ The Python client in `sdk/python/` uses the same `.proto` contract and
 loopback/credential rules. `scripts/demo-sdk.sh` runs its unit tests and a
 separate-client integration smoke test against a locally started `hydird`,
 given a trusted x86-64 ELF containing `hydir_max2`. It does not provide
-pass/C/patch/rebuild/execute calls because the service does not expose those
-operations yet.
+pass/patch/rebuild/execute calls because the service does not expose those
+operations yet. It does expose scalar C and an optional source-archive retrieval.
+
+## Matching-source development build
+
+A normal `hydird` development build advertises no archive. After a clean
+commit, `bash scripts/package-source-snapshot.sh` creates a revision-named
+tar. Build `hydird` with both `HYDIR_SOURCE_REVISION=<full HEAD SHA>` and
+`HYDIR_SOURCE_ARCHIVE=<absolute archive path>` set. Its build script rejects
+a dirty or nonmatching checkout and embeds the bounded archive bytes into
+the binary. `Discover` advertises the revision and SHA-256; authenticated
+`GetSource`, `hydirctl remote source --output <new-file.tar>`, and the Python
+SDK return/check the same bytes. `bash scripts/demo-source-offer.sh` exercises
+that complete matching-source flow on loopback. This technical mechanism
+does not complete the third-party notice/legal review needed before release.
 
 ## Security boundary and missing release gates
 
@@ -91,6 +106,7 @@ isolated network/filesystem namespaces, disposable sandbox, lifetime job/storage
 rate limits, detailed audit logs, or fine-grained read/analyze/mutate roles.
 The binary/message/output/time/active-job bounds are resource controls, not a
 security proof. Do not expose this build to untrusted clients or samples.
-Non-loopback/TLS deployment, execution validation, and a matching AGPL
-corresponding-source offer remain unavailable; no public deployment is
-authorized or claimed.
+Non-loopback/TLS deployment and execution validation remain unavailable.
+The matching-source endpoint exists only in an explicitly built, clean-tree
+binary and is not a public release offer. No public deployment is authorized
+or claimed.

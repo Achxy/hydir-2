@@ -27,6 +27,8 @@ if command -v opt >/dev/null 2>&1; then
   opt -passes=verify -disable-output "$demo_dir/add2-lifted.ll"
 fi
 "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" validate "$demo_dir/add2-original" hydir_add2 --assume-u64x2 --trusted-fixture --clang clang > "$demo_dir/differential-report.json"
+"${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" decompile "$demo_dir/add2-original" hydir_add2 --assume-u64x2 --output "$demo_dir/add2.c"
+"${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" validate-c "$demo_dir/add2-original" hydir_add2 --assume-u64x2 --trusted-fixture --clang clang > "$demo_dir/add2-c-differential-report.json"
 for fixture in max2 signed_max2 repeat16; do
   symbol="hydir_$fixture"
   clang -O0 -no-pie -DHYDIR_FUNCTION="$symbol" \
@@ -43,6 +45,12 @@ for fixture in max2 signed_max2 repeat16; do
   "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" validate \
     "$demo_dir/$fixture-original" "$symbol" --assume-u64x2 \
     --trusted-fixture --clang clang > "$demo_dir/$fixture-differential-report.json"
+  "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" decompile \
+    "$demo_dir/$fixture-original" "$symbol" --assume-u64x2 \
+    --output "$demo_dir/$fixture.c"
+  "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" validate-c \
+    "$demo_dir/$fixture-original" "$symbol" --assume-u64x2 \
+    --trusted-fixture --clang clang > "$demo_dir/$fixture-c-differential-report.json"
 done
 read -r max_entry_hex max_size_hex < <(nm -S --defined-only "$demo_dir/max2-original" | awk '$4 == "hydir_max2" {print $1, $2}')
 if [[ -z "${max_entry_hex:-}" || -z "${max_size_hex:-}" ]]; then
@@ -69,6 +77,13 @@ fi
   "$demo_dir/max2-stripped" "0x$max_entry_hex" "$max_size_bytes" \
   --assume-u64x2 --trusted-fixture --clang clang \
   > "$demo_dir/max2-stripped-differential-report.json"
+"${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" decompile-at \
+  "$demo_dir/max2-stripped" "0x$max_entry_hex" "$max_size_bytes" \
+  --assume-u64x2 --output "$demo_dir/max2-stripped.c"
+"${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" validate-c-at \
+  "$demo_dir/max2-stripped" "0x$max_entry_hex" "$max_size_bytes" \
+  --assume-u64x2 --trusted-fixture --clang clang \
+  > "$demo_dir/max2-stripped-c-differential-report.json"
 for report in "$demo_dir"/*differential-report.json; do
   echo "$report"
   sed -n '1,24p' "$report"
