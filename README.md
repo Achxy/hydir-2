@@ -58,6 +58,11 @@ global write and conservative treatment of an indirect call in a linked ELF.
 it verifies the named pipeline with pinned LLVM `opt` 14.0.6 and compares a
 transformed trusted fixture on eight boundary inputs. An IR change and a
 verifier pass are not, by themselves, a behavioral proof.
+The [Python SDK](sdk/python/README.md) wraps the same authenticated gRPC
+subset. With its pinned dependencies installed, `bash scripts/demo-sdk.sh
+/path/to/trusted-x86_64-elf-with-hydir_max2` exercises a separate Python
+client against `hydird`, including explicit upload, analysis, event replay,
+and digest-checked artifact export.
 
 The `validate` command runs the original binary and lifted runner **without a
 sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.

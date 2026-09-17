@@ -1,0 +1,45 @@
+# HydIR Python SDK (API v1 subset)
+
+This SDK is backed by the same protobuf schema as `hydirctl remote` and
+`hydird`. It supports authenticated loopback discovery, project creation,
+explicit ELF upload, inspect/CFG/lift, bounded global-effect analysis,
+durable lift jobs and event streams, and verified artifact download. There
+is no remote pass, C, patch, rebuild, or execution endpoint yet; the SDK
+does not claim those operations exist.
+
+Install Python 3.10+ in a private virtual environment:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install .
+```
+
+For the runnable smoke example, first run an authenticated `hydird` service
+and create a private credential file as described in
+[remote operation](../../docs/REMOTE.md).
+Then supply a trusted x86-64 ELF and a symbol with the asserted
+`u64(u64,u64)` prototype:
+
+```sh
+.venv/bin/python examples/smoke.py http://127.0.0.1:50051 /private/token.txt /path/to/fixture.elf hydir_max2 /new/output/directory
+```
+
+`examples/batch_lift.py` accepts only the symbols explicitly named on its
+command line. Passing a symbol asserts the same prototype for it; the SDK
+does not infer signatures. No sample is uploaded without a call to
+`upload_binary`. Artifact bytes are SHA-256 checked before being returned,
+and `export_artifact` refuses to overwrite an existing path. The client
+rejects plaintext non-loopback endpoints and non-private credential files.
+
+Generated `hydir_pb2.py` and `hydir_pb2_grpc.py` correspond to
+`crates/hydir-api/proto/hydir.proto`, produced with `grpcio-tools==1.84.0`.
+Regenerate after API changes with:
+
+```sh
+python -m grpc_tools.protoc -I../../crates/hydir-api/proto \
+  --python_out=hydir_sdk --grpc_python_out=hydir_sdk \
+  ../../crates/hydir-api/proto/hydir.proto
+```
+
+After regeneration, change `import hydir_pb2` in the generated gRPC file to
+`from . import hydir_pb2` so the package imports correctly.
