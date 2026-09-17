@@ -41,9 +41,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("source archive must be a bounded, nonempty tar".into());
     }
     let prefix = format!("hydir-source-{revision}/");
-    let tar_name = &archive[..100];
-    let tar_name = tar_name.split(|byte| *byte == 0).next().unwrap_or_default();
-    if tar_name != prefix.as_bytes() || &archive[257..262] != b"ustar" {
+    let first_name = archive[..100]
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    let header_offset = if first_name == b"pax_global_header" {
+        let encoded = archive[124..136]
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        let encoded = std::str::from_utf8(encoded)?.trim();
+        let size = usize::from_str_radix(encoded, 8)?;
+        512usize
+            .checked_add(
+                size.div_ceil(512)
+                    .checked_mul(512)
+                    .ok_or("PAX size overflow")?,
+            )
+            .ok_or("PAX offset overflow")?
+    } else {
+        0
+    };
+    let header = archive
+        .get(header_offset..header_offset + 512)
+        .ok_or("source archive has no root header")?;
+    let tar_name = header[..100]
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    if tar_name != prefix.as_bytes() || &header[257..262] != b"ustar" {
         return Err("source archive root does not match build revision".into());
     }
     println!("cargo:rerun-if-changed={}", archive_path.display());
