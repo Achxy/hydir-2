@@ -455,9 +455,33 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
         env::current_exe().map_err(|_| Status::internal("worker executable unavailable"))?;
     let mut command = Command::new(executable);
     command.arg("worker").arg(action);
+    command.env_clear();
     if let Some(symbol) = symbol {
         valid_symbol(symbol)?;
         command.arg(symbol);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: the closure runs after fork and before exec, uses only libc's
+    // async-signal-safe setrlimit calls, and captures no process state.
+    unsafe {
+        command.pre_exec(|| {
+            for (resource, value) in [
+                (libc::RLIMIT_AS, 2 * 1024 * 1024 * 1024),
+                (libc::RLIMIT_CPU, 25),
+                (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
+                (libc::RLIMIT_NOFILE, 64),
+                (libc::RLIMIT_CORE, 0),
+            ] {
+                let limit = libc::rlimit {
+                    rlim_cur: value,
+                    rlim_max: value,
+                };
+                if libc::setrlimit(resource, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -492,7 +516,7 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
         if !status.success() {
             let diagnostic = String::from_utf8_lossy(&output[..output.len().min(4096)]);
             return Err(Status::invalid_argument(format!(
-                "analysis worker rejected input: {}",
+                "analysis worker rejected input (exit {status}): {}",
                 diagnostic.trim()
             )));
         }

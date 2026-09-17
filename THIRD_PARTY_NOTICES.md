@@ -21,6 +21,7 @@ substitute for reading and preserving their actual license files.
 | `prost` | 0.14.4 | Apache-2.0 | Protocol message encoding |
 | `protoc-bin-vendored` | 3.2.0 | MIT | Reproducible protocol compiler |
 | `tokio` | 1.53.1 | MIT | Asynchronous RPC runtime |
+| `libc` | 0.2.189 | MIT OR Apache-2.0 | Linux child-worker resource limits |
 | `rusqlite` | 0.40.2 | MIT | Persistent SQLite project and artifact store |
 | `uuid` | 1.26.1 | Apache-2.0 OR MIT | Project IDs and generated local credentials |
 | `eframe`, `egui` | 0.36.2 | MIT OR Apache-2.0 | Native desktop workbench |

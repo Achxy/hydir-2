@@ -303,3 +303,26 @@ The SDK does not expose pass experiments, C generation, patching, rebuilding,
 or execution because no corresponding remote operations exist. Its package
 build succeeded locally; there is no published wheel, release archive, or
 complete license-notice/source-offer audit.
+
+## Linux worker resource limits
+
+The server now clears the child worker's environment and applies Linux
+`setrlimit` caps before exec. Host `cargo test --offline --workspace` passed
+all 25 Rust tests after the change. The first Linux remote run with a
+512 MiB address-space cap failed intermittently: a worker exited via
+`SIGTRAP` during fixture inspection under Docker's emulated x86-64 mode on
+Apple Silicon. That cap was raised to 2 GiB; two subsequent separate-process
+`scripts/demo-remote.sh` runs exited 0 and left artifacts in
+`target/demo-remote/run.DsaGCs/` and
+`target/demo-remote/run.89FGva/`. The cause of `SIGTRAP` has not been proven;
+the emulation/address-space interaction is a hypothesis, not a verified root
+cause. Native Linux stress testing and hostile-input isolation remain open.
+
+The subsequent full `bash scripts/demo-linux-docker.sh` exited 0 with 25
+Rust tests, warning-free Clippy, 5,040/5,040 trusted differential matches,
+the analysis and named-pass demonstrations, and the separate-process remote
+demonstration. Artifacts are under `target/demo-local/run.QEprei/`,
+`target/demo-analysis/run.vhpqK3/`,
+`target/demo-passes/run.GdkBFC/`, and
+`target/demo-remote/run.Km7w5d/`. This does not prove that the limits safely
+contain malicious code or child process trees.

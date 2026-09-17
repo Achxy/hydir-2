@@ -81,10 +81,13 @@ artifact reads from another identity return not-found errors.
 
 This is **not a hostile-binary sandbox**. ELF parsing, CFG recovery, and
 lifting run in a fresh `hydird worker` child process with a 30-second deadline
-and 16 MiB output cap. It receives bytes on stdin, not a user-controlled
+and 16 MiB output cap. On Linux the child also starts with a cleared
+environment and `setrlimit` caps of 2 GiB address space, 25 CPU seconds,
+16 MiB regular-file size, 64 open descriptors, and zero core-dump bytes.
+It receives bytes on stdin, not a user-controlled
 server path; a crash does not directly unwind the network server. The child
 still has the service user's filesystem/network privileges. There are no
-OS-level memory/CPU quotas, disposable sandbox, lifetime job/storage quotas,
+isolated network/filesystem namespaces, disposable sandbox, lifetime job/storage quotas,
 rate limits, detailed audit logs, or fine-grained read/analyze/mutate roles.
 The binary/message/output/time/active-job bounds are resource controls, not a
 security proof. Do not expose this build to untrusted clients or samples.
