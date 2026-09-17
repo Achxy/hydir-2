@@ -1,0 +1,10 @@
+FROM hydir-m1:local
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3=3.11.2-1+b1 python3-venv=3.11.2-1+b1 \
+    && python3 -m venv /opt/hydir-sdk \
+    && /opt/hydir-sdk/bin/pip install --no-cache-dir grpcio==1.84.0 protobuf==7.36.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV HYDIR_SDK_PYTHON=/opt/hydir-sdk/bin/python
+WORKDIR /work

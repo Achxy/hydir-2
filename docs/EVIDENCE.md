@@ -1,5 +1,59 @@
 # HydIR evidence — 2026-09-18
 
+## Shared local/remote rebuild and workbench operations — 2026-09-18
+
+`bash scripts/demo-linux-docker.sh` exited 0 on the macOS Apple Silicon host
+running the pinned Linux x86-64 image (Rust 1.96.0, Debian Clang/LLVM
+14.0.6). The run passed **34 Rust tests** and workspace Clippy with
+`-D warnings`. Retained outputs are `target/demo-local/run.QPv9E4/`,
+`target/demo-corpus/run.S6xag3/`, `target/demo-analysis/run.pSR2ZX/`,
+`target/demo-passes/run.k2WQow/`, `target/demo-patch/run.QBv5E2/`,
+`target/demo-remote/run.jHYm7i/`, and
+`target/demo-recompile/run.vs8g1v/`. The 20 distinct scalar functions and a
+stripped variant again matched **21,168/21,168 raw-LLVM/native** and
+**21,168/21,168 compiled-C/native** controlled input pairs. The three
+freestanding complete programs rebuilt into new executables and matched
+five controlled stdout/stderr/exit cases. Five deliberate semantic
+unsupported cases were rejected. These are trusted fixtures, not general
+equivalence or a hostile-input security evaluation.
+After that integrated run, two headless GUI state-transition tests were
+added. A targeted Linux `cargo test --locked --workspace` then passed **36
+Rust tests**, and workspace Clippy again passed with `-D warnings`. The two
+tests check that an ambiguous remote mutation forces reopen/clears privileged
+state and that a local pass result updates verified views and resets trust.
+
+The separate-process remote demo exercised authenticated upload, global
+analysis, scalar C, a named pass experiment, scalar patch, and a whole-ELF
+rebuild. The remote rebuild created revision 2 with owner-scoped IR, ELF, and
+report artifacts. It matched three controlled client-side inputs, survived
+restart and exact-key retry without a third revision, and denied a second
+identity. The egui headless operation probes separately exercised local and
+remote pass, patch, and rebuild/export functions. They are not a visual UI
+interaction test; the current macOS window was launched, but the available
+computer-use surface did not expose it for reliable control, so no new visual
+interaction claim is made. The service never executed the samples.
+
+`bash scripts/demo-sdk-linux-docker.sh` exited 0 with the SDK image and
+retained `target/demo-sdk/run.5Kuqam/`. Its seven Python boundary tests,
+separate-client smoke, typed remote rebuild, digest-checked artifact export,
+and three controlled client-side behavior comparisons passed. Separately,
+`sdk/python/examples/validate_program.py` saved
+`target/demo-remote/run.y382s5/sdk-docker-validation.json` with **3/3**
+matched original/rebuilt choice cases under no-network, read-only,
+resource-limited Docker runs. An initial attempt with an eight-second outer
+timeout expired while Docker was under concurrent build load; a thirty-second
+startup bound plus a five-second in-container execution bound then passed.
+Omitting the required `--trusted-fixture` flag exited 2 before execution.
+The Docker controls are not a proof of safe hostile execution.
+
+An earlier integrated run on this date reached the pass/patch gates but
+exited during a concurrent Cargo manifest/lockfile edit (`--locked` refused
+the in-progress lockfile). After the lockfile settled, the full unchanged
+gate above passed. Matching-source verification for this new code revision
+must be repeated after a clean commit; previous source-offer hashes below are
+historical, not evidence for this tree. No release, public service, push, or
+deployment was made.
+
 ## Revisioned remote pass and integrated checkpoint — 2026-09-18
 
 `bash scripts/demo-linux-docker.sh` exited 0 with pinned Rust 1.96.0 and

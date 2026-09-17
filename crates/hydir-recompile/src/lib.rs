@@ -27,9 +27,6 @@ fn fail(message: impl Into<String>) -> Box<dyn Error> {
 }
 
 pub fn run(args: &[String]) -> R<()> {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err(fail("rebuild requires Linux x86-64; run the Docker gate"));
-    }
     if args.len() != 4 && args.len() != 6 {
         return Err(fail(
             "rebuild <elf> --trusted-fixture --output-dir <new-directory> [--clang <path>]",
@@ -48,15 +45,7 @@ pub fn run(args: &[String]) -> R<()> {
     } else {
         "clang"
     };
-    let version = Command::new(clang).arg("--version").output()?;
-    if !version.status.success() || !String::from_utf8_lossy(&version.stdout).contains("14.0.6") {
-        return Err(fail("rebuild requires pinned Clang/LLVM 14.0.6"));
-    }
     let binary = fs::read(&args[0])?;
-    if binary.len() > 64 * 1024 * 1024 {
-        return Err(fail("binary exceeds 64 MiB"));
-    }
-    let (ir, mut report) = lift(&binary)?;
     let dir = Path::new(&args[3]);
     if dir.exists() {
         return Err(fail(format!(
@@ -64,42 +53,65 @@ pub fn run(args: &[String]) -> R<()> {
             dir.display()
         )));
     }
+    let result = rebuild_bytes(&binary, Path::new(clang), Path::new("opt"))?;
     fs::create_dir(dir)?;
-    let ir_path = dir.join("whole.ll");
-    let runtime_path = dir.join("runtime.c");
+    fs::write(dir.join("whole.ll"), &result.ir)?;
+    fs::write(dir.join("runtime.c"), RUNTIME_C)?;
     let executable = dir.join("rebuilt");
-    for path in [
-        &ir_path,
-        &runtime_path,
-        &executable,
-        &dir.join("report.json"),
-    ] {
-        if path.exists() {
-            return Err(fail(format!("refusing to overwrite {}", path.display())));
+    fs::write(&executable, &result.executable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::write(dir.join("report.json"), &result.report_json)?;
+    println!("{}", String::from_utf8(result.report_json)?);
+    Ok(())
+}
+
+const RUNTIME_C: &str = include_str!("../../../native/whole-runtime/runtime.c");
+pub const MAX_REBUILT_BYTES: usize = 16 * 1024 * 1024;
+
+pub struct RebuildArtifacts {
+    pub ir: Vec<u8>,
+    pub executable: Vec<u8>,
+    pub report_json: Vec<u8>,
+}
+
+/// Reconstruct a complete program without executing it or copying its code
+/// bytes. This is only a trusted-fixture operation, not a hostile-input sandbox.
+pub fn rebuild_bytes(binary: &[u8], clang: &Path, opt: &Path) -> R<RebuildArtifacts> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(fail("rebuild requires Linux x86-64; run the Docker gate"));
+    }
+    if binary.is_empty() || binary.len() > 64 * 1024 * 1024 {
+        return Err(fail("binary must be 1..=64 MiB"));
+    }
+    for (tool, label) in [(clang, "Clang"), (opt, "LLVM opt")] {
+        let version = Command::new(tool).arg("--version").output()?;
+        if !version.status.success() || !String::from_utf8_lossy(&version.stdout).contains("14.0.6")
+        {
+            return Err(fail(format!("rebuild requires pinned {label} 14.0.6")));
         }
     }
-    fs::write(&ir_path, ir)?;
-    fs::write(
-        &runtime_path,
-        include_str!("../../../native/whole-runtime/runtime.c"),
-    )?;
-    let opt_version = Command::new("opt").arg("--version").output()?;
-    if !opt_version.status.success()
-        || !String::from_utf8_lossy(&opt_version.stdout).contains("14.0.6")
-    {
-        return Err(fail("rebuild requires pinned LLVM opt 14.0.6"));
-    }
-    let verify = Command::new("opt")
+    let (ir, mut report) = lift(binary)?;
+    let directory = tempfile::tempdir()?;
+    let ir_path = directory.path().join("whole.ll");
+    let runtime_path = directory.path().join("runtime.c");
+    let executable_path = directory.path().join("rebuilt");
+    fs::write(&ir_path, &ir)?;
+    fs::write(&runtime_path, RUNTIME_C)?;
+    let verified = Command::new(opt)
         .args(["-verify", "-disable-output"])
         .arg(&ir_path)
         .output()?;
-    if !verify.status.success() {
+    if !verified.status.success() {
         return Err(fail(format!(
             "generated LLVM IR failed verification: {}",
-            String::from_utf8_lossy(&verify.stderr)
+            String::from_utf8_lossy(&verified.stderr)
         )));
     }
-    let output = Command::new(clang)
+    let compiled = Command::new(clang)
         .args([
             "-O0",
             "-nostdlib",
@@ -109,21 +121,27 @@ pub fn run(args: &[String]) -> R<()> {
             "-Wl,-e,_start",
             "-o",
         ])
-        .arg(&executable)
+        .arg(&executable_path)
         .arg(&ir_path)
         .arg(&runtime_path)
         .output()?;
-    if !output.status.success() {
+    if !compiled.status.success() {
         return Err(fail(format!(
             "rebuild compiler failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&compiled.stderr)
         )));
+    }
+    let executable_size = fs::metadata(&executable_path)?.len();
+    if executable_size > MAX_REBUILT_BYTES as u64 {
+        return Err(fail("rebuilt executable exceeds 16 MiB"));
     }
     report["llvm_verified"] = json!(true);
     report["toolchain"] = json!("Clang/LLVM 14.0.6");
-    fs::write(dir.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    Ok(RebuildArtifacts {
+        ir: ir.into_bytes(),
+        executable: fs::read(&executable_path)?,
+        report_json: serde_json::to_vec_pretty(&report)?,
+    })
 }
 
 fn lift(bytes: &[u8]) -> R<(String, serde_json::Value)> {

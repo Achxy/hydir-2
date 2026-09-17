@@ -5,17 +5,21 @@ use eframe::egui::{self, Color32, RichText};
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
     ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobReply, JobRequest,
-    ProjectRequest, StartLiftJobRequest, UploadBinaryRequest, hydir_client::HydirClient,
+    PatchRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest, TransformRequest,
+    UploadBinaryRequest, hydir_client::HydirClient,
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
 use hydir_core::{FunctionCfg, FunctionSpec, ProgramSpec};
+use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
+use hydir_recompile::rebuild_bytes;
+use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
     time::Duration,
@@ -29,6 +33,8 @@ const MUTED: Color32 = Color32::from_rgb(157, 169, 170);
 const ACCENT: Color32 = Color32::from_rgb(224, 170, 93);
 const GOOD: Color32 = Color32::from_rgb(124, 190, 152);
 const BAD: Color32 = Color32::from_rgb(232, 139, 124);
+const PINNED_OPT: &str = "/usr/bin/opt-14";
+const PINNED_CLANG: &str = "/usr/bin/clang-14";
 
 enum Task {
     Open(PathBuf),
@@ -57,12 +63,45 @@ enum Task {
     RefreshJob(String),
     CancelJob(String),
     OpenJobArtifact(String),
+    TransformRemote {
+        symbol: String,
+        passes: String,
+        key: String,
+    },
+    TransformLocal {
+        symbol: String,
+        passes: String,
+        output_dir: PathBuf,
+    },
+    RebuildRemote {
+        key: String,
+    },
+    RebuildLocal {
+        output_dir: PathBuf,
+    },
+    PatchLocal {
+        symbol: String,
+        replacement: String,
+        output_path: PathBuf,
+    },
+    PatchRemote {
+        symbol: String,
+        replacement: String,
+        key: String,
+    },
+    ExportRebuiltRemote {
+        digest: String,
+        path: PathBuf,
+    },
 }
 
 enum Event {
     Imported {
         source: String,
         remote: bool,
+        revision: Option<u64>,
+        named_pass_transform: bool,
+        whole_rebuild: bool,
         source_offer: Option<String>,
         spec: ProgramSpec,
     },
@@ -76,6 +115,53 @@ enum Event {
     Analyzed(Result<AnalysisReport, String>),
     JobUpdated(JobReply),
     JobArtifact(String),
+    Transformed {
+        source: String,
+        revision: u64,
+        before: String,
+        after: String,
+        report: String,
+        changed: bool,
+        c: Result<String, String>,
+    },
+    LocalTransformed {
+        before: String,
+        after: String,
+        report: String,
+        c: Result<String, String>,
+        output_dir: PathBuf,
+    },
+    Rebuilt {
+        source: String,
+        revision: u64,
+        spec: ProgramSpec,
+        ir: String,
+        report: String,
+        binary_sha256: String,
+    },
+    LocalRebuilt {
+        spec: ProgramSpec,
+        ir: String,
+        report: String,
+        binary_sha256: String,
+        output_dir: PathBuf,
+    },
+    LocalPatched {
+        spec: ProgramSpec,
+        binary_sha256: String,
+        output_path: PathBuf,
+    },
+    RemotePatched {
+        source: String,
+        revision: u64,
+        spec: ProgramSpec,
+        binary_sha256: String,
+    },
+    ArtifactExported {
+        path: PathBuf,
+        digest: String,
+    },
+    MutationUncertain(String),
     Failed(String),
 }
 
@@ -86,6 +172,8 @@ struct RemoteAccess {
     project_id: String,
     revision: u64,
     source_offer: String,
+    named_pass_transform: bool,
+    whole_rebuild: bool,
 }
 
 enum Source {
@@ -163,6 +251,8 @@ async fn open_remote(
         project_id,
         revision: 0,
         source_offer: String::new(),
+        named_pass_transform: false,
+        whole_rebuild: false,
     };
     let mut client = remote_client(&access).await?;
     let discovery = client
@@ -204,6 +294,8 @@ async fn open_remote(
     let access = RemoteAccess {
         revision: project.revision,
         source_offer,
+        named_pass_transform: discovery.named_pass_transform,
+        whole_rebuild: discovery.whole_rebuild,
         ..access
     };
     let reply = client
@@ -241,6 +333,8 @@ async fn create_remote_project(
         project_id: String::new(),
         revision: 0,
         source_offer: String::new(),
+        named_pass_transform: false,
+        whole_rebuild: false,
     };
     let mut client = remote_client(&access).await?;
     let created = client
@@ -275,6 +369,8 @@ async fn upload_remote(
         project_id: project_id.clone(),
         revision: 0,
         source_offer: String::new(),
+        named_pass_transform: false,
+        whole_rebuild: false,
     };
     let mut client = remote_client(&access).await?;
     let project = client
@@ -464,6 +560,449 @@ async fn remote_job_artifact(access: &RemoteAccess, digest: &str) -> Result<Stri
     String::from_utf8(artifact.content).map_err(|error| format!("Job IR is not UTF-8: {error}"))
 }
 
+async fn verified_text_artifact(
+    client: &mut HydirClient<Channel>,
+    access: &RemoteAccess,
+    revision: u64,
+    digest: &str,
+    media_type: &str,
+) -> Result<String, String> {
+    let artifact = client
+        .get_artifact(authorized(
+            ArtifactRequest {
+                project_id: access.project_id.clone(),
+                sha256: digest.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not retrieve {media_type} artifact: {error}"))?
+        .into_inner();
+    if artifact.sha256 != digest
+        || artifact.project_revision != revision
+        || artifact.media_type != media_type
+        || format!("{:x}", Sha256::digest(&artifact.content)) != digest
+    {
+        return Err(format!(
+            "{media_type} artifact failed digest/type/revision verification."
+        ));
+    }
+    String::from_utf8(artifact.content)
+        .map_err(|error| format!("{media_type} artifact is not UTF-8: {error}"))
+}
+
+async fn transform_remote(
+    access: &RemoteAccess,
+    symbol: &str,
+    passes: &str,
+    key: &str,
+) -> Result<(u64, String, String, String, bool), String> {
+    if !access.named_pass_transform {
+        return Err("Service does not advertise named-pass transformation.".to_owned());
+    }
+    parse_passes(passes)?;
+    let mut client = remote_client(access).await?;
+    let reply = client
+        .transform(authorized(
+            TransformRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                function_symbol: symbol.to_owned(),
+                assume_u64x2: true,
+                trusted_fixture: true,
+                passes: passes.to_owned(),
+                idempotency_key: key.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote transform failed: {error}"))?
+        .into_inner();
+    if reply.project_id != access.project_id
+        || Some(reply.project_revision) != access.revision.checked_add(1)
+    {
+        return Err("Transform returned an unexpected project or revision.".to_owned());
+    }
+    let before = verified_text_artifact(
+        &mut client,
+        access,
+        reply.project_revision,
+        &reply.before_sha256,
+        "text/x-llvm-ir",
+    )
+    .await?;
+    let after = verified_text_artifact(
+        &mut client,
+        access,
+        reply.project_revision,
+        &reply.after_sha256,
+        "text/x-llvm-ir",
+    )
+    .await?;
+    let report = verified_text_artifact(
+        &mut client,
+        access,
+        reply.project_revision,
+        &reply.report_sha256,
+        "application/json",
+    )
+    .await?;
+    if report != reply.report_json || reply.ir_text_changed != (before != after) {
+        return Err("Transform report or change flag differs from stored artifacts.".to_owned());
+    }
+    Ok((
+        reply.project_revision,
+        before,
+        after,
+        report,
+        reply.ir_text_changed,
+    ))
+}
+
+async fn rebuild_remote(
+    access: &RemoteAccess,
+    key: &str,
+) -> Result<(u64, ProgramSpec, String, String, String), String> {
+    if !access.whole_rebuild {
+        return Err("Service does not advertise whole-executable rebuilding.".to_owned());
+    }
+    let mut client = remote_client(access).await?;
+    let reply = client
+        .rebuild(authorized(
+            RebuildRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                trusted_fixture: true,
+                idempotency_key: key.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote rebuild failed: {error}"))?
+        .into_inner();
+    if reply.project_id != access.project_id
+        || Some(reply.revision) != access.revision.checked_add(1)
+    {
+        return Err("Rebuild returned an unexpected project or revision.".to_owned());
+    }
+    let ir = verified_text_artifact(
+        &mut client,
+        access,
+        reply.revision,
+        &reply.ir_sha256,
+        "text/x-llvm-ir",
+    )
+    .await?;
+    let report = verified_text_artifact(
+        &mut client,
+        access,
+        reply.revision,
+        &reply.report_sha256,
+        "application/json",
+    )
+    .await?;
+    if report != reply.report_json {
+        return Err("Rebuild report differs from stored artifact.".to_owned());
+    }
+    let project = client
+        .get_project(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: reply.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not verify rebuilt project: {error}"))?
+        .into_inner();
+    if project.binary_sha256 != reply.binary_sha256 || project.revision != reply.revision {
+        return Err("Rebuilt project binary digest or revision differs from reply.".to_owned());
+    }
+    let inspection = client
+        .inspect(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: reply.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not inspect rebuilt binary: {error}"))?
+        .into_inner();
+    let spec: ProgramSpec = serde_json::from_str(&inspection.json)
+        .map_err(|error| format!("Invalid rebuilt program model: {error}"))?;
+    if spec.binary_sha256 != reply.binary_sha256 {
+        return Err("Rebuilt program model digest differs from project.".to_owned());
+    }
+    Ok((reply.revision, spec, ir, report, reply.binary_sha256))
+}
+
+async fn export_rebuilt_remote(
+    access: &RemoteAccess,
+    digest: &str,
+    path: &PathBuf,
+) -> Result<(), String> {
+    let mut client = remote_client(access).await?;
+    let artifact = client
+        .get_artifact(authorized(
+            ArtifactRequest {
+                project_id: access.project_id.clone(),
+                sha256: digest.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not retrieve rebuilt ELF: {error}"))?
+        .into_inner();
+    if artifact.sha256 != digest
+        || artifact.project_revision != access.revision
+        || artifact.media_type != "application/x-elf"
+        || format!("{:x}", Sha256::digest(&artifact.content)) != digest
+    {
+        return Err("Rebuilt ELF failed digest/type/revision verification.".to_owned());
+    }
+    import_elf(&artifact.content)
+        .map_err(|error| format!("Retrieved ELF failed import: {error}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Could not create new export file: {error}"))?;
+    let write_result = file
+        .write_all(&artifact.content)
+        .and_then(|()| file.sync_all());
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("Could not complete ELF export: {error}"));
+    }
+    Ok(())
+}
+
+fn new_output_dir(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("Output directory must be an absolute path.".to_owned());
+    }
+    fs::create_dir(path)
+        .map_err(|error| format!("Could not create a new output directory: {error}"))
+}
+
+fn transform_local(
+    binary: &[u8],
+    symbol: &str,
+    passes: &str,
+    output_dir: &Path,
+) -> Result<(String, String, String), String> {
+    let raw = lift_symbol(binary, symbol).map_err(|error| error.to_string())?;
+    let result = transform(&raw, passes, Path::new(PINNED_OPT))?;
+    let before = String::from_utf8(result.before.clone())
+        .map_err(|error| format!("Canonical LLVM IR is not UTF-8: {error}"))?;
+    let after = String::from_utf8(result.after.clone())
+        .map_err(|error| format!("Transformed LLVM IR is not UTF-8: {error}"))?;
+    let report = serde_json::json!({
+        "scope": "trusted scalar function; named LLVM passes",
+        "function": symbol,
+        "passes": result.pipeline,
+        "llvm_version": result.llvm_version,
+        "llvm_verified": true,
+        "ir_text_changed": before != after,
+        "raw_sha256": format!("{:x}", Sha256::digest(&result.raw)),
+        "before_sha256": format!("{:x}", Sha256::digest(&result.before)),
+        "after_sha256": format!("{:x}", Sha256::digest(&result.after)),
+    })
+    .to_string();
+    new_output_dir(output_dir)?;
+    for (name, content) in [
+        ("raw.ll", result.raw.as_slice()),
+        ("before.ll", result.before.as_slice()),
+        ("after.ll", result.after.as_slice()),
+        ("report.json", report.as_bytes()),
+    ] {
+        fs::write(output_dir.join(name), content)
+            .map_err(|error| format!("Could not write {name} in new output directory: {error}"))?;
+    }
+    Ok((before, after, report))
+}
+
+fn rebuild_local(
+    binary: &[u8],
+    output_dir: &Path,
+) -> Result<(Vec<u8>, ProgramSpec, String, String, String), String> {
+    let result = rebuild_bytes(binary, Path::new(PINNED_CLANG), Path::new(PINNED_OPT))
+        .map_err(|error| error.to_string())?;
+    let spec = import_elf(&result.executable)
+        .map_err(|error| format!("Rebuilt ELF failed import: {error}"))?;
+    let ir = String::from_utf8(result.ir.clone())
+        .map_err(|error| format!("Rebuilt LLVM IR is not UTF-8: {error}"))?;
+    let report = String::from_utf8(result.report_json.clone())
+        .map_err(|error| format!("Rebuild report is not UTF-8: {error}"))?;
+    let digest = format!("{:x}", Sha256::digest(&result.executable));
+    if spec.binary_sha256 != digest {
+        return Err("Rebuilt ELF model digest differs from produced bytes.".to_owned());
+    }
+    new_output_dir(output_dir)?;
+    fs::write(output_dir.join("whole.ll"), result.ir)
+        .map_err(|error| format!("Could not save rebuilt LLVM IR: {error}"))?;
+    fs::write(output_dir.join("report.json"), result.report_json)
+        .map_err(|error| format!("Could not save rebuild report: {error}"))?;
+    let executable_path = output_dir.join("rebuilt");
+    fs::write(&executable_path, &result.executable)
+        .map_err(|error| format!("Could not save rebuilt ELF: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not make rebuilt ELF executable: {error}"))?;
+    }
+    Ok((result.executable, spec, ir, report, digest))
+}
+
+fn patch_document(binary_sha256: &str, symbol: &str, replacement: &str) -> Result<Vec<u8>, String> {
+    let document = PatchDocument {
+        schema_version: 1,
+        binary_sha256: binary_sha256.to_owned(),
+        function_symbol: symbol.to_owned(),
+        prototype: "u64(u64,u64)".to_owned(),
+        replacement: replacement.to_owned(),
+    };
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|error| format!("Could not encode scalar patch: {error}"))?;
+    parse_patch_json(&bytes)?;
+    Ok(bytes)
+}
+
+fn write_new_elf(path: &Path, content: &[u8]) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("ELF output path must be absolute.".to_owned());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Could not create new ELF file: {error}"))?;
+    if let Err(error) = file.write_all(content).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("Could not complete ELF output: {error}"));
+    }
+    Ok(())
+}
+
+fn patch_local(
+    binary: &[u8],
+    symbol: &str,
+    replacement: &str,
+    output_path: &Path,
+) -> Result<(Vec<u8>, ProgramSpec, String), String> {
+    let digest = format!("{:x}", Sha256::digest(binary));
+    let document = patch_document(&digest, symbol, replacement)?;
+    let validated = parse_patch_json(&document)?;
+    let patched = patch_binary(binary, &validated)?;
+    let spec = import_elf(&patched.content)
+        .map_err(|error| format!("Patched ELF failed import: {error}"))?;
+    if spec.binary_sha256 != patched.patched_sha256 {
+        return Err("Patched ELF model digest differs from produced bytes.".to_owned());
+    }
+    write_new_elf(output_path, &patched.content)?;
+    Ok((patched.content, spec, patched.patched_sha256))
+}
+
+async fn patch_remote(
+    access: &RemoteAccess,
+    symbol: &str,
+    replacement: &str,
+    key: &str,
+) -> Result<(u64, ProgramSpec, String), String> {
+    let mut client = remote_client(access).await?;
+    let current = client
+        .get_project(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not verify current project before patch: {error}"))?
+        .into_inner();
+    if current.revision != access.revision || current.binary_sha256.is_empty() {
+        return Err("Remote project revision changed; reopen it before patching.".to_owned());
+    }
+    let document = patch_document(&current.binary_sha256, symbol, replacement)?;
+    let reply = client
+        .apply_patch(authorized(
+            PatchRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                patch_json: document,
+                idempotency_key: key.to_owned(),
+                trusted_fixture: true,
+                assume_u64x2: true,
+                assume_entry_only: true,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote scalar patch failed: {error}"))?
+        .into_inner();
+    if reply.project_id != access.project_id
+        || Some(reply.revision) != access.revision.checked_add(1)
+        || reply.binary_sha256 != reply.artifact_sha256
+    {
+        return Err(
+            "Patch returned an unexpected project, revision, or artifact digest.".to_owned(),
+        );
+    }
+    let artifact = client
+        .get_artifact(authorized(
+            ArtifactRequest {
+                project_id: access.project_id.clone(),
+                sha256: reply.artifact_sha256.clone(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not retrieve patched ELF: {error}"))?
+        .into_inner();
+    if artifact.project_revision != reply.revision
+        || artifact.sha256 != reply.binary_sha256
+        || artifact.media_type != "application/x-elf"
+        || format!("{:x}", Sha256::digest(&artifact.content)) != reply.binary_sha256
+    {
+        return Err("Patched ELF failed digest/type/revision verification.".to_owned());
+    }
+    let spec = import_elf(&artifact.content)
+        .map_err(|error| format!("Patched ELF failed import: {error}"))?;
+    if spec.binary_sha256 != reply.binary_sha256 {
+        return Err("Patched ELF model digest differs from project.".to_owned());
+    }
+    let project = client
+        .get_project(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: reply.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not verify patched project: {error}"))?
+        .into_inner();
+    if project.revision != reply.revision || project.binary_sha256 != reply.binary_sha256 {
+        return Err("Patched project state differs from patch reply.".to_owned());
+    }
+    Ok((reply.revision, spec, reply.binary_sha256))
+}
+
 fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
     let metadata = fs::metadata(path).map_err(|e| format!("Cannot read binary metadata: {e}"))?;
     if metadata.len() > MAX_BINARY_BYTES as u64 {
@@ -499,6 +1038,9 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     Event::Imported {
                         source: path.display().to_string(),
                         remote: false,
+                        revision: None,
+                        named_pass_transform: false,
+                        whole_rebuild: false,
                         source_offer: None,
                         spec,
                     }
@@ -516,10 +1058,16 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         access.endpoint, access.project_id, access.revision
                     );
                     let source_offer = access.source_offer.clone();
+                    let revision = access.revision;
+                    let named_pass_transform = access.named_pass_transform;
+                    let whole_rebuild = access.whole_rebuild;
                     source = Source::Remote(access);
                     Event::Imported {
                         source: label,
                         remote: true,
+                        revision: Some(revision),
+                        named_pass_transform,
+                        whole_rebuild,
                         source_offer: Some(source_offer),
                         spec,
                     }
@@ -546,10 +1094,16 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         access.endpoint, access.project_id, access.revision
                     );
                     let source_offer = access.source_offer.clone();
+                    let revision = access.revision;
+                    let named_pass_transform = access.named_pass_transform;
+                    let whole_rebuild = access.whole_rebuild;
                     source = Source::Remote(access);
                     Event::Imported {
                         source: label,
                         remote: true,
+                        revision: Some(revision),
+                        named_pass_transform,
+                        whole_rebuild,
                         source_offer: Some(source_offer),
                         spec,
                     }
@@ -610,6 +1164,162 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     "Open the owning remote project to retrieve its artifact.".to_owned(),
                 ),
             },
+            Task::TransformRemote {
+                symbol,
+                passes,
+                key,
+            } => match &mut source {
+                Source::Remote(access) => {
+                    match runtime.block_on(transform_remote(access, &symbol, &passes, &key)) {
+                        Ok((revision, before, after, report, changed)) => {
+                            access.revision = revision;
+                            let source = format!(
+                                "{} · {} · revision {}",
+                                access.endpoint, access.project_id, revision
+                            );
+                            let c = emit_c(&after);
+                            Event::Transformed {
+                                source,
+                                revision,
+                                before,
+                                after,
+                                report,
+                                changed,
+                                c,
+                            }
+                        }
+                        Err(error) => {
+                            source = Source::None;
+                            Event::MutationUncertain(format!(
+                                "{error} Mutation key {key}. Reopen the remote project before another mutation; the request may have committed."
+                            ))
+                        }
+                    }
+                }
+                _ => Event::Failed("Open a remote project before running passes.".to_owned()),
+            },
+            Task::TransformLocal {
+                symbol,
+                passes,
+                output_dir,
+            } => match &source {
+                Source::Local(bytes) => match transform_local(bytes, &symbol, &passes, &output_dir)
+                {
+                    Ok((before, after, report)) => {
+                        let c = emit_c(&after);
+                        Event::LocalTransformed {
+                            before,
+                            after,
+                            report,
+                            c,
+                            output_dir,
+                        }
+                    }
+                    Err(error) => Event::Failed(error),
+                },
+                _ => Event::Failed("Open a local ELF before running local passes.".to_owned()),
+            },
+            Task::RebuildRemote { key } => match &mut source {
+                Source::Remote(access) => match runtime.block_on(rebuild_remote(access, &key)) {
+                    Ok((revision, spec, ir, report, binary_sha256)) => {
+                        access.revision = revision;
+                        let source = format!(
+                            "{} · {} · revision {}",
+                            access.endpoint, access.project_id, revision
+                        );
+                        Event::Rebuilt {
+                            source,
+                            revision,
+                            spec,
+                            ir,
+                            report,
+                            binary_sha256,
+                        }
+                    }
+                    Err(error) => {
+                        source = Source::None;
+                        Event::MutationUncertain(format!(
+                            "{error} Mutation key {key}. Reopen the remote project before another mutation; the request may have committed."
+                        ))
+                    }
+                },
+                _ => Event::Failed("Open a remote project before rebuilding.".to_owned()),
+            },
+            Task::RebuildLocal { output_dir } => match &source {
+                Source::Local(bytes) => match rebuild_local(bytes, &output_dir) {
+                    Ok((rebuilt, spec, ir, report, binary_sha256)) => {
+                        source = Source::Local(rebuilt);
+                        Event::LocalRebuilt {
+                            spec,
+                            ir,
+                            report,
+                            binary_sha256,
+                            output_dir,
+                        }
+                    }
+                    Err(error) => Event::Failed(error),
+                },
+                _ => Event::Failed("Open a local ELF before rebuilding.".to_owned()),
+            },
+            Task::PatchLocal {
+                symbol,
+                replacement,
+                output_path,
+            } => match &source {
+                Source::Local(bytes) => {
+                    match patch_local(bytes, &symbol, &replacement, &output_path) {
+                        Ok((patched, spec, binary_sha256)) => {
+                            source = Source::Local(patched);
+                            Event::LocalPatched {
+                                spec,
+                                binary_sha256,
+                                output_path,
+                            }
+                        }
+                        Err(error) => Event::Failed(error),
+                    }
+                }
+                _ => Event::Failed("Open a local ELF before patching.".to_owned()),
+            },
+            Task::PatchRemote {
+                symbol,
+                replacement,
+                key,
+            } => match &mut source {
+                Source::Remote(access) => {
+                    match runtime.block_on(patch_remote(access, &symbol, &replacement, &key)) {
+                        Ok((revision, spec, binary_sha256)) => {
+                            access.revision = revision;
+                            let source = format!(
+                                "{} · {} · revision {}",
+                                access.endpoint, access.project_id, revision
+                            );
+                            Event::RemotePatched {
+                                source,
+                                revision,
+                                spec,
+                                binary_sha256,
+                            }
+                        }
+                        Err(error) => {
+                            source = Source::None;
+                            Event::MutationUncertain(format!(
+                                "{error} Mutation key {key}. Reopen the remote project before another mutation; the request may have committed."
+                            ))
+                        }
+                    }
+                }
+                _ => Event::Failed("Open a remote project before patching.".to_owned()),
+            },
+            Task::ExportRebuiltRemote { digest, path } => match &source {
+                Source::Remote(access) => runtime
+                    .block_on(export_rebuilt_remote(access, &digest, &path))
+                    .map(|()| Event::ArtifactExported { path, digest })
+                    .unwrap_or_else(Event::Failed),
+                _ => Event::Failed(
+                    "Open the owning remote project to export its rebuilt ELF.".to_owned(),
+                ),
+            },
         };
         if events.send(event).is_err() {
             break;
@@ -623,6 +1333,7 @@ enum Tab {
     Bytes,
     Cfg,
     Llvm,
+    Passes,
     C,
     Analysis,
 }
@@ -636,10 +1347,29 @@ struct AnalystApp {
     remote_project_id: String,
     remote_project_name: String,
     remote_upload_path: String,
+    pass_pipeline: String,
+    trusted_fixture: bool,
+    transform_before: Option<String>,
+    transform_after: Option<String>,
+    transform_report: Option<String>,
+    rebuild_report: Option<String>,
+    rebuilt_binary_sha256: Option<String>,
+    rebuild_output_path: String,
+    local_pass_output_dir: String,
+    local_rebuild_output_dir: String,
+    rebuilt_exported_path: Option<PathBuf>,
+    patch_replacement: String,
+    patch_output_path: String,
+    patch_digest: Option<String>,
+    patch_exported_path: Option<PathBuf>,
+    entry_only_assertion: bool,
     search: String,
     source_label: Option<String>,
     source_offer: Option<String>,
     remote: bool,
+    project_revision: Option<u64>,
+    named_pass_transform: bool,
+    whole_rebuild: bool,
     spec: Option<ProgramSpec>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
@@ -685,10 +1415,29 @@ impl AnalystApp {
             remote_project_id: String::new(),
             remote_project_name: String::new(),
             remote_upload_path: String::new(),
+            pass_pipeline: "instcombine,sccp,simplifycfg,dce".to_owned(),
+            trusted_fixture: false,
+            transform_before: None,
+            transform_after: None,
+            transform_report: None,
+            rebuild_report: None,
+            rebuilt_binary_sha256: None,
+            rebuild_output_path: String::new(),
+            local_pass_output_dir: String::new(),
+            local_rebuild_output_dir: String::new(),
+            rebuilt_exported_path: None,
+            patch_replacement: "return arg0 - arg1;".to_owned(),
+            patch_output_path: String::new(),
+            patch_digest: None,
+            patch_exported_path: None,
+            entry_only_assertion: false,
             search: String::new(),
             source_label: None,
             source_offer: None,
             remote: false,
+            project_revision: None,
+            named_pass_transform: false,
+            whole_rebuild: false,
             spec: None,
             symbol: None,
             cfg: None,
@@ -728,6 +1477,9 @@ impl AnalystApp {
                 Event::Imported {
                     source,
                     remote,
+                    revision,
+                    named_pass_transform,
+                    whole_rebuild,
                     source_offer,
                     spec,
                 } => {
@@ -736,6 +1488,9 @@ impl AnalystApp {
                     self.source_label = Some(source);
                     self.source_offer = source_offer;
                     self.remote = remote;
+                    self.project_revision = revision;
+                    self.named_pass_transform = named_pass_transform;
+                    self.whole_rebuild = whole_rebuild;
                     self.spec = Some(spec);
                     self.symbol = None;
                     self.cfg = None;
@@ -746,6 +1501,17 @@ impl AnalystApp {
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
+                    self.transform_before = None;
+                    self.transform_after = None;
+                    self.transform_report = None;
+                    self.rebuild_report = None;
+                    self.rebuilt_binary_sha256 = None;
+                    self.rebuilt_exported_path = None;
+                    self.patch_digest = None;
+                    self.patch_exported_path = None;
+                    self.rebuild_output_path.clear();
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
                     self.failure = None;
                 }
                 Event::RemoteProjectCreated(project_id) => {
@@ -844,6 +1610,249 @@ impl AnalystApp {
                     self.status = "Opened verified lift-job IR artifact".to_owned();
                     self.failure = None;
                 }
+                Event::Transformed {
+                    source,
+                    revision,
+                    before,
+                    after,
+                    report,
+                    changed,
+                    c,
+                } => {
+                    self.remote = true;
+                    self.source_label = Some(source);
+                    self.project_revision = Some(revision);
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.transform_before = Some(before);
+                    self.transform_after = Some(after.clone());
+                    self.transform_report = Some(report);
+                    self.ir = Some(after);
+                    match c {
+                        Ok(value) => {
+                            self.c = Some(value);
+                            self.c_error = None;
+                        }
+                        Err(error) => {
+                            self.c = None;
+                            self.c_error = Some(error);
+                        }
+                    }
+                    self.tab = Tab::Passes;
+                    self.status = format!(
+                        "Pass pipeline saved revision {revision} · IR text {}",
+                        if changed { "changed" } else { "unchanged" }
+                    );
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
+                Event::LocalTransformed {
+                    before,
+                    after,
+                    report,
+                    c,
+                    output_dir,
+                } => {
+                    self.transform_before = Some(before);
+                    self.transform_after = Some(after.clone());
+                    self.transform_report = Some(report);
+                    self.ir = Some(after);
+                    match c {
+                        Ok(value) => {
+                            self.c = Some(value);
+                            self.c_error = None;
+                        }
+                        Err(error) => {
+                            self.c = None;
+                            self.c_error = Some(error);
+                        }
+                    }
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.tab = Tab::Passes;
+                    self.status =
+                        format!("Local pass experiment saved to {}", output_dir.display());
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
+                Event::Rebuilt {
+                    source,
+                    revision,
+                    spec,
+                    ir,
+                    report,
+                    binary_sha256,
+                } => {
+                    self.spec = Some(spec);
+                    self.remote = true;
+                    self.source_label = Some(source);
+                    self.project_revision = Some(revision);
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.symbol = None;
+                    self.cfg = None;
+                    self.ir = Some(ir);
+                    self.c = None;
+                    self.c_error = None;
+                    self.analysis = None;
+                    self.job = None;
+                    self.job_symbol = None;
+                    self.selected_address = None;
+                    self.transform_before = None;
+                    self.transform_after = None;
+                    self.transform_report = None;
+                    self.rebuild_report = Some(report);
+                    self.rebuilt_binary_sha256 = Some(binary_sha256.clone());
+                    self.rebuild_output_path.clear();
+                    self.rebuilt_exported_path = None;
+                    self.patch_digest = None;
+                    self.patch_exported_path = None;
+                    self.status = format!(
+                        "Rebuilt executable saved as revision {revision} · SHA-256 {}…",
+                        &binary_sha256[..12]
+                    );
+                    self.history.push(self.status.clone());
+                    self.tab = Tab::Llvm;
+                    self.failure = None;
+                }
+                Event::LocalRebuilt {
+                    spec,
+                    ir,
+                    report,
+                    binary_sha256,
+                    output_dir,
+                } => {
+                    self.source_label = Some(output_dir.join("rebuilt").display().to_string());
+                    self.source_offer = None;
+                    self.spec = Some(spec);
+                    self.remote = false;
+                    self.project_revision = None;
+                    self.symbol = None;
+                    self.cfg = None;
+                    self.ir = Some(ir);
+                    self.c = None;
+                    self.c_error = None;
+                    self.analysis = None;
+                    self.job = None;
+                    self.job_symbol = None;
+                    self.selected_address = None;
+                    self.transform_before = None;
+                    self.transform_after = None;
+                    self.transform_report = None;
+                    self.rebuild_report = Some(report);
+                    self.rebuilt_binary_sha256 = Some(binary_sha256.clone());
+                    self.rebuilt_exported_path = Some(output_dir.join("rebuilt"));
+                    self.patch_digest = None;
+                    self.patch_exported_path = None;
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.status = format!(
+                        "Local rebuilt executable saved · SHA-256 {}…",
+                        &binary_sha256[..12]
+                    );
+                    self.history.push(self.status.clone());
+                    self.tab = Tab::Llvm;
+                    self.failure = None;
+                }
+                Event::LocalPatched {
+                    spec,
+                    binary_sha256,
+                    output_path,
+                } => {
+                    self.source_label = Some(output_path.display().to_string());
+                    self.source_offer = None;
+                    self.spec = Some(spec);
+                    self.remote = false;
+                    self.project_revision = None;
+                    self.symbol = None;
+                    self.cfg = None;
+                    self.ir = None;
+                    self.c = None;
+                    self.c_error = None;
+                    self.analysis = None;
+                    self.transform_before = None;
+                    self.transform_after = None;
+                    self.transform_report = None;
+                    self.rebuild_report = None;
+                    self.rebuilt_binary_sha256 = None;
+                    self.rebuilt_exported_path = None;
+                    self.patch_digest = Some(binary_sha256.clone());
+                    self.patch_exported_path = Some(output_path.clone());
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.status = format!(
+                        "Patched local ELF saved · SHA-256 {}…",
+                        &binary_sha256[..12]
+                    );
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
+                Event::RemotePatched {
+                    source,
+                    revision,
+                    spec,
+                    binary_sha256,
+                } => {
+                    self.source_label = Some(source);
+                    self.spec = Some(spec);
+                    self.remote = true;
+                    self.project_revision = Some(revision);
+                    self.symbol = None;
+                    self.cfg = None;
+                    self.ir = None;
+                    self.c = None;
+                    self.c_error = None;
+                    self.analysis = None;
+                    self.transform_before = None;
+                    self.transform_after = None;
+                    self.transform_report = None;
+                    self.rebuild_report = None;
+                    self.rebuilt_binary_sha256 = None;
+                    self.rebuilt_exported_path = None;
+                    self.patch_digest = Some(binary_sha256.clone());
+                    self.patch_exported_path = None;
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.status = format!(
+                        "Patched remote ELF saved as revision {revision} · SHA-256 {}…",
+                        &binary_sha256[..12]
+                    );
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
+                Event::ArtifactExported { path, digest } => {
+                    let label = if self.patch_digest.as_deref() == Some(digest.as_str()) {
+                        self.patch_exported_path = Some(path.clone());
+                        "patched"
+                    } else if self.rebuilt_binary_sha256.as_deref() == Some(digest.as_str()) {
+                        self.rebuilt_exported_path = Some(path.clone());
+                        "rebuilt"
+                    } else {
+                        "ELF"
+                    };
+                    self.status = format!("Verified {label} ELF exported to {}", path.display());
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
+                Event::MutationUncertain(error) => {
+                    self.remote = false;
+                    self.project_revision = None;
+                    self.spec = None;
+                    self.symbol = None;
+                    self.cfg = None;
+                    self.ir = None;
+                    self.c = None;
+                    self.analysis = None;
+                    self.rebuilt_binary_sha256 = None;
+                    self.rebuilt_exported_path = None;
+                    self.patch_digest = None;
+                    self.patch_exported_path = None;
+                    self.trusted_fixture = false;
+                    self.entry_only_assertion = false;
+                    self.status = "Remote project requires reopening".to_owned();
+                    self.failure = Some(error.clone());
+                    self.history.push(error);
+                }
             }
             if self.history.len() > 40 {
                 self.history.drain(..self.history.len() - 40);
@@ -914,6 +1923,14 @@ impl AnalystApp {
         ui.heading(RichText::new("Program").size(16.0));
         if let Some(label) = &self.source_label {
             ui.label(RichText::new(label).size(11.0).color(ACCENT));
+        }
+        if let Some(revision) = self.project_revision {
+            ui.label(
+                RichText::new(format!("REMOTE REVISION  ·  {revision}"))
+                    .size(10.0)
+                    .strong()
+                    .color(ACCENT),
+            );
         }
         ui.label(
             RichText::new("Open a local ELF to inspect symbol facts. No binary is uploaded.")
@@ -1090,6 +2107,178 @@ impl AnalystApp {
             );
         }
         ui.separator();
+        ui.heading(RichText::new("Build / artifacts").size(14.0));
+        ui.checkbox(
+            &mut self.trusted_fixture,
+            "Trusted fixture; I authorize compiler processing",
+        );
+        ui.label(RichText::new("Only the documented static freestanding Linux x86-64 subset is rebuildable. Rebuilding never executes or behaviorally validates the binary.").size(11.0).color(MUTED));
+        if self.remote {
+            let rebuild = ui.add_enabled(
+                self.whole_rebuild && self.trusted_fixture && !self.busy,
+                egui::Button::new("Rebuild whole executable remotely"),
+            );
+            if rebuild.clicked() {
+                self.enqueue(
+                    Task::RebuildRemote {
+                        key: uuid::Uuid::new_v4().to_string(),
+                    },
+                    "Rebuilding trusted executable in bounded worker…",
+                );
+            }
+            rebuild.on_disabled_hover_text(
+                "Service must advertise rebuild; assert a trusted fixture first.",
+            );
+        } else {
+            ui.label(
+                RichText::new("LOCAL OUTPUT DIRECTORY · NEW DIRECTORY ONLY")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.local_rebuild_output_dir)
+                    .hint_text("/absolute/path/to/new-rebuild"),
+            );
+            let local_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+            let rebuild = ui.add_enabled(
+                self.spec.is_some()
+                    && local_capable
+                    && self.trusted_fixture
+                    && !self.busy
+                    && !self.local_rebuild_output_dir.trim().is_empty(),
+                egui::Button::new("Rebuild local whole executable"),
+            );
+            if rebuild.clicked() {
+                self.enqueue(
+                    Task::RebuildLocal {
+                        output_dir: PathBuf::from(self.local_rebuild_output_dir.trim()),
+                    },
+                    "Rebuilding trusted local executable…",
+                );
+            }
+            rebuild.on_disabled_hover_text("Requires an open local ELF, Linux x86-64 with pinned Clang/LLVM 14.0.6, a new absolute output directory, and the trusted-fixture assertion.");
+        }
+        if let Some(digest) = &self.rebuilt_binary_sha256 {
+            field(ui, "REBUILT ELF SHA-256", digest);
+            if let Some(path) = &self.rebuilt_exported_path {
+                field(ui, "SAVED ELF", &path.display().to_string());
+            } else {
+                ui.label(
+                    RichText::new("EXPORT PATH · NEW FILE ONLY")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.rebuild_output_path)
+                        .hint_text("/absolute/path/to/rebuilt.elf"),
+                );
+                let export = ui.add_enabled(
+                    !self.busy && !self.rebuild_output_path.trim().is_empty(),
+                    egui::Button::new("Export verified rebuilt ELF"),
+                );
+                if export.clicked() {
+                    self.enqueue(
+                        Task::ExportRebuiltRemote {
+                            digest: digest.clone(),
+                            path: PathBuf::from(self.rebuild_output_path.trim()),
+                        },
+                        "Retrieving and verifying rebuilt ELF…",
+                    );
+                }
+                export.on_disabled_hover_text(
+                    "Enter a new destination file path; existing files are never overwritten.",
+                );
+            }
+        }
+        if let Some(report) = &self.rebuild_report {
+            egui::CollapsingHeader::new("Rebuild diagnostics").show(ui, |ui| {
+                ui.code(report);
+            });
+        }
+        ui.separator();
+        ui.heading(RichText::new("Scalar patch v1").size(14.0));
+        ui.label(RichText::new("Whole-function, entry-only u64(u64,u64) return expression. The replacement must fit the original symbol. This intentionally changes behavior; no equivalence is claimed.").size(11.0).color(MUTED));
+        ui.label(RichText::new("REPLACEMENT").size(10.0).color(MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.patch_replacement)
+                .hint_text("return arg0 - arg1;"),
+        );
+        ui.checkbox(
+            &mut self.entry_only_assertion,
+            "I assert no control flow enters this function interior",
+        );
+        ui.label(
+            RichText::new(if self.remote {
+                "EXPORT PATCHED ELF · NEW FILE ONLY"
+            } else {
+                "LOCAL PATCH OUTPUT · NEW FILE ONLY"
+            })
+            .size(10.0)
+            .color(MUTED),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.patch_output_path)
+                .hint_text("/absolute/path/to/patched.elf"),
+        );
+        let selected_symbol = self.symbol.clone();
+        let patch_ready = self.spec.is_some()
+            && selected_symbol.is_some()
+            && self.trusted_fixture
+            && self.entry_only_assertion
+            && !self.patch_replacement.trim().is_empty()
+            && !self.busy
+            && (self.remote || !self.patch_output_path.trim().is_empty());
+        let patch = ui.add_enabled(
+            patch_ready,
+            egui::Button::new(if self.remote {
+                "Apply scalar patch remotely"
+            } else {
+                "Apply scalar patch locally"
+            }),
+        );
+        if patch.clicked()
+            && let Some(symbol) = selected_symbol
+        {
+            let task = if self.remote {
+                Task::PatchRemote {
+                    symbol,
+                    replacement: self.patch_replacement.trim().to_owned(),
+                    key: uuid::Uuid::new_v4().to_string(),
+                }
+            } else {
+                Task::PatchLocal {
+                    symbol,
+                    replacement: self.patch_replacement.trim().to_owned(),
+                    output_path: PathBuf::from(self.patch_output_path.trim()),
+                }
+            };
+            self.enqueue(task, "Validating and applying bounded scalar patch…");
+        }
+        patch.on_disabled_hover_text("Select a function, enter a supported return expression, assert trusted fixture and entry-only control flow, and provide a new output file for local patching.");
+        if let Some(digest) = &self.patch_digest {
+            field(ui, "PATCHED ELF SHA-256", digest);
+            if let Some(path) = &self.patch_exported_path {
+                field(ui, "SAVED ELF", &path.display().to_string());
+            } else {
+                let export = ui.add_enabled(
+                    !self.busy && !self.patch_output_path.trim().is_empty(),
+                    egui::Button::new("Export verified patched ELF"),
+                );
+                if export.clicked() {
+                    self.enqueue(
+                        Task::ExportRebuiltRemote {
+                            digest: digest.clone(),
+                            path: PathBuf::from(self.patch_output_path.trim()),
+                        },
+                        "Retrieving and verifying patched ELF…",
+                    );
+                }
+                export.on_disabled_hover_text(
+                    "Enter a new local file path; existing files are never overwritten.",
+                );
+            }
+        }
+        ui.separator();
         if let Some(function) = self.selected_function() {
             ui.label(RichText::new(&function.name).monospace().color(ACCENT));
             field(ui, "ENTRY", &format!("0x{:016x}", function.address.0));
@@ -1217,6 +2406,7 @@ impl AnalystApp {
                 (Tab::Bytes, "Disassembly"),
                 (Tab::Cfg, "CFG"),
                 (Tab::Llvm, "LLVM IR"),
+                (Tab::Passes, "Passes"),
                 (Tab::Analysis, "Global effects"),
                 (Tab::C, "C output"),
             ] {
@@ -1231,6 +2421,7 @@ impl AnalystApp {
             Tab::Bytes => self.disassembly(ui),
             Tab::Cfg => self.cfg_view(ui),
             Tab::Llvm => self.llvm_view(ui),
+            Tab::Passes => self.passes_view(ui),
             Tab::Analysis => self.analysis_view(ui),
             Tab::C => self.c_view(ui),
         }
@@ -1327,6 +2518,102 @@ impl AnalystApp {
             .show(ui, |ui| {
                 ui.code(ir);
             });
+    }
+
+    fn passes_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new(if self.remote {
+                "NAMED LLVM PASS PIPELINE · REMOTE EXPERIMENT"
+            } else {
+                "NAMED LLVM PASS PIPELINE · LOCAL EXPERIMENT"
+            })
+            .size(11.0)
+            .strong()
+            .color(ACCENT),
+        );
+        ui.label(RichText::new("Allowed passes: instcombine, sccp, simplifycfg, dce. Raw, before, after, and report artifacts are retained. LLVM verification runs at the pass boundary.").size(11.0).color(MUTED));
+        ui.label(
+            RichText::new("PASSES (COMMA-SEPARATED)")
+                .size(10.0)
+                .color(MUTED),
+        );
+        ui.add(egui::TextEdit::singleline(&mut self.pass_pipeline).desired_width(f32::INFINITY));
+        let selected = self.symbol.clone();
+        let has_passes = !self.pass_pipeline.trim().is_empty();
+        if !self.remote {
+            ui.label(
+                RichText::new("LOCAL EXPERIMENT DIRECTORY · NEW DIRECTORY ONLY")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.local_pass_output_dir)
+                    .hint_text("/absolute/path/to/new-experiment"),
+            );
+        }
+        let local_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+        let mode_capable = if self.remote {
+            self.named_pass_transform
+        } else {
+            local_capable && !self.local_pass_output_dir.trim().is_empty()
+        };
+        let run = ui.add_enabled(
+            mode_capable && self.trusted_fixture && !self.busy && selected.is_some() && has_passes,
+            egui::Button::new("Run named passes on selected function"),
+        );
+        if run.clicked()
+            && let Some(symbol) = selected
+        {
+            let task = if self.remote {
+                Task::TransformRemote {
+                    symbol,
+                    passes: self.pass_pipeline.trim().to_owned(),
+                    key: uuid::Uuid::new_v4().to_string(),
+                }
+            } else {
+                Task::TransformLocal {
+                    symbol,
+                    passes: self.pass_pipeline.trim().to_owned(),
+                    output_dir: PathBuf::from(self.local_pass_output_dir.trim()),
+                }
+            };
+            self.enqueue(task, "Verifying and saving pass experiment…");
+        }
+        run.on_disabled_hover_text("Select a function, assert a trusted fixture in Build / artifacts, and provide the mode's required LLVM capability/output directory.");
+        ui.separator();
+        if let (Some(before), Some(after)) = (&self.transform_before, &self.transform_after) {
+            ui.columns(2, |columns| {
+                columns[0].label(
+                    RichText::new("BEFORE · VERIFIED LLVM IR")
+                        .size(11.0)
+                        .strong()
+                        .color(MUTED),
+                );
+                egui::ScrollArea::both()
+                    .id_salt("pass_before")
+                    .show(&mut columns[0], |ui| {
+                        ui.code(before);
+                    });
+                columns[1].label(
+                    RichText::new("AFTER · VERIFIED LLVM IR")
+                        .size(11.0)
+                        .strong()
+                        .color(ACCENT),
+                );
+                egui::ScrollArea::both()
+                    .id_salt("pass_after")
+                    .show(&mut columns[1], |ui| {
+                        ui.code(after);
+                    });
+            });
+            if let Some(report) = &self.transform_report {
+                egui::CollapsingHeader::new("Pass diagnostics").show(ui, |ui| {
+                    ui.code(report);
+                });
+            }
+        } else {
+            ui.label(RichText::new("No pass experiment on this revision. Select a function and run a named pipeline to compare verified IR.").color(MUTED));
+        }
     }
 
     fn c_view(&mut self, ui: &mut egui::Ui) {
@@ -1491,9 +2778,13 @@ impl eframe::App for AnalystApp {
             .default_size(290.0)
             .min_size(220.0)
             .show(ui, |ui| {
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::same(12))
-                    .show(ui, |ui| self.inspector(ui));
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| self.inspector(ui));
+                    });
             });
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Frame::new()
@@ -1505,6 +2796,232 @@ impl eframe::App for AnalystApp {
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [probe, binary, symbol, replacement, output] = arguments.as_slice()
+        && probe == "--probe-local-patch"
+    {
+        let result = bounded_read(&PathBuf::from(binary))
+            .and_then(|bytes| patch_local(&bytes, symbol, replacement, Path::new(output)));
+        match result {
+            Ok((patched, spec, digest)) if !patched.is_empty() && spec.binary_sha256 == digest => {
+                println!("HydIR GUI local patch operations passed: patched ELF SHA-256 {digest}");
+                return Ok(());
+            }
+            Ok(_) => {
+                eprintln!("HydIR GUI local patch probe returned inconsistent artifacts");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI local patch probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let [
+        probe,
+        endpoint,
+        token_file,
+        binary,
+        symbol,
+        replacement,
+        output,
+    ] = arguments.as_slice()
+        && probe == "--probe-remote-patch"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let token_file = PathBuf::from(token_file);
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                token_file.clone(),
+                "GUI scalar patch probe".to_owned(),
+            )
+            .await?;
+            let (mut access, _) = upload_remote(
+                endpoint.clone(),
+                token_file,
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            let (revision, spec, digest) = patch_remote(
+                &access,
+                symbol,
+                replacement,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await?;
+            if spec.binary_sha256 != digest {
+                return Err("GUI patch probe returned inconsistent program model.".to_owned());
+            }
+            access.revision = revision;
+            export_rebuilt_remote(&access, &digest, &PathBuf::from(output)).await?;
+            Ok::<_, String>((revision, digest))
+        });
+        match result {
+            Ok((revision, digest)) => {
+                println!(
+                    "HydIR GUI remote patch operations passed: revision {revision}, exported ELF SHA-256 {digest}"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI remote patch probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let [probe, binary, symbol, output_dir] = arguments.as_slice()
+        && probe == "--probe-local-pass"
+    {
+        let result = bounded_read(&PathBuf::from(binary)).and_then(|bytes| {
+            transform_local(
+                &bytes,
+                symbol,
+                "instcombine,sccp,simplifycfg,dce",
+                Path::new(output_dir),
+            )
+        });
+        match result {
+            Ok((before, after, report))
+                if before != after && report.contains("\"llvm_verified\":true") =>
+            {
+                println!(
+                    "HydIR GUI local pass operations passed: verified before/after IR in {output_dir}"
+                );
+                return Ok(());
+            }
+            Ok(_) => {
+                eprintln!("HydIR GUI local pass probe did not observe a verified IR change");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI local pass probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let [probe, binary, output_dir] = arguments.as_slice()
+        && probe == "--probe-local-rebuild"
+    {
+        let result = bounded_read(&PathBuf::from(binary))
+            .and_then(|bytes| rebuild_local(&bytes, Path::new(output_dir)));
+        match result {
+            Ok((rebuilt, spec, ir, report, digest))
+                if spec.binary_sha256 == digest
+                    && !rebuilt.is_empty()
+                    && !ir.is_empty()
+                    && report.contains("\"llvm_verified\": true") =>
+            {
+                println!("HydIR GUI local rebuild operations passed: rebuilt ELF SHA-256 {digest}");
+                return Ok(());
+            }
+            Ok(_) => {
+                eprintln!("HydIR GUI local rebuild probe returned inconsistent artifacts");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI local rebuild probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let [probe, endpoint, token_file, binary, symbol] = arguments.as_slice()
+        && probe == "--probe-transform"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let token_file = PathBuf::from(token_file);
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                token_file.clone(),
+                "GUI pass probe".to_owned(),
+            )
+            .await?;
+            let (access, _) = upload_remote(
+                endpoint.clone(),
+                token_file,
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            let (revision, before, after, report, changed) = transform_remote(
+                &access,
+                symbol,
+                "instcombine,sccp,simplifycfg,dce",
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await?;
+            if !changed || before == after || !report.contains("llvm_verified") {
+                return Err("GUI pass probe did not observe a verified IR change.".to_owned());
+            }
+            Ok::<_, String>(revision)
+        });
+        match result {
+            Ok(revision) => {
+                println!(
+                    "HydIR GUI pass operations passed: immutable revision {revision}, verified before/after IR"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI pass probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let [probe, endpoint, token_file, binary, output] = arguments.as_slice()
+        && probe == "--probe-rebuild"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let token_file = PathBuf::from(token_file);
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                token_file.clone(),
+                "GUI rebuild probe".to_owned(),
+            )
+            .await?;
+            let (mut access, _) = upload_remote(
+                endpoint.clone(),
+                token_file,
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            let (revision, spec, ir, report, digest) =
+                rebuild_remote(&access, &uuid::Uuid::new_v4().to_string()).await?;
+            let report_json: serde_json::Value = serde_json::from_str(&report)
+                .map_err(|error| format!("Invalid rebuild report: {error}"))?;
+            if spec.binary_sha256 != digest || ir.is_empty() || report_json["llvm_verified"] != true
+            {
+                return Err("GUI rebuild probe returned inconsistent artifacts.".to_owned());
+            }
+            access.revision = revision;
+            export_rebuilt_remote(&access, &digest, &PathBuf::from(output)).await?;
+            Ok::<_, String>((revision, digest))
+        });
+        match result {
+            Ok((revision, digest)) => {
+                println!(
+                    "HydIR GUI rebuild operations passed: immutable revision {revision}, exported ELF SHA-256 {digest}"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI rebuild probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, endpoint, token_file, binary] = arguments.as_slice()
         && probe == "--probe-create-upload"
     {
@@ -1610,7 +3127,7 @@ fn main() -> eframe::Result<()> {
     }
     if !arguments.is_empty() {
         eprintln!(
-            "Usage: hydir [--probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf>]"
+            "Usage: hydir [--probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     }
@@ -1629,7 +3146,8 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ir_slice, validate_endpoint};
+    use super::{AnalystApp, Event, Tab, ir_slice, validate_endpoint};
+    use std::sync::mpsc;
 
     #[test]
     fn extracts_selected_instruction_ir_without_crossing_next_block() {
@@ -1647,5 +3165,57 @@ mod tests {
         assert!(validate_endpoint("http://0.0.0.0:50051").is_err());
         assert!(validate_endpoint("http://192.0.2.1:50051").is_err());
         assert!(validate_endpoint("https://127.0.0.1:50051").is_err());
+    }
+
+    #[test]
+    fn uncertain_remote_mutation_forces_reopen_and_clears_artifacts() {
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.events = receiver;
+        app.remote = true;
+        app.project_revision = Some(2);
+        app.trusted_fixture = true;
+        app.entry_only_assertion = true;
+        app.rebuilt_binary_sha256 = Some("rebuild-digest".to_owned());
+        app.patch_digest = Some("patch-digest".to_owned());
+        sender
+            .send(Event::MutationUncertain(
+                "request may have committed".to_owned(),
+            ))
+            .unwrap();
+        app.poll();
+        assert!(!app.remote);
+        assert!(app.project_revision.is_none());
+        assert!(!app.trusted_fixture && !app.entry_only_assertion);
+        assert!(app.rebuilt_binary_sha256.is_none() && app.patch_digest.is_none());
+        assert!(
+            app.failure
+                .as_deref()
+                .unwrap()
+                .contains("may have committed")
+        );
+    }
+
+    #[test]
+    fn local_pass_completion_shows_verified_views_and_resets_assertion() {
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.events = receiver;
+        app.trusted_fixture = true;
+        sender
+            .send(Event::LocalTransformed {
+                before: "before".to_owned(),
+                after: "after".to_owned(),
+                report: "verified".to_owned(),
+                c: Ok("generated C".to_owned()),
+                output_dir: "/tmp/hydir-test-output".into(),
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::Passes));
+        assert_eq!(app.transform_before.as_deref(), Some("before"));
+        assert_eq!(app.ir.as_deref(), Some("after"));
+        assert_eq!(app.c.as_deref(), Some("generated C"));
+        assert!(!app.trusted_fixture);
     }
 }

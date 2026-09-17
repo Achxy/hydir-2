@@ -62,6 +62,11 @@ class ClientBoundaryTests(unittest.TestCase):
                     trusted_fixture=True,
                 )
 
+    def test_rebuild_requires_trusted_fixture_before_network_use(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.rebuild("project", 1, trusted_fixture=False)
+
 
 if __name__ == "__main__":
     unittest.main()

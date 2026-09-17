@@ -3,8 +3,9 @@
 use super::{read_binary, write_new_or_identical};
 use hydir_api::v1::{
     ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobEventRequest,
-    JobReply, JobRequest, PatchRequest, ProjectReply, ProjectRequest, SourceRequest,
-    StartLiftJobRequest, TransformRequest, UploadBinaryRequest, hydir_client::HydirClient,
+    JobReply, JobRequest, PatchRequest, ProjectReply, ProjectRequest, RebuildRequest,
+    SourceRequest, StartLiftJobRequest, TransformRequest, UploadBinaryRequest,
+    hydir_client::HydirClient,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -23,6 +24,7 @@ const HELP: &str = "Remote commands:
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
   hydirctl remote decompile <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.c>
   hydirctl remote transform <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory>
+  hydirctl remote rebuild <project-id> <revision> <idempotency-key> --trusted-fixture --output-dir <new-directory>
   hydirctl remote patch <project-id> <revision> <patch-v1.json> <idempotency-key> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
   hydirctl remote artifact <project-id> <sha256> --output <file>
   hydirctl remote job-start-lift <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2
@@ -151,6 +153,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "source_sha256": result.source_sha256,
                     "named_pass_transform": result.named_pass_transform,
                     "scalar_patch_v1": result.scalar_patch_v1,
+                    "whole_rebuild": result.whole_rebuild,
                 }))?
             );
         }
@@ -292,6 +295,81 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&json!({
                     "sha256": result.sha256, "media_type": result.media_type,
                     "project_revision": result.project_revision, "output": file,
+                }))?
+            );
+        }
+        [command, id, expected, key, trusted, output, directory]
+            if command == "rebuild"
+                && trusted == "--trusted-fixture"
+                && output == "--output-dir" =>
+        {
+            if Path::new(directory).exists() {
+                return Err("rebuild output directory exists; refusing to overwrite".into());
+            }
+            let expected = revision(expected)?;
+            let next = expected.checked_add(1).ok_or("project revision overflow")?;
+            let reply = client
+                .rebuild(authorized(
+                    RebuildRequest {
+                        project_id: id.clone(),
+                        expected_revision: expected,
+                        trusted_fixture: true,
+                        idempotency_key: key.clone(),
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            if reply.project_id != *id || reply.revision != next {
+                return Err("rebuild returned unexpected project or revision".into());
+            }
+            let artifacts = [
+                ("whole.ll", &reply.ir_sha256, "text/x-llvm-ir"),
+                ("rebuilt", &reply.binary_sha256, "application/x-elf"),
+                ("report.json", &reply.report_sha256, "application/json"),
+            ];
+            let mut contents = Vec::with_capacity(3);
+            for (_, digest, media_type) in &artifacts {
+                let artifact = client
+                    .get_artifact(authorized(
+                        ArtifactRequest {
+                            project_id: id.clone(),
+                            sha256: (*digest).clone(),
+                        },
+                        &credential,
+                    ))
+                    .await?
+                    .into_inner();
+                if artifact.project_revision != next || artifact.media_type != *media_type {
+                    return Err("rebuild artifact metadata mismatch".into());
+                }
+                check_artifact(&artifact.content, digest)?;
+                contents.push(artifact.content);
+            }
+            if contents[2] != reply.report_json.as_bytes() {
+                return Err("rebuild report bytes differ from reply".into());
+            }
+            fs::create_dir(directory)?;
+            for ((name, _, _), content) in artifacts.iter().zip(contents) {
+                let path = Path::new(directory).join(name);
+                if *name == "rebuilt" {
+                    write_executable_new(
+                        path.to_str().ok_or("output path is not UTF-8")?,
+                        &content,
+                    )?;
+                } else {
+                    fs::write(path, content)?;
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "project_id": reply.project_id,
+                    "revision": reply.revision,
+                    "binary_sha256": reply.binary_sha256,
+                    "ir_sha256": reply.ir_sha256,
+                    "report_sha256": reply.report_sha256,
+                    "output_dir": directory,
                 }))?
             );
         }

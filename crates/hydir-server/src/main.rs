@@ -4,13 +4,14 @@ use hydir_analysis::analyze_elf;
 use hydir_api::v1::{
     ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
     FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, PatchReply,
-    PatchRequest, ProjectReply, ProjectRequest, SourceReply, SourceRequest, StartLiftJobRequest,
-    TransformReply, TransformRequest, UploadBinaryRequest,
+    PatchRequest, ProjectReply, ProjectRequest, RebuildReply, RebuildRequest, SourceReply,
+    SourceRequest, StartLiftJobRequest, TransformReply, TransformRequest, UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
 use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
+use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -44,6 +45,29 @@ const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
 #[cfg(not(test))]
 const WORKER_DEADLINE: Duration = Duration::from_secs(30);
+
+#[cfg(all(not(test), target_os = "linux"))]
+struct WorkerProcessGroup {
+    pid: i32,
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+impl WorkerProcessGroup {
+    fn disarm(&mut self) {
+        self.pid = 0;
+    }
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+impl Drop for WorkerProcessGroup {
+    fn drop(&mut self) {
+        if self.pid > 0 {
+            // SAFETY: the worker is placed in its own process group before
+            // exec, and a negative PID targets only that group.
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+        }
+    }
+}
 
 const SCHEMA: &str = "
 BEGIN IMMEDIATE;
@@ -144,6 +168,23 @@ PRAGMA user_version=4;
 COMMIT;
 ";
 
+const REBUILD_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE rebuild_requests (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    new_revision INTEGER NOT NULL,
+    binary_sha256 TEXT NOT NULL,
+    ir_sha256 TEXT NOT NULL,
+    report_sha256 TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    PRIMARY KEY(project_id, idempotency_key)
+);
+PRAGMA user_version=5;
+COMMIT;
+";
+
 #[derive(Clone)]
 struct Store {
     db: Arc<Mutex<Connection>>,
@@ -177,7 +218,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 4 {
+        if version > 5 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -191,6 +232,9 @@ impl Store {
         }
         if version <= 3 {
             connection.execute_batch(TRANSFORM_MIGRATION)?;
+        }
+        if version <= 4 {
+            connection.execute_batch(REBUILD_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -522,16 +566,67 @@ fn transform_replay(
     }))
 }
 
-fn pack_transform_parts(parts: &[&[u8]; 4]) -> Result<Vec<u8>, String> {
-    let total = 16usize
+struct RebuildRecord {
+    expected: i64,
+    revision: i64,
+    binary_sha256: String,
+    ir_sha256: String,
+    report_sha256: String,
+    report_json: String,
+}
+
+fn rebuild_replay(
+    conn: &Connection,
+    project_id: &str,
+    key: &str,
+    expected: i64,
+) -> Result<Option<RebuildReply>, Status> {
+    let prior: Option<RebuildRecord> = conn
+        .query_row(
+            "SELECT expected_revision,new_revision,binary_sha256,ir_sha256,report_sha256,report_json FROM rebuild_requests WHERE project_id=?1 AND idempotency_key=?2",
+            params![project_id, key],
+            |row| Ok(RebuildRecord {
+                expected: row.get(0)?,
+                revision: row.get(1)?,
+                binary_sha256: row.get(2)?,
+                ir_sha256: row.get(3)?,
+                report_sha256: row.get(4)?,
+                report_json: row.get(5)?,
+            }),
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some(prior) = prior else {
+        return Ok(None);
+    };
+    if prior.expected != expected {
+        return Err(Status::already_exists(
+            "idempotency key belongs to a different rebuild request",
+        ));
+    }
+    Ok(Some(RebuildReply {
+        project_id: project_id.to_owned(),
+        revision: prior.revision as u64,
+        binary_sha256: prior.binary_sha256,
+        ir_sha256: prior.ir_sha256,
+        report_sha256: prior.report_sha256,
+        report_json: prior.report_json,
+    }))
+}
+
+fn pack_worker_parts(parts: &[&[u8]]) -> Result<Vec<u8>, String> {
+    let total = parts
+        .len()
+        .checked_mul(4)
+        .ok_or("worker header overflow")?
         .checked_add(parts.iter().map(|part| part.len()).sum::<usize>())
-        .ok_or("transform output size overflow")?;
+        .ok_or("worker output size overflow")?;
     if total > MAX_WORKER_OUTPUT {
-        return Err("transform artifacts exceed 16 MiB worker output limit".to_owned());
+        return Err("artifacts exceed 16 MiB worker output limit".to_owned());
     }
     let mut packed = Vec::with_capacity(total);
     for part in parts {
-        let size = u32::try_from(part.len()).map_err(|_| "transform artifact too large")?;
+        let size = u32::try_from(part.len()).map_err(|_| "worker artifact too large")?;
         packed.extend_from_slice(&size.to_le_bytes());
     }
     for part in parts {
@@ -540,28 +635,28 @@ fn pack_transform_parts(parts: &[&[u8]; 4]) -> Result<Vec<u8>, String> {
     Ok(packed)
 }
 
-fn unpack_transform_parts(bytes: &[u8]) -> Result<[&[u8]; 4], Status> {
-    let mut cursor = 16usize;
-    let mut parts = [&[][..]; 4];
+fn unpack_worker_parts<const N: usize>(bytes: &[u8]) -> Result<[&[u8]; N], Status> {
+    let mut cursor = N * 4;
+    let mut parts = [&[][..]; N];
     for (index, part) in parts.iter_mut().enumerate() {
         let offset = index * 4;
         let size = u32::from_le_bytes(
             bytes
                 .get(offset..offset + 4)
-                .ok_or_else(|| Status::internal("transform worker returned a short header"))?
+                .ok_or_else(|| Status::internal("worker returned a short artifact header"))?
                 .try_into()
-                .map_err(|_| Status::internal("transform worker returned a bad header"))?,
+                .map_err(|_| Status::internal("worker returned a bad artifact header"))?,
         ) as usize;
         let end = cursor
             .checked_add(size)
-            .ok_or_else(|| Status::internal("transform worker length overflow"))?;
+            .ok_or_else(|| Status::internal("worker artifact length overflow"))?;
         *part = bytes
             .get(cursor..end)
-            .ok_or_else(|| Status::internal("transform worker returned a truncated artifact"))?;
+            .ok_or_else(|| Status::internal("worker returned a truncated artifact"))?;
         cursor = end;
     }
     if cursor != bytes.len() {
-        return Err(Status::internal("transform worker returned trailing bytes"));
+        return Err(Status::internal("worker returned trailing artifact bytes"));
     }
     Ok(parts)
 }
@@ -611,7 +706,16 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
                 "llvm_verified": true,
             });
             let report = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
-            pack_transform_parts(&[&result.raw, &result.before, &result.after, &report])
+            pack_worker_parts(&[&result.raw, &result.before, &result.after, &report])
+        }
+        ("rebuild", None) => {
+            let result = rebuild_bytes(
+                bytes,
+                Path::new("/usr/bin/clang-14"),
+                Path::new("/usr/bin/opt-14"),
+            )
+            .map_err(|error| error.to_string())?;
+            pack_worker_parts(&[&result.ir, &result.executable, &result.report_json])
         }
         ("patch", None) => {
             let length_bytes: [u8; 4] = bytes
@@ -665,6 +769,9 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
     // async-signal-safe setrlimit calls, and captures no process state.
     unsafe {
         command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             for (resource, value) in [
                 (libc::RLIMIT_AS, 2 * 1024 * 1024 * 1024),
                 (libc::RLIMIT_CPU, 25),
@@ -690,6 +797,15 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
         .kill_on_drop(true)
         .spawn()
         .map_err(|_| Status::internal("analysis worker could not start"))?;
+    #[cfg(target_os = "linux")]
+    let mut process_group = WorkerProcessGroup {
+        pid: i32::try_from(
+            child
+                .id()
+                .ok_or_else(|| Status::internal("worker PID unavailable"))?,
+        )
+        .map_err(|_| Status::internal("worker PID overflow"))?,
+    };
     let mut stdin = child
         .stdin
         .take()
@@ -725,7 +841,12 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
     .await;
     writer.abort();
     match result {
-        Ok(result) => result,
+        Ok(Ok(output)) => {
+            #[cfg(target_os = "linux")]
+            process_group.disarm();
+            Ok(output)
+        }
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(Status::deadline_exceeded(
             "analysis worker exceeded 30-second deadline",
         )),
@@ -795,6 +916,9 @@ impl Hydir for Store {
             named_pass_transform: cfg!(all(target_os = "linux", target_arch = "x86_64"))
                 && Path::new("/usr/bin/opt-14").is_file(),
             scalar_patch_v1: true,
+            whole_rebuild: cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                && Path::new("/usr/bin/opt-14").is_file()
+                && Path::new("/usr/bin/clang-14").is_file(),
         }))
     }
 
@@ -1083,7 +1207,7 @@ impl Hydir for Store {
         envelope.extend_from_slice(input.passes.as_bytes());
         envelope.extend_from_slice(&binary);
         let packed = run_worker("transform", Some(&input.function_symbol), envelope).await?;
-        let parts = unpack_transform_parts(&packed)?;
+        let parts = unpack_worker_parts::<4>(&packed)?;
         let report_json = String::from_utf8(parts[3].to_vec())
             .map_err(|_| Status::internal("transform report is not UTF-8"))?;
         let digests = parts.map(sha256);
@@ -1150,6 +1274,108 @@ impl Hydir for Store {
             after_sha256: digests[2].clone(),
             report_sha256: digests[3].clone(),
             ir_text_changed: parts[1] != parts[2],
+            report_json,
+        }))
+    }
+
+    async fn rebuild(
+        &self,
+        request: Request<RebuildRequest>,
+    ) -> Result<Response<RebuildReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.trusted_fixture {
+            return Err(Status::invalid_argument(
+                "rebuild requires an explicit trusted-fixture assertion",
+            ));
+        }
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "rebuild idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        self.project(&principal, &input.project_id)?;
+        let prior = {
+            let conn = self.connection()?;
+            rebuild_replay(&conn, &input.project_id, &input.idempotency_key, expected)?
+        };
+        if let Some(prior) = prior {
+            return Ok(Response::new(prior));
+        }
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let packed = run_worker("rebuild", None, binary).await?;
+        let parts = unpack_worker_parts::<3>(&packed)?;
+        run_worker("inspect", None, parts[1].to_vec()).await?;
+        let report_json = String::from_utf8(parts[2].to_vec())
+            .map_err(|_| Status::internal("rebuild report is not UTF-8"))?;
+        let ir_sha256 = sha256(parts[0]);
+        let binary_sha256 = sha256(parts[1]);
+        let report_sha256 = sha256(parts[2]);
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            if let Some(prior) =
+                rebuild_replay(&tx, &input.project_id, &input.idempotency_key, expected)?
+            {
+                return Ok(Response::new(prior));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
+                    params![input.project_id, principal],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
+                params![binary_sha256, parts[1]],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+                params![input.project_id, next, binary_sha256],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "UPDATE projects SET current_revision=?1 WHERE id=?2",
+                params![next, input.project_id],
+            )
+            .map_err(internal)?;
+            for (digest, media_type, content) in [
+                (&ir_sha256, "text/x-llvm-ir", parts[0]),
+                (&binary_sha256, "application/x-elf", parts[1]),
+                (&report_sha256, "application/json", parts[2]),
+            ] {
+                tx.execute(
+                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
+                    params![input.project_id, next, digest, media_type, content],
+                )
+                .map_err(internal)?;
+            }
+            tx.execute(
+                "INSERT INTO rebuild_requests(project_id,idempotency_key,expected_revision,new_revision,binary_sha256,ir_sha256,report_sha256,report_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![input.project_id, input.idempotency_key, expected, next, binary_sha256, ir_sha256, report_sha256, report_json],
+            )
+            .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        }
+        Ok(Response::new(RebuildReply {
+            project_id: input.project_id,
+            revision: next as u64,
+            binary_sha256,
+            ir_sha256,
+            report_sha256,
             report_json,
         }))
     }
@@ -1818,6 +2044,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_requires_assertion_and_project_ownership() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "rebuild target".to_owned(),
+                    idempotency_key: "rebuild-project".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = RebuildRequest {
+            project_id: project.project_id,
+            expected_revision: 0,
+            trusted_fixture: false,
+            idempotency_key: "rebuild-1".to_owned(),
+        };
+        let denied = store
+            .rebuild(authorized(request.clone(), &alice))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+        let denied = store
+            .rebuild(authorized(
+                RebuildRequest {
+                    trusted_fixture: true,
+                    ..request
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
     async fn malformed_upload_and_unasserted_lift_are_denied() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let token = store.create_identity("analyst").unwrap();
@@ -1897,7 +2163,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=5;")
+            .execute_batch("PRAGMA user_version=6;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -1931,7 +2197,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
     }
 

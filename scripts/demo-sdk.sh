@@ -4,11 +4,12 @@ umask 077
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
-if [[ $# -ne 1 ]]; then
-  echo "Usage: bash scripts/demo-sdk.sh /path/to/trusted-x86_64-elf-with-hydir_max2" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: bash scripts/demo-sdk.sh /path/to/trusted-x86_64-elf-with-hydir_max2 [/path/to/trusted-freestanding-elf]" >&2
   exit 2
 fi
 binary="$1"
+rebuild_binary="${2:-}"
 python="${HYDIR_SDK_PYTHON:-python3}"
 "$python" -c 'import grpc, google.protobuf' >/dev/null
 base="$repo_dir/target/demo-sdk"
@@ -51,4 +52,22 @@ PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/smoke.py \
   "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$binary" hydir_max2 \
   "$demo_dir/output" > "$demo_dir/sdk-smoke.txt"
 test -s "$demo_dir/output/lifted.ll"
+if [[ -n "$rebuild_binary" ]]; then
+  grep -q '"whole_rebuild": true' "$demo_dir/discover.json"
+  PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/rebuild_program.py \
+    "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$rebuild_binary" \
+    "$demo_dir/rebuild-output" > "$demo_dir/sdk-rebuild.txt"
+  test -x "$demo_dir/rebuild-output/rebuilt"
+  test -s "$demo_dir/rebuild-output/whole.ll"
+  test -s "$demo_dir/rebuild-output/report.json"
+  for choice in A B ''; do
+    original_status=0
+    rebuilt_status=0
+    printf '%s' "$choice" | timeout 5 "$rebuild_binary" > "$demo_dir/original.stdout" 2> "$demo_dir/original.stderr" || original_status=$?
+    printf '%s' "$choice" | timeout 5 "$demo_dir/rebuild-output/rebuilt" > "$demo_dir/rebuilt.stdout" 2> "$demo_dir/rebuilt.stderr" || rebuilt_status=$?
+    test "$original_status" -eq "$rebuilt_status"
+    cmp "$demo_dir/original.stdout" "$demo_dir/rebuilt.stdout"
+    cmp "$demo_dir/original.stderr" "$demo_dir/rebuilt.stderr"
+  done
+fi
 echo "HydIR Python SDK integration passed; artifacts: $demo_dir"

@@ -18,7 +18,10 @@ The script creates a private development database and two credentials,
 starts `hydird` on loopback, uploads a fixture binary, inspects it, recovers
 its CFG, lifts it, and compiles scalar C. It runs an allowlisted LLVM pass
 experiment, verifies the after-IR, and confirms the new project revision
-retains the same binary hash. It also applies a bounded scalar patch into a new revision and
+retains the same binary hash. It rebuilds one complete trusted ELF into a new
+revision, retrieves its LLVM/ELF artifacts after restart, and compares three
+controlled input cases on the client. GUI pass and rebuild probes exercise
+the same remote operations and export a verified ELF. It also applies a bounded scalar patch into a new revision and
 starts an idempotent background lift. After restart it retrieves the same
 artifacts, replays the patch and lift events, and checks that the second
 identity cannot read or transform the first identity's project or artifacts.
@@ -42,9 +45,18 @@ and press **Upload ELF to remote project**; this creates an immutable revision.
 The workbench checks discovery version, project revision, model hash,
 and returned IR/C artifact digests. It supports inspect/CFG/lift/scalar-C, a bounded
 global-effect report, and lift-job start/monitor/cancel/artifact retrieval.
+The **Passes** tab runs the named pass pipeline and shows verified before/after
+IR. The Inspector requires a visible trusted-fixture assertion before remote
+whole-executable rebuilding, then permits hash-checked ELF export only to a
+new local file. The workbench never executes the ELF.
+The scalar patch v1 section generates a typed, hash-bound patch request for
+the selected function and requires both trusted-fixture and entry-only
+assertions. The resulting ELF has a new revision; remote export is digest-
+checked and new-file-only. The GUI probes cover both local and remote patch
+operation functions, not visual interaction.
 Credentials stay out of the displayed project label. The headless
-`--probe-create-upload` path exercises the same transfer functions, but is not
-a visual UI test.
+`--probe-create-upload`, `--probe-transform`, and `--probe-rebuild` paths
+exercise the same operation functions, but are not visual UI tests.
 The Inspector displays whether this service build offers a matching committed
 source archive, its revision and digest, and the explicit CLI download command.
 
@@ -70,6 +82,15 @@ immutable project revision with the same binary hash. An exact retry returns
 that revision after restart; a changed request with the same key is denied.
 LLVM verification does not establish behavioral equivalence.
 
+`remote rebuild` requires a current revision, an idempotency key, and a
+trusted-fixture assertion. The worker invokes fixed `/usr/bin/opt-14` and
+`/usr/bin/clang-14`, not client-provided executables or arbitrary flags. It
+imports the compiled ELF, creates a new binary revision, and saves owner-scoped
+IR, ELF, and report artifacts. Exact retries after restart return the same
+revision; other principals cannot read it. CLI, SDK, and GUI verify artifact
+hashes, types, and revisions. The server does not execute either ELF; only the
+trusted demo client compares their declared behavior.
+
 `job-start-lift` requires the project revision, an explicit prototype
 assertion, and an idempotency key. At most two jobs may be queued/running per
 identity. `job` and `job-cancel` are owner-scoped. `job-events` accepts an
@@ -77,16 +98,19 @@ exclusive sequence cursor and replays stored events before following new
 ones; the stream checks credential validity again while connected. Terminal
 jobs and their events survive restart. Queued/running jobs become
 `interrupted` on restart rather than silently resuming. Cancellation aborts
-the child-worker task and waits up to five seconds for it to stop; it is not
-an OS process-tree sandbox.
+the child-worker task and waits up to five seconds for it to stop. On Linux,
+the worker runs in a process group that is killed on timeout, error, or
+cancellation, including compiler descendants. This is not an OS security sandbox.
 
 The Python client in `sdk/python/` uses the same `.proto` contract and
 loopback/credential rules. `scripts/demo-sdk.sh` runs its unit tests and a
 separate-client integration smoke test against a locally started `hydird`,
-given a trusted x86-64 ELF containing `hydir_max2`. It does not provide
-rebuild/execute calls because the service does not expose those
-operations yet. It does expose the named pass experiment, scalar C, patch v1,
-and optional source retrieval.
+given a trusted x86-64 ELF containing `hydir_max2`. With a second trusted
+freestanding ELF, it also runs the Python rebuild example and compares three
+controlled cases on the client. `demo-sdk-linux-docker.sh` builds the pinned
+Python image and supplies both fixtures. It exposes rebuild without
+execution, the named pass experiment, scalar C, patch v1, and optional source
+retrieval.
 
 ## Matching-source development build
 
@@ -110,8 +134,8 @@ request credentials. A caller cannot send a server filesystem path, code
 plugin, shell command, or execution request through this API. Project and
 artifact reads from another identity return not-found errors.
 
-This is **not a hostile-binary sandbox**. ELF parsing, CFG recovery, and
-lifting run in a fresh `hydird worker` child process with a 30-second deadline
+This is **not a hostile-binary sandbox**. ELF parsing, CFG recovery, lifting,
+and rebuilding run in a fresh `hydird worker` child process with a 30-second deadline
 and 16 MiB output cap. On Linux the child also starts with a cleared
 environment and `setrlimit` caps of 2 GiB address space, 25 CPU seconds,
 16 MiB regular-file size, 64 open descriptors, and zero core-dump bytes.

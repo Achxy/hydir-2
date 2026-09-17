@@ -89,6 +89,11 @@ class HydirStub:
                 request_serializer=hydir__pb2.TransformRequest.SerializeToString,
                 response_deserializer=hydir__pb2.TransformReply.FromString,
                 _registered_method=True)
+        self.Rebuild = channel.unary_unary(
+                '/hydir.v1.Hydir/Rebuild',
+                request_serializer=hydir__pb2.RebuildRequest.SerializeToString,
+                response_deserializer=hydir__pb2.RebuildReply.FromString,
+                _registered_method=True)
         self.ApplyPatch = channel.unary_unary(
                 '/hydir.v1.Hydir/ApplyPatch',
                 request_serializer=hydir__pb2.PatchRequest.SerializeToString,
@@ -190,6 +195,12 @@ class HydirServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Rebuild(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ApplyPatch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -283,6 +294,11 @@ def add_HydirServicer_to_server(servicer, server):
                     servicer.Transform,
                     request_deserializer=hydir__pb2.TransformRequest.FromString,
                     response_serializer=hydir__pb2.TransformReply.SerializeToString,
+            ),
+            'Rebuild': grpc.unary_unary_rpc_method_handler(
+                    servicer.Rebuild,
+                    request_deserializer=hydir__pb2.RebuildRequest.FromString,
+                    response_serializer=hydir__pb2.RebuildReply.SerializeToString,
             ),
             'ApplyPatch': grpc.unary_unary_rpc_method_handler(
                     servicer.ApplyPatch,
@@ -612,6 +628,33 @@ class Hydir:
             '/hydir.v1.Hydir/Transform',
             hydir__pb2.TransformRequest.SerializeToString,
             hydir__pb2.TransformReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Rebuild(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v1.Hydir/Rebuild',
+            hydir__pb2.RebuildRequest.SerializeToString,
+            hydir__pb2.RebuildReply.FromString,
             options,
             channel_credentials,
             insecure,

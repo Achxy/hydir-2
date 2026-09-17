@@ -33,6 +33,8 @@ clang -O0 -no-pie -DHYDIR_FUNCTION=hydir_max2 \
 clang -c tests/fixtures/unsupported.S -o "$demo_dir/unsupported.o"
 clang -nostdlib -no-pie -Wl,-e,_start \
   tests/fixtures/global_effects.S -o "$demo_dir/global-effects"
+clang -nostdlib -no-pie -Wl,--build-id=none \
+  tests/fixtures/whole_choice.S -o "$demo_dir/whole-choice-original"
 
 "$server_bin" identity create "$demo_dir/projects.sqlite" alice \
   | awk '/credential \(save securely/ {print $NF}' > "$demo_dir/alice.token"
@@ -65,6 +67,7 @@ start_server() {
 start_server
 grep -q '"named_pass_transform": true' "$demo_dir/discovery.json"
 grep -q '"scalar_patch_v1": true' "$demo_dir/discovery.json"
+grep -q '"whole_rebuild": true' "$demo_dir/discovery.json"
 "$client_bin" remote create Alice-demo request-alice-1 > "$demo_dir/alice-project.json"
 alice_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/alice-project.json")"
 test -n "$alice_id"
@@ -166,6 +169,43 @@ test "${#transform_after_sha}" -eq 64
 grep -q '"revision": 2' "$demo_dir/transform-current.json"
 transform_binary_sha="$(sed -n 's/.*"binary_sha256": "\([^"]*\)".*/\1/p' "$demo_dir/transform-upload.json")"
 grep -q "$transform_binary_sha" "$demo_dir/transform-current.json"
+"$gui_bin" --probe-transform "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" \
+  "$demo_dir/max2-original" hydir_max2 > "$demo_dir/gui-transform-probe.txt"
+grep -q 'verified before/after IR' "$demo_dir/gui-transform-probe.txt"
+
+"$client_bin" remote create Alice-rebuild request-alice-rebuild-1 > "$demo_dir/rebuild-project.json"
+rebuild_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/rebuild-project.json")"
+test -n "$rebuild_id"
+"$client_bin" remote upload "$rebuild_id" 0 "$demo_dir/whole-choice-original" > "$demo_dir/rebuild-upload.json"
+"$client_bin" remote rebuild "$rebuild_id" 1 alice-rebuild-1 \
+  --trusted-fixture --output-dir "$demo_dir/remote-rebuild" > "$demo_dir/rebuild-reply.json"
+grep -q '"revision": 2' "$demo_dir/rebuild-reply.json"
+opt -verify -disable-output "$demo_dir/remote-rebuild/whole.ll"
+test -x "$demo_dir/remote-rebuild/rebuilt"
+if cmp -s "$demo_dir/whole-choice-original" "$demo_dir/remote-rebuild/rebuilt"; then
+  echo "remote rebuild copied the original ELF" >&2
+  exit 1
+fi
+for choice in A B ''; do
+  printf '%s' "$choice" | timeout 5 "$demo_dir/whole-choice-original" > "$demo_dir/rebuild-original.stdout" 2> "$demo_dir/rebuild-original.stderr"
+  printf '%s' "$choice" | timeout 5 "$demo_dir/remote-rebuild/rebuilt" > "$demo_dir/rebuild-output.stdout" 2> "$demo_dir/rebuild-output.stderr"
+  cmp "$demo_dir/rebuild-original.stdout" "$demo_dir/rebuild-output.stdout"
+  cmp "$demo_dir/rebuild-original.stderr" "$demo_dir/rebuild-output.stderr"
+done
+rebuild_sha="$(sed -n 's/.*"binary_sha256": "\([^"]*\)".*/\1/p' "$demo_dir/rebuild-reply.json")"
+test "${#rebuild_sha}" -eq 64
+"$client_bin" remote project "$rebuild_id" > "$demo_dir/rebuild-current.json"
+grep -q '"revision": 2' "$demo_dir/rebuild-current.json"
+"$gui_bin" --probe-rebuild "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" \
+  "$demo_dir/whole-choice-original" "$demo_dir/gui-rebuilt" > "$demo_dir/gui-rebuild-probe.txt"
+grep -q 'exported ELF SHA-256' "$demo_dir/gui-rebuild-probe.txt"
+test -x "$demo_dir/gui-rebuilt"
+for choice in A B ''; do
+  printf '%s' "$choice" | timeout 5 "$demo_dir/whole-choice-original" > "$demo_dir/gui-original.stdout" 2> "$demo_dir/gui-original.stderr"
+  printf '%s' "$choice" | timeout 5 "$demo_dir/gui-rebuilt" > "$demo_dir/gui-rebuilt.stdout" 2> "$demo_dir/gui-rebuilt.stderr"
+  cmp "$demo_dir/gui-original.stdout" "$demo_dir/gui-rebuilt.stdout"
+  cmp "$demo_dir/gui-original.stderr" "$demo_dir/gui-rebuilt.stderr"
+done
 
 max_digest="$(sha256sum "$demo_dir/max2-original" | awk '{print $1}')"
 printf '{"schema_version":1,"binary_sha256":"%s","function_symbol":"hydir_max2","prototype":"u64(u64,u64)","replacement":"return arg0 - arg1;"}\n' \
@@ -178,6 +218,11 @@ test "${#patched_sha}" -eq 64
 grep -q '"revision": 2' "$demo_dir/patch-reply.json"
 test "$("$demo_dir/max2-original" 9 4)" = 9
 test "$("$demo_dir/remote-patched" 9 4)" = 5
+"$gui_bin" --probe-remote-patch "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" \
+  "$demo_dir/max2-original" hydir_max2 'return arg0 - arg1;' \
+  "$demo_dir/gui-remote-patched" > "$demo_dir/gui-patch-probe.txt"
+grep -q 'exported ELF SHA-256' "$demo_dir/gui-patch-probe.txt"
+test "$("$demo_dir/gui-remote-patched" 9 4)" = 5
 "$client_bin" remote project "$alice_id" > "$demo_dir/after-patch-project.json"
 grep -q '"revision": 2' "$demo_dir/after-patch-project.json"
 "$client_bin" remote lift "$alice_id" 2 hydir_max2 --assume-u64x2 \
@@ -206,6 +251,14 @@ cmp "$demo_dir/remote-decompile.c" "$demo_dir/after-restart.c"
 "$client_bin" remote artifact "$transform_id" "$transform_after_sha" \
   --output "$demo_dir/transform-after-restart.ll" > "$demo_dir/transform-artifact.json"
 cmp "$demo_dir/remote-transform/after.ll" "$demo_dir/transform-after-restart.ll"
+"$client_bin" remote artifact "$rebuild_id" "$rebuild_sha" \
+  --output "$demo_dir/rebuild-after-restart" > "$demo_dir/rebuild-artifact.json"
+cmp "$demo_dir/remote-rebuild/rebuilt" "$demo_dir/rebuild-after-restart"
+"$client_bin" remote rebuild "$rebuild_id" 1 alice-rebuild-1 \
+  --trusted-fixture --output-dir "$demo_dir/remote-rebuild-retry" > "$demo_dir/rebuild-retry.json"
+cmp "$demo_dir/remote-rebuild/rebuilt" "$demo_dir/remote-rebuild-retry/rebuilt"
+"$client_bin" remote project "$rebuild_id" > "$demo_dir/rebuild-after-retry.json"
+grep -q '"revision": 2' "$demo_dir/rebuild-after-retry.json"
 "$client_bin" remote transform "$transform_id" 1 hydir_max2 alice-transform-1 \
   --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce \
   --output-dir "$demo_dir/remote-transform-retry" > "$demo_dir/transform-retry.json"
@@ -264,6 +317,13 @@ if "$client_bin" remote transform "$transform_id" 1 hydir_max2 bob-denied-transf
   exit 1
 fi
 grep -q 'project not found' "$demo_dir/denied-transform.err"
+if "$client_bin" remote rebuild "$rebuild_id" 1 bob-denied-rebuild \
+  --trusted-fixture --output-dir "$demo_dir/denied-rebuild" \
+  > "$demo_dir/denied-rebuild.out" 2> "$demo_dir/denied-rebuild.err"; then
+  echo "Bob unexpectedly rebuilt Alice's binary" >&2
+  exit 1
+fi
+grep -q 'project not found' "$demo_dir/denied-rebuild.err"
 if "$client_bin" remote project "$alice_id" > "$demo_dir/denied-project.out" 2> "$demo_dir/denied-project.err"; then
   echo "Bob unexpectedly accessed Alice's project" >&2
   exit 1

@@ -23,6 +23,12 @@ if cmp -s "$demo_dir/experiment/before.ll" "$demo_dir/experiment/after.ll"; then
   echo "pass pipeline unexpectedly made no observable IR change" >&2
   exit 1
 fi
+cargo build --locked -q -p hydir-gui
+"${CARGO_TARGET_DIR:-target}/debug/hydir" --probe-local-pass \
+  "$demo_dir/max2-original" hydir_max2 "$demo_dir/gui-experiment" \
+  > "$demo_dir/gui-pass-probe.txt"
+grep -q 'verified before/after IR' "$demo_dir/gui-pass-probe.txt"
+opt -verify -disable-output "$demo_dir/gui-experiment/after.ll"
 clang -O0 -DHYDIR_FUNCTION=hydir_lifted \
   "$demo_dir/experiment/after.ll" tests/fixtures/scalar_main.c \
   -o "$demo_dir/transformed-runner"

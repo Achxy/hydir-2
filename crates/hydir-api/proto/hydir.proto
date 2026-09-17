@@ -13,6 +13,7 @@ service Hydir {
   rpc Lift (FunctionRequest) returns (ArtifactReply);
   rpc Decompile (FunctionRequest) returns (ArtifactReply);
   rpc Transform (TransformRequest) returns (TransformReply);
+  rpc Rebuild (RebuildRequest) returns (RebuildReply);
   rpc ApplyPatch (PatchRequest) returns (PatchReply);
   rpc GetArtifact (ArtifactRequest) returns (ArtifactReply);
   rpc StartLiftJob (StartLiftJobRequest) returns (JobReply);
@@ -40,6 +41,7 @@ message DiscoverReply {
   string source_sha256 = 15;
   bool named_pass_transform = 16;
   bool scalar_patch_v1 = 17;
+  bool whole_rebuild = 18;
 }
 message SourceRequest {}
 message SourceReply {
@@ -100,6 +102,20 @@ message TransformReply {
   string report_sha256 = 6;
   bool ir_text_changed = 7;
   string report_json = 8;
+}
+message RebuildRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  bool trusted_fixture = 3;
+  string idempotency_key = 4;
+}
+message RebuildReply {
+  string project_id = 1;
+  uint64 revision = 2;
+  string binary_sha256 = 3;
+  string ir_sha256 = 4;
+  string report_sha256 = 5;
+  string report_json = 6;
 }
 message PatchReply {
   string project_id = 1;

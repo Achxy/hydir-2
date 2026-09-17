@@ -45,12 +45,15 @@ The development Python SDK uses `grpcio` 1.84.0 (Apache-2.0), `protobuf`
 `grpcio-tools` 1.84.0 (Apache-2.0) and `setuptools` 84.0.0 (MIT) used for
 generation/build. This is a package-metadata inventory, not a complete
 redistribution notice audit. No SDK wheel has been published.
+`Dockerfile.sdk` installs Debian Python 3.11 packages and the pinned Python
+runtime packages into a separate development test image. Redistributing that
+image would require its own package-level license/notice audit.
 
 The trusted local pass experiment invokes Debian LLVM `opt` 14.0.6 from the
 development image. LLVM is a separate native tool, not statically linked into
 these Rust binaries. Its license and runtime redistribution obligations must
 be included if a future package bundles it.
-The restricted local rebuild path also invokes Clang and LLVM `opt` 14.0.6,
+The restricted local and authenticated-loopback rebuild paths also invoke Clang and LLVM `opt` 14.0.6,
 and links a first-party C guest-memory/syscall runtime into generated ELF
 artifacts. No LLVM library is statically linked into `hydirctl`; generated
 artifacts and toolchain redistribution still need a distribution notice audit.
