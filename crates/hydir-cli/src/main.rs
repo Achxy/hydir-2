@@ -80,7 +80,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
                     "remote_api": true,
-                    "remote_scope": "authenticated loopback project/upload/inspect/cfg/lift/artifact and durable lift-job subset",
+                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
                     "c_output": false,
