@@ -2,6 +2,7 @@ use hydir_analysis::analyze_elf;
 use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
+mod passes;
 mod remote;
 use serde_json::json;
 use std::{
@@ -23,6 +24,7 @@ Usage:
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
+  hydirctl transform <elf> <function-symbol> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory> [--opt <path>]
   hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl remote <operation> ...
@@ -53,6 +55,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .filter(|output| output.status.success())
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .and_then(|value| value.lines().next().map(str::to_owned));
+            let opt_version = Command::new("opt")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.lines().next().map(str::to_owned));
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -67,12 +76,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "conservative_global_effect_analysis": true,
                     "trusted_fixture_validation_available": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.is_some(),
                     "clang": clang_version,
+                    "llvm_opt": opt_version,
+                    "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
                     "remote_api": true,
                     "remote_scope": "authenticated loopback project/upload/inspect/cfg/lift/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
                     "c_output": false,
+                    "patching": false,
                     "whole_executable_rebuild": false
                 }))?
             );
@@ -142,6 +154,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 print!("{ir}");
             }
         }
+        Some("transform") => passes::run(&args[1..])?,
         Some("validate") if args.len() >= 4 => validate(&args[1..], false)?,
         Some("validate-at") if args.len() >= 5 => validate(&args[1..], true)?,
         Some("remote") if args.len() >= 2 => {

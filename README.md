@@ -13,9 +13,11 @@ The `hydir` egui desktop workbench opens local ELF files and explicitly
 connects to existing authenticated loopback projects. It shows function facts,
 reachable disassembly/CFG, LLVM IR, assumptions, and diagnostics in resizable
 panes. Opening a local binary never uploads it. GUI remote upload, saved
-layouts, passes, and C output are not yet implemented. It can start, monitor,
+layouts and C output are not yet implemented. It can start, monitor,
 cancel, and retrieve a remote lift job and display a conservative global-effect
-analysis. That analysis is not complete whole-program recovery.
+analysis. The local CLI has a named LLVM pass experiment for trusted fixtures;
+there is no GUI/remote pass editor. The analysis is not complete whole-program
+recovery.
 
 ## Build and inspect
 
@@ -31,6 +33,7 @@ cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
 cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
+cargo run --locked --bin hydirctl -- transform /path/to/program.elf function_name --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce --output-dir /path/to/new-experiment --opt opt
 ```
 
 On a Linux x86-64 host with Clang, `bash scripts/demo-local.sh` builds four
@@ -49,6 +52,10 @@ replay, restart, cancellation, and cross-project denial checks. See
 [remote operation and threat model](docs/REMOTE.md).
 `bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
 global write and conservative treatment of an indirect call in a linked ELF.
+`bash scripts/demo-passes.sh` saves raw, canonical before, and after LLVM IR;
+it verifies the named pipeline with pinned LLVM `opt` 14.0.6 and compares a
+transformed trusted fixture on eight boundary inputs. An IR change and a
+verifier pass are not, by themselves, a behavioral proof.
 
 The `validate` command runs the original binary and lifted runner **without a
 sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.
