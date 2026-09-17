@@ -29,9 +29,15 @@ report artifacts. It matched three controlled client-side inputs, survived
 restart and exact-key retry without a third revision, and denied a second
 identity. The egui headless operation probes separately exercised local and
 remote pass, patch, and rebuild/export functions. They are not a visual UI
-interaction test; the current macOS window was launched, but the available
-computer-use surface did not expose it for reliable control, so no new visual
-interaction claim is made. The service never executed the samples.
+interaction test. A subsequent macOS run used `hydir --open-local <trusted
+ELF> hydir_max2` and visually inspected the populated function tree, selected
+disassembly row, CFG summary, and inspector at
+`target/visual-qa/hydir-populated-collapsed.png`.
+The optional mutation controls were collapsed after an earlier capture showed
+them pushing function facts below the fold. Direct pointer/keyboard control of
+the eframe canvas was not reliably established, so this is a render/initial-
+selection smoke check, not full visual interaction QA. The service never
+executed the samples.
 
 `bash scripts/demo-sdk-linux-docker.sh` exited 0 with the SDK image and
 retained `target/demo-sdk/run.5Kuqam/`. Its seven Python boundary tests,

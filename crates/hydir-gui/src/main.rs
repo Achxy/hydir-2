@@ -1364,6 +1364,7 @@ struct AnalystApp {
     patch_exported_path: Option<PathBuf>,
     entry_only_assertion: bool,
     search: String,
+    initial_symbol: Option<String>,
     source_label: Option<String>,
     source_offer: Option<String>,
     remote: bool,
@@ -1432,6 +1433,7 @@ impl AnalystApp {
             patch_exported_path: None,
             entry_only_assertion: false,
             search: String::new(),
+            initial_symbol: None,
             source_label: None,
             source_offer: None,
             remote: false,
@@ -1513,6 +1515,9 @@ impl AnalystApp {
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
                     self.failure = None;
+                    if let Some(symbol) = self.initial_symbol.take() {
+                        self.select(symbol);
+                    }
                 }
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
@@ -2107,7 +2112,9 @@ impl AnalystApp {
             );
         }
         ui.separator();
-        ui.heading(RichText::new("Build / artifacts").size(14.0));
+        egui::CollapsingHeader::new("Build & patch · trusted fixtures")
+            .default_open(false)
+            .show(ui, |ui| {
         ui.checkbox(
             &mut self.trusted_fixture,
             "Trusted fixture; I authorize compiler processing",
@@ -2278,6 +2285,7 @@ impl AnalystApp {
                 );
             }
         }
+            });
         ui.separator();
         if let Some(function) = self.selected_function() {
             ui.label(RichText::new(&function.name).monospace().color(ACCENT));
@@ -2579,7 +2587,7 @@ impl AnalystApp {
             };
             self.enqueue(task, "Verifying and saving pass experiment…");
         }
-        run.on_disabled_hover_text("Select a function, assert a trusted fixture in Build / artifacts, and provide the mode's required LLVM capability/output directory.");
+        run.on_disabled_hover_text("Select a function, assert a trusted fixture in Build & patch, and provide the mode's required LLVM capability/output directory.");
         ui.separator();
         if let (Some(before), Some(after)) = (&self.transform_before, &self.transform_after) {
             ui.columns(2, |columns| {
@@ -3125,12 +3133,22 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
-    if !arguments.is_empty() {
+    let open_local = if let [flag, path] = arguments.as_slice()
+        && flag == "--open-local"
+    {
+        Some((PathBuf::from(path), None))
+    } else if let [flag, path, symbol] = arguments.as_slice()
+        && flag == "--open-local"
+    {
+        Some((PathBuf::from(path), Some(symbol.clone())))
+    } else if arguments.is_empty() {
+        None
+    } else {
         eprintln!(
-            "Usage: hydir [--probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
-    }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("HydIR · Native Analysis")
@@ -3140,7 +3158,15 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "HydIR",
         options,
-        Box::new(|context| Ok(Box::new(AnalystApp::new(&context.egui_ctx)))),
+        Box::new(move |context| {
+            let mut app = AnalystApp::new(&context.egui_ctx);
+            if let Some((path, symbol)) = open_local {
+                app.path_input = path.display().to_string();
+                app.initial_symbol = symbol;
+                app.enqueue(Task::Open(path), "Importing local ELF…");
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
