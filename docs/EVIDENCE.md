@@ -191,3 +191,34 @@ M2 remains partial: the desktop lacks a live jobs panel, remote binary upload,
 and saved layout; service authorization is owner-only rather than per-role and
 the worker has no OS sandbox. M3–M5 and the broad M0 licensing/backend audit
 remain open. Do not infer release readiness from this job-slice result.
+
+## Bounded interprocedural effect analysis and workbench expansion
+
+On 2026-09-17, `cargo fmt --all`, `cargo test --locked --workspace`,
+`bash -n scripts/demo-analysis.sh scripts/demo-remote.sh
+scripts/demo-linux-docker.sh`, and `git diff --check` passed on the macOS
+development host. The workspace had **24 passing tests**: 3 analysis, 10
+backend, 1 core, 2 GUI, and 8 server. The final
+`bash scripts/demo-linux-docker.sh` exited 0 in the pinned Linux x86-64 image:
+all 24 tests, warning-free Clippy, the five LLVM verifier/differential fixture
+variants (**5,040/5,040 matches**), `scripts/demo-analysis.sh`, and the
+separate-process remote demo passed. New artifacts are under
+`target/demo-local/run.OxXSUZ/`, `target/demo-analysis/run.uQsqpz/`, and
+`target/demo-remote/run.E1LvSk/`.
+
+The linked ELF analysis fixture demonstrates a leaf write to `.data` at
+`0x402000`, a caller whose direct write set is empty but propagated possible
+write set contains that address, and an indirect-call function with
+`unknown_global_effects=true`. Three Rust tests cover a changed callee
+summary, unresolved-call conservatism, and recursive SCC fixed-point
+propagation. The remote demo uploads the fixture into a separate project,
+retrieves the analysis via gRPC, and denies another identity's attempt to
+analyze it. The GUI's headless remote-operation probe now also exercises
+analysis and a completed job with verified artifact retrieval; this is not
+visual interaction evidence.
+
+M3 is **partial**: this is one concrete interprocedural property, but there
+is no named pass pipeline, C output, or patching. M2 remains partial due
+missing remote GUI upload, saved layouts, fine-grained roles, OS worker
+sandbox, and non-loopback TLS. M4 whole-executable rebuild and M5 release
+hardening are absent. No hostile binary or remote execution was attempted.

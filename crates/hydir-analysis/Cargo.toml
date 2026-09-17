@@ -1,0 +1,13 @@
+[package]
+name = "hydir-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hydir-core = { path = "../hydir-core" }
+hydir-backend = { path = "../hydir-backend" }
+object.workspace = true
+iced-x86.workspace = true
+serde.workspace = true

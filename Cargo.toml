@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hydir-core", "crates/hydir-backend", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-server", "crates/hydir-gui"]
+members = ["crates/hydir-core", "crates/hydir-backend", "crates/hydir-analysis", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-server", "crates/hydir-gui"]
 resolver = "2"
 
 [workspace.package]

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hydir-backend = { path = "../hydir-backend" }
+hydir-analysis = { path = "../hydir-analysis" }
 hydir-core = { path = "../hydir-core" }
 hydir-api = { path = "../hydir-api" }
 eframe.workspace = true
@@ -18,3 +19,4 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+uuid.workspace = true

@@ -1,5 +1,6 @@
 //! Local-only, authenticated HydIR RPC slice. No sample execution endpoint.
 
+use hydir_analysis::analyze_elf;
 use hydir_api::v1::{
     ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
     FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, ProjectReply,
@@ -421,6 +422,9 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
             .and_then(|spec| serde_json::to_vec(&spec).map_err(|error| error.to_string())),
+        ("analyze", None) => analyze_elf(bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|report| serde_json::to_vec(&report).map_err(|error| error.to_string())),
         ("cfg", Some(symbol)) => recover_symbol_cfg(bytes, symbol)
             .map_err(|error| error.to_string())
             .and_then(|cfg| serde_json::to_vec(&cfg).map_err(|error| error.to_string())),
@@ -551,6 +555,7 @@ impl Hydir for Store {
             durable_lift_jobs: true,
             reconnectable_job_events: true,
             job_cancellation: true,
+            conservative_global_effect_analysis: true,
         }))
     }
 
@@ -688,6 +693,20 @@ impl Hydir for Store {
         Ok(Response::new(JsonReply {
             json: String::from_utf8(spec)
                 .map_err(|_| Status::internal("worker returned non-UTF-8 program model"))?,
+        }))
+    }
+
+    async fn analyze(
+        &self,
+        request: Request<ProjectRequest>,
+    ) -> Result<Response<JsonReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let report = run_worker("analyze", None, bytes).await?;
+        Ok(Response::new(JsonReply {
+            json: String::from_utf8(report)
+                .map_err(|_| Status::internal("worker returned non-UTF-8 analysis"))?,
         }))
     }
 

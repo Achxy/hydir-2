@@ -17,6 +17,7 @@ const HELP: &str = "Remote commands:
   hydirctl remote project <project-id>
   hydirctl remote upload <project-id> <expected-revision> <elf>
   hydirctl remote inspect <project-id> <revision>
+  hydirctl remote analyze <project-id> <revision>
   hydirctl remote cfg <project-id> <revision> <function-symbol>
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
   hydirctl remote artifact <project-id> <sha256> --output <file>
@@ -118,6 +119,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "durable_lift_jobs": result.durable_lift_jobs,
                     "reconnectable_job_events": result.reconnectable_job_events,
                     "job_cancellation": result.job_cancellation,
+                    "conservative_global_effect_analysis": result.conservative_global_effect_analysis,
                 }))?
             );
         }
@@ -167,6 +169,19 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         [command, id, expected] if command == "inspect" => {
             let result = client
                 .inspect(authorized(
+                    ProjectRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            println!("{}", result.json);
+        }
+        [command, id, expected] if command == "analyze" => {
+            let result = client
+                .analyze(authorized(
                     ProjectRequest {
                         project_id: id.clone(),
                         expected_revision: revision(expected)?,

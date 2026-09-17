@@ -31,6 +31,8 @@ clang -O0 -no-pie -DHYDIR_FUNCTION=hydir_max2 \
   tests/fixtures/max2.S tests/fixtures/scalar_main.c \
   -o "$demo_dir/max2-original"
 clang -c tests/fixtures/unsupported.S -o "$demo_dir/unsupported.o"
+clang -nostdlib -no-pie -Wl,-e,_start \
+  tests/fixtures/global_effects.S -o "$demo_dir/global-effects"
 
 "$server_bin" identity create "$demo_dir/projects.sqlite" alice \
   | awk '/credential \(save securely/ {print $NF}' > "$demo_dir/alice.token"
@@ -104,6 +106,15 @@ grep -q '"state": "succeeded"' "$demo_dir/alice-job.json"
 grep -q '"state":"queued"' "$demo_dir/alice-job-events.jsonl"
 grep -q '"state":"succeeded"' "$demo_dir/alice-job-events.jsonl"
 
+"$client_bin" remote create Alice-effects request-alice-effects-1 > "$demo_dir/effects-project.json"
+effects_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/effects-project.json")"
+test -n "$effects_id"
+"$client_bin" remote upload "$effects_id" 0 "$demo_dir/global-effects" > "$demo_dir/effects-upload.json"
+"$client_bin" remote analyze "$effects_id" 1 > "$demo_dir/effects-analysis.json"
+grep -q '"direct_callees":\["hydir_leaf"\]' "$demo_dir/effects-analysis.json"
+grep -q '"section":".data"' "$demo_dir/effects-analysis.json"
+grep -q '"unknown_global_effects":true' "$demo_dir/effects-analysis.json"
+
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 server_pid=""
@@ -141,6 +152,11 @@ if "$client_bin" remote job "$alice_id" "$alice_job_id" > "$demo_dir/denied-job.
   exit 1
 fi
 grep -q 'job not found' "$demo_dir/denied-job.err"
+if "$client_bin" remote analyze "$effects_id" 1 > "$demo_dir/denied-analysis.out" 2> "$demo_dir/denied-analysis.err"; then
+  echo "Bob unexpectedly analyzed Alice's binary" >&2
+  exit 1
+fi
+grep -q 'project not found' "$demo_dir/denied-analysis.err"
 if "$client_bin" remote project "$alice_id" > "$demo_dir/denied-project.out" 2> "$demo_dir/denied-project.err"; then
   echo "Bob unexpectedly accessed Alice's project" >&2
   exit 1

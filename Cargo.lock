@@ -1182,6 +1182,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hydir-analysis"
+version = "0.1.0"
+dependencies = [
+ "hydir-backend",
+ "hydir-core",
+ "iced-x86",
+ "object",
+ "serde",
+]
+
+[[package]]
 name = "hydir-api"
 version = "0.1.0"
 dependencies = [
@@ -1206,6 +1217,7 @@ dependencies = [
 name = "hydir-cli"
 version = "0.1.0"
 dependencies = [
+ "hydir-analysis",
  "hydir-api",
  "hydir-backend",
  "serde_json",
@@ -1228,6 +1240,7 @@ name = "hydir-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "hydir-analysis",
  "hydir-api",
  "hydir-backend",
  "hydir-core",
@@ -1235,12 +1248,14 @@ dependencies = [
  "sha2",
  "tokio",
  "tonic",
+ "uuid",
 ]
 
 [[package]]
 name = "hydir-server"
 version = "0.1.0"
 dependencies = [
+ "hydir-analysis",
  "hydir-api",
  "hydir-backend",
  "rusqlite",

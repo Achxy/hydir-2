@@ -28,19 +28,21 @@ a 64-character random credential once. Save it to a private file (mode 0600),
 then start `hydird serve <database.sqlite> 127.0.0.1:50051`. Set
 `HYDIR_ENDPOINT=http://127.0.0.1:50051` and `HYDIR_TOKEN_FILE` to that file
 before running `hydirctl remote discover`. `hydirctl remote` without arguments
-prints available operations. `hydird identity rotate` replaces a principal's
+prints available operations, including `analyze` for a linked ELF project.
+`hydird identity rotate` replaces a principal's
 credential and immediately revokes its predecessor.
 
 In `hydir`, expand **Existing remote project**, enter the same loopback
 endpoint, private credential-file path, and an existing project ID, then open
 it. The workbench checks discovery version, project revision, model hash,
-and returned IR artifact digest. It supports inspect/CFG/lift there, but
+and returned IR artifact digest. It supports inspect/CFG/lift, a bounded
+global-effect report, and lift-job start/monitor/cancel/artifact retrieval, but
 cannot upload through the GUI. Credentials stay out of the displayed project
 label.
 
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is
-recorded. A revision precondition is required for upload, inspect, CFG, and
+recorded. A revision precondition is required for upload, inspect, analyze, CFG, and
 lift. Project creation uses an idempotency key. Lifted IR is a SHA-256-addressed
 artifact scoped to a project revision. Artifact retrieval rechecks ownership;
 remote commands verify the returned digest and refuse to overwrite differing

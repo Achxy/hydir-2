@@ -7,6 +7,7 @@ service Hydir {
   rpc GetProject (ProjectRequest) returns (ProjectReply);
   rpc UploadBinary (UploadBinaryRequest) returns (ProjectReply);
   rpc Inspect (ProjectRequest) returns (JsonReply);
+  rpc Analyze (ProjectRequest) returns (JsonReply);
   rpc RecoverCfg (FunctionRequest) returns (JsonReply);
   rpc Lift (FunctionRequest) returns (ArtifactReply);
   rpc GetArtifact (ArtifactRequest) returns (ArtifactReply);
@@ -29,6 +30,7 @@ message DiscoverReply {
   bool durable_lift_jobs = 9;
   bool reconnectable_job_events = 10;
   bool job_cancellation = 11;
+  bool conservative_global_effect_analysis = 12;
 }
 message CreateProjectRequest {
   string name = 1;

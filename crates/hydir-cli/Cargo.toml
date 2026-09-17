@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hydir-backend = { path = "../hydir-backend" }
+hydir-analysis = { path = "../hydir-analysis" }
 hydir-api = { path = "../hydir-api" }
 serde_json.workspace = true
 sha2.workspace = true
