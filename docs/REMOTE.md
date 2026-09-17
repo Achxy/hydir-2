@@ -32,13 +32,16 @@ prints available operations, including `analyze` for a linked ELF project.
 `hydird identity rotate` replaces a principal's
 credential and immediately revokes its predecessor.
 
-In `hydir`, expand **Existing remote project**, enter the same loopback
-endpoint, private credential-file path, and an existing project ID, then open
-it. The workbench checks discovery version, project revision, model hash,
+In `hydir`, expand **Remote project · explicit transfer**, enter the loopback
+endpoint and private credential-file path, then create a project or enter an
+existing project ID. Opening never uploads. To send bytes, enter an ELF path
+and press **Upload ELF to remote project**; this creates an immutable revision.
+The workbench checks discovery version, project revision, model hash,
 and returned IR artifact digest. It supports inspect/CFG/lift, a bounded
-global-effect report, and lift-job start/monitor/cancel/artifact retrieval, but
-cannot upload through the GUI. Credentials stay out of the displayed project
-label.
+global-effect report, and lift-job start/monitor/cancel/artifact retrieval.
+Credentials stay out of the displayed project label. The headless
+`--probe-create-upload` path exercises the same transfer functions, but is not
+a visual UI test.
 
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is

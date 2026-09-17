@@ -28,9 +28,11 @@ before, and after IR snapshots plus SHA-256 diagnostics in a new experiment
 directory. This is tested on a trusted scalar function fixture, not on
 arbitrary binaries and not through the current remote API or GUI.
 
-The `hydir` egui app can open a local ELF or explicitly inspect an existing
-authenticated loopback project, then browse function facts, reachable CFG,
-machine bytes, and LLVM IR. Its remote path does not upload binaries. A
+The `hydir` egui app can open a local ELF, create an authenticated loopback
+project, explicitly upload an ELF to it, or reopen an existing project, then
+browse function facts, reachable CFG,
+machine bytes, and LLVM IR. Only the separate labelled upload action transfers
+bytes. A
 desktop smoke run was attempted on macOS; automated visual/interaction QA is
 still outstanding. The `hydird` gRPC service supports authenticated loopback discovery,
 idempotent project creation, immutable binary uploads, project inspection,

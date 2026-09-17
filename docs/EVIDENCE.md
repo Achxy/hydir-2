@@ -246,3 +246,32 @@ on eight boundary inputs. It did not validate arbitrary programs or prove
 the pass pipeline semantics universally. The command is opt-in and local-only
 because `opt` is not sandboxed for hostile inputs. Remote passes, a GUI pass
 editor, C generation, and patching remain M3 blockers.
+
+## Explicit desktop remote transfer
+
+The workbench now has separate, labelled create-project and upload-ELF actions.
+Opening a local binary or an existing remote project never transfers local
+bytes. The upload path checks the local file size, sends a SHA-256 assertion
+and expected project revision, and verifies the returned revision, hash, and
+reopened model. The same operations are exercised in
+`hydir --probe-create-upload`; this verifies UI code paths, not a visual
+interaction or a real mouse click.
+
+`cargo fmt --all`, `cargo test --locked --workspace` (**25 passing tests**),
+`bash -n scripts/demo-remote.sh`, and `git diff --check` passed on the macOS
+host. A targeted Linux container run of warning-free workspace Clippy and
+`scripts/demo-remote.sh` exited 0, leaving
+`target/demo-remote/run.QfVNkn/`. A subsequent full
+`bash scripts/demo-linux-docker.sh` exited 0 with 25 tests, Clippy,
+5,040/5,040 differential matches, the global-effect fixture, the LLVM pass
+experiment's eight boundary matches, and separate-process remote checks. Its
+artifacts are under `target/demo-local/run.kBDkpn/`,
+`target/demo-analysis/run.HnIjKp/`,
+`target/demo-passes/run.S0pObU/`, and
+`target/demo-remote/run.kpx0gy/`.
+
+M2 remains partial: visual GUI interaction QA, saved/reopened layouts,
+fine-grained roles, quotas/audit, an OS-level worker sandbox, non-loopback TLS,
+and full operation coverage are not present. The upload demo uses a trusted
+fixture and an authenticated loopback service; it is not a hostile-sample or
+public-network security demonstration.

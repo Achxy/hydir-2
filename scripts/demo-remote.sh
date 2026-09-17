@@ -76,6 +76,8 @@ fi
 grep -q 'stale project revision' "$demo_dir/stale.err"
 "$client_bin" remote inspect "$alice_id" 1 > "$demo_dir/inspect.json"
 "$client_bin" remote cfg "$alice_id" 1 hydir_max2 > "$demo_dir/cfg.json"
+"$gui_bin" --probe-create-upload "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$demo_dir/max2-original" \
+  > "$demo_dir/gui-transfer-probe.txt"
 "$gui_bin" --probe-remote "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$alice_id" hydir_max2 \
   > "$demo_dir/gui-remote-probe.txt"
 "$client_bin" remote lift "$alice_id" 1 hydir_max2 --assume-u64x2 \

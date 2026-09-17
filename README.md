@@ -9,11 +9,12 @@ machine bytes to LLVM IR, differentially executes trusted fixtures on Linux
 x86-64, and exposes import/CFG/lift artifacts through a persistent local-only
 service.
 
-The `hydir` egui desktop workbench opens local ELF files and explicitly
-connects to existing authenticated loopback projects. It shows function facts,
+The `hydir` egui desktop workbench opens local ELF files and can create or
+open authenticated loopback projects. It shows function facts,
 reachable disassembly/CFG, LLVM IR, assumptions, and diagnostics in resizable
-panes. Opening a local binary never uploads it. GUI remote upload, saved
-layouts and C output are not yet implemented. It can start, monitor,
+panes. Opening a local binary never uploads it; sending a binary requires the
+separate, labelled remote-upload action and creates a new immutable revision.
+Saved layouts and C output are not yet implemented. It can start, monitor,
 cancel, and retrieve a remote lift job and display a conservative global-effect
 analysis. The local CLI has a named LLVM pass experiment for trusted fixtures;
 there is no GUI/remote pass editor. The analysis is not complete whole-program
@@ -48,7 +49,8 @@ On macOS with Docker Desktop, `bash scripts/demo-linux-docker.sh` builds the
 pinned Linux x86-64 development image and runs the tests plus demo there.
 On Linux x86-64, `bash scripts/demo-remote.sh` runs the separate-process,
 authenticated service/client fixture, including durable lift jobs, event
-replay, restart, cancellation, and cross-project denial checks. See
+replay, restart, cancellation, GUI create/upload logic, and cross-project
+denial checks. See
 [remote operation and threat model](docs/REMOTE.md).
 `bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
 global write and conservative treatment of an indirect call in a linked ELF.
