@@ -2316,6 +2316,15 @@ impl AnalystApp {
                 field(ui, "DIRECT CALLS", &summary.direct_callees.join(", "));
                 field(
                     ui,
+                    "OBSERVED SITES",
+                    &format!(
+                        "{} call · {} memory · partial recovery",
+                        summary.call_sites.len(),
+                        summary.reference_sites.len()
+                    ),
+                );
+                field(
+                    ui,
                     "POSSIBLE GLOBAL WRITES",
                     &format!("{} mapped addresses", summary.possible_global_writes.len()),
                 );
@@ -2729,6 +2738,67 @@ impl AnalystApp {
                                     .collect::<Vec<_>>()
                                     .join(", "),
                             );
+                            field(
+                                ui,
+                                "CALL SITES",
+                                &format!(
+                                    "{} observed within this symbol",
+                                    summary.call_sites.len()
+                                ),
+                            );
+                            for call in summary.call_sites.iter().take(24) {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "0x{:016x}  →  {}",
+                                        call.source.0,
+                                        call.target.map_or_else(
+                                            || "unresolved".to_owned(),
+                                            |target| format!("0x{:016x}", target.0)
+                                        )
+                                    ))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(if call.target.is_some() { TEXT } else { BAD }),
+                                );
+                            }
+                            if summary.call_sites.len() > 24 {
+                                ui.label(RichText::new("Showing first 24 call sites").color(MUTED));
+                            }
+                            field(
+                                ui,
+                                "MEMORY REFERENCES",
+                                &format!(
+                                    "{} observed within this symbol",
+                                    summary.reference_sites.len()
+                                ),
+                            );
+                            for reference in summary.reference_sites.iter().take(24) {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "0x{:016x}  →  {}",
+                                        reference.source.0,
+                                        reference.target.map_or_else(
+                                            || "unresolved".to_owned(),
+                                            |target| format!("0x{:016x}", target.0)
+                                        )
+                                    ))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(
+                                        if reference.target.is_some() {
+                                            TEXT
+                                        } else {
+                                            BAD
+                                        },
+                                    ),
+                                );
+                            }
+                            if summary.reference_sites.len() > 24 {
+                                ui.label(
+                                    RichText::new("Showing first 24 memory references")
+                                        .color(MUTED),
+                                );
+                            }
                         });
                     }
                 }

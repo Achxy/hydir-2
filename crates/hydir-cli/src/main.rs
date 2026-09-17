@@ -1,4 +1,4 @@
-use hydir_analysis::analyze_elf;
+use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
@@ -23,6 +23,7 @@ Usage:
   hydirctl doctor
   hydirctl inspect <elf>
   hydirctl analyze <linked-elf>
+  hydirctl analyze-spec <linked-elf>
   hydirctl cfg <elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
@@ -113,6 +114,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             let bytes = read_binary(&args[1])?;
             let report = analyze_elf(&bytes)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Some("analyze-spec") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            let spec = analyze_spec_elf(&bytes)?;
+            println!("{}", serde_json::to_string_pretty(&spec)?);
         }
         Some("cfg") if args.len() == 3 => {
             let bytes = read_binary(&args[1])?;

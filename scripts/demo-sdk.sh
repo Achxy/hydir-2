@@ -52,6 +52,14 @@ PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/smoke.py \
   "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$binary" hydir_max2 \
   "$demo_dir/output" > "$demo_dir/sdk-smoke.txt"
 test -s "$demo_dir/output/lifted.ll"
+clang -nostdlib -no-pie -Wl,-e,_start tests/fixtures/global_effects.S \
+  -o "$demo_dir/global-effects"
+PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/global_analysis.py \
+  "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$demo_dir/global-effects" \
+  "$demo_dir/analysis.json" "$demo_dir/analyzed-spec.json" > "$demo_dir/sdk-analysis.txt"
+grep -q '"unknown_global_effects": true' "$demo_dir/analysis.json"
+grep -q '"call_recovery": "partial"' "$demo_dir/analyzed-spec.json"
+grep -q '"reference_recovery": "partial"' "$demo_dir/analyzed-spec.json"
 if [[ -n "$rebuild_binary" ]]; then
   grep -q '"whole_rebuild": true' "$demo_dir/discover.json"
   PYTHONPATH="$repo_dir/sdk/python" "$python" sdk/python/examples/rebuild_program.py \

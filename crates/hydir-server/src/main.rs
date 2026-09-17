@@ -1,6 +1,6 @@
 //! Local-only, authenticated HydIR RPC slice. No sample execution endpoint.
 
-use hydir_analysis::analyze_elf;
+use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_api::v1::{
     ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
     FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, PatchReply,
@@ -669,6 +669,9 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("analyze", None) => analyze_elf(bytes)
             .map_err(|error| error.to_string())
             .and_then(|report| serde_json::to_vec(&report).map_err(|error| error.to_string())),
+        ("analyze-spec", None) => analyze_spec_elf(bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|spec| serde_json::to_vec(&spec).map_err(|error| error.to_string())),
         ("cfg", Some(symbol)) => recover_symbol_cfg(bytes, symbol)
             .map_err(|error| error.to_string())
             .and_then(|cfg| serde_json::to_vec(&cfg).map_err(|error| error.to_string())),
@@ -919,6 +922,7 @@ impl Hydir for Store {
             whole_rebuild: cfg!(all(target_os = "linux", target_arch = "x86_64"))
                 && Path::new("/usr/bin/opt-14").is_file()
                 && Path::new("/usr/bin/clang-14").is_file(),
+            analyzed_program_spec: true,
         }))
     }
 
@@ -1087,6 +1091,20 @@ impl Hydir for Store {
         Ok(Response::new(JsonReply {
             json: String::from_utf8(report)
                 .map_err(|_| Status::internal("worker returned non-UTF-8 analysis"))?,
+        }))
+    }
+
+    async fn analyze_spec(
+        &self,
+        request: Request<ProjectRequest>,
+    ) -> Result<Response<JsonReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let spec = run_worker("analyze-spec", None, bytes).await?;
+        Ok(Response::new(JsonReply {
+            json: String::from_utf8(spec)
+                .map_err(|_| Status::internal("worker returned non-UTF-8 analyzed model"))?,
         }))
     }
 

@@ -20,6 +20,7 @@ const HELP: &str = "Remote commands:
   hydirctl remote upload <project-id> <expected-revision> <elf>
   hydirctl remote inspect <project-id> <revision>
   hydirctl remote analyze <project-id> <revision>
+  hydirctl remote analyze-spec <project-id> <revision>
   hydirctl remote cfg <project-id> <revision> <function-symbol>
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
   hydirctl remote decompile <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.c>
@@ -154,6 +155,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "named_pass_transform": result.named_pass_transform,
                     "scalar_patch_v1": result.scalar_patch_v1,
                     "whole_rebuild": result.whole_rebuild,
+                    "analyzed_program_spec": result.analyzed_program_spec,
                 }))?
             );
         }
@@ -244,6 +246,19 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         [command, id, expected] if command == "analyze" => {
             let result = client
                 .analyze(authorized(
+                    ProjectRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            println!("{}", result.json);
+        }
+        [command, id, expected] if command == "analyze-spec" => {
+            let result = client
+                .analyze_spec(authorized(
                     ProjectRequest {
                         project_id: id.clone(),
                         expected_revision: revision(expected)?,

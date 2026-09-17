@@ -5,9 +5,13 @@
 //! as possible global effects rather than treated as pure.
 
 use hydir_backend::{HydirError, MAX_BINARY_BYTES, import_elf};
-use hydir_core::Address;
+use hydir_core::{
+    Address, AssumptionSpec, CallSpec, FactProvenance, FactSource, ProgramSpec, RecoveryState,
+    ReferenceSpec,
+};
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, OpAccess, OpKind, Register,
+    Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
+    Register,
 };
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -28,6 +32,11 @@ pub struct FunctionSummary {
     pub entry: Address,
     pub reachable_instructions: usize,
     pub direct_callees: Vec<String>,
+    /// Recovered instruction sites, including direct targets outside the
+    /// bounded symbol set and unknown indirect targets.
+    pub call_sites: Vec<CallSpec>,
+    /// Mapped-global targets where known; `None` means unresolved memory.
+    pub reference_sites: Vec<ReferenceSpec>,
     pub unresolved_targets: Vec<Address>,
     pub direct_global_reads: Vec<GlobalReference>,
     pub direct_global_writes: Vec<GlobalReference>,
@@ -69,6 +78,8 @@ struct DirectFacts {
     entry: u64,
     instruction_count: usize,
     callees: BTreeSet<usize>,
+    call_sites: BTreeSet<(Address, Option<Address>)>,
+    reference_sites: BTreeSet<(Address, Option<Address>)>,
     unresolved: BTreeSet<Address>,
     reads: BTreeSet<GlobalReference>,
     writes: BTreeSet<GlobalReference>,
@@ -171,6 +182,48 @@ pub fn analyze_elf(bytes: &[u8]) -> Result<AnalysisReport, HydirError> {
     Ok(report)
 }
 
+/// Join the bounded analysis facts to an ELF metadata inventory. This is a
+/// derived view, not a claim of whole-program recovery or persisted analyst
+/// assumptions. Omitted symbols and unresolved edges keep recovery partial.
+pub fn analyze_spec_elf(bytes: &[u8]) -> Result<ProgramSpec, HydirError> {
+    let report = analyze_elf(bytes)?;
+    let mut spec = import_elf(bytes)?;
+    for summary in &report.functions {
+        spec.calls.extend(summary.call_sites.iter().cloned());
+        spec.references
+            .extend(summary.reference_sites.iter().cloned());
+        if let Some(function) = spec
+            .functions
+            .iter_mut()
+            .find(|function| function.name == summary.name && function.address == summary.entry)
+        {
+            function.control_flow_status = if summary.recovery_complete_within_symbol {
+                "reachable instructions recovered within bounded symbol; not whole-program complete"
+            } else {
+                "partial reachable recovery within bounded symbol"
+            }
+            .to_owned();
+        }
+    }
+    spec.call_recovery = RecoveryState::Partial;
+    spec.reference_recovery = RecoveryState::Partial;
+    spec.assumptions.push(AssumptionSpec {
+        id: format!("sha256:{}:analysis-contract:1", spec.binary_sha256),
+        statement: report.assumption,
+        scope: report.scope,
+        provenance: FactProvenance {
+            source: FactSource::NativeAnalysis,
+            scope: "HydIR bounded global-effects analysis contract".to_owned(),
+        },
+    });
+    spec.recovery_scope = format!(
+        "ELF metadata plus bounded analysis of {} symbolized functions; {} skipped; calls/references remain partial",
+        report.functions.len(),
+        report.skipped_functions.len()
+    );
+    Ok(spec)
+}
+
 fn analyze_inputs(inputs: &[FunctionInput], regions: &[GlobalRegion]) -> AnalysisReport {
     let by_address: BTreeMap<u64, usize> = inputs
         .iter()
@@ -212,7 +265,7 @@ fn analyze_inputs(inputs: &[FunctionInput], regions: &[GlobalRegion]) -> Analysi
         }
     }
     AnalysisReport {
-        schema_version: 1,
+        schema_version: 2,
         binary_sha256: String::new(),
         scope: "Reachable instructions inside bounded ELF text symbols; only direct calls to selected symbol entries are resolved. Listed global addresses are may-accesses, not exhaustive when unknown_global_effects is true.".to_owned(),
         assumption: "Linked x86-64 ELF virtual addresses; call/return stack bookkeeping is treated as stack-local under the System V AMD64 stack contract. No other register-based memory access is assumed stack-local.".to_owned(),
@@ -229,6 +282,24 @@ fn analyze_inputs(inputs: &[FunctionInput], regions: &[GlobalRegion]) -> Analysi
                     .iter()
                     .map(|callee| direct[*callee].name.clone())
                     .collect(),
+                call_sites: facts
+                    .call_sites
+                    .iter()
+                    .map(|(source, target)| CallSpec {
+                        source: *source,
+                        target: *target,
+                        provenance: analysis_site_provenance(),
+                    })
+                    .collect(),
+                reference_sites: facts
+                    .reference_sites
+                    .iter()
+                    .map(|(source, target)| ReferenceSpec {
+                        source: *source,
+                        target: *target,
+                        provenance: analysis_site_provenance(),
+                    })
+                    .collect(),
                 unresolved_targets: facts.unresolved.iter().copied().collect(),
                 direct_global_reads: facts.reads.iter().cloned().collect(),
                 direct_global_writes: facts.writes.iter().cloned().collect(),
@@ -239,6 +310,13 @@ fn analyze_inputs(inputs: &[FunctionInput], regions: &[GlobalRegion]) -> Analysi
                 scc_id: scc[index],
             })
             .collect(),
+    }
+}
+
+fn analysis_site_provenance() -> FactProvenance {
+    FactProvenance {
+        source: FactSource::NativeAnalysis,
+        scope: "reachable instruction within a bounded ELF text symbol".to_owned(),
     }
 }
 
@@ -301,7 +379,7 @@ fn analyze_function(
             }
             if matches!(
                 instruction.flow_control(),
-                FlowControl::Call | FlowControl::Return
+                FlowControl::Call | FlowControl::IndirectCall | FlowControl::Return
             ) && memory.base() == Register::RSP
                 && memory.index() == Register::None
             {
@@ -328,9 +406,15 @@ fn analyze_function(
                     })
                 })
             }) else {
+                facts
+                    .reference_sites
+                    .insert((Address(instruction.ip()), address.map(Address)));
                 facts.unknown = true;
                 continue;
             };
+            facts
+                .reference_sites
+                .insert((Address(instruction.ip()), Some(reference.address)));
             let size = memory.memory_size().size() as u64;
             if size == 0
                 || reference
@@ -378,6 +462,9 @@ fn analyze_function(
                     if let Some(callee) = by_address.get(&target)
                         && (target < input.entry || target >= end)
                     {
+                        facts
+                            .call_sites
+                            .insert((Address(instruction.ip()), Some(Address(target))));
                         facts.callees.insert(*callee); // direct tail call
                     } else {
                         pending.push_back(target);
@@ -388,17 +475,28 @@ fn analyze_function(
                 }
             }
             FlowControl::Call => {
-                if let Some(target) = direct_target.and_then(|target| by_address.get(&target)) {
-                    facts.callees.insert(*target);
-                } else {
-                    facts.unknown = true;
+                if instruction.mnemonic() == Mnemonic::Call {
                     facts
-                        .unresolved
-                        .insert(Address(direct_target.unwrap_or(instruction.ip())));
+                        .call_sites
+                        .insert((Address(instruction.ip()), direct_target.map(Address)));
+                    if let Some(target) = direct_target.and_then(|target| by_address.get(&target)) {
+                        facts.callees.insert(*target);
+                    } else {
+                        facts.unknown = true;
+                        facts
+                            .unresolved
+                            .insert(Address(direct_target.unwrap_or(instruction.ip())));
+                    }
+                } else {
+                    // SYSCALL and similar control transfers are external
+                    // effects, not function-call graph edges.
+                    facts.unknown = true;
+                    facts.unresolved.insert(Address(instruction.ip()));
                 }
                 pending.push_back(next);
             }
             FlowControl::IndirectCall => {
+                facts.call_sites.insert((Address(instruction.ip()), None));
                 facts.unknown = true;
                 facts.unresolved.insert(Address(instruction.ip()));
                 pending.push_back(next);
@@ -496,6 +594,19 @@ mod tests {
             writing.functions[0].possible_global_writes[0].address,
             Address(0x3000)
         );
+        assert_eq!(writing.functions[0].call_sites[0].source, Address(0x1000));
+        assert_eq!(
+            writing.functions[0].call_sites[0].target,
+            Some(Address(0x2000))
+        );
+        assert_eq!(
+            writing.functions[1].reference_sites[0].source,
+            Address(0x2000)
+        );
+        assert_eq!(
+            writing.functions[1].reference_sites[0].target,
+            Some(Address(0x3000))
+        );
     }
 
     #[test]
@@ -510,6 +621,41 @@ mod tests {
         );
         assert!(report.functions[0].unknown_global_effects);
         assert_eq!(report.functions[0].unresolved_targets, [Address(0x2000)]);
+        assert_eq!(
+            report.functions[0].call_sites[0].target,
+            Some(Address(0x2000))
+        );
+    }
+
+    #[test]
+    fn indirect_call_keeps_unknown_target_and_effects() {
+        let report = analyze_inputs(
+            &[FunctionInput {
+                name: "caller".to_owned(),
+                entry: 0x1000,
+                code: vec![0xff, 0xd0, 0xc3], // call rax; ret
+            }],
+            &[],
+        );
+        assert_eq!(report.functions[0].call_sites.len(), 1);
+        assert_eq!(report.functions[0].call_sites[0].source, Address(0x1000));
+        assert_eq!(report.functions[0].call_sites[0].target, None);
+        assert!(report.functions[0].reference_sites.is_empty());
+        assert!(report.functions[0].unknown_global_effects);
+    }
+
+    #[test]
+    fn syscall_is_not_invented_as_a_function_call() {
+        let report = analyze_inputs(
+            &[FunctionInput {
+                name: "entry".to_owned(),
+                entry: 0x1000,
+                code: vec![0x0f, 0x05], // syscall
+            }],
+            &[],
+        );
+        assert!(report.functions[0].call_sites.is_empty());
+        assert!(report.functions[0].unknown_global_effects);
     }
 
     #[test]

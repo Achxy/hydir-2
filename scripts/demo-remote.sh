@@ -68,6 +68,7 @@ start_server
 grep -q '"named_pass_transform": true' "$demo_dir/discovery.json"
 grep -q '"scalar_patch_v1": true' "$demo_dir/discovery.json"
 grep -q '"whole_rebuild": true' "$demo_dir/discovery.json"
+grep -q '"analyzed_program_spec": true' "$demo_dir/discovery.json"
 "$client_bin" remote create Alice-demo request-alice-1 > "$demo_dir/alice-project.json"
 alice_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/alice-project.json")"
 test -n "$alice_id"
@@ -133,9 +134,13 @@ effects_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/effects-p
 test -n "$effects_id"
 "$client_bin" remote upload "$effects_id" 0 "$demo_dir/global-effects" > "$demo_dir/effects-upload.json"
 "$client_bin" remote analyze "$effects_id" 1 > "$demo_dir/effects-analysis.json"
+"$client_bin" remote analyze-spec "$effects_id" 1 > "$demo_dir/effects-analyzed-spec.json"
 grep -q '"direct_callees":\["hydir_leaf"\]' "$demo_dir/effects-analysis.json"
 grep -q '"section":".data"' "$demo_dir/effects-analysis.json"
 grep -q '"unknown_global_effects":true' "$demo_dir/effects-analysis.json"
+grep -q '"call_recovery":"partial"' "$demo_dir/effects-analyzed-spec.json"
+grep -q '"reference_recovery":"partial"' "$demo_dir/effects-analyzed-spec.json"
+grep -q '"source":"native_analysis"' "$demo_dir/effects-analyzed-spec.json"
 
 "$client_bin" remote create Alice-transform request-alice-transform-1 > "$demo_dir/transform-project.json"
 transform_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/transform-project.json")"
@@ -309,6 +314,11 @@ if "$client_bin" remote analyze "$effects_id" 1 > "$demo_dir/denied-analysis.out
   exit 1
 fi
 grep -q 'project not found' "$demo_dir/denied-analysis.err"
+if "$client_bin" remote analyze-spec "$effects_id" 1 > "$demo_dir/denied-spec.out" 2> "$demo_dir/denied-spec.err"; then
+  echo "Bob unexpectedly analyzed Alice's specification" >&2
+  exit 1
+fi
+grep -q 'project not found' "$demo_dir/denied-spec.err"
 if "$client_bin" remote transform "$transform_id" 1 hydir_max2 bob-denied-transform \
   --assume-u64x2 --trusted-fixture --passes dce \
   --output-dir "$demo_dir/denied-transform" \

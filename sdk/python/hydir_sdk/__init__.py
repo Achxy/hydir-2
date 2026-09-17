@@ -136,6 +136,13 @@ class HydirClient:
         )
         return json.loads(reply.json)
 
+    def analyze_spec(self, project_id: str, revision: int) -> dict:
+        reply = self._call(
+            self._stub.AnalyzeSpec,
+            proto.ProjectRequest(project_id=project_id, expected_revision=revision),
+        )
+        return json.loads(reply.json)
+
     def recover_cfg(self, project_id: str, revision: int, symbol: str) -> dict:
         reply = self._call(
             self._stub.RecoverCfg,

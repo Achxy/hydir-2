@@ -39,6 +39,7 @@ cargo run --locked --bin hydir -- --open-local /path/to/program.elf function_nam
 cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
 cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
+cargo run --locked --bin hydirctl -- analyze-spec /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
 cargo run --locked --bin hydirctl -- decompile /path/to/program.elf function_name --assume-u64x2 --output lifted.c
@@ -69,7 +70,8 @@ replay, restart, cancellation, GUI create/upload logic, and cross-project
 denial checks. See
 [remote operation and threat model](docs/REMOTE.md).
 `bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
-global write and conservative treatment of an indirect call in a linked ELF.
+global write, conservative treatment of an indirect call, and a partial
+`ProgramSpec` with provenance-bearing call/reference instruction sites.
 `bash scripts/demo-passes.sh` saves raw, canonical before, and after LLVM IR;
 it verifies the named pipeline with pinned LLVM `opt` 14.0.6 and compares a
 transformed trusted fixture on eight boundary inputs. An IR change and a

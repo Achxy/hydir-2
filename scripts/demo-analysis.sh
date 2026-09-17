@@ -15,6 +15,13 @@ clang -nostdlib -no-pie -Wl,-e,_start \
   tests/fixtures/global_effects.S -o "$demo_dir/global-effects"
 cargo run --quiet --locked --bin hydirctl -- analyze "$demo_dir/global-effects" \
   > "$demo_dir/analysis.json"
+cargo run --quiet --locked --bin hydirctl -- analyze-spec "$demo_dir/global-effects" \
+  > "$demo_dir/analyzed-spec.json"
+grep -q '"call_recovery": "partial"' "$demo_dir/analyzed-spec.json"
+grep -q '"reference_recovery": "partial"' "$demo_dir/analyzed-spec.json"
+grep -q '"target": null' "$demo_dir/analyzed-spec.json"
+grep -q 'analysis-contract:1' "$demo_dir/analyzed-spec.json"
+grep -q '"source": "native_analysis"' "$demo_dir/analyzed-spec.json"
 awk '
   /"name": "hydir_parent"/ { in_parent=1; next }
   in_parent && /"name": / { exit }
@@ -29,5 +36,5 @@ awk '
   in_indirect && /"unknown_global_effects": true/ { unknown=1 }
   END { if (!unknown) exit 1 }
 ' "$demo_dir/analysis.json"
-echo "HydIR cross-function global-effect analysis passed"
+echo "HydIR cross-function global-effect analysis and analyzed specification passed"
 echo "HydIR analysis artifacts: $demo_dir"
