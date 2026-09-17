@@ -34,7 +34,9 @@ a 64-character random credential once. Save it to a private file (mode 0600),
 then start `hydird serve <database.sqlite> 127.0.0.1:50051`. Set
 `HYDIR_ENDPOINT=http://127.0.0.1:50051` and `HYDIR_TOKEN_FILE` to that file
 before running `hydirctl remote discover`. `hydirctl remote` without arguments
-prints available operations, including `analyze` for a linked ELF project.
+prints available operations, including `analyze` and `analyze-spec` for a
+linked ELF project. The latter returns a partial, provenance-bearing
+`ProgramSpec`; it does not claim all call or memory-reference sites.
 `hydird identity rotate` replaces a principal's
 credential and immediately revokes its predecessor.
 
@@ -44,7 +46,8 @@ existing project ID. Opening never uploads. To send bytes, enter an ELF path
 and press **Upload ELF to remote project**; this creates an immutable revision.
 The workbench checks discovery version, project revision, model hash,
 and returned IR/C artifact digests. It supports inspect/CFG/lift/scalar-C, a bounded
-global-effect report, and lift-job start/monitor/cancel/artifact retrieval.
+global-effect report with bounded call/reference sites, and lift-job
+start/monitor/cancel/artifact retrieval.
 The **Passes** tab runs the named pass pipeline and shows verified before/after
 IR. The Inspector requires a visible trusted-fixture assertion before remote
 whole-executable rebuilding, then permits hash-checked ELF export only to a
@@ -62,7 +65,8 @@ source archive, its revision and digest, and the explicit CLI download command.
 
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is
-recorded. A revision precondition is required for upload, inspect, analyze, CFG, and
+recorded. A revision precondition is required for upload, inspect, analyze,
+analyze-spec, CFG, and
 lift. Patch v1 additionally requires an exact input hash, explicit
 trusted-fixture/prototype/entry-only assertions, and an idempotency key. It
 creates a new immutable binary revision and an owner-scoped ELF artifact;

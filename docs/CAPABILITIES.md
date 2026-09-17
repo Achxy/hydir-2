@@ -18,14 +18,18 @@ file-derived sections, loadable segments with file/memory extents and
 permissions, imports, section and dynamic relocations, and ELF symbol facts.
 Relocation records retain raw ELF type flags when the generic parser cannot
 classify them. Dynamic relocation targets use the dynamic symbol table, not
-the separate debugging symbol table. Empty call/reference arrays are paired
-with explicit `not_attempted` states and are not interpreted as no calls or
-references. Inventory count and metadata-name caps bound inspection output.
+the separate debugging symbol table. Plain `inspect` still pairs empty
+call/reference arrays with explicit `not_attempted` states; emptiness is not
+evidence of no calls or references. The separate `analyze-spec` operation
+joins bounded reachable-symbol call and memory-reference instruction sites
+with native-analysis provenance. It marks both recovery states `partial`,
+retains unknown targets as null, and records its analysis contract as an
+assumption. Inventory count and metadata-name caps bound inspection output.
 An ELF with generic System V OSABI is labelled `x86_64-unknown-elf` rather
 than asserting Linux from the OSABI alone. A separate, versioned
 `FunctionCfg` records reachable one-instruction blocks, original bytes,
 direct edges, and provenance for a selected symbol or supplied entry. The
-global model still lacks recovered call/reference facts and actual
+global model still lacks complete call/reference recovery and actual
 analyst-supplied assumption persistence. The separate service has SQLite project and immutable binary
 revisions, but those are not yet integrated into `ProgramSpec`. These are
 versioned starting models, not the complete contract in the implementation

@@ -9,6 +9,7 @@ service Hydir {
   rpc UploadBinary (UploadBinaryRequest) returns (ProjectReply);
   rpc Inspect (ProjectRequest) returns (JsonReply);
   rpc Analyze (ProjectRequest) returns (JsonReply);
+  rpc AnalyzeSpec (ProjectRequest) returns (JsonReply);
   rpc RecoverCfg (FunctionRequest) returns (JsonReply);
   rpc Lift (FunctionRequest) returns (ArtifactReply);
   rpc Decompile (FunctionRequest) returns (ArtifactReply);
@@ -42,6 +43,7 @@ message DiscoverReply {
   bool named_pass_transform = 16;
   bool scalar_patch_v1 = 17;
   bool whole_rebuild = 18;
+  bool analyzed_program_spec = 19;
 }
 message SourceRequest {}
 message SourceReply {

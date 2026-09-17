@@ -1,5 +1,44 @@
 # HydIR evidence — 2026-09-18
 
+## Bounded analyzed-program overlay — 2026-09-18
+
+The `analyze-spec` operation joins symbol-bounded call and memory-reference
+instruction sites to the v2 ELF inventory. Five analysis unit tests now
+check direct call targets, mapped-global references, unresolved/indirect
+calls, recursive effect propagation, and that a syscall is not fabricated as
+an ordinary function call. The ordinary `inspect` result still reports
+`not_attempted` call/reference recovery; the analyzed view reports
+`partial`. Both outputs retain string-encoded virtual addresses and an
+explicit SHA-256 identity.
+
+On macOS, `cargo test --locked --offline --workspace` passed **40 Rust
+tests**. Seven Python SDK unit tests passed using the pinned local SDK
+environment. `cargo fmt --all`, `git diff --check`, and `bash -n` for the
+modified demo scripts passed. The installed pinned macOS Rust toolchain does
+not provide an applicable Clippy binary, so no final-tree Clippy result is
+claimed here. The generated Python protobuf bindings were regenerated with
+`grpcio-tools==1.84.0` and imported by the SDK unit suite.
+
+A separate local authenticated `hydird`/`hydirctl` loopback test on macOS
+used the linked `global-effects` ELF from the retained trusted fixture
+artifacts. Discovery advertised `analyzed_program_spec`; explicit upload and
+`remote analyze-spec` returned partial call/reference states, a nullable
+indirect target, and the analysis-contract assumption. A second identity's
+cross-project `analyze-spec` request was denied. The Python
+`examples/global_analysis.py` client uploaded the fixture through the SDK
+and saved both the report and analyzed specification. Retained non-secret
+outputs are under `target/demo-analyzed-spec-mac/`. The two generated token
+files were removed after the service stopped; the ignored test database and
+project artifacts must still not be published.
+
+The updated Linux `demo-analysis.sh`, `demo-remote.sh`, and `demo-sdk.sh`
+assert this operation, but were **not run** on this final tree. Docker
+Desktop did not become responsive during this run; its older backend log
+records a no-space startup error, which is not proof of the current cause.
+The prior Linux corpus and rebuild counts below belong to earlier commits,
+not a fresh run of this overlay. No broader recovery or hostile-input claim
+follows from the macOS RPC test.
+
 ## Upstream revision and notice boundary — 2026-09-18
 
 `git ls-remote` and a fresh 405-path checkout both resolved IRENE-3 `main`

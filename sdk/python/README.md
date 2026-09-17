@@ -24,7 +24,9 @@ LLVM verification is not
 behavioral equivalence. `examples/pass_experiment.py` demonstrates the
 explicit upload, named pass request, and no-overwrite artifact export.
 `examples/global_analysis.py` saves the conservative cross-function report
-through the typed `Analyze` operation.
+and a partial `ProgramSpec` with provenance-bearing call/reference sites
+through the typed `Analyze` and `AnalyzeSpec` operations. It needs two new,
+distinct output paths and does not claim complete control-flow recovery.
 `rebuild(...)` requires an explicit trusted-fixture assertion. It creates a
 new immutable binary revision and returns digest-checked ELF/IR/report
 artifacts without executing the ELF. `examples/rebuild_program.py` shows
