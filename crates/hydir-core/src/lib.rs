@@ -4,6 +4,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const SPEC_VERSION: u32 = 1;
+pub const PROGRAM_SPEC_VERSION: u32 = 2;
 
 /// JSON addresses are strings so no consumer can round a 64-bit address via f64.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -35,12 +36,127 @@ pub struct ProgramSpec {
     pub abi: String,
     pub file_kind: String,
     pub image_base: Option<Address>,
+    pub entry_point: Option<Address>,
     pub data_layout: Option<String>,
+    /// Address space zero is the ELF process image for linked files. No
+    /// runtime load bias is asserted for position-independent executables.
+    pub address_spaces: Vec<AddressSpaceSpec>,
+    /// PT_LOAD mappings, distinct from file-derived sections.
+    pub mapped_segments: Vec<MappedSegmentSpec>,
     /// Sections are file-derived. They are not a reconstructed runtime image.
     pub sections: Vec<SectionSpec>,
     pub functions: Vec<FunctionSpec>,
+    pub imports: Vec<ImportSpec>,
+    pub relocations: Vec<RelocationSpec>,
+    /// Empty collections are not negative facts while recovery is unattempted.
+    pub calls: Vec<CallSpec>,
+    pub references: Vec<ReferenceSpec>,
+    pub call_recovery: RecoveryState,
+    pub reference_recovery: RecoveryState,
+    pub assumptions: Vec<AssumptionSpec>,
     pub recovery_scope: String,
     pub unresolved_control_flow: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AddressSpaceSpec {
+    pub id: u32,
+    pub name: String,
+    pub address_kind: AddressKind,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MappedSegmentSpec {
+    pub id: String,
+    pub address_space: u32,
+    pub virtual_address: Address,
+    pub memory_size: u64,
+    pub file_offset: Address,
+    pub file_size: u64,
+    pub alignment: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportSpec {
+    pub library: String,
+    pub name: String,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelocationSpec {
+    pub location: Address,
+    pub address_kind: AddressKind,
+    pub source_section: Option<String>,
+    pub kind: String,
+    pub encoding: String,
+    /// Format-specific relocation flags preserve ELF type when the generic
+    /// object API reports `Unknown`.
+    pub format_flags: String,
+    pub size_bits: u8,
+    pub addend: i64,
+    pub implicit_addend: bool,
+    pub target: RelocationTargetSpec,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RelocationTargetSpec {
+    Symbol { id: String, name: Option<String> },
+    Section { name: String },
+    Absolute,
+    Unresolved { description: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallSpec {
+    pub source: Address,
+    pub target: Option<Address>,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReferenceSpec {
+    pub source: Address,
+    pub target: Option<Address>,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryState {
+    NotAttempted,
+    Partial,
+    Complete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AssumptionSpec {
+    pub id: String,
+    pub statement: String,
+    pub scope: String,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FactProvenance {
+    pub source: FactSource,
+    pub scope: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactSource {
+    ElfMetadata,
+    NativeAnalysis,
+    AnalystAssertion,
+    ValidationEvidence,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

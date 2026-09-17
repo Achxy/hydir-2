@@ -17,6 +17,16 @@ clang -O0 -no-pie tests/fixtures/add2.S tests/fixtures/add2_main.c -o "$demo_dir
 clang -c tests/fixtures/unsupported.S -o "$demo_dir/unsupported.o"
 cargo build --locked --bin hydirctl
 "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" inspect "$demo_dir/add2-original" > "$demo_dir/program-spec.json"
+grep -q '"schema_version": 2' "$demo_dir/program-spec.json"
+grep -q '"mapped_segments": \[' "$demo_dir/program-spec.json"
+grep -q '"file_size":' "$demo_dir/program-spec.json"
+grep -q '"call_recovery": "not_attempted"' "$demo_dir/program-spec.json"
+awk '
+  /"relocations": \[/ { in_relocations=1; next }
+  in_relocations && /"calls": \[/ { exit }
+  in_relocations && /"name": "__libc_start_main"/ { found=1 }
+  END { if (!found) exit 1 }
+' "$demo_dir/program-spec.json"
 "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" lift "$demo_dir/add2-original" hydir_add2 --assume-u64x2 --output "$demo_dir/add2-lifted.ll"
 if "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" lift "$demo_dir/unsupported.o" hydir_unsupported --assume-u64x2 > "$demo_dir/unsupported.ll" 2> "$demo_dir/unsupported-diagnostic.txt"; then
   echo "unsupported fixture unexpectedly lifted" >&2

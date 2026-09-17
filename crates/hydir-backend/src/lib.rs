@@ -9,11 +9,14 @@ mod cfg;
 pub use cfg::lift_cfg;
 
 use hydir_core::{
-    Address, AddressKind, FunctionCfg, FunctionSpec, ProgramSpec, SPEC_VERSION, SectionSpec,
+    Address, AddressKind, AddressSpaceSpec, FactProvenance, FactSource, FunctionCfg, FunctionSpec,
+    ImportSpec, MappedSegmentSpec, PROGRAM_SPEC_VERSION, ProgramSpec, RecoveryState,
+    RelocationSpec, RelocationTargetSpec, SectionSpec,
 };
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
-    Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind,
+    Architecture, BinaryFormat, Object, ObjectSection, ObjectSegment, ObjectSymbol,
+    ObjectSymbolTable, RelocationTarget, SectionKind, SymbolKind,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, error::Error, fmt};
@@ -31,6 +34,12 @@ impl Error for HydirError {}
 
 pub type Result<T> = std::result::Result<T, HydirError>;
 pub const MAX_BINARY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SPEC_SECTIONS: usize = 4096;
+const MAX_SPEC_SEGMENTS: usize = 128;
+const MAX_SPEC_FUNCTIONS: usize = 8192;
+const MAX_SPEC_IMPORTS: usize = 8192;
+const MAX_SPEC_RELOCATIONS: usize = 32768;
+const MAX_METADATA_NAME_BYTES: usize = 4096;
 
 fn error(message: impl Into<String>) -> HydirError {
     HydirError(message.into())
@@ -61,15 +70,98 @@ pub fn import_elf(bytes: &[u8]) -> Result<ProgramSpec> {
     };
     let sections = file
         .sections()
-        .map(|section| SectionSpec {
-            name: section.name().unwrap_or("<invalid-name>").to_owned(),
-            address: Address(section.address()),
-            address_kind,
-            file_offset: section.file_range().map(|(offset, _)| Address(offset)),
-            size: section.size(),
-            kind: format!("{:?}", section.kind()),
+        .take(MAX_SPEC_SECTIONS + 1)
+        .map(|section| {
+            Ok(SectionSpec {
+                name: bounded_name(section.name().unwrap_or("<invalid-name>"))?,
+                address: Address(section.address()),
+                address_kind,
+                file_offset: section.file_range().map(|(offset, _)| Address(offset)),
+                size: section.size(),
+                kind: format!("{:?}", section.kind()),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
+    ensure_inventory_limit("sections", sections.len(), MAX_SPEC_SECTIONS)?;
+    let mapped_segments = file
+        .segments()
+        .enumerate()
+        .take(MAX_SPEC_SEGMENTS + 1)
+        .map(|(index, segment)| {
+            let (offset, file_size) = segment.file_range();
+            let permissions = segment.permissions();
+            MappedSegmentSpec {
+                id: format!("sha256:{digest}:load:{index}"),
+                address_space: 0,
+                virtual_address: Address(segment.address()),
+                memory_size: segment.size(),
+                file_offset: Address(offset),
+                file_size,
+                alignment: segment.align(),
+                readable: permissions.readable(),
+                writable: permissions.writable(),
+                executable: permissions.executable(),
+                provenance: elf_metadata("PT_LOAD program header"),
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure_inventory_limit("load segments", mapped_segments.len(), MAX_SPEC_SEGMENTS)?;
+    let raw_imports = file
+        .imports()
+        .map_err(|e| error(format!("ELF import inventory failed: {e}")))?;
+    ensure_inventory_limit("imports", raw_imports.len(), MAX_SPEC_IMPORTS)?;
+    let imports = raw_imports
+        .into_iter()
+        .map(|import| {
+            Ok(ImportSpec {
+                library: byte_label(import.library())?,
+                name: byte_label(import.name())?,
+                provenance: elf_metadata("ELF dynamic import table"),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut relocations = Vec::new();
+    for section in file.sections() {
+        let section_name = bounded_name(section.name().unwrap_or("<invalid-name>"))?;
+        for (offset, relocation) in section.relocations() {
+            ensure_inventory_slot("relocations", relocations.len(), MAX_SPEC_RELOCATIONS)?;
+            let location = section
+                .address()
+                .checked_add(offset)
+                .ok_or_else(|| error(format!("relocation address overflows in {section_name}")))?;
+            relocations.push(RelocationSpec {
+                location: Address(location),
+                address_kind,
+                source_section: Some(section_name.clone()),
+                kind: format!("{:?}", relocation.kind()),
+                encoding: format!("{:?}", relocation.encoding()),
+                format_flags: format!("{:?}", relocation.flags()),
+                size_bits: relocation.size(),
+                addend: relocation.addend(),
+                implicit_addend: relocation.has_implicit_addend(),
+                target: relocation_target(&file, relocation.target(), &digest, false)?,
+                provenance: elf_metadata("ELF section relocation"),
+            });
+        }
+    }
+    if let Some(dynamic_relocations) = file.dynamic_relocations() {
+        for (location, relocation) in dynamic_relocations {
+            ensure_inventory_slot("relocations", relocations.len(), MAX_SPEC_RELOCATIONS)?;
+            relocations.push(RelocationSpec {
+                location: Address(location),
+                address_kind: AddressKind::Virtual,
+                source_section: None,
+                kind: format!("{:?}", relocation.kind()),
+                encoding: format!("{:?}", relocation.encoding()),
+                format_flags: format!("{:?}", relocation.flags()),
+                size_bits: relocation.size(),
+                addend: relocation.addend(),
+                implicit_addend: relocation.has_implicit_addend(),
+                target: relocation_target(&file, relocation.target(), &digest, true)?,
+                provenance: elf_metadata("ELF dynamic relocation"),
+            });
+        }
+    }
     let functions = file
         .symbols()
         .filter(|symbol| {
@@ -78,33 +170,162 @@ pub fn import_elf(bytes: &[u8]) -> Result<ProgramSpec> {
                 && symbol.size() > 0
                 && symbol.section_index().is_some()
         })
-        .map(|symbol| FunctionSpec {
-            id: format!("sha256:{digest}:symbol:{:?}", symbol.index()),
-            name: symbol.name().unwrap_or("<invalid-name>").to_owned(),
-            address: Address(symbol.address()),
-            address_kind,
-            section_name: symbol
-                .section_index()
-                .and_then(|index| file.section_by_index(index).ok())
-                .and_then(|section| section.name().ok().map(str::to_owned))
-                .unwrap_or_else(|| "<invalid-name>".to_owned()),
-            size: symbol.size(),
-            provenance: "ELF symbol table".to_owned(),
-            control_flow_status: "not recovered".to_owned(),
+        .take(MAX_SPEC_FUNCTIONS + 1)
+        .map(|symbol| {
+            Ok(FunctionSpec {
+                id: format!("sha256:{digest}:symbol:{:?}", symbol.index()),
+                name: bounded_name(symbol.name().unwrap_or("<invalid-name>"))?,
+                address: Address(symbol.address()),
+                address_kind,
+                section_name: symbol
+                    .section_index()
+                    .and_then(|index| file.section_by_index(index).ok())
+                    .and_then(|section| section.name().ok().map(str::to_owned))
+                    .map(|name| bounded_name(&name))
+                    .transpose()?
+                    .unwrap_or_else(|| "<invalid-name>".to_owned()),
+                size: symbol.size(),
+                provenance: "ELF symbol table".to_owned(),
+                control_flow_status: "not recovered".to_owned(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
+    ensure_inventory_limit("functions", functions.len(), MAX_SPEC_FUNCTIONS)?;
     Ok(ProgramSpec {
-        schema_version: SPEC_VERSION,
+        schema_version: PROGRAM_SPEC_VERSION,
         binary_sha256: digest,
-        target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+        target_triple: elf_target_triple(file.flags()).to_owned(),
         abi: "System V AMD64 (target convention; individual prototypes unknown)".to_owned(),
         file_kind: format!("{:?}", file.kind()),
         image_base: None,
+        entry_point: (file.kind() != object::ObjectKind::Relocatable && file.entry() != 0)
+            .then(|| Address(file.entry())),
         data_layout: None,
+        address_spaces: (address_kind == AddressKind::Virtual)
+            .then(|| AddressSpaceSpec {
+                id: 0,
+                name: "ELF process virtual memory".to_owned(),
+                address_kind: AddressKind::Virtual,
+                provenance: elf_metadata("linked ELF virtual address space"),
+            })
+            .into_iter()
+            .collect(),
+        mapped_segments,
         sections,
         functions,
-        recovery_scope: "ELF symbol table only; no stripped-code discovery".to_owned(),
+        imports,
+        relocations,
+        calls: Vec::new(),
+        references: Vec::new(),
+        call_recovery: RecoveryState::NotAttempted,
+        reference_recovery: RecoveryState::NotAttempted,
+        assumptions: Vec::new(),
+        recovery_scope: "ELF metadata inventory only; calls, references, and stripped-code discovery not attempted".to_owned(),
         unresolved_control_flow: true,
+    })
+}
+
+fn ensure_inventory_limit(label: &str, count: usize, limit: usize) -> Result<()> {
+    if count > limit {
+        return Err(error(format!(
+            "ELF {label} exceed inspection limit of {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_inventory_slot(label: &str, count: usize, limit: usize) -> Result<()> {
+    if count >= limit {
+        return Err(error(format!(
+            "ELF {label} exceed inspection limit of {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_name(name: &str) -> Result<String> {
+    if name.len() > MAX_METADATA_NAME_BYTES {
+        return Err(error(format!(
+            "ELF metadata name exceeds {MAX_METADATA_NAME_BYTES}-byte inspection limit"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+fn elf_target_triple(flags: object::FileFlags) -> &'static str {
+    match flags {
+        object::FileFlags::Elf { os_abi, .. } if os_abi == object::elf::ELFOSABI_LINUX => {
+            "x86_64-unknown-linux-gnu"
+        }
+        object::FileFlags::Elf { os_abi, .. } if os_abi == object::elf::ELFOSABI_FREEBSD => {
+            "x86_64-unknown-freebsd"
+        }
+        _ => "x86_64-unknown-elf",
+    }
+}
+
+fn elf_metadata(scope: &str) -> FactProvenance {
+    FactProvenance {
+        source: FactSource::ElfMetadata,
+        scope: scope.to_owned(),
+    }
+}
+
+fn byte_label(bytes: &[u8]) -> Result<String> {
+    if bytes.len() > MAX_METADATA_NAME_BYTES {
+        return Err(error(format!(
+            "ELF import name exceeds {MAX_METADATA_NAME_BYTES}-byte inspection limit"
+        )));
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(name) => Ok(name.to_owned()),
+        Err(_) => Ok(format!(
+            "hex:{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )),
+    }
+}
+
+fn relocation_target(
+    file: &object::File<'_>,
+    target: RelocationTarget,
+    digest: &str,
+    dynamic: bool,
+) -> Result<RelocationTargetSpec> {
+    Ok(match target {
+        RelocationTarget::Symbol(index) => RelocationTargetSpec::Symbol {
+            id: format!(
+                "sha256:{digest}:{}:{index:?}",
+                if dynamic { "dynamic-symbol" } else { "symbol" }
+            ),
+            name: if dynamic {
+                file.dynamic_symbol_table()
+                    .and_then(|table| table.symbol_by_index(index).ok())
+                    .and_then(|symbol| symbol.name().ok().map(str::to_owned))
+            } else {
+                file.symbol_by_index(index)
+                    .ok()
+                    .and_then(|symbol| symbol.name().ok().map(str::to_owned))
+            }
+            .map(|name| bounded_name(&name))
+            .transpose()?,
+        },
+        RelocationTarget::Section(index) => RelocationTargetSpec::Section {
+            name: bounded_name(
+                &file
+                    .section_by_index(index)
+                    .ok()
+                    .and_then(|section| section.name().ok().map(str::to_owned))
+                    .unwrap_or_else(|| format!("<invalid-section:{index:?}>")),
+            )?,
+        },
+        RelocationTarget::Absolute => RelocationTargetSpec::Absolute,
+        other => RelocationTargetSpec::Unresolved {
+            description: format!("{other:?}"),
+        },
     })
 }
 
@@ -468,5 +689,34 @@ mod tests {
         // mov rax,[rdi]; ret
         let err = lift_linear(&[0x48, 0x8b, 0x07, 0xc3], 0).unwrap_err();
         assert!(err.0.contains("unsupported Mov"));
+    }
+
+    #[test]
+    fn metadata_inventory_limits_are_explicit() {
+        assert!(ensure_inventory_limit("sections", MAX_SPEC_SECTIONS, MAX_SPEC_SECTIONS).is_ok());
+        assert!(
+            ensure_inventory_limit("sections", MAX_SPEC_SECTIONS + 1, MAX_SPEC_SECTIONS)
+                .unwrap_err()
+                .0
+                .contains("sections exceed")
+        );
+        assert!(bounded_name(&"x".repeat(MAX_METADATA_NAME_BYTES)).is_ok());
+        assert!(bounded_name(&"x".repeat(MAX_METADATA_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn generic_elf_osabi_is_not_claimed_as_linux() {
+        let flags = object::FileFlags::Elf {
+            os_abi: object::elf::ELFOSABI_SYSV,
+            abi_version: 0,
+            e_flags: 0,
+        };
+        assert_eq!(elf_target_triple(flags), "x86_64-unknown-elf");
+        let flags = object::FileFlags::Elf {
+            os_abi: object::elf::ELFOSABI_LINUX,
+            abi_version: 0,
+            e_flags: 0,
+        };
+        assert_eq!(elf_target_triple(flags), "x86_64-unknown-linux-gnu");
     }
 }

@@ -1,5 +1,40 @@
 # HydIR evidence — 2026-09-18
 
+## ProgramSpec v2 inventory and bounded inspection — 2026-09-18
+
+The native ELF inspection path now reports `PT_LOAD` file/memory mappings and
+permissions, the ELF entry, dynamic imports, section/dynamic relocations, and
+typed provenance. Dynamic relocation targets are resolved against `.dynsym`;
+the first live inspection exposed and corrected a wrong ordinary-symbol-table
+lookup. Calls/references remain explicitly `not_attempted`, and the OS is not
+inferred as Linux from a generic System V ELF OSABI. Count/name limits reject
+excessive metadata rather than emitting an unbounded inspection response.
+
+On the final v2 tree, a pinned Linux x86-64 Docker run of `cargo test --locked
+--workspace` passed **38 Rust tests**, workspace `cargo clippy --locked
+--workspace --all-targets -- -D warnings` passed, and
+`scripts/demo-analysis.sh`, `scripts/demo-remote.sh`, and
+`scripts/demo-recompile.sh` all exited 0. Their new artifacts are
+`target/demo-analysis/run.nQuJK6/`, `target/demo-remote/run.gEnOHw/`, and
+`target/demo-recompile/run.fjsI5n/`. The remote test again exercised v2
+inspection through a separate authenticated client/server and project
+reopening; the three complete-program fixtures again matched all five
+controlled stdout/stderr/exit cases.
+
+Before adding the final metadata limits, `scripts/demo-linux-docker.sh`
+passed the workspace test/Clippy stages and the complete local scalar and
+stripped-function differential demo in `target/demo-local/run.fiV0GX/`.
+The local v2 fixture asserted nonempty load mapping data, unrecovered call
+state, and a correctly named dynamic relocation target. The integrated run
+was intentionally stopped during the 16-function corpus after the first
+function passed 1,008/1,008 raw-LLVM/native and 1,008/1,008 compiled-C/native
+cases. It is **not** counted as a completed integrated run for this commit.
+The earlier full 21,168-pair corpus result below is for the preceding code
+revision; the scalar lift/C backends were not modified in this v2 change.
+The current complete local demo result precedes only the metadata bounds,
+which are covered by final-tree unit, remote, and rebuild gates. No general
+equivalence or hostile-input safety claim follows from these fixtures.
+
 ## Shared local/remote rebuild and workbench operations — 2026-09-18
 
 `bash scripts/demo-linux-docker.sh` exited 0 on the macOS Apple Silicon host
