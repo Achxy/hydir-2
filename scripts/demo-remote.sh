@@ -85,6 +85,24 @@ grep -q '"schema_version":1' "$demo_dir/inspect.json"
 if command -v opt >/dev/null 2>&1; then
   opt -passes=verify -disable-output "$demo_dir/remote-lift.ll"
 fi
+"$client_bin" remote job-start-lift "$alice_id" 1 hydir_max2 alice-lift-job-1 --assume-u64x2 \
+  > "$demo_dir/alice-job-start.json"
+alice_job_id="$(sed -n 's/.*"job_id": "\([^"]*\)".*/\1/p' "$demo_dir/alice-job-start.json")"
+test -n "$alice_job_id"
+"$client_bin" remote job-start-lift "$alice_id" 1 hydir_max2 alice-lift-job-1 --assume-u64x2 \
+  > "$demo_dir/alice-job-retry.json"
+grep -q "$alice_job_id" "$demo_dir/alice-job-retry.json"
+for _ in {1..40}; do
+  "$client_bin" remote job "$alice_id" "$alice_job_id" > "$demo_dir/alice-job.json"
+  if grep -q '"state": "succeeded"' "$demo_dir/alice-job.json"; then
+    break
+  fi
+  sleep 0.25
+done
+grep -q '"state": "succeeded"' "$demo_dir/alice-job.json"
+"$client_bin" remote job-events "$alice_id" "$alice_job_id" 0 > "$demo_dir/alice-job-events.jsonl"
+grep -q '"state":"queued"' "$demo_dir/alice-job-events.jsonl"
+grep -q '"state":"succeeded"' "$demo_dir/alice-job-events.jsonl"
 
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
@@ -94,6 +112,10 @@ start_server
 "$client_bin" remote artifact "$alice_id" "$artifact_sha" \
   --output "$demo_dir/after-restart.ll" > "$demo_dir/artifact.json"
 cmp "$demo_dir/remote-lift.ll" "$demo_dir/after-restart.ll"
+"$client_bin" remote job "$alice_id" "$alice_job_id" > "$demo_dir/alice-job-after-restart.json"
+grep -q '"state": "succeeded"' "$demo_dir/alice-job-after-restart.json"
+"$client_bin" remote job-events "$alice_id" "$alice_job_id" 0 > "$demo_dir/alice-job-events-replayed.jsonl"
+cmp "$demo_dir/alice-job-events.jsonl" "$demo_dir/alice-job-events-replayed.jsonl"
 
 export HYDIR_TOKEN_FILE="$demo_dir/bob.token"
 "$client_bin" remote create Bob-demo request-bob-1 > "$demo_dir/bob-project.json"
@@ -107,6 +129,18 @@ if "$client_bin" remote lift "$bob_id" 1 hydir_unsupported --assume-u64x2 \
   exit 1
 fi
 grep -q 'unsupported Push' "$demo_dir/unsupported.err"
+"$client_bin" remote job-start-lift "$bob_id" 1 hydir_unsupported bob-lift-job-1 --assume-u64x2 \
+  > "$demo_dir/bob-job-start.json"
+bob_job_id="$(sed -n 's/.*"job_id": "\([^"]*\)".*/\1/p' "$demo_dir/bob-job-start.json")"
+test -n "$bob_job_id"
+"$client_bin" remote job-cancel "$bob_id" "$bob_job_id" > "$demo_dir/bob-job-cancel.json"
+grep -Eq '"state": "(cancelled|failed)"' "$demo_dir/bob-job-cancel.json"
+"$client_bin" remote job-events "$bob_id" "$bob_job_id" 0 > "$demo_dir/bob-job-events.jsonl"
+if "$client_bin" remote job "$alice_id" "$alice_job_id" > "$demo_dir/denied-job.out" 2> "$demo_dir/denied-job.err"; then
+  echo "Bob unexpectedly accessed Alice's job" >&2
+  exit 1
+fi
+grep -q 'job not found' "$demo_dir/denied-job.err"
 if "$client_bin" remote project "$alice_id" > "$demo_dir/denied-project.out" 2> "$demo_dir/denied-project.err"; then
   echo "Bob unexpectedly accessed Alice's project" >&2
   exit 1

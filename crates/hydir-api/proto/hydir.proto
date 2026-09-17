@@ -10,6 +10,10 @@ service Hydir {
   rpc RecoverCfg (FunctionRequest) returns (JsonReply);
   rpc Lift (FunctionRequest) returns (ArtifactReply);
   rpc GetArtifact (ArtifactRequest) returns (ArtifactReply);
+  rpc StartLiftJob (StartLiftJobRequest) returns (JobReply);
+  rpc GetJob (JobRequest) returns (JobReply);
+  rpc CancelJob (JobRequest) returns (JobReply);
+  rpc StreamJobEvents (JobEventRequest) returns (stream JobEvent);
 }
 
 message DiscoverRequest {}
@@ -22,6 +26,9 @@ message DiscoverReply {
   bool scalar_direct_cfg_lift = 6;
   bool execution_validation = 7;
   uint64 max_binary_bytes = 8;
+  bool durable_lift_jobs = 9;
+  bool reconnectable_job_events = 10;
+  bool job_cancellation = 11;
 }
 message CreateProjectRequest {
   string name = 1;
@@ -59,4 +66,36 @@ message ArtifactReply {
   string media_type = 2;
   bytes content = 3;
   uint64 project_revision = 4;
+}
+message StartLiftJobRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string function_symbol = 3;
+  bool assume_u64x2 = 4;
+  string idempotency_key = 5;
+}
+message JobRequest {
+  string project_id = 1;
+  string job_id = 2;
+}
+message JobReply {
+  string project_id = 1;
+  string job_id = 2;
+  uint64 project_revision = 3;
+  string kind = 4;
+  string state = 5;
+  string artifact_sha256 = 6;
+  string diagnostic = 7;
+}
+message JobEventRequest {
+  string project_id = 1;
+  string job_id = 2;
+  uint64 after_sequence = 3;
+}
+message JobEvent {
+  uint64 sequence = 1;
+  string job_id = 2;
+  string state = 3;
+  string message = 4;
+  string artifact_sha256 = 5;
 }

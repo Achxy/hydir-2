@@ -14,6 +14,7 @@ hydir-api = { path = "../hydir-api" }
 hydir-backend = { path = "../hydir-backend" }
 tonic.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true
 sha2.workspace = true

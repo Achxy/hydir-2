@@ -13,7 +13,7 @@ The `hydir` egui desktop workbench opens local ELF files and explicitly
 connects to existing authenticated loopback projects. It shows function facts,
 reachable disassembly/CFG, LLVM IR, assumptions, and diagnostics in resizable
 panes. Opening a local binary never uploads it. GUI remote upload, saved
-layouts, full jobs, passes, C output, and whole-program analysis are not yet
+layouts, remote job controls, passes, C output, and whole-program analysis are not yet
 implemented.
 
 ## Build and inspect
@@ -42,8 +42,9 @@ are written to a fresh `target/demo-local/run.*` directory.
 On macOS with Docker Desktop, `bash scripts/demo-linux-docker.sh` builds the
 pinned Linux x86-64 development image and runs the tests plus demo there.
 On Linux x86-64, `bash scripts/demo-remote.sh` runs the separate-process,
-authenticated service/client fixture, including restart and cross-project
-denial checks. See [remote operation and threat model](docs/REMOTE.md).
+authenticated service/client fixture, including durable lift jobs, event
+replay, restart, cancellation, and cross-project denial checks. See
+[remote operation and threat model](docs/REMOTE.md).
 
 The `validate` command runs the original binary and lifted runner **without a
 sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.

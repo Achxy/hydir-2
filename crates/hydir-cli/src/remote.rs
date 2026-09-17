@@ -2,8 +2,9 @@
 
 use super::{read_binary, write_new_or_identical};
 use hydir_api::v1::{
-    ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, ProjectReply,
-    ProjectRequest, UploadBinaryRequest, hydir_client::HydirClient,
+    ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest, JobEventRequest,
+    JobReply, JobRequest, ProjectReply, ProjectRequest, StartLiftJobRequest, UploadBinaryRequest,
+    hydir_client::HydirClient,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -19,6 +20,10 @@ const HELP: &str = "Remote commands:
   hydirctl remote cfg <project-id> <revision> <function-symbol>
   hydirctl remote lift <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.ll>
   hydirctl remote artifact <project-id> <sha256> --output <file>
+  hydirctl remote job-start-lift <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2
+  hydirctl remote job <project-id> <job-id>
+  hydirctl remote job-cancel <project-id> <job-id>
+  hydirctl remote job-events <project-id> <job-id> <after-sequence>
 
 Set HYDIR_ENDPOINT=http://127.0.0.1:50051 and HYDIR_TOKEN_FILE to a private
 credential file. No remote binary upload occurs except the explicit upload command.
@@ -42,6 +47,18 @@ fn project_json(project: ProjectReply) -> serde_json::Value {
         "name": project.name,
         "revision": project.revision,
         "binary_sha256": project.binary_sha256,
+    })
+}
+
+fn job_json(job: JobReply) -> serde_json::Value {
+    json!({
+        "project_id": job.project_id,
+        "job_id": job.job_id,
+        "project_revision": job.project_revision,
+        "kind": job.kind,
+        "state": job.state,
+        "artifact_sha256": job.artifact_sha256,
+        "diagnostic": job.diagnostic,
     })
 }
 
@@ -98,6 +115,9 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "scalar_direct_cfg_lift": result.scalar_direct_cfg_lift,
                     "execution_validation": result.execution_validation,
                     "max_binary_bytes": result.max_binary_bytes,
+                    "durable_lift_jobs": result.durable_lift_jobs,
+                    "reconnectable_job_events": result.reconnectable_job_events,
+                    "job_cancellation": result.job_cancellation,
                 }))?
             );
         }
@@ -217,6 +237,64 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "project_revision": result.project_revision, "output": file,
                 }))?
             );
+        }
+        [command, id, expected, symbol, key, assume]
+            if command == "job-start-lift" && assume == "--assume-u64x2" =>
+        {
+            let job = client
+                .start_lift_job(authorized(
+                    StartLiftJobRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                        function_symbol: symbol.clone(),
+                        assume_u64x2: true,
+                        idempotency_key: key.clone(),
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            println!("{}", serde_json::to_string_pretty(&job_json(job))?);
+        }
+        [command, id, job_id] if command == "job" || command == "job-cancel" => {
+            let request = authorized(
+                JobRequest {
+                    project_id: id.clone(),
+                    job_id: job_id.clone(),
+                },
+                &credential,
+            );
+            let job = if command == "job" {
+                client.get_job(request).await?.into_inner()
+            } else {
+                client.cancel_job(request).await?.into_inner()
+            };
+            println!("{}", serde_json::to_string_pretty(&job_json(job))?);
+        }
+        [command, id, job_id, after] if command == "job-events" => {
+            let mut events = client
+                .stream_job_events(authorized(
+                    JobEventRequest {
+                        project_id: id.clone(),
+                        job_id: job_id.clone(),
+                        after_sequence: revision(after)?,
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            while let Some(event) = events.message().await? {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "sequence": event.sequence,
+                        "job_id": event.job_id,
+                        "state": event.state,
+                        "message": event.message,
+                        "artifact_sha256": event.artifact_sha256,
+                    }))?
+                );
+            }
         }
         _ => return Err(HELP.into()),
     }
