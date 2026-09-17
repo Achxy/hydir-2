@@ -3,13 +3,17 @@
 use hydir_analysis::analyze_elf;
 use hydir_api::v1::{
     ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply, DiscoverRequest,
-    FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, ProjectReply,
-    ProjectRequest, SourceReply, SourceRequest, StartLiftJobRequest, UploadBinaryRequest,
+    FunctionRequest, JobEvent, JobEventRequest, JobReply, JobRequest, JsonReply, PatchReply,
+    PatchRequest, ProjectReply, ProjectRequest, SourceReply, SourceRequest, StartLiftJobRequest,
+    TransformReply, TransformRequest, UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
+use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
+use hydir_transform::{parse_passes, transform};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 #[cfg(not(test))]
 use std::process::Stdio;
@@ -105,6 +109,41 @@ PRAGMA user_version=2;
 COMMIT;
 ";
 
+const PATCH_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE patch_requests (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    patch_sha256 TEXT NOT NULL,
+    new_revision INTEGER NOT NULL,
+    binary_sha256 TEXT NOT NULL,
+    PRIMARY KEY(project_id, idempotency_key)
+);
+PRAGMA user_version=3;
+COMMIT;
+";
+
+const TRANSFORM_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE transform_requests (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    new_revision INTEGER NOT NULL,
+    raw_sha256 TEXT NOT NULL,
+    before_sha256 TEXT NOT NULL,
+    after_sha256 TEXT NOT NULL,
+    report_sha256 TEXT NOT NULL,
+    ir_text_changed INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    PRIMARY KEY(project_id, idempotency_key)
+);
+PRAGMA user_version=4;
+COMMIT;
+";
+
 #[derive(Clone)]
 struct Store {
     db: Arc<Mutex<Connection>>,
@@ -138,7 +177,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 2 {
+        if version > 4 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -146,6 +185,12 @@ impl Store {
         }
         if version <= 1 {
             connection.execute_batch(JOBS_MIGRATION)?;
+        }
+        if version <= 2 {
+            connection.execute_batch(PATCH_MIGRATION)?;
+        }
+        if version <= 3 {
+            connection.execute_batch(TRANSFORM_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -420,6 +465,107 @@ fn valid_symbol(symbol: &str) -> Result<(), Status> {
     Ok(())
 }
 
+struct TransformRecord {
+    expected: i64,
+    request_sha256: String,
+    revision: i64,
+    raw_sha256: String,
+    before_sha256: String,
+    after_sha256: String,
+    report_sha256: String,
+    changed: i64,
+    report_json: String,
+}
+
+fn transform_replay(
+    conn: &Connection,
+    project_id: &str,
+    key: &str,
+    expected: i64,
+    request_sha256: &str,
+) -> Result<Option<TransformReply>, Status> {
+    let prior: Option<TransformRecord> = conn
+        .query_row(
+            "SELECT expected_revision,request_sha256,new_revision,raw_sha256,before_sha256,after_sha256,report_sha256,ir_text_changed,report_json FROM transform_requests WHERE project_id=?1 AND idempotency_key=?2",
+            params![project_id, key],
+            |row| Ok(TransformRecord {
+                expected: row.get(0)?,
+                request_sha256: row.get(1)?,
+                revision: row.get(2)?,
+                raw_sha256: row.get(3)?,
+                before_sha256: row.get(4)?,
+                after_sha256: row.get(5)?,
+                report_sha256: row.get(6)?,
+                changed: row.get(7)?,
+                report_json: row.get(8)?,
+            }),
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some(prior) = prior else {
+        return Ok(None);
+    };
+    if prior.expected != expected || prior.request_sha256 != request_sha256 {
+        return Err(Status::already_exists(
+            "idempotency key belongs to a different transform request",
+        ));
+    }
+    Ok(Some(TransformReply {
+        project_id: project_id.to_owned(),
+        project_revision: prior.revision as u64,
+        raw_sha256: prior.raw_sha256,
+        before_sha256: prior.before_sha256,
+        after_sha256: prior.after_sha256,
+        report_sha256: prior.report_sha256,
+        ir_text_changed: prior.changed != 0,
+        report_json: prior.report_json,
+    }))
+}
+
+fn pack_transform_parts(parts: &[&[u8]; 4]) -> Result<Vec<u8>, String> {
+    let total = 16usize
+        .checked_add(parts.iter().map(|part| part.len()).sum::<usize>())
+        .ok_or("transform output size overflow")?;
+    if total > MAX_WORKER_OUTPUT {
+        return Err("transform artifacts exceed 16 MiB worker output limit".to_owned());
+    }
+    let mut packed = Vec::with_capacity(total);
+    for part in parts {
+        let size = u32::try_from(part.len()).map_err(|_| "transform artifact too large")?;
+        packed.extend_from_slice(&size.to_le_bytes());
+    }
+    for part in parts {
+        packed.extend_from_slice(part);
+    }
+    Ok(packed)
+}
+
+fn unpack_transform_parts(bytes: &[u8]) -> Result<[&[u8]; 4], Status> {
+    let mut cursor = 16usize;
+    let mut parts = [&[][..]; 4];
+    for (index, part) in parts.iter_mut().enumerate() {
+        let offset = index * 4;
+        let size = u32::from_le_bytes(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| Status::internal("transform worker returned a short header"))?
+                .try_into()
+                .map_err(|_| Status::internal("transform worker returned a bad header"))?,
+        ) as usize;
+        let end = cursor
+            .checked_add(size)
+            .ok_or_else(|| Status::internal("transform worker length overflow"))?;
+        *part = bytes
+            .get(cursor..end)
+            .ok_or_else(|| Status::internal("transform worker returned a truncated artifact"))?;
+        cursor = end;
+    }
+    if cursor != bytes.len() {
+        return Err(Status::internal("transform worker returned trailing bytes"));
+    }
+    Ok(parts)
+}
+
 fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<Vec<u8>, String> {
     match (action, symbol) {
         ("inspect", None) => import_elf(bytes)
@@ -438,6 +584,53 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             .map_err(|error| error.to_string())
             .and_then(|ir| emit_c(&ir))
             .map(String::into_bytes),
+        ("transform", Some(symbol)) => {
+            let pass_length = *bytes.first().ok_or("transform worker lacks pass list")? as usize;
+            let pass_bytes = bytes
+                .get(1..1 + pass_length)
+                .ok_or("transform worker pass list is truncated")?;
+            let passes =
+                std::str::from_utf8(pass_bytes).map_err(|_| "transform pass list is not UTF-8")?;
+            parse_passes(passes)?;
+            let binary = bytes
+                .get(1 + pass_length..)
+                .ok_or("transform worker lacks binary")?;
+            let raw_ir = lift_symbol(binary, symbol).map_err(|error| error.to_string())?;
+            let result = transform(&raw_ir, passes, Path::new("/usr/bin/opt-14"))?;
+            let report = json!({
+                "scope": "trusted function fixture; LLVM verification only, not behavioral equivalence",
+                "binary_sha256": sha256(binary),
+                "function": symbol,
+                "prototype_assertion": "u64(u64,u64) System V AMD64",
+                "pipeline": result.pipeline,
+                "llvm_version": result.llvm_version,
+                "raw_ir_sha256": sha256(&result.raw),
+                "before_ir_sha256": sha256(&result.before),
+                "after_ir_sha256": sha256(&result.after),
+                "ir_text_changed": result.before != result.after,
+                "llvm_verified": true,
+            });
+            let report = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+            pack_transform_parts(&[&result.raw, &result.before, &result.after, &report])
+        }
+        ("patch", None) => {
+            let length_bytes: [u8; 4] = bytes
+                .get(..4)
+                .ok_or("patch worker input lacks a length prefix")?
+                .try_into()
+                .map_err(|_| "invalid patch length prefix")?;
+            let patch_length = u32::from_le_bytes(length_bytes) as usize;
+            if patch_length == 0 || patch_length > MAX_PATCH_BYTES {
+                return Err("patch document exceeds worker limit".to_owned());
+            }
+            let end = 4usize
+                .checked_add(patch_length)
+                .ok_or("patch envelope length overflow")?;
+            let patch_json = bytes.get(4..end).ok_or("patch envelope is truncated")?;
+            let binary = bytes.get(end..).ok_or("patch envelope lacks binary")?;
+            let patch = parse_patch_json(patch_json)?;
+            patch_binary(binary, &patch).map(|result| result.content)
+        }
         _ => Err("unsupported worker operation".to_owned()),
     }
 }
@@ -599,6 +792,9 @@ impl Hydir for Store {
             } else {
                 sha256(SOURCE_ARCHIVE)
             },
+            named_pass_transform: cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                && Path::new("/usr/bin/opt-14").is_file(),
+            scalar_patch_v1: true,
         }))
     }
 
@@ -836,6 +1032,264 @@ impl Hydir for Store {
             media_type: "text/x-csrc".to_owned(),
             content,
             project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn transform(
+        &self,
+        request: Request<TransformRequest>,
+    ) -> Result<Response<TransformReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.assume_u64x2 || !input.trusted_fixture {
+            return Err(Status::invalid_argument(
+                "transform requires u64x2 and trusted-fixture assertions",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        parse_passes(&input.passes).map_err(Status::invalid_argument)?;
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "transform idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        self.project(&principal, &input.project_id)?;
+        let request_sha256 =
+            sha256(format!("{}\0{}", input.function_symbol, input.passes).as_bytes());
+        let prior = {
+            let conn = self.connection()?;
+            transform_replay(
+                &conn,
+                &input.project_id,
+                &input.idempotency_key,
+                expected,
+                &request_sha256,
+            )?
+        };
+        if let Some(prior) = prior {
+            return Ok(Response::new(prior));
+        }
+        let pass_length = u8::try_from(input.passes.len())
+            .map_err(|_| Status::invalid_argument("pass list is too long"))?;
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary_sha256 = sha256(&binary);
+        let mut envelope = Vec::with_capacity(1 + input.passes.len() + binary.len());
+        envelope.push(pass_length);
+        envelope.extend_from_slice(input.passes.as_bytes());
+        envelope.extend_from_slice(&binary);
+        let packed = run_worker("transform", Some(&input.function_symbol), envelope).await?;
+        let parts = unpack_transform_parts(&packed)?;
+        let report_json = String::from_utf8(parts[3].to_vec())
+            .map_err(|_| Status::internal("transform report is not UTF-8"))?;
+        let digests = parts.map(sha256);
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            if let Some(prior) = transform_replay(
+                &tx,
+                &input.project_id,
+                &input.idempotency_key,
+                expected,
+                &request_sha256,
+            )? {
+                return Ok(Response::new(prior));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
+                    params![input.project_id, principal],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            tx.execute(
+                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+                params![input.project_id, next, binary_sha256],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "UPDATE projects SET current_revision=?1 WHERE id=?2",
+                params![next, input.project_id],
+            )
+            .map_err(internal)?;
+            for (index, (media_type, part)) in [
+                ("text/x-llvm-ir", parts[0]),
+                ("text/x-llvm-ir", parts[1]),
+                ("text/x-llvm-ir", parts[2]),
+                ("application/json", parts[3]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
+                    params![input.project_id, next, digests[index], media_type, part],
+                ).map_err(internal)?;
+            }
+            tx.execute(
+                "INSERT INTO transform_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision,raw_sha256,before_sha256,after_sha256,report_sha256,ir_text_changed,report_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![input.project_id, input.idempotency_key, expected, request_sha256, next, digests[0], digests[1], digests[2], digests[3], i64::from(parts[1] != parts[2]), report_json],
+            ).map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        }
+        Ok(Response::new(TransformReply {
+            project_id: input.project_id,
+            project_revision: next as u64,
+            raw_sha256: digests[0].clone(),
+            before_sha256: digests[1].clone(),
+            after_sha256: digests[2].clone(),
+            report_sha256: digests[3].clone(),
+            ir_text_changed: parts[1] != parts[2],
+            report_json,
+        }))
+    }
+
+    async fn apply_patch(
+        &self,
+        request: Request<PatchRequest>,
+    ) -> Result<Response<PatchReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.trusted_fixture || !input.assume_u64x2 || !input.assume_entry_only {
+            return Err(Status::invalid_argument(
+                "patch requires trusted-fixture, u64x2, and entry-only assertions",
+            ));
+        }
+        if input.patch_json.is_empty() || input.patch_json.len() > MAX_PATCH_BYTES {
+            return Err(Status::invalid_argument(
+                "patch document must be 1..=4096 bytes",
+            ));
+        }
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "patch idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        self.project(&principal, &input.project_id)?;
+        let patch_digest = sha256(&input.patch_json);
+        let prior: Option<(i64, String, i64, String)> = self
+            .connection()?
+            .query_row(
+                "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
+                params![input.project_id, input.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some((prior_expected, prior_digest, revision, binary_sha256)) = prior {
+            if prior_expected != expected || prior_digest != patch_digest {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to a different patch request",
+                ));
+            }
+            return Ok(Response::new(PatchReply {
+                project_id: input.project_id,
+                revision: revision as u64,
+                artifact_sha256: binary_sha256.clone(),
+                binary_sha256,
+            }));
+        }
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        if binary.len() > MAX_WORKER_OUTPUT {
+            return Err(Status::resource_exhausted(
+                "remote patch binary exceeds 16 MiB worker output limit",
+            ));
+        }
+        let patch_length = u32::try_from(input.patch_json.len())
+            .map_err(|_| Status::invalid_argument("patch document too long"))?;
+        let mut envelope = Vec::with_capacity(4 + input.patch_json.len() + binary.len());
+        envelope.extend_from_slice(&patch_length.to_le_bytes());
+        envelope.extend_from_slice(&input.patch_json);
+        envelope.extend_from_slice(&binary);
+        let patched = run_worker("patch", None, envelope).await?;
+        if patched.len() != binary.len() {
+            return Err(Status::internal("patch worker changed ELF file size"));
+        }
+        let binary_sha256 = sha256(&patched);
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            let raced: Option<(i64, String, i64, String)> = tx
+                .query_row(
+                    "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
+                    params![input.project_id, input.idempotency_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(internal)?;
+            if let Some((prior_expected, prior_digest, revision, prior_binary_sha)) = raced {
+                if prior_expected != expected || prior_digest != patch_digest {
+                    return Err(Status::already_exists(
+                        "idempotency key belongs to a different patch request",
+                    ));
+                }
+                return Ok(Response::new(PatchReply {
+                    project_id: input.project_id,
+                    revision: revision as u64,
+                    artifact_sha256: prior_binary_sha.clone(),
+                    binary_sha256: prior_binary_sha,
+                }));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
+                    params![input.project_id, principal],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
+                params![binary_sha256, patched],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+                params![input.project_id, next, binary_sha256],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "UPDATE projects SET current_revision=?1 WHERE id=?2",
+                params![next, input.project_id],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO artifacts(project_id,revision,sha256,media_type,content) SELECT ?1,?2,sha256,'application/x-elf',content FROM binaries WHERE sha256=?3",
+                params![input.project_id, next, binary_sha256],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO patch_requests(project_id,idempotency_key,expected_revision,patch_sha256,new_revision,binary_sha256) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![input.project_id, input.idempotency_key, expected, patch_digest, next, binary_sha256],
+            )
+            .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+        }
+        Ok(Response::new(PatchReply {
+            project_id: input.project_id,
+            revision: next as u64,
+            artifact_sha256: binary_sha256.clone(),
+            binary_sha256,
         }))
     }
 
@@ -1278,6 +1732,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_requires_assertions_and_project_ownership() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "patch target".to_owned(),
+                    idempotency_key: "patch-project".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = PatchRequest {
+            project_id: project.project_id,
+            expected_revision: 0,
+            patch_json: b"{}".to_vec(),
+            idempotency_key: "patch-1".to_owned(),
+            trusted_fixture: false,
+            assume_u64x2: true,
+            assume_entry_only: true,
+        };
+        let denied = store
+            .apply_patch(authorized(request.clone(), &alice))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+        let denied = store
+            .apply_patch(authorized(
+                PatchRequest {
+                    trusted_fixture: true,
+                    ..request
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn transform_requires_assertions_and_project_ownership() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "transform target".to_owned(),
+                    idempotency_key: "transform-project".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = TransformRequest {
+            project_id: project.project_id,
+            expected_revision: 0,
+            function_symbol: "function".to_owned(),
+            assume_u64x2: true,
+            trusted_fixture: false,
+            passes: "dce".to_owned(),
+            idempotency_key: "transform-1".to_owned(),
+        };
+        let denied = store
+            .transform(authorized(request.clone(), &alice))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::InvalidArgument);
+        let denied = store
+            .transform(authorized(
+                TransformRequest {
+                    trusted_fixture: true,
+                    ..request
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
     async fn malformed_upload_and_unasserted_lift_are_denied() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let token = store.create_identity("analyst").unwrap();
@@ -1357,7 +1897,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=3;")
+            .execute_batch("PRAGMA user_version=5;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -1391,7 +1931,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
     }
 

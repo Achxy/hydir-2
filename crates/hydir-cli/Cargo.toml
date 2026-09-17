@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 hydir-backend = { path = "../hydir-backend" }
 hydir-c = { path = "../hydir-c" }
+hydir-patch = { path = "../hydir-patch" }
+hydir-transform = { path = "../hydir-transform" }
 hydir-analysis = { path = "../hydir-analysis" }
 hydir-api = { path = "../hydir-api" }
 object.workspace = true

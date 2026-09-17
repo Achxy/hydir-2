@@ -1,0 +1,9 @@
+[package]
+name = "hydir-transform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tempfile = "3.23"

@@ -12,6 +12,8 @@ service Hydir {
   rpc RecoverCfg (FunctionRequest) returns (JsonReply);
   rpc Lift (FunctionRequest) returns (ArtifactReply);
   rpc Decompile (FunctionRequest) returns (ArtifactReply);
+  rpc Transform (TransformRequest) returns (TransformReply);
+  rpc ApplyPatch (PatchRequest) returns (PatchReply);
   rpc GetArtifact (ArtifactRequest) returns (ArtifactReply);
   rpc StartLiftJob (StartLiftJobRequest) returns (JobReply);
   rpc GetJob (JobRequest) returns (JobReply);
@@ -36,6 +38,8 @@ message DiscoverReply {
   bool scalar_c_output = 13;
   string source_revision = 14;
   string source_sha256 = 15;
+  bool named_pass_transform = 16;
+  bool scalar_patch_v1 = 17;
 }
 message SourceRequest {}
 message SourceReply {
@@ -68,6 +72,40 @@ message FunctionRequest {
   uint64 expected_revision = 2;
   string function_symbol = 3;
   bool assume_u64x2 = 4;
+}
+message PatchRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  bytes patch_json = 3;
+  string idempotency_key = 4;
+  bool trusted_fixture = 5;
+  bool assume_u64x2 = 6;
+  bool assume_entry_only = 7;
+}
+message TransformRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string function_symbol = 3;
+  bool assume_u64x2 = 4;
+  bool trusted_fixture = 5;
+  string passes = 6;
+  string idempotency_key = 7;
+}
+message TransformReply {
+  string project_id = 1;
+  uint64 project_revision = 2;
+  string raw_sha256 = 3;
+  string before_sha256 = 4;
+  string after_sha256 = 5;
+  string report_sha256 = 6;
+  bool ir_text_changed = 7;
+  string report_json = 8;
+}
+message PatchReply {
+  string project_id = 1;
+  uint64 revision = 2;
+  string binary_sha256 = 3;
+  string artifact_sha256 = 4;
 }
 message JsonReply { string json = 1; }
 message ArtifactRequest {

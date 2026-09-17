@@ -63,6 +63,8 @@ start_server() {
 }
 
 start_server
+grep -q '"named_pass_transform": true' "$demo_dir/discovery.json"
+grep -q '"scalar_patch_v1": true' "$demo_dir/discovery.json"
 "$client_bin" remote create Alice-demo request-alice-1 > "$demo_dir/alice-project.json"
 alice_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/alice-project.json")"
 test -n "$alice_id"
@@ -132,17 +134,94 @@ grep -q '"direct_callees":\["hydir_leaf"\]' "$demo_dir/effects-analysis.json"
 grep -q '"section":".data"' "$demo_dir/effects-analysis.json"
 grep -q '"unknown_global_effects":true' "$demo_dir/effects-analysis.json"
 
+"$client_bin" remote create Alice-transform request-alice-transform-1 > "$demo_dir/transform-project.json"
+transform_id="$(sed -n 's/.*"project_id": "\([^"]*\)".*/\1/p' "$demo_dir/transform-project.json")"
+test -n "$transform_id"
+"$client_bin" remote upload "$transform_id" 0 "$demo_dir/max2-original" > "$demo_dir/transform-upload.json"
+"$client_bin" remote transform "$transform_id" 1 hydir_max2 alice-transform-1 \
+  --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce \
+  --output-dir "$demo_dir/remote-transform" > "$demo_dir/transform-reply.json"
+grep -q '"llvm_verified": true' "$demo_dir/remote-transform/report.json"
+grep -q '"ir_text_changed": true' "$demo_dir/transform-reply.json"
+opt -passes=verify -disable-output "$demo_dir/remote-transform/after.ll"
+if "$client_bin" remote transform "$transform_id" 1 hydir_max2 rejected-plugin \
+  --assume-u64x2 --trusted-fixture --passes load=/tmp/plugin.so \
+  --output-dir "$demo_dir/rejected-plugin" \
+  > "$demo_dir/rejected-plugin.out" 2> "$demo_dir/rejected-plugin.err"; then
+  echo "unallowlisted remote pass unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$demo_dir/rejected-plugin"
+if "$client_bin" remote transform "$transform_id" 1 hydir_max2 rejected-overwrite \
+  --assume-u64x2 --trusted-fixture --passes dce \
+  --output-dir "$demo_dir/remote-transform" \
+  > "$demo_dir/transform-overwrite.out" 2> "$demo_dir/transform-overwrite.err"; then
+  echo "remote transform unexpectedly overwrote experiment output" >&2
+  exit 1
+fi
+grep -q 'output directory exists' "$demo_dir/transform-overwrite.err"
+transform_after_sha="$(sed -n 's/.*"after_sha256": "\([^"]*\)".*/\1/p' "$demo_dir/transform-reply.json")"
+test "${#transform_after_sha}" -eq 64
+"$client_bin" remote project "$transform_id" > "$demo_dir/transform-current.json"
+grep -q '"revision": 2' "$demo_dir/transform-current.json"
+transform_binary_sha="$(sed -n 's/.*"binary_sha256": "\([^"]*\)".*/\1/p' "$demo_dir/transform-upload.json")"
+grep -q "$transform_binary_sha" "$demo_dir/transform-current.json"
+
+max_digest="$(sha256sum "$demo_dir/max2-original" | awk '{print $1}')"
+printf '{"schema_version":1,"binary_sha256":"%s","function_symbol":"hydir_max2","prototype":"u64(u64,u64)","replacement":"return arg0 - arg1;"}\n' \
+  "$max_digest" > "$demo_dir/patch.json"
+"$client_bin" remote patch "$alice_id" 1 "$demo_dir/patch.json" alice-patch-1 \
+  --trusted-fixture --assume-u64x2 --assume-entry-only \
+  --output "$demo_dir/remote-patched" > "$demo_dir/patch-reply.json"
+patched_sha="$(sed -n 's/.*"binary_sha256": "\([^"]*\)".*/\1/p' "$demo_dir/patch-reply.json")"
+test "${#patched_sha}" -eq 64
+grep -q '"revision": 2' "$demo_dir/patch-reply.json"
+test "$("$demo_dir/max2-original" 9 4)" = 9
+test "$("$demo_dir/remote-patched" 9 4)" = 5
+"$client_bin" remote project "$alice_id" > "$demo_dir/after-patch-project.json"
+grep -q '"revision": 2' "$demo_dir/after-patch-project.json"
+"$client_bin" remote lift "$alice_id" 2 hydir_max2 --assume-u64x2 \
+  --output "$demo_dir/patched-lift.ll" > "$demo_dir/patched-lift.json"
+
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 server_pid=""
 start_server
 "$client_bin" remote project "$alice_id" > "$demo_dir/reopened-project.json"
+grep -q '"revision": 2' "$demo_dir/reopened-project.json"
+"$client_bin" remote patch "$alice_id" 1 "$demo_dir/patch.json" alice-patch-1 \
+  --trusted-fixture --assume-u64x2 --assume-entry-only \
+  --output "$demo_dir/remote-patched-retry" > "$demo_dir/patch-retry.json"
+cmp "$demo_dir/remote-patched" "$demo_dir/remote-patched-retry"
+grep -q '"revision": 2' "$demo_dir/patch-retry.json"
+"$client_bin" remote artifact "$alice_id" "$patched_sha" \
+  --output "$demo_dir/after-restart-patched" > "$demo_dir/patched-artifact.json"
+cmp "$demo_dir/remote-patched" "$demo_dir/after-restart-patched"
 "$client_bin" remote artifact "$alice_id" "$artifact_sha" \
   --output "$demo_dir/after-restart.ll" > "$demo_dir/artifact.json"
 cmp "$demo_dir/remote-lift.ll" "$demo_dir/after-restart.ll"
 "$client_bin" remote artifact "$alice_id" "$c_sha" \
   --output "$demo_dir/after-restart.c" > "$demo_dir/c-artifact.json"
 cmp "$demo_dir/remote-decompile.c" "$demo_dir/after-restart.c"
+"$client_bin" remote artifact "$transform_id" "$transform_after_sha" \
+  --output "$demo_dir/transform-after-restart.ll" > "$demo_dir/transform-artifact.json"
+cmp "$demo_dir/remote-transform/after.ll" "$demo_dir/transform-after-restart.ll"
+"$client_bin" remote transform "$transform_id" 1 hydir_max2 alice-transform-1 \
+  --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce \
+  --output-dir "$demo_dir/remote-transform-retry" > "$demo_dir/transform-retry.json"
+cmp "$demo_dir/remote-transform/after.ll" "$demo_dir/remote-transform-retry/after.ll"
+grep -q '"project_revision": 2' "$demo_dir/transform-retry.json"
+"$client_bin" remote project "$transform_id" > "$demo_dir/transform-after-retry.json"
+grep -q '"revision": 2' "$demo_dir/transform-after-retry.json"
+if "$client_bin" remote transform "$transform_id" 1 hydir_max2 alice-transform-1 \
+  --assume-u64x2 --trusted-fixture --passes dce \
+  --output-dir "$demo_dir/transform-key-conflict" \
+  > "$demo_dir/transform-key-conflict.out" 2> "$demo_dir/transform-key-conflict.err"; then
+  echo "changed transform unexpectedly reused an idempotency key" >&2
+  exit 1
+fi
+grep -q 'different transform request' "$demo_dir/transform-key-conflict.err"
+test ! -e "$demo_dir/transform-key-conflict"
 "$client_bin" remote job "$alice_id" "$alice_job_id" > "$demo_dir/alice-job-after-restart.json"
 grep -q '"state": "succeeded"' "$demo_dir/alice-job-after-restart.json"
 "$client_bin" remote job-events "$alice_id" "$alice_job_id" 0 > "$demo_dir/alice-job-events-replayed.jsonl"
@@ -177,6 +256,14 @@ if "$client_bin" remote analyze "$effects_id" 1 > "$demo_dir/denied-analysis.out
   exit 1
 fi
 grep -q 'project not found' "$demo_dir/denied-analysis.err"
+if "$client_bin" remote transform "$transform_id" 1 hydir_max2 bob-denied-transform \
+  --assume-u64x2 --trusted-fixture --passes dce \
+  --output-dir "$demo_dir/denied-transform" \
+  > "$demo_dir/denied-transform.out" 2> "$demo_dir/denied-transform.err"; then
+  echo "Bob unexpectedly transformed Alice's binary" >&2
+  exit 1
+fi
+grep -q 'project not found' "$demo_dir/denied-transform.err"
 if "$client_bin" remote project "$alice_id" > "$demo_dir/denied-project.out" 2> "$demo_dir/denied-project.err"; then
   echo "Bob unexpectedly accessed Alice's project" >&2
   exit 1
@@ -193,9 +280,17 @@ if "$client_bin" remote artifact "$alice_id" "$c_sha" \
   echo "Bob unexpectedly accessed Alice's C artifact" >&2
   exit 1
 fi
+if "$client_bin" remote patch "$alice_id" 1 "$demo_dir/patch.json" bob-denied-patch-1 \
+  --trusted-fixture --assume-u64x2 --assume-entry-only \
+  --output "$demo_dir/denied-patched" > "$demo_dir/denied-patch.out" 2> "$demo_dir/denied-patch.err"; then
+  echo "Bob unexpectedly patched Alice's project" >&2
+  exit 1
+fi
+test ! -e "$demo_dir/denied-patched"
 grep -q 'project not found' "$demo_dir/denied-project.err"
 grep -q 'artifact not found' "$demo_dir/denied-artifact.err"
 grep -q 'artifact not found' "$demo_dir/denied-c-artifact.err"
+grep -q 'project not found' "$demo_dir/denied-patch.err"
 
 "$server_bin" identity rotate "$demo_dir/projects.sqlite" alice \
   | awk '/new credential \(save securely/ {print $NF}' > "$demo_dir/alice-rotated.token"

@@ -25,14 +25,25 @@ def main() -> None:
         cfg = client.recover_cfg(project.project_id, uploaded.revision, symbol)
         assert cfg["blocks"]
         direct_ir = client.lift(project.project_id, uploaded.revision, symbol, assume_u64x2=True)
-        analysis = client.analyze(project.project_id, uploaded.revision)
+        transform_report, transform_artifacts = client.transform(
+            project.project_id, uploaded.revision, symbol,
+            "instcombine,sccp,simplifycfg,dce",
+            assume_u64x2=True, trusted_fixture=True,
+        )
+        assert transform_report["llvm_verified"] is True
+        assert transform_artifacts["raw.ll"] == direct_ir
+        transformed_revision = uploaded.revision + 1
+        assert client.get_project(project.project_id).revision == transformed_revision
+        for name, content in transform_artifacts.items():
+            client.export_artifact(content, output / name)
+        analysis = client.analyze(project.project_id, transformed_revision)
         assert analysis["binary_sha256"] == uploaded.binary_sha256
         job = client.start_lift_job(
-            project.project_id, uploaded.revision, symbol, assume_u64x2=True,
+            project.project_id, transformed_revision, symbol, assume_u64x2=True,
             idempotency_key="python-sdk-smoke-lift-1",
         )
         replay = client.start_lift_job(
-            project.project_id, uploaded.revision, symbol, assume_u64x2=True,
+            project.project_id, transformed_revision, symbol, assume_u64x2=True,
             idempotency_key="python-sdk-smoke-lift-1",
         )
         assert replay.job_id == job.job_id
@@ -43,7 +54,7 @@ def main() -> None:
         assert job_ir == direct_ir
         client.export_artifact(job_ir, output / "lifted.ll")
         print(
-            f"Python SDK passed: project={project.project_id} revision={uploaded.revision} "
+            f"Python SDK passed: project={project.project_id} revision={transformed_revision} "
             f"blocks={len(cfg['blocks'])} summaries={len(analysis['functions'])} "
             f"events={len(states)}"
         )

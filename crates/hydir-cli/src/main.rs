@@ -4,6 +4,7 @@ use hydir_backend::{
 };
 use hydir_c::emit_c;
 mod passes;
+mod patch;
 mod recompile;
 mod remote;
 use serde_json::json;
@@ -28,6 +29,7 @@ Usage:
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
+  hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
   hydirctl transform <elf> <function-symbol> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory> [--opt <path>]
   hydirctl rebuild <linked-elf> --trusted-fixture --output-dir <new-directory> [--clang <path>]
   hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
@@ -89,12 +91,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
                     "remote_api": true,
-                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/artifact and durable lift-job subset",
+                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/transform/patch/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
                     "c_output": true,
                     "c_output_scope": "raw lifted scalar LLVM-to-C, explicit CFG/goto and parallel SSA edge copies; u64(u64,u64) only",
-                    "patching": false,
+                    "patching": true,
+                    "patching_scope": "trusted linked x86-64 ELF, one complete scalar u64x2 function, entry-only assertion, exact in-place size bound; local CLI and owner-scoped remote revision",
                     "whole_executable_rebuild": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.as_deref().is_some_and(|version| version.contains("14.0.6")),
                     "whole_executable_rebuild_scope": "trusted freestanding static symbolized x86-64 ELF; direct calls/branches, bounded mapped data, read/write/exit only; local CLI only"
                 }))?
@@ -211,6 +214,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Some("transform") => passes::run(&args[1..])?,
+        Some("patch") => patch::run(&args[1..])?,
         Some("rebuild") => recompile::run(&args[1..])?,
         Some("validate") if args.len() >= 4 => validate(&args[1..], false, false)?,
         Some("validate-at") if args.len() >= 5 => validate(&args[1..], true, false)?,

@@ -41,6 +41,27 @@ class ClientBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.decompile("project", 1, "symbol", assume_u64x2=False)
 
+    def test_patch_requires_all_assertions_before_network_use(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.apply_patch(
+                    "project", 1, b"{}", trusted_fixture=True,
+                    assume_u64x2=True, assume_entry_only=False,
+                )
+
+    def test_transform_rejects_untrusted_or_unallowlisted_pipeline(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.transform(
+                    "project", 1, "symbol", "dce", assume_u64x2=True,
+                    trusted_fixture=False,
+                )
+            with self.assertRaises(ValueError):
+                client.transform(
+                    "project", 1, "symbol", "load=/tmp/plugin.so", assume_u64x2=True,
+                    trusted_fixture=True,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

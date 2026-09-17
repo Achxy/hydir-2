@@ -183,6 +183,90 @@ class HydirClient:
         )
         return self._checked_artifact(reply, revision=revision)
 
+    def transform(
+        self, project_id: str, revision: int, symbol: str, passes: str, *,
+        assume_u64x2: bool, trusted_fixture: bool, idempotency_key: str | None = None,
+    ) -> tuple[dict, dict[str, bytes]]:
+        """Run pinned named LLVM passes; return the report and verified IR artifacts."""
+        if not (assume_u64x2 and trusted_fixture):
+            raise ValueError("Transform requires u64x2 and trusted-fixture assertions")
+        allowed = {"instcombine", "sccp", "simplifycfg", "dce"}
+        names = passes.split(",")
+        if not 1 <= len(names) <= 4 or len(set(names)) != len(names) or any(
+            name not in allowed for name in names
+        ):
+            raise ValueError("Pass list must contain 1..=4 unique allowlisted names")
+        reply = self._call(
+            self._stub.Transform,
+            proto.TransformRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+                trusted_fixture=True,
+                passes=passes,
+                idempotency_key=idempotency_key or str(uuid4()),
+            ),
+        )
+        if reply.project_id != project_id or reply.project_revision != revision + 1:
+            raise RuntimeError("Transform returned an unexpected project or revision")
+        digests = {
+            "raw.ll": reply.raw_sha256,
+            "before.ll": reply.before_sha256,
+            "after.ll": reply.after_sha256,
+            "report.json": reply.report_sha256,
+        }
+        artifacts: dict[str, bytes] = {}
+        for name, digest in digests.items():
+            artifact = self._call(
+                self._stub.GetArtifact,
+                proto.ArtifactRequest(project_id=project_id, sha256=digest),
+            )
+            artifacts[name] = self._checked_artifact(
+                artifact, expected_sha256=digest, revision=reply.project_revision
+            )
+        if artifacts["report.json"] != reply.report_json.encode("utf-8"):
+            raise RuntimeError("Transform report bytes differ from reply")
+        if (artifacts["before.ll"] != artifacts["after.ll"]) != reply.ir_text_changed:
+            raise RuntimeError("Transform change flag differs from IR artifacts")
+        return json.loads(reply.report_json), artifacts
+
+    def apply_patch(
+        self, project_id: str, revision: int, patch_json: bytes, *,
+        idempotency_key: str | None = None, trusted_fixture: bool,
+        assume_u64x2: bool, assume_entry_only: bool,
+    ) -> tuple[int, bytes]:
+        """Create an immutable patched revision; never executes its ELF."""
+        if not (trusted_fixture and assume_u64x2 and assume_entry_only):
+            raise ValueError("Patch requires trusted-fixture, u64x2, and entry-only assertions")
+        if not patch_json or len(patch_json) > 4096:
+            raise ValueError("Patch document must be 1..=4096 bytes")
+        reply = self._call(
+            self._stub.ApplyPatch,
+            proto.PatchRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                patch_json=patch_json,
+                idempotency_key=idempotency_key or str(uuid4()),
+                trusted_fixture=True,
+                assume_u64x2=True,
+                assume_entry_only=True,
+            ),
+        )
+        if reply.project_id != project_id or reply.revision != revision + 1:
+            raise RuntimeError("Patch returned an unexpected project revision")
+        if reply.binary_sha256 != reply.artifact_sha256:
+            raise RuntimeError("Patch binary and artifact digests differ")
+        artifact = self._call(
+            self._stub.GetArtifact,
+            proto.ArtifactRequest(project_id=project_id, sha256=reply.artifact_sha256),
+        )
+        if artifact.media_type != "application/x-elf":
+            raise RuntimeError("Patch did not return an ELF artifact")
+        return reply.revision, self._checked_artifact(
+            artifact, expected_sha256=reply.binary_sha256, revision=reply.revision
+        )
+
     def get_artifact(self, project_id: str, sha256: str) -> bytes:
         reply = self._call(
             self._stub.GetArtifact,
