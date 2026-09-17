@@ -1,5 +1,35 @@
 # HydIR evidence — 2026-09-17
 
+## Twenty-function scalar corpus checkpoint — 2026-09-17
+
+The final `bash scripts/demo-linux-docker.sh` exited 0 with the new corpus
+gate integrated. Rust 1.96.0 ran **27 passing unit tests**, workspace Clippy
+passed with `-D warnings`, and pinned Clang/LLVM 14.0.6 handled every LLVM
+module. The original `demo-local.sh` variants matched **5,040/5,040**
+boundary/seeded cases in `target/demo-local/run.TrJWrj/`. The added
+`demo-corpus.sh` gate matched **16,128/16,128** cases across 16 new distinct
+functions in `target/demo-corpus/run.xCv35Y/`, each with 8 boundary inputs,
+1,000 seeded pairs, an LLVM-verifier pass, and a retained JSON report. The
+new functions include identity, wrapping arithmetic, signed/unsigned minima
+and predicates, bit overlap, and bounded loops. Combined, this is **20
+distinct supported functions**, **21 supported variants** including the
+stripped max fixture, and **21,168/21,168 observed comparisons**. The
+deliberately unsupported `push` function is a 22nd attempted variant and was
+rejected. These results are not an equivalence proof or optimized/stack/
+buffer coverage.
+
+| Corpus unit | Attempted | Supported | Lifted | IR-valid | Executable lifted form | Behaviorally matched | C-generated | Whole-program rebuilt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Scalar function variants | 22 | 21 | 21 | 21 | 21 | 21 (21,168 input pairs) | 0 | 0 |
+
+The same integrated run passed the mapped-global/call analysis fixture
+(`target/demo-analysis/run.lf1mn8/`), named LLVM-pass experiment (8 boundary
+matches; `target/demo-passes/run.OrScuV/`), authenticated separate-process
+remote demo (`target/demo-remote/run.UPVvv4/`), and restricted whole-rebuild
+gate (`target/demo-recompile/run.P9bfgc/`). The latter remained three
+supported complete programs, five matched controlled executions, and five
+rejected semantic cases.
+
 ## Restricted local whole-program rebuild checkpoint — 2026-09-17
 
 `bash scripts/demo-linux-docker.sh` exited 0 after the whole-rebuild path was
@@ -9,11 +39,11 @@ added. The pinned Linux x86-64 image ran Rust 1.96.0 and Debian Clang/LLVM
 **5,040/5,040** seeded/boundary executions. The direct-call/global-effect
 analysis fixture, named LLVM-pass experiment (8 boundary matches), and
 separate-process remote demo also passed. Their final artifacts are under
-`target/demo-local/run.442o8y/`, `target/demo-analysis/run.1RCq7p/`,
-`target/demo-passes/run.rk7mAY/`, and `target/demo-remote/run.Kwjvqk/`.
+`target/demo-local/run.TrJWrj/`, `target/demo-analysis/run.lf1mn8/`,
+`target/demo-passes/run.OrScuV/`, and `target/demo-remote/run.UPVvv4/`.
 
 The new `scripts/demo-recompile.sh` gate in that run passed and left
-`target/demo-recompile/run.o2gyHw/`. It compiled three complete fixture
+`target/demo-recompile/run.P9bfgc/`. It compiled three complete fixture
 programs to static ELFs, passed only those ELF bytes to `hydirctl rebuild`,
 verified each generated LLVM module with `opt`, linked three new executables,
 and compared stdout, stderr, and exit status for five controlled cases:
