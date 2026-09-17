@@ -46,6 +46,12 @@ executions per function (eight boundary cases and 1,000 seeded cases). It
 also strips one fixture and repeats CFG, lift, IR verification, and 1,008
 comparisons using an explicitly supplied entry and byte extent. Artifacts
 are written to a fresh `target/demo-local/run.*` directory.
+`bash scripts/demo-corpus.sh` separately checks 16 more distinct scalar
+functions (identity, wrapping arithmetic, signed/unsigned comparison,
+bit test, bounded loops): each is lifted, LLVM-verified, and compared with
+native execution on 1,008 inputs. Together with the four distinct functions
+in `demo-local.sh`, this makes 20 distinct supported scalar functions. It
+does not cover optimized compiler output, stack/buffer access, or C output.
 
 On macOS with Docker Desktop, `bash scripts/demo-linux-docker.sh` builds the
 pinned Linux x86-64 development image and runs the tests plus demo there.
