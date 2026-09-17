@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hydir-core", "crates/hydir-backend", "crates/hydir-cli"]
+members = ["crates/hydir-core", "crates/hydir-backend", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-server", "crates/hydir-gui"]
 resolver = "2"
 
 [workspace.package]
@@ -14,3 +14,10 @@ serde_json = "1.0"
 sha2 = "0.10"
 object = { version = "0.39.1", features = ["read"] }
 iced-x86 = "1.21.0"
+tonic = "=0.14.6"
+tonic-prost = "=0.14.6"
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+uuid = { version = "=1.26.1", features = ["v4"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }

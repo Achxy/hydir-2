@@ -112,3 +112,55 @@ has **no sandbox** and must remain limited to trusted fixtures.
 The next blocking engineering task is memory and direct-call semantics with
 declared machine-state, ABI, and observable-memory contracts; remote/product
 gates will also require persistent projects and isolated workers.
+
+## Partial M2 local service and desktop checkpoint
+
+On 2026-09-17, `cargo fmt --all`, `cargo test --locked --workspace`,
+`git diff --check`, and `bash -n scripts/demo-linux-docker.sh
+scripts/demo-remote.sh` exited 0 on the macOS arm64 development host. The
+workspace suite passed **18 tests**: 10 backend, 1 core, 2 GUI, and 5 server.
+
+The final `bash scripts/demo-linux-docker.sh` exited 0. In the pinned Linux
+x86-64 image (Rust 1.96.0; Debian Clang and LLVM 14.0.6), the same 18 tests
+passed and `cargo clippy --locked --workspace --all-targets -- -D warnings`
+completed without warnings. The local demo artifacts are under
+`target/demo-local/run.7HTzAz/`. Four symbolized function fixtures and one
+stripped variant again produced **5,040 attempted, 5,040 matched, 0
+mismatched** cases with seed `0x6859644952203236`. The five emitted IR
+modules passed `opt -passes=verify` in the script. The unsupported `push`
+fixture remained rejected. This is the same narrow function contract as the
+M1 evidence above, not additional whole-program coverage.
+
+The separate-process remote demo in that same Docker run exited 0 and wrote
+`target/demo-remote/run.vzEe46/`. It exercised two identities and two
+projects, an explicit binary upload, inspect/CFG/lift, SHA-256-verified IR
+artifact retrieval after server restart, project creation retry, stale
+revision rejection, denied cross-project and cross-artifact reads, token
+rotation with old-token rejection, and rejection of the unsupported `push`
+fixture through a child worker. The headless `hydir --probe-remote` path,
+which calls the same remote functions as the GUI, reported **4 discovered
+functions, 5 selected CFG blocks, and 2,704 IR bytes**. The child worker has
+a 30-second deadline and 16 MiB output cap. No execution request or public
+binding was exposed.
+
+The macOS `hydir` process launched and remained running until stopped, and
+the GUI compiled and passed unit tests on macOS and Linux. A visual/window
+interaction test was **not** completed: the desktop-control surface did not
+identify the unbundled Cargo binary as an app. The headless probe is remote
+logic evidence, not visual QA. No Windows build was attempted.
+
+M2 remains **partial**. The SQLite store persists identities, owner-scoped
+projects, immutable binary revisions, and artifacts; the GUI can inspect a
+local ELF or explicitly connect to an existing remote project. It cannot
+upload remotely, reopen saved local layouts/projects, run a pass editor, or
+show completed C/global-analysis/rebuild views. The service lacks durable
+jobs, cancellation/event streams, per-role authorization, quotas, OS-level
+worker sandboxing, TLS/non-loopback mode, source archive/offer, and full API/
+SDK coverage. Worker subprocess isolation is not a hostile-sample sandbox.
+M0 native-dependency/license gates and M1 general memory/call/ABI coverage
+also remain open. M3–M5 are not implemented; there is no decompiler, tested
+interprocedural analysis, patching, or whole-executable recompilation. No
+benchmark timing or memory measurements were recorded. The next blocking
+product task is durable, cancellable, resource-constrained jobs and a complete
+typed local/remote operation surface; semantic expansion needs explicit
+memory and call models before broader lifting or rebuilding claims.

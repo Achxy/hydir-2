@@ -1,19 +1,23 @@
 [package]
-name = "hydir-cli"
+name = "hydir-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hydirctl"
+name = "hydird"
 path = "src/main.rs"
 
 [dependencies]
-hydir-backend = { path = "../hydir-backend" }
 hydir-api = { path = "../hydir-api" }
-serde_json.workspace = true
-sha2.workspace = true
+hydir-backend = { path = "../hydir-backend" }
 tonic.workspace = true
 tokio.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
 tempfile = "3.23"

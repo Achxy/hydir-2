@@ -1,0 +1,62 @@
+syntax = "proto3";
+package hydir.v1;
+
+service Hydir {
+  rpc Discover (DiscoverRequest) returns (DiscoverReply);
+  rpc CreateProject (CreateProjectRequest) returns (ProjectReply);
+  rpc GetProject (ProjectRequest) returns (ProjectReply);
+  rpc UploadBinary (UploadBinaryRequest) returns (ProjectReply);
+  rpc Inspect (ProjectRequest) returns (JsonReply);
+  rpc RecoverCfg (FunctionRequest) returns (JsonReply);
+  rpc Lift (FunctionRequest) returns (ArtifactReply);
+  rpc GetArtifact (ArtifactRequest) returns (ArtifactReply);
+}
+
+message DiscoverRequest {}
+message DiscoverReply {
+  uint32 api_version = 1;
+  string hydir_version = 2;
+  string license = 3;
+  string source_status = 4;
+  bool native_elf_import = 5;
+  bool scalar_direct_cfg_lift = 6;
+  bool execution_validation = 7;
+  uint64 max_binary_bytes = 8;
+}
+message CreateProjectRequest {
+  string name = 1;
+  string idempotency_key = 2;
+}
+message ProjectRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+}
+message ProjectReply {
+  string project_id = 1;
+  string name = 2;
+  uint64 revision = 3;
+  string binary_sha256 = 4;
+}
+message UploadBinaryRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string content_sha256 = 3;
+  bytes content = 4;
+}
+message FunctionRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string function_symbol = 3;
+  bool assume_u64x2 = 4;
+}
+message JsonReply { string json = 1; }
+message ArtifactRequest {
+  string project_id = 1;
+  string sha256 = 2;
+}
+message ArtifactReply {
+  string sha256 = 1;
+  string media_type = 2;
+  bytes content = 3;
+  uint64 project_revision = 4;
+}

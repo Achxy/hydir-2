@@ -15,6 +15,9 @@ Its submodule pointers were inspected but not fetched or built.
 | Native ELF symbol and bounded-address reader | `object` 0.39.1 | `hydir-backend` | Newly implemented integration | Symbolized and stripped local demos |
 | x86 decoder and direct CFG recovery | `iced-x86` 1.21.0 | `hydir-backend` | Newly implemented integration | Byte-pattern tests and CFG fixture exports |
 | Scalar LLVM IR emission with explicit register/flag joins | No copied upstream code | `hydir-backend` | Newly implemented, narrow subset | LLVM verifier and five differential fixture variants |
+| Versioned gRPC schema and client/server | `tonic`/`prost` 0.14.6/0.14.4 | `hydir-api`, `hydir-cli`, `hydir-server` | Newly implemented integration; local-only subset | Separate-process remote demo and protocol unit tests |
+| Transactional project store | `rusqlite` 0.40.2 | `hydir-server` | Newly implemented subset | Restart, isolation, malformed-upload, rotation tests |
+| Desktop workbench | `eframe`/`egui` 0.36.2 | `hydir-gui` | Newly implemented local and explicit remote inspection subset | macOS compile/unit smoke; Linux unit build, visual QA pending |
 
 IRENE-3 C++ code, generated sources, schemas, and tests are not vendored or
 translated here. Its root is AGPLv3; its `irene-ghidra/LICENSE` is Apache-2.0,
