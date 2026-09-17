@@ -78,6 +78,13 @@ sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.
 There is no remote execution endpoint, and the current RPC service cannot
 bind outside loopback.
 
+For a local developer-only source snapshot of a clean committed tree, run
+`bash scripts/package-source-snapshot.sh`. It verifies that the archive
+contains the license, notices, lockfile, runtime, and protocol, and excludes
+local design context and project data. This is not a release or AGPL remote
+source offer; license/notice review and matching deployed-build verification
+remain open.
+
 ## Exact supported lift contract
 
 - Input: little-endian x86-64 ELF with a nonzero-size text function symbol.
