@@ -275,3 +275,31 @@ fine-grained roles, quotas/audit, an OS-level worker sandbox, non-loopback TLS,
 and full operation coverage are not present. The upload demo uses a trusted
 fixture and an authenticated loopback service; it is not a hostile-sample or
 public-network security demonstration.
+
+## Python SDK for the implemented remote subset
+
+The Python package was generated from the checked-in v1 `.proto` with
+`grpcio-tools==1.84.0` and wrapped in `sdk/python/hydir_sdk`. It covers
+discovery, owner-scoped projects, explicit upload, inspect/CFG/lift,
+conservative analysis, lift jobs and reconnectable events, and artifact
+retrieval with SHA-256 verification. `PYTHONPATH=sdk/python
+target/sdk-venv/bin/python -m unittest discover -s sdk/python/tests -v`
+passed **3 tests** for non-loopback refusal, private credential permissions,
+artifact hash checking, and exclusive output creation.
+
+With pinned `grpcio==1.84.0` and `protobuf==7.36.1` in a private local
+virtual environment, `HYDIR_SDK_PYTHON=target/sdk-venv/bin/python bash
+scripts/demo-sdk.sh
+/Users/achu/Projects/hydir-2/target/demo-remote/run.kpx0gy/max2-original`
+exited 0 on the macOS development host. It started a separate `hydird`,
+used the SDK to create a project and explicitly upload the Linux fixture,
+inspected/decoded/lifted it, obtained global summaries, retried a lift job
+with the same idempotency key, consumed terminal events, and compared the
+SHA-verified job artifact with the direct lift. Evidence remains under
+`target/demo-sdk/run.ekEeQP/`. The SDK ran on macOS against an ELF fixture;
+this is not macOS native execution validation or a visual GUI test.
+
+The SDK does not expose pass experiments, C generation, patching, rebuilding,
+or execution because no corresponding remote operations exist. Its package
+build succeeded locally; there is no published wheel, release archive, or
+complete license-notice/source-offer audit.

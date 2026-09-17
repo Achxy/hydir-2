@@ -20,6 +20,7 @@ Its submodule pointers were inspected but not fetched or built.
 | Versioned gRPC schema and client/server | `tonic`/`prost` 0.14.6/0.14.4 | `hydir-api`, `hydir-cli`, `hydir-server` | Newly implemented integration; local-only subset | Separate-process remote demo and protocol unit tests |
 | Transactional project store | `rusqlite` 0.40.2 | `hydir-server` | Newly implemented subset | Restart, isolation, malformed-upload, rotation tests |
 | Desktop workbench | `eframe`/`egui` 0.36.2 | `hydir-gui` | Newly implemented local and explicit remote inspection subset | macOS compile/unit smoke; Linux unit build, visual QA pending |
+| Python API client and generated stubs | First-party `hydir.proto`; `grpcio-tools` 1.84.0 generator | `sdk/python/hydir_sdk` | Newly implemented wrapper and generated protocol bindings | Three Python unit tests and separate-process SDK smoke |
 
 IRENE-3 C++ code, generated sources, schemas, and tests are not vendored or
 translated here. Its root is AGPLv3; its `irene-ghidra/LICENSE` is Apache-2.0,

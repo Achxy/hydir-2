@@ -39,6 +39,7 @@ idempotent project creation, immutable binary uploads, project inspection,
 symbol-scoped CFG/lift, conservative global-effect analysis, owner-scoped durable lift jobs with event replay and
 cancellation, and artifact retrieval. It does not support remote
 execution, TLS/non-loopback clients, or full authorization
-roles. There is no Python SDK, Ghidra adapter, C decompiler, or executable
+roles. There is a Python SDK for the implemented API subset, but no Ghidra
+adapter, C decompiler, or executable
 rebuild yet. The effect analysis is a tested interprocedural subset, not full
 M3 completion.

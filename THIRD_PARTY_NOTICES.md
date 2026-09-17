@@ -32,6 +32,12 @@ research inputs, not current binary dependencies. The AGPLv3 text in
 corresponding-source offer has been prepared yet. The current service is a
 development-only authenticated loopback slice; it is not release-ready.
 
+The development Python SDK uses `grpcio` 1.84.0 (Apache-2.0), `protobuf`
+7.36.1 (BSD-3-Clause), and `typing-extensions` 4.16.0 (PSF-2.0), with
+`grpcio-tools` 1.84.0 (Apache-2.0) and `setuptools` 84.0.0 (MIT) used for
+generation/build. This is a package-metadata inventory, not a complete
+redistribution notice audit. No SDK wheel has been published.
+
 The trusted local pass experiment invokes Debian LLVM `opt` 14.0.6 from the
 development image. LLVM is a separate native tool, not statically linked into
 these Rust binaries. Its license and runtime redistribution obligations must
