@@ -12,17 +12,23 @@ prefix="hydir-source-$revision"
 mkdir -p target/source-snapshot
 archive="target/source-snapshot/$prefix.tar"
 if [[ -e "$archive" ]]; then
-  echo "refusing to overwrite $archive" >&2
-  exit 1
+  candidate="$(mktemp target/source-snapshot/.candidate.XXXXXX)"
+  trap 'rm -f "$candidate"' EXIT
+  git archive --format=tar --prefix="$prefix/" --output="$candidate" HEAD
+  if ! cmp -s "$candidate" "$archive"; then
+    echo "existing source snapshot differs from the committed tree: $archive" >&2
+    exit 1
+  fi
+else
+  git archive --format=tar --prefix="$prefix/" --output="$archive" HEAD
 fi
-git archive --format=tar --prefix="$prefix/" --output="$archive" HEAD
 for required in LICENSE Cargo.lock rust-toolchain.toml Dockerfile.m1 PROVENANCE.md THIRD_PARTY_NOTICES.md crates/hydir-api/proto/hydir.proto crates/hydir-c/src/lib.rs crates/hydir-server/build.rs native/whole-runtime/runtime.c scripts/demo-recompile.sh; do
-  if ! tar -tf "$archive" | grep -Fxq "$prefix/$required"; then
+  if ! tar -tf "$archive" | grep -Fx "$prefix/$required" >/dev/null; then
     echo "archive missing required source: $required" >&2
     exit 1
   fi
 done
-if tar -tf "$archive" | grep -Eq '(^|/)(target|\.git|\.impeccable\.md|copilot-instructions\.md)(/|$)|\.(sqlite|token)$'; then
+if tar -tf "$archive" | grep -E '(^|/)(target|\.git|\.impeccable\.md|copilot-instructions\.md)(/|$)|\.(sqlite|token)$' >/dev/null; then
   echo 'archive contains excluded development context or project data' >&2
   exit 1
 fi
