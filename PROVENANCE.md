@@ -1,9 +1,11 @@
 # Provenance and port ledger
 
-Audit snapshot: 2026-09-17. `trailofbits/irene3` `main` resolved to
+Audit snapshot: 2026-09-18. `trailofbits/irene3` `main` again resolved to
 `d97aee937ebb6d1cb8a362748c56414404eb75ff` (commit date 2026-02-13).
 This records a revision, **not** a claim that the repository is unmaintained.
-Its submodule pointers were inspected but not fetched or built.
+Its submodule pointers were inspected but not fetched or built. The scoped
+[file-level notice inventory](docs/UPSTREAM_LICENSE_AUDIT.md) identifies
+special Apache, BSD, MIT, and LLVM-exception headers; it is not legal clearance.
 
 | Component inspected | Upstream revision/source | HydIR destination | Status | Regression evidence |
 | --- | --- | --- | --- | --- |

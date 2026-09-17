@@ -34,6 +34,9 @@ public corresponding-source offer has been made. A clean-revision archive can
 be embedded and hash-served by a development service; its third-party notice
 sufficiency has not been reviewed. The current service is a
 development-only authenticated loopback slice; it is not release-ready.
+The [IRENE-3 source/license inventory](docs/UPSTREAM_LICENSE_AUDIT.md)
+records file-level Apache, BSD, MIT, and LLVM-exception variants in the
+upstream checkout; none of those implementation files is bundled here.
 
 The C11 emitter and restricted C-like patch parser/encoder in this checkout
 are first-party code. They were not copied or translated from IRENE-3,

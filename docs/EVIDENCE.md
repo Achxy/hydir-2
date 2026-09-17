@@ -1,5 +1,16 @@
 # HydIR evidence — 2026-09-18
 
+## Upstream revision and notice boundary — 2026-09-18
+
+`git ls-remote` and a fresh 405-path checkout both resolved IRENE-3 `main`
+to `d97aee937ebb6d1cb8a362748c56414404eb75ff`. Its root AGPLv3 text
+matches this repository's `LICENSE` byte-for-byte, while upstream Ghidra,
+grammar, Scala, version-helper, Gradle, and LLVM-derived files carry distinct
+Apache, BSD, MIT, and LLVM-exception notices. The exact scoped findings are
+in [the source/license inventory](UPSTREAM_LICENSE_AUDIT.md). No upstream
+implementation code was copied or built. This does not close transitive
+redistribution notices, submodule audits, or legal review.
+
 ## ProgramSpec v2 inventory and bounded inspection — 2026-09-18
 
 The native ELF inspection path now reports `PT_LOAD` file/memory mappings and
