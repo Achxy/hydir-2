@@ -1,4 +1,6 @@
-use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol};
+use hydir_backend::{
+    MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
+};
 use serde_json::json;
 use std::{
     env,
@@ -14,10 +16,16 @@ const HELP: &str = "HydIR native x86-64 ELF vertical slice
 Usage:
   hydirctl doctor
   hydirctl inspect <elf>
+  hydirctl cfg <elf> <function-symbol>
+  hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
+  hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
 
-The lift requires a non-stripped function symbol. --assume-u64x2 explicitly
+Symbol mode requires a non-stripped function symbol. Address mode requires an
+analyst-supplied virtual entry and exact byte extent, and works on stripped
+linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
 ";
@@ -48,7 +56,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "elf_parser": "object 0.39.1 (Cargo.lock)",
                     "decoder": "iced-x86 1.21.0 (Cargo.lock)",
                     "native_elf_import": true,
-                    "linear_scalar_llvm_lift": true,
+                    "direct_cfg_scalar_llvm_lift": true,
+                    "symbol_scoped_cfg_export": true,
                     "trusted_fixture_validation_available": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.is_some(),
                     "clang": clang_version,
                     "ghidra_required": false,
@@ -62,6 +71,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             let bytes = read_binary(&args[1])?;
             let spec = import_elf(&bytes)?;
             println!("{}", serde_json::to_string_pretty(&spec)?);
+        }
+        Some("cfg") if args.len() == 3 => {
+            let bytes = read_binary(&args[1])?;
+            let cfg = recover_symbol_cfg(&bytes, &args[2])?;
+            println!("{}", serde_json::to_string_pretty(&cfg)?);
+        }
+        Some("cfg-at") if args.len() == 4 => {
+            let bytes = read_binary(&args[1])?;
+            let (address, size) = parse_address_extent(&args[2], &args[3])?;
+            let cfg = recover_at_cfg(&bytes, address, size)?;
+            println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         Some("lift") if args.len() == 4 || args.len() == 6 => {
             if args[3] != "--assume-u64x2" {
@@ -86,14 +106,51 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("lift") if args.len() == 3 => {
             return Err("lift requires explicit --assume-u64x2 prototype assertion".into());
         }
-        Some("validate") if args.len() >= 4 => validate(&args[1..])?,
+        Some("lift-at") if args.len() == 5 || args.len() == 7 => {
+            if args[4] != "--assume-u64x2" {
+                return Err("lift-at requires explicit --assume-u64x2 prototype assertion".into());
+            }
+            let output = if args.len() == 7 {
+                if args[5] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[6].as_str())
+            } else {
+                None
+            };
+            let (address, size) = parse_address_extent(&args[2], &args[3])?;
+            let bytes = read_binary(&args[1])?;
+            let ir = lift_at(&bytes, address, size)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, ir.as_bytes())?;
+            } else {
+                print!("{ir}");
+            }
+        }
+        Some("validate") if args.len() >= 4 => validate(&args[1..], false)?,
+        Some("validate-at") if args.len() >= 5 => validate(&args[1..], true)?,
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => print!("{HELP}"),
         _ => return Err(HELP.into()),
     }
     Ok(())
 }
 
-fn validate(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn parse_address_extent(address: &str, size: &str) -> Result<(u64, u64), Box<dyn Error>> {
+    let digits = address
+        .strip_prefix("0x")
+        .ok_or("virtual address must use 0x-prefixed hexadecimal")?;
+    if digits.is_empty() {
+        return Err("virtual address has no hex digits".into());
+    }
+    let address = u64::from_str_radix(digits, 16)?;
+    let size = size.parse::<u64>()?;
+    if size == 0 || size > 4096 {
+        return Err("size must be 1..=4096 bytes".into());
+    }
+    Ok((address, size))
+}
+
+fn validate(args: &[String], by_address: bool) -> Result<(), Box<dyn Error>> {
     if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
         return Err(
             "validation executes only on Linux x86-64; import and lift are portable".into(),
@@ -103,7 +160,7 @@ fn validate(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut assume_u64x2 = false;
     let mut clang = "clang";
     let mut random_cases = 1000usize;
-    let mut index = 2usize;
+    let mut index = if by_address { 3 } else { 2 };
     while index < args.len() {
         match args[index].as_str() {
             "--trusted-fixture" if !trusted => trusted = true,
@@ -134,12 +191,25 @@ fn validate(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("validation requires explicit --assume-u64x2 prototype assertion".into());
     }
     let binary = fs::canonicalize(&args[0])?;
-    let symbol = &args[1];
+    let address_extent = if by_address {
+        Some(parse_address_extent(&args[1], &args[2])?)
+    } else {
+        None
+    };
+    let label = if let Some((address, size)) = address_extent {
+        format!("analyst_entry_0x{address:x}_size_{size}")
+    } else {
+        args[1].clone()
+    };
     if random_cases > 10_000 {
         return Err("--random-cases is limited to 10000".into());
     }
     let bytes = read_binary(&binary)?;
-    let ir = lift_symbol(&bytes, symbol)?;
+    let ir = if let Some((address, size)) = address_extent {
+        lift_at(&bytes, address, size)?
+    } else {
+        lift_symbol(&bytes, &args[1])?
+    };
     let directory = tempfile::tempdir()?;
     let ir_path = directory.path().join("lifted.ll");
     let harness_path = directory.path().join("harness.c");
@@ -199,7 +269,8 @@ fn validate(args: &[String]) -> Result<(), Box<dyn Error>> {
     let report = json!({
         "scope": "trusted two-u64 function fixture; stdout/stderr/exit status",
         "binary": binary,
-        "function": symbol,
+        "function": label,
+        "entry_assumption": address_extent.map(|(address, size)| json!({"virtual_address": format!("0x{address:016x}"), "size_bytes": size, "provenance": "analyst-supplied"})),
         "seed": format!("0x{seed:016x}"),
         "cases_attempted": cases.len(),
         "cases_matched": matched,

@@ -1,10 +1,16 @@
 //! Narrow, native ELF/x86-64 frontend and machine-code-to-LLVM lift.
 //!
-//! The first slice accepts only linear, symbol-bounded, two-u64-argument
-//! SysV functions. It rejects memory operations, branches, calls, partial
-//! registers and unknown instructions rather than guessing their behavior.
+//! The supported slice accepts symbol-bounded, two-u64-argument SysV
+//! functions. It rejects memory operations, calls, partial registers and
+//! unknown instructions rather than guessing their behavior.
 
-use hydir_core::{Address, AddressKind, FunctionSpec, ProgramSpec, SPEC_VERSION, SectionSpec};
+mod cfg;
+
+pub use cfg::lift_cfg;
+
+use hydir_core::{
+    Address, AddressKind, FunctionCfg, FunctionSpec, ProgramSpec, SPEC_VERSION, SectionSpec,
+};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind,
@@ -105,6 +111,90 @@ pub fn import_elf(bytes: &[u8]) -> Result<ProgramSpec> {
 /// Lift a named ELF symbol. The symbol's bytes, not source or pseudocode, are
 /// decoded. The caller asserts the function prototype `u64(u64, u64)`.
 pub fn lift_symbol(bytes: &[u8], name: &str) -> Result<String> {
+    let (code, address, _) = symbol_code(bytes, name)?;
+    lift_cfg(&code, address)
+}
+
+/// Recover the reachable, direct CFG for a named function symbol. This is a
+/// symbol-scoped analysis result, separate from the initial ELF inventory.
+pub fn recover_symbol_cfg(bytes: &[u8], name: &str) -> Result<FunctionCfg> {
+    let (code, address, address_kind) = symbol_code(bytes, name)?;
+    cfg::recover_function_cfg(
+        &code,
+        address,
+        address_kind,
+        name,
+        format!("{:x}", Sha256::digest(bytes)),
+        "ELF symbol extent and native iced-x86 decoding",
+    )
+}
+
+/// Lift a bounded function at an analyst-supplied virtual entry address.
+/// This permits stripped executables without inventing code-discovery facts.
+pub fn lift_at(bytes: &[u8], address: u64, size: u64) -> Result<String> {
+    let code = code_at(bytes, address, size)?;
+    lift_cfg(&code, address)
+}
+
+pub fn recover_at_cfg(bytes: &[u8], address: u64, size: u64) -> Result<FunctionCfg> {
+    let code = code_at(bytes, address, size)?;
+    cfg::recover_function_cfg(
+        &code,
+        address,
+        AddressKind::Virtual,
+        &format!("analyst_entry_0x{address:x}"),
+        format!("{:x}", Sha256::digest(bytes)),
+        "Analyst-supplied virtual entry and byte extent; native iced-x86 decoding",
+    )
+}
+
+fn code_at(bytes: &[u8], address: u64, size: u64) -> Result<Vec<u8>> {
+    if size == 0 || size > 4096 {
+        return Err(error(
+            "analyst-supplied function size must be 1..=4096 bytes",
+        ));
+    }
+    let end = address
+        .checked_add(size)
+        .ok_or_else(|| error("analyst-supplied address range overflow"))?;
+    let file = parse_elf(bytes)?;
+    if file.kind() == object::ObjectKind::Relocatable {
+        return Err(error(
+            "address-based recovery requires a linked ELF with virtual addresses",
+        ));
+    }
+    let mut match_bytes = None;
+    for section in file.sections() {
+        if section.kind() != SectionKind::Text || section.size() > 16 * 1024 * 1024 {
+            continue;
+        }
+        let section_end = section
+            .address()
+            .checked_add(section.size())
+            .ok_or_else(|| error("text section address range overflow"))?;
+        if address < section.address() || end > section_end {
+            continue;
+        }
+        let start = usize::try_from(address - section.address())
+            .map_err(|_| error("analyst entry exceeds host size"))?;
+        let finish = usize::try_from(end - section.address())
+            .map_err(|_| error("analyst extent exceeds host size"))?;
+        let data = section
+            .data()
+            .map_err(|e| error(format!("text section read failed: {e}")))?;
+        let code = data
+            .get(start..finish)
+            .ok_or_else(|| error("analyst extent exceeds text section data"))?;
+        if match_bytes.replace(code.to_vec()).is_some() {
+            return Err(error(
+                "analyst address range matches multiple text sections",
+            ));
+        }
+    }
+    match_bytes.ok_or_else(|| error("analyst address range is not inside one text section"))
+}
+
+fn symbol_code(bytes: &[u8], name: &str) -> Result<(Vec<u8>, u64, AddressKind)> {
     let file = parse_elf(bytes)?;
     let symbol = file
         .symbols()
@@ -148,7 +238,12 @@ pub fn lift_symbol(bytes: &[u8], name: &str) -> Result<String> {
     let code = section_bytes
         .get(start..end)
         .ok_or_else(|| error("symbol bytes exceed section data"))?;
-    lift_linear(code, symbol.address())
+    let address_kind = if file.kind() == object::ObjectKind::Relocatable {
+        AddressKind::SectionRelative
+    } else {
+        AddressKind::Virtual
+    };
+    Ok((code.to_vec(), symbol.address(), address_kind))
 }
 
 /// Emits a raw LLVM module for the supported instruction subset.
