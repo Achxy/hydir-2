@@ -1,6 +1,7 @@
 use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
+mod remote;
 use serde_json::json;
 use std::{
     env,
@@ -22,12 +23,15 @@ Usage:
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl remote <operation> ...
 
 Symbol mode requires a non-stripped function symbol. Address mode requires an
 analyst-supplied virtual entry and exact byte extent, and works on stripped
 linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
+Remote operations require HYDIR_ENDPOINT and a HYDIR_TOKEN_FILE containing a
+credential created by hydird. Remote upload is always an explicit command.
 ";
 
 fn main() {
@@ -129,6 +133,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("validate") if args.len() >= 4 => validate(&args[1..], false)?,
         Some("validate-at") if args.len() >= 5 => validate(&args[1..], true)?,
+        Some("remote") if args.len() >= 2 => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(remote::run(&args[1..]))?;
+        }
         Some("help") | Some("--help") | Some("-h") if args.len() == 1 => print!("{HELP}"),
         _ => return Err(HELP.into()),
     }
