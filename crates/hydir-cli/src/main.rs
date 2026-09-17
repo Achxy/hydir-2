@@ -65,7 +65,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "trusted_fixture_validation_available": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.is_some(),
                     "clang": clang_version,
                     "ghidra_required": false,
-                    "remote_api": false,
+                    "remote_api": true,
+                    "remote_scope": "authenticated loopback discovery/project/upload/inspect/cfg/lift/artifact subset",
+                    "remote_execution": false,
+                    "remote_non_loopback": false,
                     "c_output": false,
                     "whole_executable_rebuild": false
                 }))?
