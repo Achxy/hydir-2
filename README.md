@@ -35,6 +35,7 @@ execution validation requires Linux x86-64.
 ```sh
 cargo test --locked --workspace
 cargo run --locked --bin hydir
+cargo run --locked --bin hydir -- --open-local /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
 cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
