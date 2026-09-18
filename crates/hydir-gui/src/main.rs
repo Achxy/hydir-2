@@ -15,7 +15,7 @@ use hydir_core::{
     overlay_analyst_assumptions,
 };
 use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
-use hydir_project::{LocalProject, LocalProjectStore};
+use hydir_project::{LocalProject, LocalProjectStore, WorkbenchSettings};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,8 @@ const PINNED_OPT: &str = "/usr/bin/opt-14";
 const PINNED_CLANG: &str = "/usr/bin/clang-14";
 
 enum Task {
+    LoadWorkbench,
+    SaveWorkbench(WorkbenchSettings),
     Open(PathBuf),
     OpenRemote {
         endpoint: String,
@@ -111,6 +113,8 @@ enum Task {
 }
 
 enum Event {
+    WorkbenchLoaded(Result<WorkbenchSettings, String>),
+    WorkbenchSaved(WorkbenchSettings),
     Imported {
         source: String,
         remote: bool,
@@ -1192,6 +1196,17 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
         .expect("Tokio runtime initialization");
     while let Ok(task) = tasks.recv() {
         let event = match task {
+            Task::LoadWorkbench => Event::WorkbenchLoaded(
+                LocalProjectStore::open_default().and_then(|store| store.load_workbench_settings()),
+            ),
+            Task::SaveWorkbench(settings) => {
+                match LocalProjectStore::open_default()
+                    .and_then(|mut store| store.save_workbench_settings(&settings))
+                {
+                    Ok(()) => Event::WorkbenchSaved(settings),
+                    Err(error) => Event::Failed(format!("Could not save workbench: {error}")),
+                }
+            }
             Task::Open(path) => match bounded_read(&path).and_then(|bytes| {
                 let spec = import_elf(&bytes).map_err(|e| format!("ELF import failed: {e}"))?;
                 let project = attach_local_project(&path, &spec)?;
@@ -1635,6 +1650,10 @@ struct AnalystApp {
     tasks: SyncSender<Task>,
     events: Receiver<Event>,
     path_input: String,
+    workbench: WorkbenchSettings,
+    workbench_loaded: bool,
+    startup_open_local: Option<PathBuf>,
+    current_local_path: Option<PathBuf>,
     remote_endpoint: String,
     remote_token_file: String,
     remote_project_id: String,
@@ -1709,6 +1728,10 @@ impl AnalystApp {
             tasks: task_sender,
             events: event_receiver,
             path_input: String::new(),
+            workbench: WorkbenchSettings::default(),
+            workbench_loaded: false,
+            startup_open_local: None,
+            current_local_path: None,
             remote_endpoint: "http://127.0.0.1:50051".to_owned(),
             remote_token_file: String::new(),
             remote_project_id: String::new(),
@@ -1779,6 +1802,33 @@ impl AnalystApp {
         while let Ok(event) = self.events.try_recv() {
             self.busy = false;
             match event {
+                Event::WorkbenchLoaded(result) => {
+                    self.workbench_loaded = true;
+                    match result {
+                        Ok(settings) => {
+                            self.workbench = settings;
+                            self.status = "Saved workbench loaded".to_owned();
+                        }
+                        Err(error) => {
+                            self.failure = Some(format!(
+                                "Saved workbench unavailable; using default panes: {error}"
+                            ));
+                            self.history.push(format!(
+                                "Saved workbench unavailable; using default panes: {error}"
+                            ));
+                            self.status = "Workbench defaults active".to_owned();
+                        }
+                    }
+                    if let Some(path) = self.startup_open_local.take() {
+                        self.enqueue(Task::Open(path), "Importing local ELF…");
+                    }
+                }
+                Event::WorkbenchSaved(settings) => {
+                    self.workbench = settings;
+                    self.status = "Workbench layout and recent local path saved".to_owned();
+                    self.history.push(self.status.clone());
+                    self.failure = None;
+                }
                 Event::Imported {
                     source,
                     remote,
@@ -1791,6 +1841,11 @@ impl AnalystApp {
                     let binary_sha256 = spec.binary_sha256.clone();
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
+                    self.current_local_path = if remote {
+                        None
+                    } else {
+                        Some(PathBuf::from(&source))
+                    };
                     self.source_label = Some(source);
                     self.source_offer = source_offer;
                     self.remote = remote;
@@ -2044,6 +2099,7 @@ impl AnalystApp {
                 } => {
                     self.spec = Some(spec);
                     self.remote = true;
+                    self.current_local_path = None;
                     self.source_label = Some(source);
                     self.project_revision = Some(revision);
                     self.trusted_fixture = false;
@@ -2087,6 +2143,7 @@ impl AnalystApp {
                     binary_sha256,
                     output_dir,
                 } => {
+                    self.current_local_path = Some(output_dir.join("rebuilt"));
                     self.source_label = Some(output_dir.join("rebuilt").display().to_string());
                     self.source_offer = None;
                     self.spec = Some(spec);
@@ -2130,6 +2187,7 @@ impl AnalystApp {
                     binary_sha256,
                     output_path,
                 } => {
+                    self.current_local_path = Some(output_path.clone());
                     self.source_label = Some(output_path.display().to_string());
                     self.source_offer = None;
                     self.spec = Some(spec);
@@ -2172,6 +2230,7 @@ impl AnalystApp {
                     self.source_label = Some(source);
                     self.spec = Some(spec);
                     self.remote = true;
+                    self.current_local_path = None;
                     self.project_revision = Some(revision);
                     self.symbol = None;
                     self.cfg = None;
@@ -2341,6 +2400,41 @@ impl AnalystApp {
                 "Importing local ELF…",
             );
         }
+        egui::CollapsingHeader::new("Saved workbench · on this device")
+            .id_salt("saved_workbench")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Save the pane widths and recent local ELF path in the private local database. Credentials and binary bytes are never saved here.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                if let Some(path) = &self.workbench.recent_local_path {
+                    ui.label(RichText::new(path.display().to_string()).monospace().size(11.0));
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Reopen saved local ELF"))
+                        .clicked()
+                    {
+                        let path = path.clone();
+                        self.path_input = path.display().to_string();
+                        self.enqueue(Task::Open(path), "Reopening saved local ELF…");
+                    }
+                } else {
+                    ui.label(RichText::new("No local ELF saved yet").size(11.0).color(MUTED));
+                }
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Save workbench layout"))
+                    .clicked()
+                {
+                    let mut settings = self.workbench.clone();
+                    if let Some(path) = &self.current_local_path {
+                        settings.recent_local_path = Some(path.clone());
+                    }
+                    self.enqueue(Task::SaveWorkbench(settings), "Saving workbench layout…");
+                }
+            });
         ui.separator();
         egui::CollapsingHeader::new("Remote project · explicit transfer")
             .id_salt("remote_project")
@@ -3332,6 +3426,14 @@ fn ir_slice(ir: &str, address: u64) -> Option<String> {
 impl eframe::App for AnalystApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        if !self.workbench_loaded {
+            self.header(ui);
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.label("Loading private workbench settings…");
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+            return;
+        }
         if !self.busy
             && self.last_job_poll.elapsed() >= std::time::Duration::from_millis(750)
             && let Some(job) = &self.job
@@ -3342,18 +3444,19 @@ impl eframe::App for AnalystApp {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
         self.header(ui);
-        egui::Panel::left("navigator")
+        let navigator = egui::Panel::left("navigator")
             .resizable(true)
-            .default_size(260.0)
+            .default_size(self.workbench.navigator_width)
             .min_size(180.0)
             .show(ui, |ui| {
                 egui::Frame::new()
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| self.navigator(ui));
             });
-        egui::Panel::right("inspector")
+        self.workbench.navigator_width = navigator.response.rect.width().clamp(180.0, 800.0);
+        let inspector = egui::Panel::right("inspector")
             .resizable(true)
-            .default_size(290.0)
+            .default_size(self.workbench.inspector_width)
             .min_size(220.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -3364,6 +3467,7 @@ impl eframe::App for AnalystApp {
                             .show(ui, |ui| self.inspector(ui));
                     });
             });
+        self.workbench.inspector_width = inspector.response.rect.width().clamp(220.0, 800.0);
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin::same(12))
@@ -3374,6 +3478,49 @@ impl eframe::App for AnalystApp {
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [probe, binary] = arguments.as_slice()
+        && probe == "--probe-workbench"
+    {
+        let result = (|| {
+            if std::env::var_os("HYDIR_LOCAL_DB").is_none() {
+                return Err(
+                    "Set HYDIR_LOCAL_DB to a private absolute test database path".to_owned(),
+                );
+            }
+            let path = PathBuf::from(binary);
+            let bytes = bounded_read(&path)?;
+            let spec = import_elf(&bytes).map_err(|error| error.to_string())?;
+            let project = attach_local_project(&path, &spec)?;
+            let settings = WorkbenchSettings {
+                navigator_width: 344.0,
+                inspector_width: 368.0,
+                recent_local_path: Some(project.path.clone()),
+            };
+            LocalProjectStore::open_default()?.save_workbench_settings(&settings)?;
+            let reopened = LocalProjectStore::open_default()?.load_workbench_settings()?;
+            let reopened_project = attach_local_project(
+                reopened
+                    .recent_local_path
+                    .as_deref()
+                    .ok_or("Recent local ELF path was not saved")?,
+                &spec,
+            )?;
+            if reopened != settings || reopened_project.id != project.id {
+                return Err("Saved workbench did not reopen the same local project".to_owned());
+            }
+            Ok::<_, String>(())
+        })();
+        match result {
+            Ok(()) => {
+                println!("HydIR GUI workbench save/reopen operations passed");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI workbench probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, binary] = arguments.as_slice()
         && probe == "--probe-local-annotation"
     {
@@ -3841,7 +3988,7 @@ fn main() -> eframe::Result<()> {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -3856,10 +4003,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |context| {
             let mut app = AnalystApp::new(&context.egui_ctx);
+            app.enqueue(Task::LoadWorkbench, "Loading saved workbench…");
             if let Some((path, symbol)) = open_local {
                 app.path_input = path.display().to_string();
                 app.initial_symbol = symbol;
-                app.enqueue(Task::Open(path), "Importing local ELF…");
+                app.startup_open_local = Some(path);
             }
             Ok(Box::new(app))
         }),

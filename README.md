@@ -15,7 +15,10 @@ open authenticated loopback projects. It shows function facts,
 reachable disassembly/CFG, LLVM IR, scalar C, assumptions, and diagnostics in resizable
 panes. Opening a local binary never uploads it; sending a binary requires the
 separate, labelled remote-upload action and creates a new immutable revision.
-Saved layouts and high-level structured C recovery are not yet implemented. It can start, monitor,
+The workbench can save its navigator/inspector widths and recent local ELF
+path in the private on-device project database, then explicitly reopen that
+file. It does not persist credentials or automatically reconnect to a remote
+project. High-level structured C recovery is not yet implemented. It can start, monitor,
 cancel, and retrieve a remote lift job and display a conservative global-effect
 analysis. The workbench also has local/remote named-pass editing with verified
 before/after IR and separately authorized local/remote rebuild flows for trusted
@@ -84,7 +87,7 @@ the CLI and GUI; otherwise they share HydIR's user-data database. The CLI
 `local annotate` command requires the current revision, an idempotency key,
 kind, virtual address or `-`, scope, and value.
 `bash scripts/demo-local-project.sh [trusted-linked-x86-64-ELF]` checks CLI/GUI
-persistence, retries, stale writes, and digest isolation. Without an argument
+persistence, saved-workbench reopening, retries, stale writes, and digest isolation. Without an argument
 it builds its fixture on Linux x86-64.
 `bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
 global write, conservative treatment of an indirect call, and a partial

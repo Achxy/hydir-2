@@ -58,6 +58,8 @@ grep -q 'analyst_assertion' "$demo_dir/analyzed-spec-3.json"
 
 "$gui" --probe-local-annotation "$binary" > "$demo_dir/gui-probe.out"
 grep -q 'private revision 4' "$demo_dir/gui-probe.out"
+"$gui" --probe-workbench "$binary" > "$demo_dir/workbench-probe.out"
+grep -q 'workbench save/reopen operations passed' "$demo_dir/workbench-probe.out"
 "$cli" local annotations "$binary" > "$demo_dir/annotations-4.json"
 grep -q 'GUI local analyst assertion' "$demo_dir/annotations-4.json"
 
