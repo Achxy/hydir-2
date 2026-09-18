@@ -93,6 +93,11 @@ file bytes at the same canonical path advances the project revision and
 hides facts for the previous digest. `bash scripts/demo-local-project.sh`
 checks restart, exact-key replay, stale/conflicting writes, GUI/CLI sharing,
 and digest isolation on a disposable fixture copy.
+The **Saved workbench · on this device** section saves the two pane widths
+and recent local ELF path into the local database. Reopening is explicit; it
+does not persist credentials, binary bytes, or a remote authenticated session.
+Schema v2 migrates pre-existing v1 local annotation databases without dropping
+their facts.
 
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is

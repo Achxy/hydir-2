@@ -16,8 +16,7 @@ use uuid::Uuid;
 
 const MAX_BINARY_BYTES: usize = 64 * 1024 * 1024;
 
-const SCHEMA: &str = "BEGIN IMMEDIATE;
-CREATE TABLE local_projects (
+const SCHEMA: &str = "CREATE TABLE local_projects (
     id TEXT PRIMARY KEY,
     canonical_path TEXT NOT NULL UNIQUE,
     current_revision INTEGER NOT NULL CHECK(current_revision >= 1),
@@ -49,8 +48,56 @@ CREATE TABLE annotation_requests (
     new_revision INTEGER NOT NULL,
     PRIMARY KEY(project_id, idempotency_key)
 );
-PRAGMA user_version=1;
-COMMIT;";
+CREATE TABLE workbench_settings (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    navigator_width REAL NOT NULL,
+    inspector_width REAL NOT NULL,
+    recent_local_path TEXT
+);
+PRAGMA user_version=2;";
+
+const MIGRATE_V1_TO_V2: &str = "CREATE TABLE workbench_settings (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    navigator_width REAL NOT NULL,
+    inspector_width REAL NOT NULL,
+    recent_local_path TEXT
+);
+PRAGMA user_version=2;";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkbenchSettings {
+    pub navigator_width: f32,
+    pub inspector_width: f32,
+    pub recent_local_path: Option<PathBuf>,
+}
+
+impl Default for WorkbenchSettings {
+    fn default() -> Self {
+        Self {
+            navigator_width: 260.0,
+            inspector_width: 290.0,
+            recent_local_path: None,
+        }
+    }
+}
+
+impl WorkbenchSettings {
+    fn validate(&self) -> Result<(), String> {
+        if !self.navigator_width.is_finite()
+            || !(180.0..=800.0).contains(&self.navigator_width)
+            || !self.inspector_width.is_finite()
+            || !(220.0..=800.0).contains(&self.inspector_width)
+        {
+            return Err("Workbench pane widths are outside the supported range".to_owned());
+        }
+        if let Some(path) = &self.recent_local_path
+            && (!path.is_absolute() || path.to_str().is_none_or(|value| value.len() > 4096))
+        {
+            return Err("Recent local ELF path must be absolute UTF-8 and bounded".to_owned());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct LocalProject {
@@ -123,46 +170,103 @@ impl LocalProjectStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            match fs::symlink_metadata(path) {
-                Ok(metadata) => {
-                    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0
-                    {
-                        return Err(
-                            "Local project database must be a regular owner-private file"
-                                .to_owned(),
-                        );
-                    }
+            let check_existing = || {
+                let metadata = fs::symlink_metadata(path)
+                    .map_err(|error| format!("Cannot inspect local project database: {error}"))?;
+                if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(
+                        "Local project database must be a regular owner-private file".to_owned(),
+                    );
                 }
+                Ok(())
+            };
+            match fs::symlink_metadata(path) {
+                Ok(_) => check_existing()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    fs::OpenOptions::new()
+                    match fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .mode(0o600)
                         .open(path)
-                        .map_err(|error| {
-                            format!("Cannot create local project database: {error}")
-                        })?;
+                    {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            check_existing()?;
+                        }
+                        Err(error) => {
+                            return Err(format!("Cannot create local project database: {error}"));
+                        }
+                    }
                 }
                 Err(error) => {
                     return Err(format!("Cannot inspect local project database: {error}"));
                 }
             }
         }
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .map_err(|error| format!("Cannot open local project database: {error}"))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(db_error)?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(db_error)?;
-        let version: i64 = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let version: i64 = tx
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(db_error)?;
-        if version == 0 {
-            conn.execute_batch(SCHEMA).map_err(db_error)?;
-        } else if version != 1 {
-            return Err("Local project database schema is not supported by this build".to_owned());
+        match version {
+            0 => tx.execute_batch(SCHEMA).map_err(db_error)?,
+            1 => tx.execute_batch(MIGRATE_V1_TO_V2).map_err(db_error)?,
+            2 => {}
+            _ => {
+                return Err(
+                    "Local project database schema is not supported by this build".to_owned(),
+                );
+            }
         }
+        tx.commit().map_err(db_error)?;
         Ok(Self { conn })
+    }
+
+    pub fn load_workbench_settings(&self) -> Result<WorkbenchSettings, String> {
+        let settings: Option<(f32, f32, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT navigator_width,inspector_width,recent_local_path FROM workbench_settings WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let settings =
+            settings.map_or_else(WorkbenchSettings::default, |value| WorkbenchSettings {
+                navigator_width: value.0,
+                inspector_width: value.1,
+                recent_local_path: value.2.map(PathBuf::from),
+            });
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub fn save_workbench_settings(&mut self, settings: &WorkbenchSettings) -> Result<(), String> {
+        settings.validate()?;
+        let path = settings
+            .recent_local_path
+            .as_ref()
+            .map(|path| path.to_str().ok_or("Non-UTF-8 recent local ELF path"))
+            .transpose()?;
+        self.conn
+            .execute(
+                "INSERT INTO workbench_settings(id,navigator_width,inspector_width,recent_local_path) \
+                 VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET \
+                 navigator_width=excluded.navigator_width, \
+                 inspector_width=excluded.inspector_width, \
+                 recent_local_path=excluded.recent_local_path",
+                params![settings.navigator_width, settings.inspector_width, path],
+            )
+            .map_err(db_error)?;
+        Ok(())
     }
 
     pub fn open_binary(&mut self, path: &Path, spec: &ProgramSpec) -> Result<LocalProject, String> {
@@ -618,6 +722,76 @@ mod tests {
         assert_eq!(facts[0].kind, AnnotationKind::Name);
     }
 
+    #[test]
+    fn workbench_settings_survive_restart_and_version_one_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let recent = directory.path().join("recent.elf");
+        let expected = WorkbenchSettings {
+            navigator_width: 342.0,
+            inspector_width: 376.0,
+            recent_local_path: Some(recent),
+        };
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        assert_eq!(
+            store.load_workbench_settings().unwrap(),
+            WorkbenchSettings::default()
+        );
+        store.save_workbench_settings(&expected).unwrap();
+        drop(store);
+        let mut reopened = LocalProjectStore::open(&database).unwrap();
+        assert_eq!(reopened.load_workbench_settings().unwrap(), expected);
+        assert!(
+            reopened
+                .save_workbench_settings(&WorkbenchSettings {
+                    navigator_width: f32::NAN,
+                    ..expected.clone()
+                })
+                .is_err()
+        );
+        reopened
+            .conn
+            .execute_batch("DROP TABLE workbench_settings; PRAGMA user_version=1;")
+            .unwrap();
+        drop(reopened);
+        let migrated = LocalProjectStore::open(&database).unwrap();
+        assert_eq!(
+            migrated.load_workbench_settings().unwrap(),
+            WorkbenchSettings::default()
+        );
+        assert_eq!(
+            migrated
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_initial_database_opens_serialize_schema_creation() {
+        use std::sync::{Arc, Barrier};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    LocalProjectStore::open(&database)
+                        .unwrap()
+                        .load_workbench_settings()
+                        .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), WorkbenchSettings::default());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_database_refuses_public_files_symlinks_and_newer_schema() {
@@ -637,7 +811,7 @@ mod tests {
 
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
         let store = LocalProjectStore::open(&database).unwrap();
-        store.conn.execute_batch("PRAGMA user_version=2;").unwrap();
+        store.conn.execute_batch("PRAGMA user_version=3;").unwrap();
         drop(store);
         assert!(
             LocalProjectStore::open(&database)

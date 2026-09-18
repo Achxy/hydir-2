@@ -9,8 +9,9 @@ facts, and idempotency requests. It does not copy the ELF into the database
 or upload it. The default database lives in HydIR's per-user data directory;
 `HYDIR_LOCAL_DB` selects an absolute path for both the CLI and GUI. New Unix
 files are owner-private and an existing database with group/other access or
-an unsupported schema version is rejected. Schema v1 is the first local
-schema; migrations for future changes are still required.
+an unsupported schema version is rejected. Schema v1 was the first local
+schema; v2 adds saved workbench settings with a transactional migration.
+Future schema changes still require explicit migrations.
 
 Names, comments, and assumptions use the shared local/remote validation
 functions. Writes require a current revision and an idempotency key, produce

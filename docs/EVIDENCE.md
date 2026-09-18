@@ -1,5 +1,37 @@
 # HydIR evidence — 2026-09-18
 
+## Saved local workbench — 2026-09-18
+
+The private local SQLite schema now migrates transactionally from v1 to v2,
+adding one workbench-settings row for navigator/inspector pane widths and a
+recent local ELF path. The path is not auto-opened. `hydir` loads/saves these
+settings on its worker and offers explicit **Save workbench layout** and
+**Reopen saved local ELF** controls. No credential, token-file path, binary
+content, or remote session is persisted there. New unit tests cover settings
+restart/migration, invalid widths, and concurrent first-open serialization.
+The first concurrency test exposed a `create_new` file race, which was fixed
+before the final run.
+
+`bash scripts/demo-local-project.sh
+target/demo-analysis/run.ufXm8n/global-effects` exited 0 in
+`target/demo-local-project/run.OY3VBH/`, now including a GUI headless
+save/reopen probe. The prior ignored v1 database at
+`target/local-project-check.sqlite` was independently opened by the new CLI;
+its SQLite `user_version` advanced from 1 to 2 and its three pre-existing
+analyst facts remained readable. A macOS HydIR window opened against the
+earlier disposable demo database `target/demo-local-project/run.CBiaE2/`.
+A window-scoped capture showed the persisted wider
+panes, saved local path, both explicit workbench controls, and `LOCAL · NO
+UPLOAD`; this remains visual inspection, not automated click testing.
+
+`cargo test --locked --offline --workspace` passed **48 Rust unit tests** and
+all doc-test targets. The Python SDK suite passed **9 unit tests**. The
+saved-workbench headless probe and macOS window inspection passed; automated
+pointer/keyboard interaction was not exercised. The earlier `f0b683d`
+source-offer bytes were verified separately; a changed commit needs its own
+archive check after it is clean. Linux-only demos were not rerun for this
+macOS follow-up.
+
 ## Private local analyst projects — 2026-09-18
 
 Local ELF import now attaches a path-bound, private SQLite project without

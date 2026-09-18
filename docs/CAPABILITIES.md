@@ -88,7 +88,11 @@ project, explicitly upload an ELF to it, or reopen an existing project, then
 browse function facts, reachable CFG,
 machine bytes, LLVM IR, and bounded scalar C. Only the separate labelled upload action transfers
 bytes. A
-local/remote pass editor, restricted local/remote rebuild controls, and scalar
+private v2 local project database saves navigator/inspector pane widths and
+the recent local ELF path; reopening that file requires an explicit button
+press. Credentials, binary bytes, and remote sessions are not saved in the
+workbench setting.
+A local/remote pass editor, restricted local/remote rebuild controls, and scalar
 patch v1 editor use the same first-party libraries or typed remote operations
 as the CLI. The patch editor requires an explicit entry-only assertion and
 never executes the patched ELF. A
