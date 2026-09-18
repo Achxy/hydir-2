@@ -1,211 +1,159 @@
-# HydIR
+<h1 align="center">HydIR</h1>
 
-HydIR is an early, independently implemented binary-lifting workbench. This
-checkout contains a tested **M1 native vertical slice**, a **partial M2
-desktop and local-authenticated RPC slice**, bounded scalar C emission, and a narrowly tested
-whole-executable recompilation subset. It is not the complete remote/decompilation/
-recompilation product described in the project plan. It imports little-endian
-x86-64 ELF without Ghidra, lifts a deliberately small class of functions from
-machine bytes to LLVM IR, differentially executes trusted fixtures on Linux
-x86-64, and exposes import/CFG/lift artifacts through a persistent local-only
-service.
+<p align="center">
+  <strong>A native workbench for inspecting, lifting, testing, and rebuilding a bounded x86-64 ELF subset.</strong><br>
+  Local by default, explicit about uncertainty, and designed around inspectable artifacts.
+</p>
 
-The `hydir` egui desktop workbench opens local ELF files and can create or
-open authenticated loopback projects. It shows function facts,
-reachable disassembly/CFG, LLVM IR, scalar C, assumptions, and diagnostics in resizable
-panes. Opening a local binary never uploads it; sending a binary requires the
-separate, labelled remote-upload action and creates a new immutable revision.
-The workbench can save its navigator/inspector widths and recent local ELF
-path in the private on-device project database, then explicitly reopen that
-file. It does not persist credentials or automatically reconnect to a remote
-project. High-level structured C recovery is not yet implemented. It can start, monitor,
-cancel, and retrieve a remote lift job and display a conservative global-effect
-analysis. The workbench also has local/remote named-pass editing with verified
-before/after IR and separately authorized local/remote rebuild flows for trusted
-fixtures. Local pass and rebuild actions require pinned Linux LLVM/Clang tools
-and new output directories; remote rebuild exports only to a new file. A
-separate scalar patch v1 editor supports explicit local/remote whole-function
-replacement with entry-only and trusted-fixture assertions.
-Remote and local projects can save revisioned analyst names, comments, and
-scoped assumptions. The Inspector labels them unverified; only assumptions
-are overlaid into inspected/analyzed specifications. Local projects use a
-private, path-bound SQLite ledger and never upload bytes. The two ledgers do
-not automatically sync.
-The analysis is not complete whole-program
-recovery.
+<p align="center">
+  <img alt="Rust 1.96" src="https://img.shields.io/badge/Rust-1.96-30363d?logo=rust">
+  <img alt="x86-64 ELF" src="https://img.shields.io/badge/target-x86--64%20ELF-30363d">
+  <a href="LICENSE"><img alt="AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-30363d"></a>
+</p>
 
-For local ELF work, **Disassemble ELF** scans executable x86-64 sections with
-the native `iced-x86` decoder. Symbol and entry-point paths receive recursive
-control-flow recovery; uncovered bytes are shown as explicitly uncertain
-linear-sweep output or gaps. The Console pane shows status, warnings, and JSON
-reports; it can be resized from its top edge or detached into a movable,
-independently resizable window and docked again. Its Triton REPL accepts one
-statement at a time from a restricted Python-shaped subset covering x86-64
-contexts, concrete/symbolic registers, instruction processing, symbolic
-expressions, model queries, `print`, and integer `hex`/xor. It does not expose
-filesystem, shell, network, arbitrary imports, or general Python execution.
-Whole-ELF disassembly never executes the binary.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#native-analysis-workbench">Workbench</a> ·
+  <a href="#verified-scalar-lift">Evidence</a> ·
+  <a href="#capability-map">Capabilities</a> ·
+  <a href="#exact-lift-contract">Contract</a> ·
+  <a href="#project-layout">Layout</a>
+</p>
 
-## Build and inspect
+[![HydIR recovers a control-flow graph, emits LLVM IR, and records independent checks for a trusted scalar fixture](assets/evidence/max2-evidence.png)](assets/evidence/max2-evidence.png)
 
-Rust 1.96.0 is pinned in `rust-toolchain.toml`; `Cargo.lock` pins crates.
-The demo additionally needs Clang with x86-64 ELF and LLVM IR support. Native
-execution validation requires Linux x86-64.
+HydIR opens little-endian x86-64 ELF files without uploading them. The current native slice recovers bounded control flow, emits LLVM IR and scalar C for a deliberately small instruction set, runs differential checks against trusted fixtures, and exposes the same core through a desktop app, CLI, Python SDK, and authenticated loopback service.
 
-```sh
+This is an engineering workbench, not a general decompiler. Unsupported instructions, memory behavior, calls, partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
+
+## Quick start
+
+Rust 1.96 is pinned in [`rust-toolchain.toml`](rust-toolchain.toml), and [`Cargo.lock`](Cargo.lock) fixes the Rust dependency graph.
+
+```bash
 cargo test --locked --workspace
 cargo run --locked --bin hydir
-cargo run --locked --bin hydir -- --open-local /path/to/program.elf function_name
-cargo run --locked --bin hydirctl -- doctor
-cargo run --locked --bin hydirctl -- local project /path/to/program.elf
-cargo run --locked --bin hydirctl -- local annotations /path/to/program.elf
+```
+
+Open a local binary directly:
+
+```bash
+cargo run --locked --bin hydir -- \
+  --open-local /path/to/program.elf function_name
+```
+
+Or inspect it from the CLI:
+
+```bash
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
-cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name
-cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
-cargo run --locked --bin hydirctl -- analyze-spec /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
-cargo run --locked --bin hydirctl -- lift /path/to/program.elf function_name --assume-u64x2 --output lifted.ll
-cargo run --locked --bin hydirctl -- decompile /path/to/program.elf function_name --assume-u64x2 --output lifted.c
-cargo run --locked --bin hydirctl -- patch /path/to/trusted.elf /path/to/patch-v1.json --trusted-fixture --assume-u64x2 --assume-entry-only --output /path/to/new.elf
-cargo run --locked --bin hydirctl -- transform /path/to/program.elf function_name --assume-u64x2 --trusted-fixture --passes instcombine,sccp,simplifycfg,dce --output-dir /path/to/new-experiment --opt opt
-cargo run --locked --bin hydirctl -- rebuild /path/to/trusted-static-program.elf --trusted-fixture --output-dir /path/to/new-rebuild
+cargo run --locked --bin hydirctl -- lift \
+  /path/to/program.elf function_name \
+  --assume-u64x2 --output lifted.ll
 ```
 
-On a Linux x86-64 host with Clang, `bash scripts/demo-local.sh` builds four
-trusted assembly functions, imports them, exports per-function CFG JSON,
-lifts them, emits C, verifies the IR if `opt` is installed, and compares 1,008
-executions per function (eight boundary cases and 1,000 seeded cases). It
-also strips one fixture and repeats CFG, lift, C, IR verification, and 1,008
-comparisons using an explicitly supplied entry and byte extent. Artifacts
-are written to a fresh `target/demo-local/run.*` directory.
-`bash scripts/demo-corpus.sh` separately checks 16 more distinct scalar
-functions (identity, wrapping arithmetic, signed/unsigned comparison,
-bit test, bounded loops): each is lifted, converted to C, LLVM-verified, and compared with
-native execution on 1,008 inputs for both LLVM and compiled C. Together with the four distinct functions
-in `demo-local.sh`, this makes 20 distinct supported scalar functions. It
-does not cover optimized compiler output, stack/buffer access, or high-level C structuring.
+Clang with x86-64 ELF and LLVM IR support is required for the full demo path. Native execution comparisons require Linux x86-64. On macOS with Docker Desktop:
 
-On macOS with Docker Desktop, `bash scripts/demo-linux-docker.sh` builds the
-pinned Linux x86-64 development image and runs the tests plus demo there.
-For a visual workbench demo, `bash scripts/demo-password-showcase.sh` builds a
-freestanding access-gate ELF with named scoring, comparison, meter, and policy
-functions. Open the generated ELF in the GUI, press **Disassemble ELF**, then
-explore `hydir_policy_route`, `hydir_password_score`, and the **Graph** view.
-The intentionally visible phrase and branchy flow are for demonstration only;
-this is not an authentication implementation. The access-gate behavior is covered by the local demo scripts.
-On Linux x86-64, `bash scripts/demo-remote.sh` runs the separate-process,
-authenticated service/client fixture, including durable lift jobs, event
-replay, restart, cancellation, GUI create/upload logic, and cross-project
-denial checks. See
-Remote operation and threat-model details are maintained in the local development materials.
-The remote CLI also has `annotations` and `annotate` commands for an
-owner-scoped, revisioned ledger of explicitly unverified analyst facts.
-`hydirctl local` exposes the corresponding private on-device ledger. Set
-`HYDIR_LOCAL_DB` to an absolute path to use a specific database from both
-the CLI and GUI; otherwise they share HydIR's user-data database. The CLI
-`local annotate` command requires the current revision, an idempotency key,
-kind, virtual address or `-`, scope, and value.
-`bash scripts/demo-local-project.sh [trusted-linked-x86-64-ELF]` checks CLI/GUI
-persistence, saved-workbench reopening, retries, stale writes, and digest isolation. Without an argument
-it builds its fixture on Linux x86-64.
-`bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
-global write, conservative treatment of an indirect call, and a partial
-`ProgramSpec` with provenance-bearing call/reference instruction sites.
-`bash scripts/demo-passes.sh` saves raw, canonical before, and after LLVM IR;
-it verifies the named pipeline with pinned LLVM `opt` 14.0.6 and compares a
-transformed trusted fixture on eight boundary inputs. An IR change and a
-verifier pass are not, by themselves, a behavioral proof.
-`hydirctl remote transform` runs the same allowlisted LLVM 14 pipeline in a
-limited service worker and returns owner-scoped, hash-addressed IR snapshots
-in a new immutable project revision that retains the same ELF bytes. It has
-no arbitrary plugin path.
-`bash scripts/demo-recompile.sh` lifts the complete decoded `.text` of three
-trusted, static freestanding ELFs to stateful LLVM IR, links a bounded guest
-memory/syscall bridge into new executables, verifies IR, and compares five
-controlled executions (stdout, stderr, exit status). It includes direct
-calls, branches, a loop, shared globals, `.bss`, and input-dependent output.
-The same bounded rebuild is available through the authenticated loopback RPC,
-CLI, Python SDK, and egui workbench. It rejects code outside its declared
-instruction and OS subset; this is not general ELF recompilation or a
-hostile-input sandbox. No server-side binary execution is exposed.
-`bash scripts/demo-patch.sh` checks the separate scalar whole-function
-in-place patch subset: it produces a new ELF, validates four intentional
-behavior cases, and rejects size/hash/overwrite errors. The authenticated
-remote demo also applies that patch as an immutable project revision and
-checks idempotent replay after restart.
-The [Python SDK](sdk/python/README.md) wraps the same authenticated gRPC
-subset. With its pinned dependencies installed, `bash scripts/demo-sdk.sh
-/path/to/trusted-x86_64-elf-with-hydir_max2 /path/to/trusted-freestanding-elf` exercises a separate Python
-client against `hydird`, including explicit upload, analysis, event replay,
-digest-checked artifact export, and whole-executable rebuilding. On macOS with
-Docker Desktop, `bash scripts/demo-sdk-linux-docker.sh` builds the pinned
-Python/Clang test environment and runs that integration with repository
-fixtures. `sdk/python/examples/validate_program.py` separately compares
-trusted original/rebuilt ELFs in no-network, read-only, resource-controlled
-Docker runs and saves a per-case report; Docker is not a hostile-binary
-sandbox or an equivalence proof.
-
-The `validate` command runs the original binary and lifted runner **without a
-sandbox** and requires `--trusted-fixture`. Never use it on an untrusted sample.
-There is no remote execution endpoint, and the current RPC service cannot
-bind outside loopback.
-
-For a local developer source snapshot of a clean committed tree, run
-`bash scripts/package-source-snapshot.sh`. It verifies that the archive
-contains the license, lockfile, runtime, and protocol, and excludes
-local design context and project data. `bash scripts/demo-source-offer.sh`
-builds an opt-in `hydird` with that matching archive embedded, then checks
-discovery and hash-checked RPC retrieval. This is a technical source-delivery
-gate, not a release or completed redistribution-license review.
-
-## Exact supported lift contract
-
-- Input: little-endian x86-64 ELF with a nonzero-size text function symbol.
-  For a linked stripped ELF, `cfg-at`, `lift-at`, and `validate-at` instead
-  require an analyst-supplied virtual entry (`0x...`) and exact size in bytes.
-  This is not automatic stripped-code discovery.
-- Analyst assertion via `--assume-u64x2`: the selected function has SysV AMD64
-  prototype `u64(u64, u64)`. HydIR does not infer or verify that prototype.
-- Accepted instructions: full-width scalar `mov`, non-RIP-relative `lea`,
-  `add`/`sub`, `cmp`/`test`, `nop`, `ret`, direct `jmp`, and direct integer
-  condition branches. Supported registers are RAX/RDI/RSI/RDX/RCX. Inputs
-  begin in RDI/RSI; every returning path must define RAX. ZF/SF/OF/CF are
-  modeled for accepted arithmetic and branch conditions.
-- Reachable direct branches must stay inside the selected byte extent and
-  land on non-overlapping instruction boundaries. Unknown instruction or
-  state semantics, memory access, calls, indirect edges, partial registers,
-  and uninitialized reads on any recovered path are rejected. Wrapping
-  arithmetic emits plain LLVM integer operations without `nsw`/`nuw`.
-- Import is broader than lift. `inspect` lists ELF symbol facts, while `cfg`
-  performs an explicit symbol-scoped recovery. A liftable function is not a
-  recompilable executable.
-- `lift --output` creates a new artifact or accepts byte-identical content;
-  it refuses to overwrite an existing binary or differing artifact.
-
-## Optional Triton symbolic bridge
-
-HydIR includes the Triton source as a pinned submodule at
-`third_party/Triton`. The optional `triton` command extracts a bounded named
-function using HydIR's existing ELF parser, then sends only its bytes and
-metadata to `scripts/triton_bridge.py`. The helper uses Triton's x86-64 Python
-bindings to symbolize SysV AMD64 `rdi`/`rsi` as `arg0`/`arg1`, process the
-instructions, and return instruction-level symbolic expressions plus the
-final `rax` expression. It never executes the ELF and does not use SMT, LLVM,
-or concrete emulation.
-
-Build/install Triton's Python module according to the pinned upstream checkout,
-then run:
-
-```sh
-HYDIR_TRITON_PYTHON=python cargo run --locked --bin hydirctl -- \
-  triton /path/to/program.elf function_name
+```bash
+bash scripts/demo-linux-docker.sh
 ```
 
-`HYDIR_TRITON_PYTHON` selects the Python executable and
-`HYDIR_TRITON_HELPER` can override the helper path. This first bridge supports
-only little-endian x86-64 ELF files with non-stripped, bounded text symbols.
-The GUI, gRPC server, remote API, SDK, stripped-code discovery, other binary
-formats, other architectures, solver integration, and LLVM lifting remain
-outside this slice.
+## Native analysis workbench
 
-HydIR is licensed under
+[![HydIR Studio showing a local analysis project and revisioned analyst annotations](assets/screenshots/studio-analyst-annotations.png)](assets/screenshots/studio-analyst-annotations.png)
+
+The desktop workbench keeps the program tree, analysis views, inspector, and diagnostics visible at once. It can:
+
+- disassemble executable sections with recursive recovery from symbols and entry points
+- show uncertain linear-sweep regions and undecodable gaps instead of silently promoting them to functions
+- inspect CFG, LLVM IR, scalar C, named pass results, and conservative global effects
+- save local names, comments, assumptions, and pane layout in a private SQLite project
+- create an authenticated loopback project only through an explicit transfer action
+- apply bounded transforms, rebuilds, and scalar patches to new output paths
+
+Opening a local ELF does not upload it. Credentials are not persisted, remote projects do not reconnect automatically, and the service refuses non-loopback binding.
+
+## Verified scalar lift
+
+The checked demo path covers 20 distinct scalar functions. Each function is lifted to LLVM IR and C, verified where the required LLVM tools are available, then compared with native execution on 1,008 inputs per output path.
+
+```bash
+bash scripts/demo-local.sh
+bash scripts/demo-corpus.sh
+```
+
+The primary fixture image above shows the complete evidence chain for `hydir_max2`: recovered blocks and edges, machine-byte-derived IR, verifier status, and differential results. These checks establish the documented subset only. They do not prove equivalence for arbitrary programs.
+
+## Recovery pipeline
+
+[![HydIR pipeline from ELF through CFG and LLVM IR to verification and bounded rebuild](blog/assets/hydir-pipeline.png)](blog/assets/hydir-pipeline.png)
+
+HydIR carries explicit boundaries through the pipeline. A valid import can still fail CFG recovery; a valid CFG can still fail lifting; valid LLVM IR can still fall outside the rebuild contract. Rebuild output is always written as a new artifact.
+
+## Capability map
+
+| Surface | Current scope | Entry point |
+|---|---|---|
+| Desktop | Local ELF inspection, projects, annotations, CFG, lift, C, passes, effects, patch and rebuild flows | `cargo run --bin hydir` |
+| CLI | Local inspection plus authenticated loopback operations | `hydirctl` |
+| Native lift | Bounded scalar x86-64 function subset | `hydirctl lift` |
+| Scalar C | Conservative C for the same accepted function contract | `hydirctl decompile` |
+| Whole rebuild | Trusted static freestanding fixtures with bounded memory and syscall support | `hydirctl rebuild` |
+| Scalar patch | Entry-only whole-function replacement with explicit assertions | `hydirctl patch` |
+| Python | Typed client for the authenticated loopback subset | [`sdk/python`](sdk/python/README.md) |
+| Symbolic bridge | Bounded x86-64 function expressions and a restricted REPL | `hydirctl triton` |
+
+Useful end-to-end demos:
+
+```bash
+bash scripts/demo-password-showcase.sh
+bash scripts/demo-analysis.sh
+bash scripts/demo-passes.sh
+bash scripts/demo-recompile.sh
+bash scripts/demo-patch.sh
+bash scripts/demo-remote.sh
+```
+
+Each script creates a fresh run directory under `target/` and keeps reports beside the generated artifacts.
+
+## Exact lift contract
+
+- **Input:** little-endian x86-64 ELF with a nonzero text symbol. Stripped input requires an explicit virtual entry and byte extent.
+- **ABI assertion:** `--assume-u64x2` declares `u64(u64, u64)` under SysV AMD64. HydIR does not infer that prototype.
+- **Instructions:** full-width scalar `mov`, non-RIP-relative `lea`, `add`, `sub`, `cmp`, `test`, `nop`, `ret`, direct `jmp`, and direct integer conditional branches.
+- **Registers:** RAX, RDI, RSI, RDX, and RCX. Inputs begin in RDI and RSI; every returning path must define RAX.
+- **Flags:** ZF, SF, OF, and CF for accepted arithmetic and branches.
+- **Control flow:** direct branches must stay inside the selected extent and land on non-overlapping instruction boundaries.
+- **Refusals:** unknown semantics, memory access, calls, indirect edges, partial registers, or uninitialized reads on any recovered path.
+- **Outputs:** new files only, except that byte-identical existing content is accepted.
+
+Import is intentionally broader than lift. A function that can be inspected is not automatically liftable, and a liftable function is not automatically eligible for whole-executable rebuild.
+
+## Safety boundaries
+
+`hydirctl validate` executes the original trusted fixture and its lifted runner without a hostile-input sandbox. It requires `--trusted-fixture`; never use it with an unknown binary.
+
+The local service has no remote execution endpoint. Whole-executable rebuild is limited to the documented static freestanding fixture subset and rejects code outside its instruction, memory, and OS contract.
+
+The symbolic console accepts one statement at a time from a restricted Python-shaped language. It exposes bounded register, instruction, expression, model, `print`, integer `hex`, and xor operations. It does not expose the filesystem, shell, network, arbitrary imports, or general Python execution.
+
+## Project layout
+
+| Path | Purpose |
+|---|---|
+| [`crates/hydir-backend`](crates/hydir-backend) | ELF import, disassembly, CFG recovery, and LLVM lifting |
+| [`crates/hydir-gui`](crates/hydir-gui) | Native egui workbench |
+| [`crates/hydir-cli`](crates/hydir-cli) | Local and loopback command-line interface |
+| [`crates/hydir-server`](crates/hydir-server) | Authenticated loopback service and durable jobs |
+| [`crates/hydir-project`](crates/hydir-project) | Local revisioned project storage |
+| [`crates/hydir-analysis`](crates/hydir-analysis) | Conservative program analysis |
+| [`crates/hydir-c`](crates/hydir-c) | Scalar C emission |
+| [`crates/hydir-transform`](crates/hydir-transform) | Allowlisted LLVM pass experiments |
+| [`crates/hydir-recompile`](crates/hydir-recompile) | Bounded whole-executable rebuild |
+| [`crates/hydir-patch`](crates/hydir-patch) | Scalar patch format and validation |
+| [`sdk/python`](sdk/python) | Python client, examples, and tests |
+| [`scripts`](scripts) | Reproducible demos and integration gates |
+
+## License
+
+HydIR is released under the [GNU Affero General Public License v3.0 only](LICENSE).
