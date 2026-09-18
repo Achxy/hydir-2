@@ -10,8 +10,7 @@
   <a href="#native-analysis-workbench">Workbench</a> ·
   <a href="#verified-scalar-lift">Evidence</a> ·
   <a href="#symbolic-exploration-with-triton">Triton</a> ·
-  <a href="#authenticated-loopback-service">Remote API</a> ·
-  <a href="#capability-map">Capabilities</a>
+  <a href="#authenticated-loopback-service">Remote API</a>
 </p>
 
 [![HydIR egui workbench with a selected ELF function, its lifted LLVM IR, inspector, diagnostics, and console](assets/screenshots/studio-lift.png)](assets/screenshots/studio-lift.png)
@@ -120,19 +119,6 @@ cargo run --locked --bin hydirctl -- remote upload <project-id> <expected-revisi
 ```
 
 Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent `remote inspect`, `cfg`, `lift`, `decompile`, `artifact`, or `job-*` operations. Credential files must not be group- or world-readable.
-
-## Capability map
-
-| Surface | Current scope | Entry point |
-|---|---|---|
-| Desktop | Local ELF inspection, projects, annotations, CFG, lift, C, passes, effects, patch and rebuild flows | `cargo run --bin hydir` |
-| CLI | Local inspection plus authenticated loopback operations | `hydirctl` |
-| Native lift | Bounded scalar x86-64 function subset | `hydirctl lift` |
-| Scalar C | Conservative C for the same accepted function contract | `hydirctl decompile` |
-| Whole rebuild | Trusted static freestanding fixtures with bounded memory and syscall support | `hydirctl rebuild` |
-| Scalar patch | Entry-only whole-function replacement with explicit assertions | `hydirctl patch` |
-| Python | Typed client for the authenticated loopback subset | [`sdk/python`](sdk/python/README.md) |
-| Symbolic bridge | Bounded x86-64 function expressions and a restricted REPL | `hydirctl triton` |
 
 ## License
 
