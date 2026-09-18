@@ -6,21 +6,13 @@
 </p>
 
 <p align="center">
-  <img alt="Rust 1.96" src="https://img.shields.io/badge/Rust-1.96-30363d?logo=rust">
-  <img alt="x86-64 ELF" src="https://img.shields.io/badge/target-x86--64%20ELF-30363d">
-  <a href="LICENSE"><img alt="AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-30363d"></a>
-</p>
-
-<p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#native-analysis-workbench">Workbench</a> ·
   <a href="#verified-scalar-lift">Evidence</a> ·
-  <a href="#capability-map">Capabilities</a> ·
-  <a href="#exact-lift-contract">Contract</a> ·
-  <a href="#project-layout">Layout</a>
+  <a href="#capability-map">Capabilities</a>
 </p>
 
-[![HydIR recovers a control-flow graph, emits LLVM IR, and records independent checks for a trusted scalar fixture](assets/evidence/max2-evidence.png)](assets/evidence/max2-evidence.png)
+[![HydIR egui workbench showing recovered x86-64 disassembly and the function inspector](assets/screenshots/studio-disassembly.png)](assets/screenshots/studio-disassembly.png)
 
 HydIR opens little-endian x86-64 ELF files without uploading them. The current native slice recovers bounded control flow, emits LLVM IR and scalar C for a deliberately small instruction set, runs differential checks against trusted fixtures, and exposes the same core through a desktop app, CLI, Python SDK, and authenticated loopback service.
 
@@ -82,13 +74,12 @@ bash scripts/demo-local.sh
 bash scripts/demo-corpus.sh
 ```
 
-The primary fixture image above shows the complete evidence chain for `hydir_max2`: recovered blocks and edges, machine-byte-derived IR, verifier status, and differential results. These checks establish the documented subset only. They do not prove equivalence for arbitrary programs.
+The egui workbench exposes the selected function's decoded instructions and scope. The demo scripts record CFG, LLVM IR, C, and differential results as inspectable artifacts. These checks establish the documented subset only; they do not prove equivalence for arbitrary programs.
 
-## Recovery pipeline
-
-[![HydIR pipeline from ELF through CFG and LLVM IR to verification and bounded rebuild](blog/assets/hydir-pipeline.png)](blog/assets/hydir-pipeline.png)
-
-HydIR carries explicit boundaries through the pipeline. A valid import can still fail CFG recovery; a valid CFG can still fail lifting; valid LLVM IR can still fall outside the rebuild contract. Rebuild output is always written as a new artifact.
+<p align="center">
+  <img src="assets/screenshots/egui-disassembly.webp" width="60%" alt="Decoded instructions in the egui disassembly view">
+  <img src="assets/screenshots/egui-inspector.webp" width="30%" alt="Selected function details in the egui inspector">
+</p>
 
 ## Capability map
 
@@ -115,44 +106,6 @@ bash scripts/demo-remote.sh
 ```
 
 Each script creates a fresh run directory under `target/` and keeps reports beside the generated artifacts.
-
-## Exact lift contract
-
-- **Input:** little-endian x86-64 ELF with a nonzero text symbol. Stripped input requires an explicit virtual entry and byte extent.
-- **ABI assertion:** `--assume-u64x2` declares `u64(u64, u64)` under SysV AMD64. HydIR does not infer that prototype.
-- **Instructions:** full-width scalar `mov`, non-RIP-relative `lea`, `add`, `sub`, `cmp`, `test`, `nop`, `ret`, direct `jmp`, and direct integer conditional branches.
-- **Registers:** RAX, RDI, RSI, RDX, and RCX. Inputs begin in RDI and RSI; every returning path must define RAX.
-- **Flags:** ZF, SF, OF, and CF for accepted arithmetic and branches.
-- **Control flow:** direct branches must stay inside the selected extent and land on non-overlapping instruction boundaries.
-- **Refusals:** unknown semantics, memory access, calls, indirect edges, partial registers, or uninitialized reads on any recovered path.
-- **Outputs:** new files only, except that byte-identical existing content is accepted.
-
-Import is intentionally broader than lift. A function that can be inspected is not automatically liftable, and a liftable function is not automatically eligible for whole-executable rebuild.
-
-## Safety boundaries
-
-`hydirctl validate` executes the original trusted fixture and its lifted runner without a hostile-input sandbox. It requires `--trusted-fixture`; never use it with an unknown binary.
-
-The local service has no remote execution endpoint. Whole-executable rebuild is limited to the documented static freestanding fixture subset and rejects code outside its instruction, memory, and OS contract.
-
-The symbolic console accepts one statement at a time from a restricted Python-shaped language. It exposes bounded register, instruction, expression, model, `print`, integer `hex`, and xor operations. It does not expose the filesystem, shell, network, arbitrary imports, or general Python execution.
-
-## Project layout
-
-| Path | Purpose |
-|---|---|
-| [`crates/hydir-backend`](crates/hydir-backend) | ELF import, disassembly, CFG recovery, and LLVM lifting |
-| [`crates/hydir-gui`](crates/hydir-gui) | Native egui workbench |
-| [`crates/hydir-cli`](crates/hydir-cli) | Local and loopback command-line interface |
-| [`crates/hydir-server`](crates/hydir-server) | Authenticated loopback service and durable jobs |
-| [`crates/hydir-project`](crates/hydir-project) | Local revisioned project storage |
-| [`crates/hydir-analysis`](crates/hydir-analysis) | Conservative program analysis |
-| [`crates/hydir-c`](crates/hydir-c) | Scalar C emission |
-| [`crates/hydir-transform`](crates/hydir-transform) | Allowlisted LLVM pass experiments |
-| [`crates/hydir-recompile`](crates/hydir-recompile) | Bounded whole-executable rebuild |
-| [`crates/hydir-patch`](crates/hydir-patch) | Scalar patch format and validation |
-| [`sdk/python`](sdk/python) | Python client, examples, and tests |
-| [`scripts`](scripts) | Reproducible demos and integration gates |
 
 ## License
 
