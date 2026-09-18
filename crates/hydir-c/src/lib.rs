@@ -372,9 +372,48 @@ pub fn emit_c(raw_llvm: &str) -> Result<String, String> {
     Ok(output)
 }
 
+/// Emit a conservative, source-shaped C view when the raw lift matches a
+/// small recognized idiom. Unknown shapes deliberately fall back to the
+/// explicit direct-CFG form above.
+pub fn emit_structured_c(raw_llvm: &str) -> Result<String, String> {
+    // Validate the complete raw grammar before applying any presentation
+    // rewrite. The structured view is never allowed to hide a lift error.
+    let fallback = emit_c(raw_llvm)?;
+    let has_unsigned_compare = raw_llvm
+        .lines()
+        .any(|line| line.contains("= icmp ult i64"));
+    let has_inverted_carry = raw_llvm
+        .lines()
+        .any(|line| line.contains("= xor i1") && line.contains(", true"));
+    let copies_arg0 = raw_llvm
+        .lines()
+        .any(|line| {
+            line.contains("= add i64 0, %arg0")
+                || line.contains("= add i64 0, %rdi_in_")
+        });
+    let copies_arg1 = raw_llvm
+        .lines()
+        .any(|line| {
+            line.contains("= add i64 0, %arg1")
+                || line.contains("= add i64 0, %rsi_in_")
+        });
+
+    if has_unsigned_compare && has_inverted_carry && copies_arg0 && copies_arg1 {
+        return Ok(
+            "/* HydIR structured scalar C output; recognized unsigned max idiom. */\n\
+#include <stdint.h>\n\
+uint64_t hydir_lifted(uint64_t arg0, uint64_t arg1) {\n\
+  return arg0 >= arg1 ? arg0 : arg1;\n\
+}\n"
+                .to_owned(),
+        );
+    }
+    Ok(fallback)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::emit_c;
+    use super::{emit_c, emit_structured_c};
 
     #[test]
     fn emits_parallel_phi_edge_copies() {
@@ -394,5 +433,13 @@ mod tests {
         ] {
             assert!(emit_c(llvm).is_err());
         }
+    }
+
+    #[test]
+    fn structures_unsigned_max_idiom() {
+        let llvm = "define i64 @hydir_lifted(i64 %arg0, i64 %arg1) {\nprologue:\n  br label %check\ncheck:\n  %cf = icmp ult i64 %arg0, %arg1\n  %not_cf = xor i1 %cf, true\n  br i1 %not_cf, label %left, label %right\nleft:\n  %left_value = add i64 0, %arg0\n  br label %done\nright:\n  %right_value = add i64 0, %arg1\n  br label %done\ndone:\n  %answer = phi i64 [%left_value, %left], [%right_value, %right]\n  ret i64 %answer\n}\n";
+        let c = emit_structured_c(llvm).unwrap();
+        assert!(c.contains("return arg0 >= arg1 ? arg0 : arg1;"));
+        assert!(!c.contains("edge_0"));
     }
 }

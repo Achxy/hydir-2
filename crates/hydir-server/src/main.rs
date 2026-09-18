@@ -10,7 +10,7 @@ use hydir_api::v1::{
     hydir_server::{Hydir, HydirServer},
 };
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
-use hydir_c::emit_c;
+use hydir_c::emit_structured_c;
 use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
     annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
@@ -831,7 +831,7 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             .map_err(|error| error.to_string()),
         ("decompile", Some(symbol)) => lift_symbol(bytes, symbol)
             .map_err(|error| error.to_string())
-            .and_then(|ir| emit_c(&ir))
+            .and_then(|ir| emit_structured_c(&ir))
             .map(String::into_bytes),
         ("transform", Some(symbol)) => {
             let pass_length = *bytes.first().ok_or("transform worker lacks pass list")? as usize;
