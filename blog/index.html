@@ -67,7 +67,7 @@ bash scripts/demo-corpus.sh</code></pre>
       <p>Import, CFG recovery, lifting, C generation, and whole-program rebuild are different contracts. A file can be imported without being liftable. A recovered function can have valid CFG and LLVM IR while C generation fails. The actual workbench diagnostic below is one such case: an unsupported <code>Call</code> stops C output, while the UI keeps the earlier artifacts available.</p>
 
       <figure>
-        <a href="assets/egui-refusal.webp"><img src="assets/egui-refusal.webp" width="1440" height="211" alt="Actual HydIR egui C output tab reporting unsupported Call at 0x401012 and preserving valid CFG or LLVM lift" loading="lazy"></a>
+        <a href="assets/egui-refusal.webp"><img src="assets/egui-refusal.webp" width="1440" height="212" alt="Actual HydIR egui C output tab reporting unsupported Call at 0x401012 and preserving valid CFG or LLVM lift" loading="lazy"></a>
         <figcaption>Actual egui diagnostic, cropped. Failure at a later stage does not silently erase an earlier valid result.</figcaption>
       </figure>
 
