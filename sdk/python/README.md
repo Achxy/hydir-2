@@ -12,7 +12,7 @@ from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
 decompiler. `get_source()` retrieves the exact source tar advertised by a
 matching-source build and verifies its SHA-256. Ordinary development builds
 do not embed such an archive, so `get_source()` then fails explicitly.
-`apply_patch(...)` accepts the versioned [scalar patch v1](../../docs/PATCHING.md)
+`apply_patch(...)` accepts the versioned scalar patch v1
 document and requires three explicit assertions. It commits a new project
 revision and returns hash-checked ELF bytes; it does not execute them. The
 `examples/patch_scalar.py` script demonstrates an explicit trusted-fixture
@@ -56,7 +56,7 @@ python3 -m venv .venv
 
 For the runnable smoke example, first run an authenticated `hydird` service
 and create a private credential file as described in
-[remote operation](../../docs/REMOTE.md).
+remote operation.
 Then supply a trusted x86-64 ELF and a symbol with the asserted
 `u64(u64,u64)` prototype:
 

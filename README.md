@@ -92,12 +92,12 @@ freestanding access-gate ELF with named scoring, comparison, meter, and policy
 functions. Open the generated ELF in the GUI, press **Disassemble ELF**, then
 explore `hydir_policy_route`, `hydir_password_score`, and the **Graph** view.
 The intentionally visible phrase and branchy flow are for demonstration only;
-this is not an authentication implementation. See [the access-gate demo](docs/PASSWORD_DEMO.md).
+this is not an authentication implementation. The access-gate behavior is covered by the local demo scripts.
 On Linux x86-64, `bash scripts/demo-remote.sh` runs the separate-process,
 authenticated service/client fixture, including durable lift jobs, event
 replay, restart, cancellation, GUI create/upload logic, and cross-project
 denial checks. See
-[remote operation and threat model](docs/REMOTE.md).
+Remote operation and threat-model details are maintained in the local development materials.
 The remote CLI also has `annotations` and `annotate` commands for an
 owner-scoped, revisioned ledger of explicitly unverified analyst facts.
 `hydirctl local` exposes the corresponding private on-device ledger. Set
@@ -132,7 +132,7 @@ hostile-input sandbox. No server-side binary execution is exposed.
 in-place patch subset: it produces a new ELF, validates four intentional
 behavior cases, and rejects size/hash/overwrite errors. The authenticated
 remote demo also applies that patch as an immutable project revision and
-checks idempotent replay after restart. See [patching contract](docs/PATCHING.md).
+checks idempotent replay after restart.
 The [Python SDK](sdk/python/README.md) wraps the same authenticated gRPC
 subset. With its pinned dependencies installed, `bash scripts/demo-sdk.sh
 /path/to/trusted-x86_64-elf-with-hydir_max2 /path/to/trusted-freestanding-elf` exercises a separate Python
@@ -152,7 +152,7 @@ bind outside loopback.
 
 For a local developer source snapshot of a clean committed tree, run
 `bash scripts/package-source-snapshot.sh`. It verifies that the archive
-contains the license, notices, lockfile, runtime, and protocol, and excludes
+contains the license, lockfile, runtime, and protocol, and excludes
 local design context and project data. `bash scripts/demo-source-offer.sh`
 builds an opt-in `hydird` with that matching archive embedded, then checks
 discovery and hash-checked RPC retrieval. This is a technical source-delivery
@@ -208,6 +208,4 @@ The GUI, gRPC server, remote API, SDK, stripped-code discovery, other binary
 formats, other architectures, solver integration, and LLVM lifting remain
 outside this slice.
 
-See [capabilities](docs/CAPABILITIES.md), [evidence](docs/EVIDENCE.md),
-[measured development evaluation](docs/EVALUATION.md),
-[release gates](docs/RELEASE_GATES.md),
+HydIR is licensed under

@@ -1,6 +1,10 @@
 /target/
+/docs/
 *.swp
 .DS_Store
 __pycache__/
 *.egg-info/
 .venv/
+.env*
+*.sqlite
+*.token
