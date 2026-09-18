@@ -1,19 +1,23 @@
 html { font: 18px/1.55 Georgia, serif; color: #222; background: #fff; }
 body { margin: 0; }
-main { max-width: 700px; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
-h1 { font-size: 2rem; line-height: 1.2; font-weight: normal; margin: 0; }
+main { padding: 2rem 0 5rem; }
+h1 { font-size: 2rem; line-height: 1.2; font-weight: normal; margin: 0 0 1.5rem; }
 h2 { font-size: 1.2rem; line-height: 1.3; font-weight: normal; margin: 2.4rem 0 .7rem; }
 p { margin: 1rem 0; }
-.date, figcaption { color: #666; font: 13px/1.4 system-ui, sans-serif; }
-.date { margin: .5rem 0 2rem; }
 a { color: inherit; text-underline-offset: 2px; }
 a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
 code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .85em; }
-pre { overflow-x: auto; background: #f5f5f5; padding: .8rem 1rem; }
+p code { color: #743d68; }
+pre { overflow-x: auto; background: #f6f7f7; padding: .8rem 1rem; line-height: 1.5; }
+pre code { font-size: 1em; }
+.tok-directive, .tok-keyword { color: #0c5d78; }
+.tok-var, .tok-label { color: #743d68; }
+.tok-type, .tok-number, .tok-const { color: #87500b; }
+.tok-string { color: #24643f; }
 figure { margin: 1.5rem 0 2rem; }
 figure img { display: block; max-width: 100%; height: auto; }
-figcaption { margin-top: .4rem; }
+figcaption { margin-top: .4rem; color: #666; font: 13px/1.4 system-ui, sans-serif; }
 .inspector { max-width: 340px; }
 .skip { position: absolute; left: -9999px; }
 .skip:focus { left: 1rem; top: 1rem; background: white; padding: .3rem; }
-@media (max-width: 600px) { html { font-size: 17px; } main { padding-top: 2rem; } }
+@media (max-width: 600px) { html { font-size: 17px; } main { padding-top: 1rem; } }
