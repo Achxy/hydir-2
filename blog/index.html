@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="How HydIR builds a narrow, fail-closed path from x86-64 ELF binaries to LLVM IR, verified artifacts, and bounded whole-program rebuilds."
+    />
+    <meta name="theme-color" content="#8f263d" />
+    <title>Building HydIR — HydIR Engineering Notes</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='9' fill='%23141414'/%3E%3Cpath d='M16 15v34M48 15v34M17 32h30' fill='none' stroke='%23fff' stroke-width='7' stroke-linecap='square'/%3E%3Cpath d='M38 15h10v10' fill='none' stroke='%23bc3554' stroke-width='6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/script.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#article">Skip to article</a>
+    <div class="reading-progress" aria-hidden="true"><span></span></div>
+
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="wordmark" href="#top" aria-label="HydIR Engineering Notes home">
+          <span class="wordmark-mark" aria-hidden="true">H</span>
+          <span>HydIR <em>/ Engineering Notes</em></span>
+        </a>
+        <a class="source-link" href="https://github.com/Achxy/hydir-2">View source <span aria-hidden="true">↗</span></a>
+      </header>
+
+      <div class="accent-rule" aria-hidden="true"></div>
+
+      <div class="content-grid" id="top">
+        <main class="article" id="article">
+          <header class="article-header">
+            <p class="eyebrow">Binary lifting · Native tooling · Evidence</p>
+            <h1>Building HydIR: a narrow path from binaries to LLVM IR—and back</h1>
+            <div class="byline" aria-label="Article metadata">
+              <span>HydIR Project</span>
+              <span aria-hidden="true">◆</span>
+              <time datetime="2026-09-18">September 18, 2026</time>
+              <span aria-hidden="true">◆</span>
+              <span>12 min read</span>
+            </div>
+          </header>
+
+          <section class="lede" aria-label="Summary">
+            <p>
+              <strong>TL;DR:</strong> HydIR is an independently implemented binary-lifting workbench built around a simple rule: when the tool cannot justify a transformation, it stops. Today it imports little-endian x86-64 ELF files, recovers a deliberately small control-flow subset, emits LLVM IR and bounded C, and can rebuild a narrowly defined class of freestanding programs. The useful part is not pretending that this is general decompilation. The useful part is making every supported step inspectable, reproducible, and difficult to overclaim.
+            </p>
+          </section>
+
+          <section id="pitch">
+            <h2>The pitch: binary rewriting you can audit</h2>
+            <p>
+              Binary tooling tends to be described from the finish line. A diagram starts with a compiled program and ends with clean source, a patched executable, or a recovered model. The hard middle—instruction semantics, control-flow boundaries, calling conventions, memory, relocations, and proof of behavior—gets compressed into one optimistic arrow.
+            </p>
+            <p>
+              HydIR starts in that middle. Its first milestone is not “decompile anything.” It is a native vertical slice where each transformation has a small contract and an explicit refusal mode. That makes the early system less spectacular, but much easier to reason about.
+            </p>
+
+            <aside class="pull-quote">
+              <span class="quote-mark" aria-hidden="true">“</span>
+              <p>A narrow tool that tells the truth is more useful than a broad demo that hides its assumptions.</p>
+            </aside>
+          </section>
+
+          <section id="scope">
+            <h2>Why make the first slice so small?</h2>
+            <p>
+              Because a binary lifter has several different jobs, and success in one is not success in all of them. Parsing an ELF proves that the file can be inventoried. Recovering a control-flow graph proves that a bounded set of direct edges can be followed. Emitting LLVM IR proves that the accepted instructions have a translation. None of those alone proves that the translated program behaves like the original.
+            </p>
+            <p>
+              HydIR keeps those claims separate. The current function-level contract accepts symbol-bounded or analyst-bounded x86-64 code with full-width scalar operations, direct branches, and a declared two-argument SysV ABI. Calls, memory accesses, indirect edges, partial registers, and uninitialized values are rejected on that path. Import is intentionally broader than lift; lift is intentionally broader than rebuild.
+            </p>
+          </section>
+
+          <figure class="hero-figure" id="pipeline">
+            <img
+              src="/assets/hydir-pipeline.png"
+              width="1536"
+              height="1024"
+              alt="Hand-drawn HydIR pipeline: an ELF enters a control-flow graph, becomes LLVM IR, passes verification, and is rebuilt; unsupported paths stop at a barrier."
+            />
+            <figcaption>
+              HydIR’s happy path has an equally important side path: unsupported semantics stop before an artifact can be mistaken for a verified result.
+            </figcaption>
+          </figure>
+
+          <section id="pipeline-details">
+            <h2>One pipeline, five explicit boundaries</h2>
+
+            <h3 id="import">1. Import without pretending to understand</h3>
+            <p>
+              The importer records what the file actually says: target and ABI facts, loadable segments, sections, symbols, dynamic imports, and relocations. When a generic parser cannot classify a relocation, HydIR preserves the raw type instead of erasing it. Ordinary inspection marks call and reference recovery as <code>not_attempted</code>; an empty list is never presented as proof that the program has no calls.
+            </p>
+
+            <div class="terminal" role="img" aria-label="Example HydIR inspection commands">
+              <div class="terminal-bar">
+                <span></span><span></span><span></span>
+                <p>hydirctl · local</p>
+              </div>
+              <pre><code><span class="prompt">$</span> hydirctl inspect ./sample.elf
+target       x86_64-unknown-elf
+entry        0x401000
+calls        not_attempted
+references   not_attempted
+
+<span class="prompt">$</span> hydirctl cfg ./sample.elf checked_add
+status       recovered
+edges        direct-only</code></pre>
+            </div>
+
+            <h3 id="recover">2. Recover only the control flow in scope</h3>
+            <p>
+              Reachable direct branches must remain inside the selected byte extent and land on valid instruction boundaries. The recovery engine rejects overlapping instructions and edges that escape the declared function. For stripped files, HydIR does not invent symbol discovery; the analyst supplies an entry address and exact size.
+            </p>
+
+            <h3 id="lift">3. Lift semantics, not syntax</h3>
+            <p>
+              Accepted instructions become plain LLVM integer operations with explicit flag modeling. Inputs arrive in the expected registers, every returning path must define the return register, and arithmetic keeps wrapping semantics—no convenient <code>nsw</code> or <code>nuw</code> promises are added. The output is intentionally low-level because honest structure is more important than pretty structure.
+            </p>
+
+            <div class="compare-grid" aria-label="Machine code and lifted representation">
+              <div>
+                <p class="code-label">x86-64</p>
+                <pre><code>cmp   rdi, rsi
+jge   .keep_left
+mov   rax, rsi
+ret</code></pre>
+              </div>
+              <div>
+                <p class="code-label">HydIR → LLVM IR</p>
+                <pre><code>%cmp = icmp sge i64 %rdi, %rsi
+br i1 %cmp, label %keep_left,
+             label %take_right</code></pre>
+              </div>
+            </div>
+
+            <h3 id="verify">4. Verify artifacts independently</h3>
+            <p>
+              A generated file is not accepted merely because HydIR produced it. The demo pipeline asks LLVM to verify the IR, compiles bounded C independently, and compares both lifted forms with native execution on trusted fixtures. The evidence is differential testing, not a theorem: useful, repeatable, and explicitly limited to the exercised inputs.
+            </p>
+
+            <h3 id="rebuild">5. Rebuild through a separate, stricter contract</h3>
+            <p>
+              Whole-executable rebuilding is not treated as “function lifting, but bigger.” It uses a separate stateful path for freestanding static programs with complete text coverage, direct control flow, bounded mapped data, and a small read/write/exit bridge. Stack accesses, dynamic linking, indirect edges, unknown instructions, and unsupported syscalls are rejected. The rebuilt binary is always written to a new destination.
+            </p>
+          </section>
+
+          <section id="evidence">
+            <h2>What the evidence actually says</h2>
+            <p>
+              HydIR’s checked-in evidence records a completed pinned Linux run for the supported subset. These numbers describe fixtures, not arbitrary binaries, and they are kept next to the limitations that make them meaningful.
+            </p>
+
+            <div class="stat-grid">
+              <article>
+                <strong>20</strong>
+                <span>distinct supported scalar functions</span>
+              </article>
+              <article>
+                <strong>21,168</strong>
+                <span>controlled input pairs matched by lifted IR and compiled C</span>
+              </article>
+              <article>
+                <strong>3</strong>
+                <span>freestanding programs rebuilt in the bounded whole-program path</span>
+              </article>
+              <article>
+                <strong>0</strong>
+                <span>claims of general equivalence or hostile-input safety</span>
+              </article>
+            </div>
+
+            <p class="note">
+              <strong>Reading the numbers:</strong> “21,168 matches” means the recorded test cases agreed. It does not mean 21,168 instructions, complete x86-64 support, or a proof that every input agrees.
+            </p>
+          </section>
+
+          <section id="workbench">
+            <h2>A workbench around the engine</h2>
+            <p>
+              The engine is exposed through a CLI, an egui desktop application, an authenticated loopback service, and a small Python SDK. The desktop workbench keeps machine bytes, reachable CFG, LLVM IR, bounded C, assumptions, and diagnostics visible at the same time. Local binary opening stays local; upload is a separate labelled action that creates an immutable project revision.
+            </p>
+            <p>
+              Analyst names, comments, and assumptions live in revisioned ledgers. Assumptions can be overlaid into an analyzed specification, but their provenance remains <code>analyst_assertion</code>. A comment never becomes recovered semantics because it was convenient for the UI.
+            </p>
+          </section>
+
+          <section id="refusals">
+            <h2>The refusal list is part of the product</h2>
+            <ul class="refusal-list">
+              <li><strong>No general decompiler.</strong> C output covers the same bounded scalar subset and retains explicit CFG structure.</li>
+              <li><strong>No hostile-binary sandbox.</strong> Native validation is limited to trusted fixtures; the service exposes no server-side binary execution endpoint.</li>
+              <li><strong>No automatic stripped-code discovery.</strong> Entry and extent are analyst inputs when symbols are unavailable.</li>
+              <li><strong>No silent overwrite.</strong> Generated artifacts and rebuilt programs go to new paths, or must be byte-identical to an existing output.</li>
+              <li><strong>No import-equals-support shortcut.</strong> Knowing that an instruction, relocation, or symbol exists is not the same as having semantics for it.</li>
+            </ul>
+          </section>
+
+          <section id="next">
+            <h2>What comes next?</h2>
+            <p>
+              The next useful work is not a bigger feature list. It is more semantic coverage without weakening the boundary: broader instruction forms, memory and calling behavior, stronger cross-tool differential checks, and better ways to show why a function stopped. Each expansion should arrive with its own fixture corpus, provenance, and failure story.
+            </p>
+            <p>
+              HydIR is still early. That is exactly why its language matters. The project can become more capable without becoming less honest—one explicit contract at a time.
+            </p>
+
+            <div class="article-cta">
+              <div>
+                <p class="eyebrow">Read the implementation</p>
+                <h2>Inspect the contracts, tests, and evidence.</h2>
+              </div>
+              <a href="https://github.com/Achxy/hydir-2">Open HydIR on GitHub <span aria-hidden="true">↗</span></a>
+            </div>
+          </section>
+
+          <footer class="article-footer">
+            <p>
+              This article describes the bounded capabilities documented in the repository on September 18, 2026. It is an engineering status note, not a release-readiness or equivalence claim.
+            </p>
+          </footer>
+        </main>
+
+        <aside class="sidebar" aria-label="Article navigation">
+          <div class="sidebar-inner">
+            <section class="sidebar-panel toc-panel">
+              <p class="sidebar-title">On this page</p>
+              <nav id="toc">
+                <a href="#pitch">The pitch</a>
+                <a href="#scope">Why the slice is small</a>
+                <a href="#pipeline">The pipeline</a>
+                <a href="#pipeline-details">Five boundaries</a>
+                <a class="toc-sub" href="#import">Import</a>
+                <a class="toc-sub" href="#recover">Recover</a>
+                <a class="toc-sub" href="#lift">Lift</a>
+                <a class="toc-sub" href="#verify">Verify</a>
+                <a class="toc-sub" href="#rebuild">Rebuild</a>
+                <a href="#evidence">Evidence</a>
+                <a href="#workbench">The workbench</a>
+                <a href="#refusals">Refusal list</a>
+                <a href="#next">What comes next</a>
+              </nav>
+            </section>
+
+            <section class="sidebar-panel status-panel">
+              <p class="sidebar-title">Current scope</p>
+              <dl>
+                <div><dt>Target</dt><dd>x86-64 ELF</dd></div>
+                <div><dt>Lift</dt><dd>Partial</dd></div>
+                <div><dt>Rebuild</dt><dd>Restricted</dd></div>
+                <div><dt>License</dt><dd>AGPL-3.0-only</dd></div>
+              </dl>
+            </section>
+
+            <p class="inspiration-note">
+              Editorial direction inspired by clear, diagram-led security research writing. All artwork and copy on this page are original.
+            </p>
+          </div>
+        </aside>
+      </div>
+
+      <footer class="site-footer">
+        <p>HydIR Engineering Notes</p>
+        <p>Build narrowly. Measure honestly.</p>
+      </footer>
+    </div>
+  </body>
+</html>
