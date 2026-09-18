@@ -2,17 +2,19 @@
 //! native import, CFG recovery, and lifting operations used by the CLI.
 
 use eframe::egui::{self, Color32, RichText};
+use egui_graph::{NodeId, layout_from_sizes};
+use egui_graph_egui::Direction as GraphDirection;
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
     AnnotationRequest, ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest,
     JobReply, JobRequest, PatchRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest,
     TransformRequest, UploadBinaryRequest, hydir_client::HydirClient,
 };
-use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
-use hydir_c::emit_c;
+use hydir_backend::{MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_symbol, recover_symbol_cfg};
+use hydir_c::emit_structured_c;
 use hydir_core::{
-    Address, AnalystAnnotation, AnnotationKind, FactSource, FunctionCfg, FunctionSpec, ProgramSpec,
-    overlay_analyst_assumptions,
+    Address, AnalystAnnotation, AnnotationKind, DisassemblyReport, FactSource, FunctionCfg,
+    FunctionSpec, ProgramSpec, overlay_analyst_assumptions,
 };
 use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
 use hydir_project::{LocalProject, LocalProjectStore, WorkbenchSettings};
@@ -44,6 +46,7 @@ enum Task {
     LoadWorkbench,
     SaveWorkbench(WorkbenchSettings),
     Open(PathBuf),
+    OpenGhidraGraph(PathBuf),
     OpenRemote {
         endpoint: String,
         token_file: PathBuf,
@@ -61,6 +64,7 @@ enum Task {
         path: PathBuf,
     },
     Select(String),
+    Disassemble,
     Analyze,
     RefreshAnnotations {
         binary_sha256: String,
@@ -124,6 +128,7 @@ enum Event {
         source_offer: Option<String>,
         spec: ProgramSpec,
     },
+    GhidraGraphLoaded(Result<GhidraGraph, String>),
     RemoteProjectCreated(String),
     Selected {
         symbol: String,
@@ -131,6 +136,7 @@ enum Event {
         ir: Result<String, String>,
         c: Result<String, String>,
     },
+    Disassembled(Result<DisassemblyReport, String>),
     Analyzed(Result<AnalysisReport, String>),
     AnnotationsLoaded {
         binary_sha256: String,
@@ -205,6 +211,40 @@ struct RemoteAccess {
     source_offer: String,
     named_pass_transform: bool,
     whole_rebuild: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GhidraGraph {
+    schema_version: u32,
+    source: String,
+    program: String,
+    functions: Vec<GhidraFunction>,
+    #[serde(default)]
+    cfg_edges: Vec<GhidraEdge>,
+    #[serde(default)]
+    call_edges: Vec<GhidraEdge>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GhidraFunction {
+    name: String,
+    entry: String,
+    #[allow(dead_code)]
+    size: u64,
+    #[serde(default)]
+    blocks: Vec<GhidraBlock>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GhidraBlock {
+    address: String,
+    mnemonic: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GhidraEdge {
+    source: String,
+    target: String,
 }
 
 enum Source {
@@ -1228,6 +1268,16 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 }
                 Err(error) => Event::Failed(error),
             },
+            Task::OpenGhidraGraph(path) => match fs::read_to_string(&path)
+                .map_err(|error| format!("Could not read Ghidra graph: {error}"))
+                .and_then(|text| {
+                    serde_json::from_str::<GhidraGraph>(&text)
+                        .map_err(|error| format!("Invalid Ghidra graph JSON: {error}"))
+                })
+            {
+                Ok(graph) => Event::GhidraGraphLoaded(Ok(graph)),
+                Err(error) => Event::GhidraGraphLoaded(Err(error)),
+            },
             Task::OpenRemote {
                 endpoint,
                 token_file,
@@ -1296,7 +1346,10 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
             Task::Select(symbol) => match &source {
                 Source::Local(bytes) => {
                     let ir = lift_symbol(bytes, &symbol).map_err(|e| e.to_string());
-                    let c = ir.as_ref().map_err(Clone::clone).and_then(|ir| emit_c(ir));
+                    let c = ir
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|ir| emit_structured_c(ir));
                     Event::Selected {
                         cfg: recover_symbol_cfg(bytes, &symbol).map_err(|e| e.to_string()),
                         ir,
@@ -1312,6 +1365,11 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     Event::Failed("Open a local ELF or remote project first.".to_owned())
                 }
             },
+            Task::Disassemble => Event::Disassembled(match &source {
+                Source::Local(bytes) => disassemble_elf(bytes).map_err(|error| error.to_string()),
+                Source::Remote(_) => Err("Whole-ELF disassembly is currently local-only.".to_owned()),
+                Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
+            }),
             Task::Analyze => Event::Analyzed(match &source {
                 Source::Local(bytes) => analyze_elf(bytes).map_err(|error| error.to_string()),
                 Source::Remote(access) => runtime.block_on(analyze_remote(access)),
@@ -1465,7 +1523,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                                 "{} · {} · revision {}",
                                 access.endpoint, access.project_id, revision
                             );
-                            let c = emit_c(&after);
+                            let c = emit_structured_c(&after);
                             Event::Transformed {
                                 source,
                                 revision,
@@ -1494,7 +1552,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::Local(bytes) => match transform_local(bytes, &symbol, &passes, &output_dir)
                 {
                     Ok((before, after, report)) => {
-                        let c = emit_c(&after);
+                            let c = emit_structured_c(&after);
                         Event::LocalTransformed {
                             before,
                             after,
@@ -1639,6 +1697,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
     Bytes,
+    Graph,
     Cfg,
     Llvm,
     Passes,
@@ -1646,10 +1705,18 @@ enum Tab {
     Analysis,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GraphMode {
+    Function,
+    Program,
+    Ghidra,
+}
+
 struct AnalystApp {
     tasks: SyncSender<Task>,
     events: Receiver<Event>,
     path_input: String,
+    ghidra_graph_path: String,
     workbench: WorkbenchSettings,
     workbench_loaded: bool,
     startup_open_local: Option<PathBuf>,
@@ -1684,12 +1751,15 @@ struct AnalystApp {
     named_pass_transform: bool,
     whole_rebuild: bool,
     spec: Option<ProgramSpec>,
+    ghidra_graph: Option<GhidraGraph>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
     ir: Option<String>,
     c: Option<String>,
     c_error: Option<String>,
     analysis: Option<AnalysisReport>,
+    disassembly_report: Option<DisassemblyReport>,
+    console_json: bool,
     annotations: Vec<AnalystAnnotation>,
     annotation_kind: AnnotationKind,
     annotation_value: String,
@@ -1700,6 +1770,7 @@ struct AnalystApp {
     last_job_poll: std::time::Instant,
     selected_address: Option<u64>,
     tab: Tab,
+    graph_mode: GraphMode,
     busy: bool,
     status: String,
     failure: Option<String>,
@@ -1728,6 +1799,7 @@ impl AnalystApp {
             tasks: task_sender,
             events: event_receiver,
             path_input: String::new(),
+            ghidra_graph_path: String::new(),
             workbench: WorkbenchSettings::default(),
             workbench_loaded: false,
             startup_open_local: None,
@@ -1762,12 +1834,15 @@ impl AnalystApp {
             named_pass_transform: false,
             whole_rebuild: false,
             spec: None,
+            ghidra_graph: None,
             symbol: None,
             cfg: None,
             ir: None,
             c: None,
             c_error: None,
             analysis: None,
+            disassembly_report: None,
+            console_json: false,
             annotations: Vec::new(),
             annotation_kind: AnnotationKind::Comment,
             annotation_value: String::new(),
@@ -1778,6 +1853,7 @@ impl AnalystApp {
             last_job_poll: std::time::Instant::now(),
             selected_address: None,
             tab: Tab::Bytes,
+            graph_mode: GraphMode::Function,
             busy: false,
             status: "No project open".to_owned(),
             failure: None,
@@ -1859,6 +1935,8 @@ impl AnalystApp {
                     self.c = None;
                     self.c_error = None;
                     self.analysis = None;
+                    self.disassembly_report = None;
+                    self.console_json = false;
                     self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
@@ -1883,6 +1961,25 @@ impl AnalystApp {
                         "Loading revisioned analyst annotations…",
                     );
                 }
+                Event::GhidraGraphLoaded(result) => match result {
+                    Ok(graph) => {
+                        if graph.schema_version != 1 || graph.source != "ghidra" {
+                            self.failure = Some("Unsupported Ghidra graph schema or source".to_owned());
+                        } else {
+                            self.status = format!("Loaded Ghidra graph for {}", graph.program);
+                            self.history.push(self.status.clone());
+                            self.ghidra_graph = Some(graph);
+                            self.graph_mode = GraphMode::Ghidra;
+                            self.tab = Tab::Graph;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.status = "Ghidra graph load failed".to_owned();
+                        self.history.push(error.clone());
+                        self.failure = Some(error);
+                    }
+                },
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
                     self.status = format!(
@@ -1933,6 +2030,38 @@ impl AnalystApp {
                     };
                     self.history.push(self.status.clone());
                 }
+                Event::Disassembled(result) => match result {
+                    Ok(report) => {
+                        let digest_matches = self
+                            .spec
+                            .as_ref()
+                            .map(|spec| spec.binary_sha256 == report.binary_sha256)
+                            .unwrap_or(false);
+                        if !digest_matches {
+                            self.failure = Some(
+                                "Disassembly binary digest does not match the open ELF."
+                                    .to_owned(),
+                            );
+                            self.status = "Disassembly discarded".to_owned();
+                        } else {
+                            self.status = format!(
+                                "Disassembled {} instructions across {} executable sections",
+                                report.instructions.len(),
+                                report.sections.len()
+                            );
+                            self.history.push(self.status.clone());
+                            self.disassembly_report = Some(report);
+                            self.console_json = false;
+                            self.tab = Tab::Bytes;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.failure = Some(error.clone());
+                        self.status = "Whole-ELF disassembly failed".to_owned();
+                        self.history.push(error);
+                    }
+                },
                 Event::Failed(error) => {
                     self.failure = Some(error.clone());
                     self.status = "Operation failed".to_owned();
@@ -2400,6 +2529,51 @@ impl AnalystApp {
                 "Importing local ELF…",
             );
         }
+        let disassemble = ui.add_enabled(
+            !self.busy && self.spec.is_some() && !self.remote,
+            egui::Button::new("Disassemble ELF"),
+        );
+        if disassemble.clicked() {
+            self.enqueue(Task::Disassemble, "Disassembling executable ELF sections…");
+        }
+        disassemble.on_disabled_hover_text(
+            "Open a local ELF first. Whole-ELF disassembly is currently local-only.",
+        );
+        ui.separator();
+        egui::CollapsingHeader::new("Ghidra bridge")
+            .id_salt("ghidra_bridge")
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Load HydIRExport.java JSON as external evidence; native HydIR facts stay separate.")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ghidra_graph_path)
+                        .hint_text("/absolute/path/to/ghidra-graph.json")
+                        .desired_width(f32::INFINITY),
+                );
+                let load = ui.add_enabled(
+                    !self.busy && !self.ghidra_graph_path.trim().is_empty(),
+                    egui::Button::new("Load Ghidra graph"),
+                );
+                if load.clicked() {
+                    self.enqueue(
+                        Task::OpenGhidraGraph(PathBuf::from(self.ghidra_graph_path.trim())),
+                        "Loading Ghidra graph…",
+                    );
+                }
+                if let Some(graph) = &self.ghidra_graph {
+                    ui.label(
+                        RichText::new(format!(
+                            "Loaded: {} functions / {} call edges / {}",
+                            graph.functions.len(), graph.call_edges.len(), graph.program
+                        ))
+                        .size(11.0)
+                        .color(ACCENT),
+                    );
+                }
+            });
         egui::CollapsingHeader::new("Saved workbench · on this device")
             .id_salt("saved_workbench")
             .default_open(true)
@@ -2901,7 +3075,7 @@ impl AnalystApp {
                     ),
                 );
             }
-            field(ui, "MEMORY/CALLS", "Unsupported by this lift");
+                field(ui, "MEMORY/CALLS", "Unsupported by this lift");
             if let Some(summary) = self.analysis.as_ref().and_then(|report| {
                 report.functions.iter().find(|summary| {
                     summary.name == function.name && summary.entry == function.address
@@ -2937,6 +3111,32 @@ impl AnalystApp {
                 RichText::new("Select a function to inspect its scope and assumptions.")
                     .color(MUTED),
             );
+        }
+        if let Some(report) = &self.disassembly_report
+            && let Some(address) = self.selected_address
+            && let Some(instruction) = report
+                .instructions
+                .iter()
+                .find(|instruction| instruction.address.0 == address)
+        {
+            ui.separator();
+            ui.heading(RichText::new("Selected instruction").size(14.0));
+            field(ui, "ADDRESS", &format!("0x{:016x}", instruction.address.0));
+            field(ui, "BYTES", &instruction.bytes_hex);
+            field(
+                ui,
+                "ASSEMBLY",
+                &format!("{} {}", instruction.mnemonic, instruction.operands),
+            );
+            field(ui, "FLOW", &format!("{:?}", instruction.flow));
+            field(
+                ui,
+                "BRANCH TARGET",
+                &instruction
+                    .branch_target
+                    .map_or_else(|| "none".to_owned(), |target| format!("0x{:016x}", target.0)),
+            );
+            field(ui, "PROVENANCE", &instruction.provenance);
         }
         ui.add_space(12.0);
         ui.separator();
@@ -3015,6 +3215,7 @@ impl AnalystApp {
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::Bytes, "Disassembly"),
+                (Tab::Graph, "Graph"),
                 (Tab::Cfg, "CFG"),
                 (Tab::Llvm, "LLVM IR"),
                 (Tab::Passes, "Passes"),
@@ -3030,6 +3231,7 @@ impl AnalystApp {
         ui.separator();
         match self.tab {
             Tab::Bytes => self.disassembly(ui),
+            Tab::Graph => self.graph_view(ui),
             Tab::Cfg => self.cfg_view(ui),
             Tab::Llvm => self.llvm_view(ui),
             Tab::Passes => self.passes_view(ui),
@@ -3039,6 +3241,10 @@ impl AnalystApp {
     }
 
     fn disassembly(&mut self, ui: &mut egui::Ui) {
+        if self.disassembly_report.is_some() {
+            self.full_disassembly(ui);
+            return;
+        }
         let Some(cfg) = &self.cfg else {
             ui.label(
                 RichText::new("Select a supported function to decode reachable instructions.")
@@ -3068,6 +3274,369 @@ impl AnalystApp {
         if let Some(address) = clicked {
             self.selected_address = Some(address);
         }
+    }
+
+    fn full_disassembly(&mut self, ui: &mut egui::Ui) {
+        let Some(report) = self.disassembly_report.clone() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} executable sections · {} instructions · {} gaps",
+                    report.sections.len(),
+                    report.instructions.len(),
+                    report.gaps.len()
+                ))
+                .color(ACCENT),
+            );
+            if ui.button("Show JSON in console").clicked() {
+                self.console_json = true;
+            }
+        });
+        ui.label(
+            RichText::new("Trusted symbol/entry CFG recovery is mixed with explicitly marked linear-sweep uncertainty.")
+                .size(11.0)
+                .color(MUTED),
+        );
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("ADDRESS").size(10.0).color(MUTED));
+            ui.add_space(92.0);
+            ui.label(RichText::new("BYTES").size(10.0).color(MUTED));
+            ui.add_space(95.0);
+            ui.label(RichText::new("INSTRUCTION").size(10.0).color(MUTED));
+            ui.add_space(160.0);
+            ui.label(RichText::new("FLOW / TARGET").size(10.0).color(MUTED));
+        });
+        let instructions = report.instructions;
+        let mut clicked = None;
+        egui::ScrollArea::vertical()
+            .id_salt("whole_elf_disassembly")
+            .show_rows(ui, 25.0, instructions.len(), |ui, range| {
+                for index in range {
+                    let instruction = &instructions[index];
+                    let selected = self.selected_address == Some(instruction.address.0);
+                    let target = instruction
+                        .branch_target
+                        .map_or_else(String::new, |address| format!(" → 0x{:x}", address.0));
+                    let line = format!(
+                        "0x{:016x}  {:<18} {:<26} {:?}{}",
+                        instruction.address.0,
+                        instruction.bytes_hex,
+                        format!("{} {}", instruction.mnemonic, instruction.operands),
+                        instruction.flow,
+                        target,
+                    );
+                    if ui
+                        .selectable_label(selected, RichText::new(line).monospace().size(11.0))
+                        .clicked()
+                    {
+                        clicked = Some(instruction.address.0);
+                    }
+                }
+            });
+        if let Some(address) = clicked {
+            self.selected_address = Some(address);
+        }
+        if !report.warnings.is_empty() || !report.gaps.is_empty() {
+            ui.separator();
+            egui::CollapsingHeader::new(format!(
+                "Uncertainty · {} warnings · {} gaps",
+                report.warnings.len(),
+                report.gaps.len()
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                for warning in report.warnings.iter().take(32) {
+                    ui.colored_label(BAD, warning);
+                }
+                for gap in report.gaps.iter().take(32) {
+                    ui.label(
+                        RichText::new(format!(
+                            "0x{:x} +{} · {} · {}",
+                            gap.address.0, gap.size, gap.reason, gap.provenance
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                }
+            });
+        }
+    }
+
+    fn console_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("Console").size(14.0));
+            ui.label(RichText::new("LOCAL ANALYSIS OUTPUT · no shell execution").size(10.0).color(MUTED));
+            if self.disassembly_report.is_some() {
+                if ui
+                    .button(if self.console_json { "Show activity" } else { "Show JSON" })
+                    .clicked()
+                {
+                    self.console_json = !self.console_json;
+                }
+                if ui.button("Copy JSON").clicked()
+                    && let Some(report) = &self.disassembly_report
+                    && let Ok(json) = serde_json::to_string_pretty(report)
+                {
+                    ui.ctx().copy_text(json);
+                }
+            }
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("console_output")
+            .max_height(130.0)
+            .show(ui, |ui| {
+                if self.console_json {
+                    if let Some(report) = &self.disassembly_report
+                        && let Ok(json) = serde_json::to_string_pretty(report)
+                    {
+                        ui.code(json);
+                    }
+                } else {
+                    if let Some(failure) = &self.failure {
+                        ui.colored_label(BAD, failure);
+                    } else {
+                        ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
+                    }
+                    if let Some(report) = &self.disassembly_report {
+                        for warning in report.warnings.iter().take(8) {
+                            ui.colored_label(BAD, warning);
+                        }
+                    }
+                    for entry in self.history.iter().rev().take(8) {
+                        ui.label(RichText::new(entry).size(11.0).color(MUTED));
+                    }
+                }
+            });
+    }
+
+    fn graph_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("GRAPH SCOPE").size(10.0).color(MUTED));
+            if ui
+                .selectable_label(self.graph_mode == GraphMode::Function, "Selected function CFG")
+                .clicked()
+            {
+                self.graph_mode = GraphMode::Function;
+            }
+            if ui
+                .selectable_label(self.graph_mode == GraphMode::Program, "Program calls")
+                .clicked()
+            {
+                self.graph_mode = GraphMode::Program;
+            }
+            if self.ghidra_graph.is_some()
+                && ui
+                    .selectable_label(self.graph_mode == GraphMode::Ghidra, "Ghidra evidence")
+                    .clicked()
+            {
+                self.graph_mode = GraphMode::Ghidra;
+            }
+        });
+        ui.label(
+            RichText::new(match self.graph_mode {
+                GraphMode::Function => {
+                    "Automatic layered layout of recovered one-instruction CFG blocks. Click a block to inspect its address."
+                }
+                GraphMode::Program => {
+                    "Function-level call graph from bounded native analysis. Missing edges are unknown, not proven absent."
+                }
+                GraphMode::Ghidra => {
+                    "Imported Ghidra function/call graph. This is external evidence, not native HydIR recovery."
+                }
+            })
+            .size(11.0)
+            .color(MUTED),
+        );
+
+        let mut nodes: Vec<(NodeId, String, bool)> = Vec::new();
+        let mut edges: Vec<(NodeId, NodeId)> = Vec::new();
+        match self.graph_mode {
+            GraphMode::Function => {
+                let Some(cfg) = &self.cfg else {
+                    ui.label(RichText::new("Select a function to build its CFG graph.").color(MUTED));
+                    return;
+                };
+                for block in &cfg.blocks {
+                    nodes.push((
+                        NodeId::new(("block", block.address.0)),
+                        format!("0x{:x}\n{}", block.address.0, block.mnemonic),
+                        self.selected_address == Some(block.address.0),
+                    ));
+                }
+                for edge in &cfg.edges {
+                    edges.push((
+                        NodeId::new(("block", edge.source.0)),
+                        NodeId::new(("block", edge.target.0)),
+                    ));
+                }
+            }
+            GraphMode::Program => {
+                let Some(spec) = &self.spec else {
+                    ui.label(RichText::new("Open an ELF to build its function graph.").color(MUTED));
+                    return;
+                };
+                for function in &spec.functions {
+                    nodes.push((
+                        NodeId::new(("function", function.name.as_str())),
+                        format!("{}\n0x{:x}", function.name, function.address.0),
+                        self.symbol.as_deref() == Some(function.name.as_str()),
+                    ));
+                }
+                let Some(report) = &self.analysis else {
+                    ui.label(
+                        RichText::new("Run Global effects / Analyze to populate bounded call edges.")
+                            .color(MUTED),
+                    );
+                    return;
+                };
+                for summary in &report.functions {
+                    for callee in &summary.direct_callees {
+                        if spec.functions.iter().any(|function| function.name == *callee) {
+                            let source = NodeId::new(("function", summary.name.as_str()));
+                            let target = NodeId::new(("function", callee.as_str()));
+                            if source != target {
+                                edges.push((source, target));
+                            }
+                        }
+                    }
+                }
+                /*
+                 * Analysis names are the authoritative bounded call graph.
+                 * Unresolved and indirect targets intentionally do not become
+                 * fake nodes here; the analysis pane retains those facts.
+                 */
+                for call in &spec.calls {
+                    let source = spec.functions.iter().find(|function| {
+                        function.address.0 <= call.source.0
+                            && call.source.0 < function.address.0.saturating_add(function.size)
+                    });
+                    let target = call.target.and_then(|address| {
+                        spec.functions.iter().find(|function| function.address == address)
+                    });
+                    if let (Some(source), Some(target)) = (source, target)
+                        && !edges.contains(&(
+                            NodeId::new(("function", source.name.as_str())),
+                            NodeId::new(("function", target.name.as_str())),
+                        ))
+                    {
+                        edges.push((
+                            NodeId::new(("function", source.name.as_str())),
+                            NodeId::new(("function", target.name.as_str())),
+                        ));
+                    }
+                }
+            }
+            GraphMode::Ghidra => {
+                let Some(graph) = &self.ghidra_graph else {
+                    ui.label(RichText::new("Load a Ghidra JSON export to show its graph.").color(MUTED));
+                    return;
+                };
+                let selected = self
+                    .symbol
+                    .as_deref()
+                    .and_then(|name| graph.functions.iter().find(|function| function.name == name))
+                    .or_else(|| graph.functions.first());
+                let Some(function) = selected else {
+                    ui.label(RichText::new("The Ghidra export contains no functions.").color(MUTED));
+                    return;
+                };
+                let block_addresses: std::collections::HashSet<&str> =
+                    function.blocks.iter().map(|block| block.address.as_str()).collect();
+                for block in &function.blocks {
+                    nodes.push((
+                        NodeId::new(("ghidra-block", block.address.as_str())),
+                        format!("{}\n{}", block.address, block.mnemonic),
+                        block.address == function.entry,
+                    ));
+                }
+                for edge in &graph.cfg_edges {
+                    if block_addresses.contains(edge.source.as_str())
+                        && block_addresses.contains(edge.target.as_str())
+                    {
+                        let source = NodeId::new(("ghidra-block", edge.source.as_str()));
+                        let target = NodeId::new(("ghidra-block", edge.target.as_str()));
+                        edges.push((source, target));
+                    }
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "Ghidra CFG / {} / {} blocks / {} edges",
+                        function.name,
+                        function.blocks.len(),
+                        edges.len()
+                    ))
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            }
+        }
+
+        if nodes.is_empty() {
+            ui.label(RichText::new("No graph nodes recovered.").color(MUTED));
+            return;
+        }
+
+        let node_size = [190.0_f32, 58.0_f32];
+        let layout_nodes = nodes
+            .iter()
+            .map(|(id, _, _)| (*id, egui_graph_egui::vec2(node_size[0], node_size[1])));
+        let layout = layout_from_sizes(layout_nodes, edges.iter().copied(), GraphDirection::LeftToRight);
+        let min_x = layout.values().map(|position| position.x).fold(f32::INFINITY, f32::min);
+        let min_y = layout.values().map(|position| position.y).fold(f32::INFINITY, f32::min);
+        let max_x = layout.values().map(|position| position.x).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = layout.values().map(|position| position.y).fold(f32::NEG_INFINITY, f32::max);
+        let canvas_size = egui::vec2(
+            (max_x - min_x + node_size[0] + 80.0).max(ui.available_width()),
+            (max_y - min_y + node_size[1] + 80.0).max(260.0),
+        );
+
+        egui::ScrollArea::both()
+            .id_salt("graph_canvas")
+            .show(ui, |ui| {
+                let (canvas, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
+                let painter = ui.painter_at(canvas);
+                let offset = canvas.min + egui::vec2(40.0 - min_x, 40.0 - min_y);
+                let mut rects = std::collections::HashMap::new();
+                for (id, label, selected) in &nodes {
+                    let position = layout
+                        .get(id)
+                        .map(|position| offset + egui::vec2(position.x, position.y))
+                        .unwrap_or(canvas.min);
+                    let rect = egui::Rect::from_min_size(position, egui::vec2(node_size[0], node_size[1]));
+                    rects.insert(*id, rect);
+                    painter.rect_filled(rect, 6.0, if *selected { Color32::from_rgb(82, 66, 45) } else { PANEL });
+                    painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, if *selected { ACCENT } else { MUTED }), egui::StrokeKind::Outside);
+                    painter.text(
+                        rect.left_top() + egui::vec2(10.0, 9.0),
+                        egui::Align2::LEFT_TOP,
+                        label,
+                        egui::FontId::monospace(11.0),
+                        TEXT,
+                    );
+                    let response = ui.interact(rect, ui.id().with(("graph-node", id.value())), egui::Sense::click());
+                    if response.clicked() && self.graph_mode == GraphMode::Function {
+                        if let Some(address) = label.strip_prefix("0x").and_then(|value| value.split('\n').next()).and_then(|value| u64::from_str_radix(value, 16).ok()) {
+                            self.selected_address = Some(address);
+                        }
+                    }
+                }
+                for (source, target) in &edges {
+                    if let (Some(source_rect), Some(target_rect)) = (rects.get(source), rects.get(target)) {
+                        let start = source_rect.right_center();
+                        let end = target_rect.left_center();
+                        painter.line_segment([start, end], egui::Stroke::new(1.5, ACCENT));
+                        let direction = (end - start).normalized();
+                        let tip = end;
+                        let left = tip - direction * 10.0 + egui::vec2(-direction.y, direction.x) * 4.0;
+                        let right = tip - direction * 10.0 - egui::vec2(-direction.y, direction.x) * 4.0;
+                        painter.add(egui::Shape::convex_polygon(vec![tip, left, right], ACCENT, egui::Stroke::NONE));
+                    }
+                }
+            });
     }
 
     fn cfg_view(&mut self, ui: &mut egui::Ui) {
@@ -3468,6 +4037,11 @@ impl eframe::App for AnalystApp {
                     });
             });
         self.workbench.inspector_width = inspector.response.rect.width().clamp(220.0, 800.0);
+        egui::Panel::bottom("console")
+            .resizable(true)
+            .default_size(150.0)
+            .min_size(70.0)
+            .show(ui, |ui| self.console_view(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin::same(12))

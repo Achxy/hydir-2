@@ -23,3 +23,5 @@ libc = "0.2"
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 uuid = { version = "=1.26.1", features = ["v4"] }
 eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui_graph = "=0.16.3"
+egui_graph_egui = { package = "egui", version = "=0.34.3", default-features = false }

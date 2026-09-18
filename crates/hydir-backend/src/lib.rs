@@ -5,8 +5,10 @@
 //! unknown instructions rather than guessing their behavior.
 
 mod cfg;
+mod disasm;
 
 pub use cfg::lift_cfg;
+pub use disasm::disassemble_elf;
 
 use hydir_core::{
     Address, AddressKind, AddressSpaceSpec, FactProvenance, FactSource, FunctionCfg, FunctionSpec,
@@ -334,6 +336,13 @@ fn relocation_target(
 pub fn lift_symbol(bytes: &[u8], name: &str) -> Result<String> {
     let (code, address, _) = symbol_code(bytes, name)?;
     lift_cfg(&code, address)
+}
+
+/// Extract a validated, bounded named text symbol for an external semantics
+/// backend. ELF parsing and symbol-boundary validation remain owned by HydIR.
+pub fn extract_symbol_code(bytes: &[u8], name: &str) -> Result<(Vec<u8>, u64)> {
+    let (code, address, _) = symbol_code(bytes, name)?;
+    Ok((code, address))
 }
 
 /// Recover the reachable, direct CFG for a named function symbol. This is a
@@ -718,5 +727,17 @@ mod tests {
             e_flags: 0,
         };
         assert_eq!(elf_target_triple(flags), "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn external_symbol_extraction_rejects_non_elf() {
+        let error = extract_symbol_code(b"not an ELF", "main").unwrap_err();
+        assert!(error.0.contains("binary parse failed"));
+    }
+
+    #[test]
+    fn external_symbol_extraction_rejects_missing_symbol() {
+        let error = extract_symbol_code(&[], "missing").unwrap_err();
+        assert!(error.0.contains("binary parse failed"));
     }
 }
