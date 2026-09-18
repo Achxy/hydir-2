@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A Triton model query followed by HydIR's symbolic report for a selected x86-64 ELF function.">
+  <link rel="canonical" href="https://hydir.wiki/articles/triton-api.html">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/article-styles.css">
+  <script src="/vendor/prism/prism-core.min.js" defer></script>
+  <script src="/vendor/prism/prism-bash.min.js" defer></script>
+  <script src="/vendor/prism/prism-python.min.js" defer></script>
+  <title>Finding an Input with Triton — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#article">Skip to article</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs.html">Blogs</a></nav></header>
+  <main class="site-main prose" id="article">
+    <article>
+      <p class="eyebrow"><a href="/blogs.html">Blogs</a> / Symbolic exploration</p>
+      <h1>Finding an Input with Triton</h1>
+      <p class="lead">Suppose a function copies its first argument into RAX. What value should we pass to make it return 7? <a href="https://github.com/JonathanSalwan/Triton">Triton's Python API</a> can find one. HydIR brings that symbolic analysis to selected x86-64 functions and shows the path conditions and return expressions it finds.</p>
+
+      <h2>Start with one instruction</h2>
+      <p>Open the Triton console at the bottom of the HydIR workbench. Enter these lines one at a time:</p>
+      <pre><code class="language-python">from triton import *
+ctx = TritonContext(ARCH.X86_64)
+ctx.setConcreteRegisterValue(ctx.registers.rip, 0x40000)
+ctx.symbolizeRegister(ctx.registers.rdi, 'arg0')
+ctx.processing(Instruction(b'\x48\x89\xf8'))
+rax = ctx.getSymbolicRegister(ctx.registers.rax)
+ctx.getModel(rax.getAst() == 7)</code></pre>
+      <p>The bytes <code>48 89 f8</code> are <code>mov rax, rdi</code>. We mark RDI as an unknown input, process the instruction, then ask Triton for an input that makes the resulting RAX equal 7. The console prints <code>{0: arg0:64 = 0x7}</code>: the model found <code>arg0 = 7</code>. It is a small example, but it shows the useful part of symbolic execution: we ask about an output and get a possible input back.</p>
+      <p>This console has its own context. The instruction bytes above are supplied by the example; they are not read from whichever ELF is open in the workbench. The console accepts a limited set of Triton operations, one statement at a time, and replays up to 64 accepted statements. It does not offer general Python imports, file access, shell commands, or network access.</p>
+
+      <h2>Now try a function from an ELF</h2>
+      <p>For a named function in a local ELF, HydIR can do the setup for you. Point it at a Python interpreter with Triton installed, check the bridge, then request a report:</p>
+      <pre><code class="language-bash">export HYDIR_TRITON_PYTHON=/path/to/python-with-triton
+cargo run --locked --bin hydirctl -- doctor
+cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name</code></pre>
+      <p><code>doctor</code> checks whether that interpreter can import Triton. The last command reads a non-stripped, named x86-64 function and emits JSON. In the desktop app, selecting a local function and pressing <strong>Run Triton</strong> requests the same kind of report. The report includes the binary identity and function entry, instruction expressions, explored return paths, and a final RAX expression.</p>
+      <p>Inside the <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/triton_bridge.py">bridge</a>, RDI and RSI become symbolic inputs <code>arg0</code> and <code>arg1</code>. HydIR processes instructions along each direct path with a fresh Triton context. For multiple return paths, the report records path conditions and a textual <code>ite</code> expression for RAX.</p>
+
+      <h2>Read the report</h2>
+      <p>The report covers a selected function of up to 4,096 bytes, with up to 64 direct paths and 1,024 instructions per path. It records the decoded bytes, per-instruction symbolic expressions, path conditions, and final RAX expression.</p>
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/tests/triton_bridge_test.py">bridge tests</a> include a two-path fixture and model queries. For HydIR's separate LLVM lift and finite execution checks, follow the <a href="/articles/max2.html">max2 worked example</a>. The <a href="https://github.com/Achxy/hydir-2#quick-start">quick start</a> has the local build commands.</p>
+    </article>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/blogs.html">All blogs</a> · <a href="https://github.com/JonathanSalwan/Triton">Triton upstream</a></p></footer>
+</body>
+</html>
