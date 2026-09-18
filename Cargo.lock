@@ -1225,7 +1225,9 @@ dependencies = [
  "hydir-api",
  "hydir-backend",
  "hydir-c",
+ "hydir-core",
  "hydir-patch",
+ "hydir-project",
  "hydir-recompile",
  "hydir-transform",
  "iced-x86",
@@ -1256,6 +1258,7 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-patch",
+ "hydir-project",
  "hydir-recompile",
  "hydir-transform",
  "serde_json",
@@ -1274,6 +1277,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "hydir-project"
+version = "0.1.0"
+dependencies = [
+ "hydir-core",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ if [[ -e "$archive" ]]; then
 else
   git archive --format=tar --prefix="$prefix/" --output="$archive" HEAD
 fi
-for required in LICENSE Cargo.lock rust-toolchain.toml Dockerfile.m1 Dockerfile.sdk PROVENANCE.md THIRD_PARTY_NOTICES.md docs/EVALUATION.md crates/hydir-api/proto/hydir.proto crates/hydir-c/src/lib.rs crates/hydir-patch/src/lib.rs crates/hydir-transform/src/lib.rs crates/hydir-recompile/src/lib.rs crates/hydir-server/build.rs native/whole-runtime/runtime.c sdk/python/examples/rebuild_program.py sdk/python/examples/validate_program.py tests/fixtures/whole_choice_cases.json scripts/demo-recompile.sh scripts/demo-patch.sh scripts/demo-passes.sh scripts/demo-sdk-linux-docker.sh; do
+for required in LICENSE Cargo.lock rust-toolchain.toml Dockerfile.m1 Dockerfile.sdk PROVENANCE.md THIRD_PARTY_NOTICES.md docs/EVALUATION.md crates/hydir-api/proto/hydir.proto crates/hydir-c/src/lib.rs crates/hydir-patch/src/lib.rs crates/hydir-project/src/lib.rs crates/hydir-cli/src/local.rs crates/hydir-transform/src/lib.rs crates/hydir-recompile/src/lib.rs crates/hydir-server/build.rs native/whole-runtime/runtime.c sdk/python/examples/rebuild_program.py sdk/python/examples/validate_program.py tests/fixtures/whole_choice_cases.json scripts/demo-local-project.sh scripts/demo-recompile.sh scripts/demo-patch.sh scripts/demo-passes.sh scripts/demo-sdk-linux-docker.sh; do
   if ! tar -tf "$archive" | grep -Fx "$prefix/$required" >/dev/null; then
     echo "archive missing required source: $required" >&2
     exit 1

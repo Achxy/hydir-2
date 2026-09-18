@@ -23,9 +23,10 @@ binary bytes reuploaded to the same project reuse the digest-scoped ledger;
 a different binary digest does not receive those records. Binary-specific
 annotations are not a proof of prototype, reachability, or behavior.
 
-The CLI, Python SDK, and remote egui Inspector expose these operations. The
-desktop still has no durable local-project database, so local ELF mode cannot
-save annotations. Analysis summaries and lifts do not yet use these
+The CLI, Python SDK, and remote egui Inspector expose these operations.
+ADR 0013 adds a separate private local-project database, superseding the
+local-persistence gap at the time of this decision. Analysis summaries and
+lifts do not yet use these
 assumptions as semantic inputs or cache keys; any operation that needs an
 asserted prototype still requires its explicit assertion flag. The feature
 does not close full local/remote parity or project-model completeness.

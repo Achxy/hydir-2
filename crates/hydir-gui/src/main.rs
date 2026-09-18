@@ -11,9 +11,11 @@ use hydir_api::v1::{
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
 use hydir_core::{
-    AnalystAnnotation, AnnotationKind, FactSource, FunctionCfg, FunctionSpec, ProgramSpec,
+    Address, AnalystAnnotation, AnnotationKind, FactSource, FunctionCfg, FunctionSpec, ProgramSpec,
+    overlay_analyst_assumptions,
 };
 use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
+use hydir_project::{LocalProject, LocalProjectStore};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
@@ -164,6 +166,7 @@ enum Event {
     },
     LocalRebuilt {
         spec: ProgramSpec,
+        revision: u64,
         ir: String,
         report: String,
         binary_sha256: String,
@@ -171,6 +174,7 @@ enum Event {
     },
     LocalPatched {
         spec: ProgramSpec,
+        revision: u64,
         binary_sha256: String,
         output_path: PathBuf,
     },
@@ -1141,8 +1145,47 @@ fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn attach_local_project(path: &Path, spec: &ProgramSpec) -> Result<LocalProject, String> {
+    LocalProjectStore::open_default()?.open_binary(path, spec)
+}
+
+fn list_local_annotations(project: &LocalProject) -> Result<Vec<AnalystAnnotation>, String> {
+    LocalProjectStore::open_default()?.list_annotations(project)
+}
+
+fn add_local_annotation(
+    project: &LocalProject,
+    bytes: &[u8],
+    binary_sha256: &str,
+    kind: AnnotationKind,
+    address: Option<u64>,
+    scope: &str,
+    value: &str,
+    key: &str,
+) -> Result<(LocalProject, ProgramSpec, Vec<AnalystAnnotation>), String> {
+    let mut spec =
+        import_elf(bytes).map_err(|error| format!("Local ELF import failed: {error}"))?;
+    if spec.binary_sha256 != binary_sha256 || project.binary_sha256 != binary_sha256 {
+        return Err("Local annotation binary differs from the selected ELF".to_owned());
+    }
+    let mut store = LocalProjectStore::open_default()?;
+    let updated = store.add_annotation(
+        project,
+        &spec,
+        kind,
+        address.map(Address),
+        value,
+        scope,
+        key,
+    )?;
+    let annotations = store.list_annotations(&updated)?;
+    overlay_analyst_assumptions(&mut spec, &annotations);
+    Ok((updated, spec, annotations))
+}
+
 fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) {
     let mut source = Source::None;
+    let mut local_project: Option<LocalProject> = None;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1150,16 +1193,18 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
     while let Ok(task) = tasks.recv() {
         let event = match task {
             Task::Open(path) => match bounded_read(&path).and_then(|bytes| {
-                import_elf(&bytes)
-                    .map(|spec| (bytes, spec))
-                    .map_err(|e| format!("ELF import failed: {e}"))
+                let spec = import_elf(&bytes).map_err(|e| format!("ELF import failed: {e}"))?;
+                let project = attach_local_project(&path, &spec)?;
+                Ok((bytes, spec, project))
             }) {
-                Ok((bytes, spec)) => {
+                Ok((bytes, spec, project)) => {
                     source = Source::Local(bytes);
+                    let revision = project.revision;
+                    local_project = Some(project);
                     Event::Imported {
                         source: path.display().to_string(),
                         remote: false,
-                        revision: None,
+                        revision: Some(revision),
                         named_pass_transform: false,
                         whole_rebuild: false,
                         source_offer: None,
@@ -1174,6 +1219,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 project_id,
             } => match runtime.block_on(open_remote(endpoint, token_file, project_id)) {
                 Ok((access, spec)) => {
+                    local_project = None;
                     let label = format!(
                         "{} · {} · revision {}",
                         access.endpoint, access.project_id, access.revision
@@ -1210,6 +1256,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 path,
             } => match runtime.block_on(upload_remote(endpoint, token_file, project_id, path)) {
                 Ok((access, spec)) => {
+                    local_project = None;
                     let label = format!(
                         "{} · {} · revision {}",
                         access.endpoint, access.project_id, access.revision
@@ -1256,6 +1303,22 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::None => Err("Open a local ELF or remote project first.".to_owned()),
             }),
             Task::RefreshAnnotations { binary_sha256 } => match &source {
+                Source::Local(_) => local_project
+                    .as_ref()
+                    .ok_or("Open a local ELF to load annotations".to_owned())
+                    .and_then(|project| {
+                        if project.binary_sha256 != binary_sha256 {
+                            return Err(
+                                "Local annotation digest differs from the open ELF".to_owned()
+                            );
+                        }
+                        list_local_annotations(project)
+                    })
+                    .map(|annotations| Event::AnnotationsLoaded {
+                        binary_sha256,
+                        annotations,
+                    })
+                    .unwrap_or_else(Event::Failed),
                 Source::Remote(access) => runtime
                     .block_on(list_remote_annotations(access, &binary_sha256))
                     .map(|annotations| Event::AnnotationsLoaded {
@@ -1263,7 +1326,9 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         annotations,
                     })
                     .unwrap_or_else(Event::Failed),
-                _ => Event::Failed("Open a remote project to load annotations.".to_owned()),
+                Source::None => Event::Failed(
+                    "Open a local ELF or remote project to load annotations.".to_owned(),
+                ),
             },
             Task::AddAnnotation {
                 binary_sha256,
@@ -1273,6 +1338,43 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 value,
                 key,
             } => match &mut source {
+                Source::Local(bytes) => {
+                    let result = local_project
+                        .as_ref()
+                        .ok_or("Open a local ELF before adding an annotation".to_owned())
+                        .and_then(|project| {
+                            add_local_annotation(
+                                project,
+                                bytes,
+                                &binary_sha256,
+                                kind,
+                                address,
+                                &scope,
+                                &value,
+                                &key,
+                            )
+                        });
+                    match result {
+                        Ok((updated, spec, annotations)) => {
+                            let source_label = format!(
+                                "{} · local revision {}",
+                                updated.path.display(),
+                                updated.revision
+                            );
+                            let revision = updated.revision;
+                            local_project = Some(updated);
+                            Event::AnnotationAdded {
+                                source: source_label,
+                                revision,
+                                spec,
+                                annotations,
+                            }
+                        }
+                        Err(error) => Event::Failed(format!(
+                            "{error} Annotation key {key}; reopen the local ELF if its bytes changed."
+                        )),
+                    }
+                }
                 Source::Remote(access) => match runtime.block_on(add_remote_annotation(
                     access,
                     &binary_sha256,
@@ -1301,7 +1403,9 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         ))
                     }
                 },
-                _ => Event::Failed("Open a remote project to add an annotation.".to_owned()),
+                Source::None => Event::Failed(
+                    "Open a local ELF or remote project to add an annotation.".to_owned(),
+                ),
             },
             Task::StartLiftJob { symbol, key } => match &source {
                 Source::Remote(access) => runtime
@@ -1417,13 +1521,23 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
             Task::RebuildLocal { output_dir } => match &source {
                 Source::Local(bytes) => match rebuild_local(bytes, &output_dir) {
                     Ok((rebuilt, spec, ir, report, binary_sha256)) => {
-                        source = Source::Local(rebuilt);
-                        Event::LocalRebuilt {
-                            spec,
-                            ir,
-                            report,
-                            binary_sha256,
-                            output_dir,
+                        match attach_local_project(&output_dir.join("rebuilt"), &spec) {
+                            Ok(project) => {
+                                let revision = project.revision;
+                                local_project = Some(project);
+                                source = Source::Local(rebuilt);
+                                Event::LocalRebuilt {
+                                    spec,
+                                    revision,
+                                    ir,
+                                    report,
+                                    binary_sha256,
+                                    output_dir,
+                                }
+                            }
+                            Err(error) => Event::Failed(format!(
+                                "Rebuilt ELF was written, but its local project could not open: {error}"
+                            )),
                         }
                     }
                     Err(error) => Event::Failed(error),
@@ -1438,11 +1552,21 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::Local(bytes) => {
                     match patch_local(bytes, &symbol, &replacement, &output_path) {
                         Ok((patched, spec, binary_sha256)) => {
-                            source = Source::Local(patched);
-                            Event::LocalPatched {
-                                spec,
-                                binary_sha256,
-                                output_path,
+                            match attach_local_project(&output_path, &spec) {
+                                Ok(project) => {
+                                    let revision = project.revision;
+                                    local_project = Some(project);
+                                    source = Source::Local(patched);
+                                    Event::LocalPatched {
+                                        spec,
+                                        revision,
+                                        binary_sha256,
+                                        output_path,
+                                    }
+                                }
+                                Err(error) => Event::Failed(format!(
+                                    "Patched ELF was written, but its local project could not open: {error}"
+                                )),
                             }
                         }
                         Err(error) => Event::Failed(error),
@@ -1699,12 +1823,10 @@ impl AnalystApp {
                     if let Some(symbol) = self.initial_symbol.take() {
                         self.select(symbol);
                     }
-                    if remote {
-                        self.enqueue(
-                            Task::RefreshAnnotations { binary_sha256 },
-                            "Loading revisioned analyst annotations…",
-                        );
-                    }
+                    self.enqueue(
+                        Task::RefreshAnnotations { binary_sha256 },
+                        "Loading revisioned analyst annotations…",
+                    );
                 }
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
@@ -1793,6 +1915,12 @@ impl AnalystApp {
                         == Some(binary_sha256.as_str())
                     {
                         self.status = format!("Loaded {} analyst annotations", annotations.len());
+                        if let Some(spec) = &mut self.spec {
+                            spec.assumptions.retain(|assumption| {
+                                assumption.provenance.source != FactSource::AnalystAssertion
+                            });
+                            overlay_analyst_assumptions(spec, &annotations);
+                        }
                         self.annotations = annotations;
                         self.failure = None;
                     }
@@ -1946,9 +2074,14 @@ impl AnalystApp {
                     self.history.push(self.status.clone());
                     self.tab = Tab::Llvm;
                     self.failure = None;
+                    self.enqueue(
+                        Task::RefreshAnnotations { binary_sha256 },
+                        "Loading rebuilt remote project annotations…",
+                    );
                 }
                 Event::LocalRebuilt {
                     spec,
+                    revision,
                     ir,
                     report,
                     binary_sha256,
@@ -1958,7 +2091,7 @@ impl AnalystApp {
                     self.source_offer = None;
                     self.spec = Some(spec);
                     self.remote = false;
-                    self.project_revision = None;
+                    self.project_revision = Some(revision);
                     self.symbol = None;
                     self.cfg = None;
                     self.ir = Some(ir);
@@ -1986,9 +2119,14 @@ impl AnalystApp {
                     self.history.push(self.status.clone());
                     self.tab = Tab::Llvm;
                     self.failure = None;
+                    self.enqueue(
+                        Task::RefreshAnnotations { binary_sha256 },
+                        "Loading rebuilt local project annotations…",
+                    );
                 }
                 Event::LocalPatched {
                     spec,
+                    revision,
                     binary_sha256,
                     output_path,
                 } => {
@@ -1996,7 +2134,7 @@ impl AnalystApp {
                     self.source_offer = None;
                     self.spec = Some(spec);
                     self.remote = false;
-                    self.project_revision = None;
+                    self.project_revision = Some(revision);
                     self.symbol = None;
                     self.cfg = None;
                     self.ir = None;
@@ -2020,6 +2158,10 @@ impl AnalystApp {
                     );
                     self.history.push(self.status.clone());
                     self.failure = None;
+                    self.enqueue(
+                        Task::RefreshAnnotations { binary_sha256 },
+                        "Loading patched local project annotations…",
+                    );
                 }
                 Event::RemotePatched {
                     source,
@@ -2054,6 +2196,10 @@ impl AnalystApp {
                     );
                     self.history.push(self.status.clone());
                     self.failure = None;
+                    self.enqueue(
+                        Task::RefreshAnnotations { binary_sha256 },
+                        "Loading patched remote project annotations…",
+                    );
                 }
                 Event::ArtifactExported { path, digest } => {
                     let label = if self.patch_digest.as_deref() == Some(digest.as_str()) {
@@ -2162,14 +2308,21 @@ impl AnalystApp {
         }
         if let Some(revision) = self.project_revision {
             ui.label(
-                RichText::new(format!("REMOTE REVISION  ·  {revision}"))
-                    .size(10.0)
-                    .strong()
-                    .color(ACCENT),
+                RichText::new(format!(
+                    "{} REVISION  ·  {revision}",
+                    if self.remote { "REMOTE" } else { "LOCAL" }
+                ))
+                .size(10.0)
+                .strong()
+                .color(ACCENT),
             );
         }
         ui.label(
-            RichText::new("Open a local ELF to inspect symbol facts. No binary is uploaded.")
+            RichText::new(if self.remote {
+                "Remote project is open. Uploading another ELF always requires the explicit transfer action."
+            } else {
+                "Open a local ELF to inspect symbol facts. No binary is uploaded."
+            })
                 .size(12.0)
                 .color(MUTED),
         );
@@ -2348,7 +2501,7 @@ impl AnalystApp {
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "Names, comments, and assumptions are analyst assertions, not recovered ELF facts. Saving creates a new project revision; a changed binary will not reuse them.",
+                        "Names, comments, and assumptions are analyst assertions, not recovered ELF facts. Saving creates a new project revision; a changed binary digest will not reuse them.",
                     )
                     .size(11.0)
                     .color(MUTED),
@@ -2389,13 +2542,15 @@ impl AnalystApp {
                                 ));
                         }
                     });
-                if !self.remote {
-                    ui.label(
-                        RichText::new("Open an authenticated remote project to save annotations.")
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                }
+                ui.label(
+                    RichText::new(if self.remote {
+                        "REMOTE LEDGER · owner-scoped · authenticated"
+                    } else {
+                        "LOCAL LEDGER · private SQLite · no upload"
+                    })
+                    .size(10.0)
+                    .color(MUTED),
+                );
                 egui::ComboBox::from_id_salt("annotation_kind")
                     .selected_text(match self.annotation_kind {
                         AnnotationKind::Name => "Name",
@@ -2430,8 +2585,7 @@ impl AnalystApp {
                         .desired_rows(2)
                         .hint_text("Analyst-authored name, comment, or assumption"),
                 );
-                let can_save = self.remote
-                    && self.spec.is_some()
+                let can_save = self.spec.is_some()
                     && !self.busy
                     && (address.is_some() || self.annotation_program_wide)
                     && (self.annotation_kind != AnnotationKind::Name || address.is_some())
@@ -3220,6 +3374,65 @@ impl eframe::App for AnalystApp {
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [probe, binary] = arguments.as_slice()
+        && probe == "--probe-local-annotation"
+    {
+        let result = (|| {
+            if std::env::var_os("HYDIR_LOCAL_DB").is_none() {
+                return Err(
+                    "Set HYDIR_LOCAL_DB to a private absolute test database path".to_owned(),
+                );
+            }
+            let path = PathBuf::from(binary);
+            let bytes = bounded_read(&path)?;
+            let spec = import_elf(&bytes).map_err(|error| error.to_string())?;
+            let project = attach_local_project(&path, &spec)?;
+            let statement = "GUI local analyst assertion; not independently validated";
+            let (updated, overlaid, annotations) = add_local_annotation(
+                &project,
+                &bytes,
+                &spec.binary_sha256,
+                AnnotationKind::Assumption,
+                None,
+                "trusted fixture only",
+                statement,
+                &uuid::Uuid::new_v4().to_string(),
+            )?;
+            let reopened = attach_local_project(&path, &spec)?;
+            let persisted = list_local_annotations(&reopened)?;
+            if updated.revision != project.revision + 1
+                || reopened.revision != updated.revision
+                || !overlaid.assumptions.iter().any(|assumption| {
+                    assumption.statement == statement
+                        && assumption.provenance.source == FactSource::AnalystAssertion
+                })
+                || !persisted.iter().any(|annotation| {
+                    annotation.id
+                        == annotations
+                            .last()
+                            .map(|fact| fact.id.clone())
+                            .unwrap_or_default()
+                })
+            {
+                return Err(
+                    "GUI local annotation probe returned inconsistent project facts".to_owned(),
+                );
+            }
+            Ok::<_, String>(updated.revision)
+        })();
+        match result {
+            Ok(revision) => {
+                println!(
+                    "HydIR GUI local annotation operations passed: private revision {revision}, reopened analyst fact"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI local annotation probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, endpoint, token_file, binary] = arguments.as_slice()
         && probe == "--probe-annotation"
     {
@@ -3628,7 +3841,7 @@ fn main() -> eframe::Result<()> {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -3656,7 +3869,72 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{AnalystApp, Event, Tab, ir_slice, validate_endpoint};
+    use hydir_core::{
+        AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
+    };
     use std::sync::mpsc;
+
+    #[test]
+    fn annotation_refresh_overlays_once_and_rejects_stale_binary_events() {
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(3);
+        app.events = receiver;
+        app.spec = Some(ProgramSpec {
+            schema_version: 2,
+            binary_sha256: "a".repeat(64),
+            target_triple: "x86_64-unknown-elf".to_owned(),
+            abi: "System V AMD64".to_owned(),
+            file_kind: "executable".to_owned(),
+            image_base: None,
+            entry_point: None,
+            data_layout: None,
+            address_spaces: Vec::new(),
+            mapped_segments: Vec::new(),
+            sections: Vec::new(),
+            functions: Vec::new(),
+            imports: Vec::new(),
+            relocations: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            call_recovery: RecoveryState::NotAttempted,
+            reference_recovery: RecoveryState::NotAttempted,
+            assumptions: Vec::new(),
+            recovery_scope: "test".to_owned(),
+            unresolved_control_flow: true,
+        });
+        let annotation = AnalystAnnotation {
+            id: "analyst-1".to_owned(),
+            binary_sha256: "a".repeat(64),
+            created_revision: 2,
+            kind: AnnotationKind::Assumption,
+            address: None,
+            value: "unverified caller contract".to_owned(),
+            scope: "whole binary".to_owned(),
+            provenance: FactProvenance {
+                source: FactSource::AnalystAssertion,
+                scope: "test assertion".to_owned(),
+            },
+        };
+        for _ in 0..2 {
+            sender
+                .send(Event::AnnotationsLoaded {
+                    binary_sha256: "a".repeat(64),
+                    annotations: vec![annotation.clone()],
+                })
+                .unwrap();
+            app.poll();
+        }
+        assert_eq!(app.spec.as_ref().unwrap().assumptions.len(), 1);
+        sender
+            .send(Event::AnnotationsLoaded {
+                binary_sha256: "b".repeat(64),
+                annotations: Vec::new(),
+            })
+            .unwrap();
+        app.poll();
+        assert_eq!(app.annotations.len(), 1);
+        assert_eq!(app.spec.as_ref().unwrap().assumptions.len(), 1);
+    }
 
     #[test]
     fn extracts_selected_instruction_ir_without_crossing_next_block() {

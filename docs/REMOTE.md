@@ -72,13 +72,27 @@ assertions. The resulting ELF has a new revision; remote export is digest-
 checked and new-file-only. The GUI probes cover both local and remote patch
 operation functions, not visual interaction.
 The Inspector includes an explicitly unverified analyst ledger and form for
-the selected virtual address or a program-wide fact. Saving uses the same
-revisioned API as the CLI. Local ELF mode cannot persist annotations yet.
+the selected virtual address or a program-wide fact. Remote saving uses the
+same revisioned API as the CLI. Local ELF mode uses a separate private,
+path-bound SQLite project ledger through the same shared fact validation;
+opening a local file never transfers it. The ledgers do not auto-sync.
 Credentials stay out of the displayed project label. The headless
 `--probe-create-upload`, `--probe-transform`, and `--probe-rebuild` paths
 exercise the same operation functions, but are not visual UI tests.
 The Inspector displays whether this service build offers a matching committed
 source archive, its revision and digest, and the explicit CLI download command.
+
+`hydirctl local project|inspect|analyze-spec|annotations <elf>` opens the
+on-device project. `hydirctl local annotate <elf> <revision> <key>
+<name|comment|assumption> <hex-address|-> <scope> <value>` creates a revisioned
+fact; `--db <absolute-private-sqlite>` or `HYDIR_LOCAL_DB` selects a test or
+custom database. The GUI uses `HYDIR_LOCAL_DB` or the same user-data default.
+The original ELF stays on disk unchanged. Only assumptions are overlaid into
+the local `ProgramSpec`; names/comments stay separately visible. Changing
+file bytes at the same canonical path advances the project revision and
+hides facts for the previous digest. `bash scripts/demo-local-project.sh`
+checks restart, exact-key replay, stale/conflicting writes, GUI/CLI sharing,
+and digest isolation on a disposable fixture copy.
 
 Projects have an owner identity and an integer revision. Uploaded binaries
 are verified by SHA-256 and parsed as ELF before a new immutable revision is

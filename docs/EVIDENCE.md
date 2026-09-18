@@ -1,5 +1,44 @@
 # HydIR evidence — 2026-09-18
 
+## Private local analyst projects — 2026-09-18
+
+Local ELF import now attaches a path-bound, private SQLite project without
+copying or uploading the binary. `hydirctl local` and the egui worker share
+the same store, validation rules, revision preconditions, idempotency keys,
+digest-scoped facts, and assumption overlay. The `hydir-project` unit tests
+cover restart persistence, exact replay and changed-key refusal, stale reads,
+changed-binary isolation, mapped-address checks, and Unix private-file mode.
+
+On macOS, `bash scripts/demo-local-project.sh
+target/demo-analysis/run.ufXm8n/global-effects` exited 0 on the final tree in
+`target/demo-local-project/run.vYu45p/`. It copied the retained trusted ELF
+into a disposable directory, created a private local project, saved an
+addressed name and program-wide assumption through the CLI, checked exact
+retry/conflicting-key/stale-revision behavior, confirmed assumption provenance
+in `analyze-spec`, saved another assumption through the GUI operation probe,
+and reopened the ledger through the CLI. Appending one byte to only the
+disposable ELF copy advanced the path-bound project revision and returned an
+empty ledger for its new digest. The probe exercises GUI operation functions,
+not pointer/keyboard interaction.
+
+An actual macOS `hydir --open-local` window was captured by its own window ID
+and visually inspected in the dark-first workbench. The first capture exposed
+an incorrect `REMOTE REVISION` label in local mode; after correction, a
+second window-scoped capture showed `LOCAL REVISION · 4` and `LOCAL · NO
+UPLOAD`. The captured selected function's C output rejected an unsupported
+call, which is expected for that fixture and is not claimed as C support.
+The window capture is not automated interaction QA. No whole-display capture
+was used after the permission reviewer rejected one.
+
+`cargo test --locked --offline --workspace` passed **46 Rust unit tests** and
+all doc-test targets. `PYTHONPATH=sdk/python target/sdk-venv/bin/python -m
+unittest discover -s sdk/python/tests -v` passed **9 Python unit tests**.
+`cargo fmt --all`, `bash -n` for the changed scripts, and `git diff --check`
+passed. The pinned macOS Rust toolchain reports that `cargo-clippy` is not
+applicable; no final-tree Clippy result is claimed. Linux-only integration
+gates have not been re-executed for this change in the current macOS
+environment. Matching-source verification requires the clean commit below.
+
 ## Revisioned analyst facts — 2026-09-18
 
 The authenticated loopback service now persists binary-digest-bound analyst

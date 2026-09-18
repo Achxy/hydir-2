@@ -31,11 +31,13 @@ than asserting Linux from the OSABI alone. A separate, versioned
 direct edges, and provenance for a selected symbol or supplied entry. The
 global model still lacks complete call/reference recovery. The remote
 service now persists owner-scoped, digest-bound analyst names, comments, and
-assumptions as immutable project revisions. Remote `inspect` and
-`analyze-spec` overlay only the assumptions, with explicit analyst
-provenance and optional virtual address; names/comments remain in the
-separate ledger and do not change recovered semantics. Local ELF mode has no
-durable annotation store. These are versioned starting models, not the
+assumptions as immutable project revisions. A separate private local SQLite
+store persists path-bound projects and digest-scoped analyst facts across
+CLI/GUI restarts. Local and remote `inspect`/`analyze-spec` overlay only the
+assumptions, with explicit analyst provenance and optional virtual address;
+names/comments remain in separate ledgers and do not change recovered
+semantics. Local records are not automatically transferred to remote projects.
+These are versioned starting models, not the
 complete contract in the implementation plan.
 
 The scalar patch v1 operation accepts a versioned JSON document with a
@@ -90,8 +92,8 @@ local/remote pass editor, restricted local/remote rebuild controls, and scalar
 patch v1 editor use the same first-party libraries or typed remote operations
 as the CLI. The patch editor requires an explicit entry-only assertion and
 never executes the patched ELF. A
-desktop smoke run was attempted on macOS; automated visual/interaction QA is
-still outstanding. The `hydird` gRPC service supports authenticated loopback discovery,
+desktop window was visually inspected on macOS in its dark-first local-project
+state; automated pointer/keyboard interaction QA remains outstanding. The `hydird` gRPC service supports authenticated loopback discovery,
 idempotent project creation, immutable binary uploads, project inspection,
 symbol-scoped CFG/lift/C, conservative global-effect analysis, owner-scoped durable lift jobs with event replay and
 cancellation, named pass execution, whole-executable rebuilding for the restricted subset,
