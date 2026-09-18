@@ -14,6 +14,7 @@ hydir-backend = { path = "../hydir-backend" }
 hydir-c = { path = "../hydir-c" }
 hydir-analysis = { path = "../hydir-analysis" }
 hydir-core = { path = "../hydir-core" }
+hydir-project = { path = "../hydir-project" }
 hydir-api = { path = "../hydir-api" }
 hydir-transform = { path = "../hydir-transform" }
 hydir-recompile = { path = "../hydir-recompile" }

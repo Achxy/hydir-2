@@ -12,8 +12,9 @@ use hydir_api::v1::{
 use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
 use hydir_c::emit_c;
 use hydir_core::{
-    Address, AnalystAnnotation, AnnotationKind, AssumptionSpec, FactProvenance, FactSource,
-    ProgramSpec,
+    Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
+    annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
+    validate_analyst_annotation,
 };
 use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
 use hydir_recompile::rebuild_bytes;
@@ -546,68 +547,26 @@ fn valid_symbol(symbol: &str) -> Result<(), Status> {
 }
 
 fn annotation_kind(value: &str) -> Result<AnnotationKind, Status> {
-    match value {
-        "name" => Ok(AnnotationKind::Name),
-        "comment" => Ok(AnnotationKind::Comment),
-        "assumption" => Ok(AnnotationKind::Assumption),
-        _ => Err(Status::invalid_argument(
-            "annotation kind must be name, comment, or assumption",
-        )),
-    }
+    AnnotationKind::parse(value).map_err(Status::invalid_argument)
 }
 
 fn annotation_address(value: &str) -> Result<Option<Address>, Status> {
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let digits = value
-        .strip_prefix("0x")
-        .filter(|digits| !digits.is_empty() && digits.len() <= 16)
-        .ok_or_else(|| Status::invalid_argument("address must be 0x plus 1..=16 hex digits"))?;
-    u64::from_str_radix(digits, 16)
-        .map(Address)
-        .map(Some)
-        .map_err(|_| Status::invalid_argument("address must be hexadecimal"))
+    parse_annotation_address(value).map_err(Status::invalid_argument)
 }
 
 fn validate_annotation(
     input: &AnnotationRequest,
 ) -> Result<(AnnotationKind, Option<Address>), Status> {
-    if input.idempotency_key.is_empty()
-        || input.idempotency_key.len() > 128
-        || input.idempotency_key.chars().any(char::is_control)
-    {
-        return Err(Status::invalid_argument(
-            "annotation idempotency key must be 1..=128 non-control bytes",
-        ));
-    }
     let kind = annotation_kind(&input.kind)?;
     let address = annotation_address(&input.address)?;
-    if kind == AnnotationKind::Name && address.is_none() {
-        return Err(Status::invalid_argument("name requires a virtual address"));
-    }
-    let max_value = match kind {
-        AnnotationKind::Name => 128,
-        AnnotationKind::Comment => 2048,
-        AnnotationKind::Assumption => 1024,
-    };
-    if input.value.trim().is_empty()
-        || input.value.len() > max_value
-        || input.value.chars().any(|character| character == '\0')
-        || (kind == AnnotationKind::Name && input.value.chars().any(char::is_control))
-    {
-        return Err(Status::invalid_argument(format!(
-            "annotation value must be 1..={max_value} bytes without forbidden control characters"
-        )));
-    }
-    if input.scope.trim().is_empty()
-        || input.scope.len() > 256
-        || input.scope.chars().any(char::is_control)
-    {
-        return Err(Status::invalid_argument(
-            "annotation scope must be 1..=256 non-control bytes",
-        ));
-    }
+    validate_analyst_annotation(
+        kind,
+        address,
+        &input.value,
+        &input.scope,
+        &input.idempotency_key,
+    )
+    .map_err(Status::invalid_argument)?;
     Ok((kind, address))
 }
 
@@ -667,20 +626,6 @@ fn annotations_for(
         ));
     }
     Ok(annotations)
-}
-
-fn overlay_assumptions(spec: &mut ProgramSpec, annotations: &[AnalystAnnotation]) {
-    for annotation in annotations {
-        if annotation.kind == AnnotationKind::Assumption {
-            spec.assumptions.push(AssumptionSpec {
-                id: annotation.id.clone(),
-                statement: annotation.value.clone(),
-                scope: annotation.scope.clone(),
-                address: annotation.address,
-                provenance: annotation.provenance.clone(),
-            });
-        }
-    }
 }
 
 fn annotation_replay(
@@ -1289,7 +1234,7 @@ impl Hydir for Store {
             input.expected_revision,
             &spec.binary_sha256,
         )?;
-        overlay_assumptions(&mut spec, &annotations);
+        overlay_analyst_assumptions(&mut spec, &annotations);
         let json = serde_json::to_string(&spec)
             .map_err(|_| Status::internal("program model serialization failed"))?;
         Ok(Response::new(JsonReply { json }))
@@ -1325,7 +1270,7 @@ impl Hydir for Store {
             input.expected_revision,
             &spec.binary_sha256,
         )?;
-        overlay_assumptions(&mut spec, &annotations);
+        overlay_analyst_assumptions(&mut spec, &annotations);
         let json = serde_json::to_string(&spec)
             .map_err(|_| Status::internal("analyzed model serialization failed"))?;
         Ok(Response::new(JsonReply { json }))
@@ -1401,14 +1346,7 @@ impl Hydir for Store {
             let raw = run_worker("inspect", None, bytes).await?;
             let spec: ProgramSpec = serde_json::from_slice(&raw)
                 .map_err(|_| Status::internal("worker returned invalid program model"))?;
-            if !spec.mapped_segments.iter().any(|segment| {
-                segment.virtual_address.0 <= address.0
-                    && segment
-                        .virtual_address
-                        .0
-                        .checked_add(segment.memory_size)
-                        .is_some_and(|end| address.0 < end)
-            }) {
+            if !annotation_address_in_spec(&spec, address) {
                 return Err(Status::invalid_argument(
                     "annotation address is outside linked ELF load mappings",
                 ));

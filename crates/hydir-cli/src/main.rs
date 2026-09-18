@@ -3,6 +3,7 @@ use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
 };
 use hydir_c::emit_c;
+mod local;
 mod passes;
 mod patch;
 use hydir_recompile as recompile;
@@ -37,6 +38,8 @@ Usage:
   hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl validate-c <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl validate-c-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl local <project|inspect|analyze-spec|annotations> <elf> [--db <private-sqlite>]
+  hydirctl local annotate <elf> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value> [--db <private-sqlite>]
   hydirctl remote <operation> ...
 
 Symbol mode requires a non-stripped function symbol. Address mode requires an
@@ -49,6 +52,9 @@ freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
 Remote operations require HYDIR_ENDPOINT and a HYDIR_TOKEN_FILE containing a
 credential created by hydird. Remote upload is always an explicit command.
+Local project annotations use a private SQLite database in the user data
+directory, or the absolute HYDIR_LOCAL_DB path. --db overrides it for one
+command. ELF bytes are never written to that database.
 ";
 
 fn main() {
@@ -93,7 +99,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
                     "remote_api": true,
-                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/transform/rebuild/patch/artifact and durable lift-job subset",
+                    "local_project_annotations": true,
+                    "local_project_scope": "private path-bound SQLite ledger, digest-scoped names/comments/assumptions, revisioned CLI/GUI writes; no automatic remote sync",
+                    "remote_scope": "authenticated loopback project/upload/inspect/analyze/cfg/lift/decompile/transform/rebuild/patch/annotations/artifact and durable lift-job subset",
                     "remote_execution": false,
                     "remote_non_loopback": false,
                     "c_output": true,
@@ -101,7 +109,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "patching": true,
                     "patching_scope": "trusted linked x86-64 ELF, one complete scalar u64x2 function, entry-only assertion, exact in-place size bound; local CLI and owner-scoped remote revision",
                     "whole_executable_rebuild": env::consts::OS == "linux" && env::consts::ARCH == "x86_64" && clang_version.as_deref().is_some_and(|version| version.contains("14.0.6")),
-                    "whole_executable_rebuild_scope": "trusted freestanding static symbolized x86-64 ELF; direct calls/branches, bounded mapped data, read/write/exit only; local CLI only"
+                    "whole_executable_rebuild_scope": "trusted freestanding static symbolized x86-64 ELF; direct calls/branches, bounded mapped data, read/write/exit only; local and authenticated-loopback operations"
                 }))?
             );
         }
@@ -227,6 +235,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("validate-at") if args.len() >= 5 => validate(&args[1..], true, false)?,
         Some("validate-c") if args.len() >= 4 => validate(&args[1..], false, true)?,
         Some("validate-c-at") if args.len() >= 5 => validate(&args[1..], true, true)?,
+        Some("local") if args.len() >= 3 => local::run(&args[1..])?,
         Some("remote") if args.len() >= 2 => {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

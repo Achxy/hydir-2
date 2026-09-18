@@ -169,6 +169,100 @@ pub enum AnnotationKind {
     Assumption,
 }
 
+impl AnnotationKind {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "name" => Ok(Self::Name),
+            "comment" => Ok(Self::Comment),
+            "assumption" => Ok(Self::Assumption),
+            _ => Err("annotation kind must be name, comment, or assumption"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Comment => "comment",
+            Self::Assumption => "assumption",
+        }
+    }
+}
+
+pub fn parse_annotation_address(value: &str) -> Result<Option<Address>, &'static str> {
+    if value.is_empty() || value == "-" {
+        return Ok(None);
+    }
+    let digits = value
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty() && digits.len() <= 16)
+        .ok_or("address must be 0x plus 1..=16 hex digits")?;
+    u64::from_str_radix(digits, 16)
+        .map(Address)
+        .map(Some)
+        .map_err(|_| "address must be hexadecimal")
+}
+
+pub fn validate_analyst_annotation(
+    kind: AnnotationKind,
+    address: Option<Address>,
+    value: &str,
+    scope: &str,
+    idempotency_key: &str,
+) -> Result<(), String> {
+    if idempotency_key.is_empty()
+        || idempotency_key.len() > 128
+        || idempotency_key.chars().any(char::is_control)
+    {
+        return Err("annotation idempotency key must be 1..=128 non-control bytes".to_owned());
+    }
+    if kind == AnnotationKind::Name && address.is_none() {
+        return Err("name requires a virtual address".to_owned());
+    }
+    let max_value = match kind {
+        AnnotationKind::Name => 128,
+        AnnotationKind::Comment => 2048,
+        AnnotationKind::Assumption => 1024,
+    };
+    if value.trim().is_empty()
+        || value.len() > max_value
+        || value.chars().any(|character| character == '\0')
+        || (kind == AnnotationKind::Name && value.chars().any(char::is_control))
+    {
+        return Err(format!(
+            "annotation value must be 1..={max_value} bytes without forbidden control characters"
+        ));
+    }
+    if scope.trim().is_empty() || scope.len() > 256 || scope.chars().any(char::is_control) {
+        return Err("annotation scope must be 1..=256 non-control bytes".to_owned());
+    }
+    Ok(())
+}
+
+pub fn annotation_address_in_spec(spec: &ProgramSpec, address: Address) -> bool {
+    spec.mapped_segments.iter().any(|segment| {
+        segment.virtual_address.0 <= address.0
+            && segment
+                .virtual_address
+                .0
+                .checked_add(segment.memory_size)
+                .is_some_and(|end| address.0 < end)
+    })
+}
+
+pub fn overlay_analyst_assumptions(spec: &mut ProgramSpec, annotations: &[AnalystAnnotation]) {
+    for annotation in annotations {
+        if annotation.kind == AnnotationKind::Assumption {
+            spec.assumptions.push(AssumptionSpec {
+                id: annotation.id.clone(),
+                statement: annotation.value.clone(),
+                scope: annotation.scope.clone(),
+                address: annotation.address,
+                provenance: annotation.provenance.clone(),
+            });
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FactProvenance {
     pub source: FactSource,

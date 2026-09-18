@@ -23,10 +23,11 @@ fixtures. Local pass and rebuild actions require pinned Linux LLVM/Clang tools
 and new output directories; remote rebuild exports only to a new file. A
 separate scalar patch v1 editor supports explicit local/remote whole-function
 replacement with entry-only and trusted-fixture assertions.
-Remote projects can save revisioned analyst names, comments, and scoped
-assumptions. The Inspector labels them unverified; only assumptions are
-overlaid into remote inspected/analyzed specifications. Local ELF mode has no
-durable annotation store yet.
+Remote and local projects can save revisioned analyst names, comments, and
+scoped assumptions. The Inspector labels them unverified; only assumptions
+are overlaid into inspected/analyzed specifications. Local projects use a
+private, path-bound SQLite ledger and never upload bytes. The two ledgers do
+not automatically sync.
 The analysis is not complete whole-program
 recovery.
 
@@ -41,6 +42,8 @@ cargo test --locked --workspace
 cargo run --locked --bin hydir
 cargo run --locked --bin hydir -- --open-local /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- doctor
+cargo run --locked --bin hydirctl -- local project /path/to/program.elf
+cargo run --locked --bin hydirctl -- local annotations /path/to/program.elf
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
 cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- analyze-spec /path/to/linked-program.elf
@@ -75,6 +78,14 @@ denial checks. See
 [remote operation and threat model](docs/REMOTE.md).
 The remote CLI also has `annotations` and `annotate` commands for an
 owner-scoped, revisioned ledger of explicitly unverified analyst facts.
+`hydirctl local` exposes the corresponding private on-device ledger. Set
+`HYDIR_LOCAL_DB` to an absolute path to use a specific database from both
+the CLI and GUI; otherwise they share HydIR's user-data database. The CLI
+`local annotate` command requires the current revision, an idempotency key,
+kind, virtual address or `-`, scope, and value.
+`bash scripts/demo-local-project.sh [trusted-linked-x86-64-ELF]` checks CLI/GUI
+persistence, retries, stale writes, and digest isolation. Without an argument
+it builds its fixture on Linux x86-64.
 `bash scripts/demo-analysis.sh` checks direct-call propagation of a mapped
 global write, conservative treatment of an indirect call, and a partial
 `ProgramSpec` with provenance-bearing call/reference instruction sites.
