@@ -20,6 +20,9 @@ hydir-transform = { path = "../hydir-transform" }
 hydir-recompile = { path = "../hydir-recompile" }
 hydir-patch = { path = "../hydir-patch" }
 eframe.workspace = true
+egui_graph.workspace = true
+egui_graph_egui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

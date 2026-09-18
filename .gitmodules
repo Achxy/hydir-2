@@ -1,0 +1,3 @@
+[submodule "third_party/Triton"]
+	path = third_party/Triton
+	url = https://github.com/JonathanSalwan/Triton.git

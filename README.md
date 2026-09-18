@@ -34,6 +34,13 @@ not automatically sync.
 The analysis is not complete whole-program
 recovery.
 
+For local ELF work, **Disassemble ELF** scans executable x86-64 sections with
+the native `iced-x86` decoder. Symbol and entry-point paths receive recursive
+control-flow recovery; uncovered bytes are shown as explicitly uncertain
+linear-sweep output or gaps. The docked Console pane shows status, warnings,
+and a JSON representation of the report. The operation never executes the
+binary.
+
 ## Build and inspect
 
 Rust 1.96.0 is pinned in `rust-toolchain.toml`; `Cargo.lock` pins crates.
@@ -48,6 +55,7 @@ cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydirctl -- local project /path/to/program.elf
 cargo run --locked --bin hydirctl -- local annotations /path/to/program.elf
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
+cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- analyze /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- analyze-spec /path/to/linked-program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
@@ -162,6 +170,32 @@ gate, not a release or completed redistribution-license review.
   recompilable executable.
 - `lift --output` creates a new artifact or accepts byte-identical content;
   it refuses to overwrite an existing binary or differing artifact.
+
+## Optional Triton symbolic bridge
+
+HydIR includes the Triton source as a pinned submodule at
+`third_party/Triton`. The optional `triton` command extracts a bounded named
+function using HydIR's existing ELF parser, then sends only its bytes and
+metadata to `scripts/triton_bridge.py`. The helper uses Triton's x86-64 Python
+bindings to symbolize SysV AMD64 `rdi`/`rsi` as `arg0`/`arg1`, process the
+instructions, and return instruction-level symbolic expressions plus the
+final `rax` expression. It never executes the ELF and does not use SMT, LLVM,
+or concrete emulation.
+
+Build/install Triton's Python module according to the pinned upstream checkout,
+then run:
+
+```sh
+HYDIR_TRITON_PYTHON=python cargo run --locked --bin hydirctl -- \
+  triton /path/to/program.elf function_name
+```
+
+`HYDIR_TRITON_PYTHON` selects the Python executable and
+`HYDIR_TRITON_HELPER` can override the helper path. This first bridge supports
+only little-endian x86-64 ELF files with non-stripped, bounded text symbols.
+The GUI, gRPC server, remote API, SDK, stripped-code discovery, other binary
+formats, other architectures, solver integration, and LLVM lifting remain
+outside this slice.
 
 See [capabilities](docs/CAPABILITIES.md), [evidence](docs/EVIDENCE.md),
 [measured development evaluation](docs/EVALUATION.md),

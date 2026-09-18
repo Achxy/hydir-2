@@ -64,3 +64,11 @@ The development Docker image additionally installs Debian Git
 `1:2.39.5-0+deb12u3` for clean-revision source-archive verification. This
 tool is not embedded in the HydIR executables; distributing the development
 image would require its own package/license review.
+
+The optional Triton symbolic bridge is provided from the pinned Apache-2.0
+source submodule `third_party/Triton` at commit
+`bc84cf745e99768e07d51dcd734eba35c59f1b3e`. Triton uses Capstone (BSD-style
+license) for instruction decoding and exposes the Python module used by
+`scripts/triton_bridge.py`. Triton, Capstone, Python, and any platform
+packages required to build or install them are optional runtime/build
+dependencies for this feature and are not linked into HydIR's Rust binaries.

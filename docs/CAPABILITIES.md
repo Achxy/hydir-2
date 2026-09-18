@@ -16,6 +16,11 @@ lifting or rebuilding.
 The v2 `ProgramSpec` records content hash, target, ABI description, ELF entry,
 file-derived sections, loadable segments with file/memory extents and
 permissions, imports, section and dynamic relocations, and ELF symbol facts.
+The local GUI's **Disassemble ELF** action separately scans executable
+x86-64 text sections with `iced-x86`, recursively recovers symbol/entry-point
+control flow, and marks uncovered or undecodable bytes as uncertain gaps. It
+does not execute the binary and does not claim stripped-code function
+discovery.
 Relocation records retain raw ELF type flags when the generic parser cannot
 classify them. Dynamic relocation targets use the dynamic symbol table, not
 the separate debugging symbol table. Plain `inspect` still pairs empty
@@ -52,7 +57,10 @@ See [patching](PATCHING.md).
 
 The scalar C operation consumes the raw HydIR LLVM lift and rejects syntax
 outside its exact grammar. It is not a general C decompiler or a Rellic
-integration; the emitted C retains labels/gotos. Across 21 supported scalar
+integration. Recognized simple scalar idioms, currently including unsigned
+max-style compare/select control flow, receive a conservative structured-C
+view; other accepted functions retain explicit labels/gotos and SSA edge
+copies. Across 21 supported scalar
 variants (20 distinct functions plus a stripped variant), compiled C matched
 native execution on 21,168/21,168 tested input pairs. This is fixture evidence,
 not equivalence proof or evidence for memory/call-heavy functions.

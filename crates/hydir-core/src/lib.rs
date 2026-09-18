@@ -317,6 +317,72 @@ pub struct FunctionCfg {
     pub recovery_scope: String,
 }
 
+pub const DISASSEMBLY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisassemblyReport {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub target_triple: String,
+    pub sections: Vec<DisassemblySection>,
+    pub functions: Vec<DisassemblyFunction>,
+    pub instructions: Vec<DisassemblyInstruction>,
+    pub gaps: Vec<DisassemblyGap>,
+    pub warnings: Vec<String>,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisassemblySection {
+    pub name: String,
+    pub address: Address,
+    pub size: u64,
+    pub executable: bool,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisassemblyFunction {
+    pub name: String,
+    pub entry: Address,
+    pub size: u64,
+    pub instruction_addresses: Vec<Address>,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisassemblyInstruction {
+    pub address: Address,
+    pub bytes_hex: String,
+    pub mnemonic: String,
+    pub operands: String,
+    pub flow: DisassemblyFlow,
+    pub branch_target: Option<Address>,
+    pub function: Option<String>,
+    pub provenance: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisassemblyFlow {
+    Next,
+    ConditionalBranch,
+    UnconditionalBranch,
+    Call,
+    Return,
+    IndirectBranch,
+    IndirectCall,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisassemblyGap {
+    pub address: Address,
+    pub size: u64,
+    pub reason: String,
+    pub provenance: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockSpec {
     pub address: Address,
