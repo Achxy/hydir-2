@@ -47,6 +47,11 @@
 
       <p>For <code>hydir_max2</code>, the result contains five instruction blocks and five edges. The <code>jae</code> at <code>0x40113e</code> has a taken edge to the return at <code>0x401147</code> and a fallthrough edge to the second move at <code>0x401144</code>. Both paths meet at the return. The CFG artifact retains addresses, original byte strings, edge kinds, a binary SHA-256, the symbol extent, and a recovery-scope statement. Its block count is not a claim that arbitrary x86-64 has been analyzed.</p>
 
+      <figure>
+        <a href="assets/egui-cfg.webp"><img src="assets/egui-cfg.webp" width="1440" height="427" alt="HydIR egui CFG view listing five reachable instructions and the taken and fallthrough edges of jae" loading="lazy"></a>
+        <figcaption>The branch has two successors; both reach the return.</figcaption>
+      </figure>
+
       <figure class="inspector">
         <a href="assets/egui-inspector.webp"><img src="assets/egui-inspector.webp" width="610" height="995" alt="HydIR egui inspector showing the 16-byte symbol extent, asserted ABI, and five CFG blocks and edges" loading="lazy"></a>
         <figcaption>Symbol extent, ABI assertion, and recovered CFG counts.</figcaption>
@@ -90,6 +95,27 @@
       <p>The report is finite test evidence, not a proof over all 64-bit input pairs. <code>opt -passes=verify</code> checks that the generated LLVM IR is well formed; it does not prove equivalence to the binary. Validation executes the original binary, so the CLI requires <code>--trusted-fixture</code>. There is no hostile-input sandbox in this path. The demos require Linux x86-64; the repository provides a Docker-based runner for macOS.</p>
 
       <h2>Refusal and separate contracts</h2>
+
+      <p>Global-effect analysis is a separate bounded pass over ELF function symbols. On the <code>hydir_max2</code> demo ELF, it marks the selected function <code>BOUNDED</code> but marks <code>_start</code> <code>UNKNOWN EFFECTS</code>. The function lift does not imply that the whole executable has known effects.</p>
+
+      <figure>
+        <a href="assets/egui-effects.webp"><img src="assets/egui-effects.webp" width="1440" height="121" alt="HydIR egui global-effects rows marking hydir_max2 bounded and _start unknown effects" loading="lazy"></a>
+        <figcaption>Per-function effect status in the max2 ELF.</figcaption>
+      </figure>
+
+      <p>A separate fixture shows the program-call view. It resolves direct edges from <code>_start</code> to <code>hydir_parent</code> and from <code>hydir_parent</code> to <code>hydir_leaf</code>. <code>hydir_indirect</code> has no resolved edge in this view; missing edges remain unknown, not proven absent.</p>
+
+      <figure>
+        <a href="assets/egui-program-calls.webp"><img src="assets/egui-program-calls.webp" width="1440" height="529" alt="HydIR egui program-call graph with direct edges from _start to hydir_parent to hydir_leaf and a separate hydir_indirect node" loading="lazy"></a>
+        <figcaption>Only resolved direct calls become edges.</figcaption>
+      </figure>
+
+      <p>In that fixture, <code>hydir_leaf</code> writes <code>hydir_counter</code> in <code>.data</code>. The effect summary for its direct caller, <code>hydir_parent</code>, includes the possible write at <code>0x402000</code>. This is a may-write result within the bounded analysis scope.</p>
+
+      <figure>
+        <a href="assets/egui-propagated-write.webp"><img src="assets/egui-propagated-write.webp" width="628" height="250" alt="HydIR egui global-effects view listing hydir_parent calling hydir_leaf and a possible write to .data address 0x402000" loading="lazy"></a>
+        <figcaption>The caller carries the callee's possible global write.</figcaption>
+      </figure>
 
       <p>The workbench keeps stage failures distinct. In the separate <code>global-effects</code> fixture shown below, C output reports an unsupported <code>Call</code> at <code>0x401012</code>. The message says that this C-generation failure does not discard a valid CFG or LLVM lift. It does not imply that the call has been modeled by the function-level scalar lift.</p>
 
