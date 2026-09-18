@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Follow a 16-byte unsigned-max function from assembly through HydIR's CFG, LLVM IR, C output, and finite fixture checks.">
+  <link rel="canonical" href="https://hydir.wiki/articles/max2.html">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/article-styles.css">
+  <title>How HydIR Lifts a 16-Byte Function — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#article">Skip to article</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs.html">Blogs</a></nav></header>
+  <main class="site-main prose" id="article">
+    <article>
+      <p class="eyebrow"><a href="/blogs.html">Blogs</a> / Worked example</p>
+      <h1>How HydIR Lifts a 16-Byte Function</h1>
+
+      <p>Let's take one small function apart. <code>hydir_max2</code> returns the larger of two unsigned arguments, and its assembly fits in 16 bytes. We will read those bytes, follow the branch HydIR recovers, inspect the LLVM IR and C output, and finish with a finite comparison against the original fixture. Along the way, each stage tells us something different about the function.</p>
+
+      <h2>Start with the function</h2>
+      <p>Here is the <a href="https://github.com/Achxy/hydir-2/blob/main/tests/fixtures/max2.S">assembly fixture</a> in full:</p>
+
+      <pre><code class="language-asm"><span class="tok-directive">.globl</span> hydir_max2
+<span class="tok-directive">.type</span> hydir_max2, @function
+<span class="tok-label">hydir_max2:</span>
+    <span class="tok-keyword">movq</span> <span class="tok-var">%rdi</span>, <span class="tok-var">%rax</span>
+    <span class="tok-keyword">cmpq</span> <span class="tok-var">%rsi</span>, <span class="tok-var">%rdi</span>
+    <span class="tok-keyword">jae</span> <span class="tok-label">.Ldone</span>
+    <span class="tok-keyword">movq</span> <span class="tok-var">%rsi</span>, <span class="tok-var">%rax</span>
+<span class="tok-label">.Ldone:</span>
+    <span class="tok-keyword">ret</span></code></pre>
+
+      <p>Read it from the top. The first <code>movq</code> puts the first argument in RAX, the return register. <code>cmpq %rsi, %rdi</code> then sets flags as if it had calculated <code>rdi - rsi</code>. If RDI is at least RSI, <code>jae</code> jumps straight to <code>ret</code>; otherwise the second move replaces RAX with RSI. That is unsigned maximum. A signed comparison would give a different answer for some values with the top bit set.</p>
+
+      <figure>
+        <a href="/assets/egui-disassembly.webp"><img src="/assets/egui-disassembly.webp" width="1440" height="358" alt="HydIR egui disassembly of hydir_max2 with five instruction addresses and their machine bytes"></a>
+        <figcaption>Decoded bytes in the egui workbench.</figcaption>
+      </figure>
+
+      <h2>Give HydIR a boundary</h2>
+      <p>HydIR begins by reading the ELF file. Its importer accepts little-endian x86-64 ELF up to 64 MiB and records sections, load mappings, symbols, imports, and relocations. That inventory gives the later CFG recovery its function boundaries and file provenance.</p>
+
+      <p>For this fixture, the symbol table points to <code>0x401138</code> and says the function occupies 16 bytes. That gives the lift a place to start and a boundary it must respect. You can also supply an address and byte count yourself; the demo does this with <code>cfg-at</code> and <code>lift-at</code> after stripping a copy of the fixture. Either way, the CLI needs <code>--assume-u64x2</code> to assert the SysV AMD64 prototype <code>u64(u64, u64)</code>. Those argument types come from us, not from the machine bytes.</p>
+
+      <h2>Follow the two routes to <code>ret</code></h2>
+
+      <p>Starting at the declared entry, HydIR uses <code>iced-x86</code> to decode reachable instructions. It follows direct jumps and both sides of a conditional branch until it reaches returns. Here the <code>jae</code> gives us two routes: take the jump or execute the second move. HydIR checks that both routes stay inside the selected function and that decoded instruction boundaries do not overlap. This function-scoped path accepts up to 4,096 bytes.</p>
+
+      <p>The recovered graph has five instruction blocks and five edges. From <code>jae</code> at <code>0x40113e</code>, the taken edge reaches the return at <code>0x401147</code>; the fallthrough edge reaches the second move at <code>0x401144</code>. Both routes end at the same return. The saved CFG includes addresses, original bytes, edge kinds, the binary SHA-256, the symbol extent, and the stated recovery scope. Those details let you check exactly which function the graph describes.</p>
+
+      <figure>
+        <a href="/assets/egui-cfg.webp"><img src="/assets/egui-cfg.webp" width="1440" height="427" alt="HydIR egui CFG view listing five reachable instructions and the taken and fallthrough edges of jae" loading="lazy"></a>
+        <figcaption>The branch has two successors; both reach the return.</figcaption>
+      </figure>
+
+      <figure class="figure-narrow">
+        <a href="/assets/egui-inspector.webp"><img src="/assets/egui-inspector.webp" width="610" height="995" alt="HydIR egui inspector showing the 16-byte symbol extent, asserted ABI, and five CFG blocks and edges" loading="lazy"></a>
+        <figcaption>Symbol extent, ABI assertion, and recovered CFG counts.</figcaption>
+      </figure>
+
+      <h2>Turn the branch into LLVM IR</h2>
+
+      <p>The lift now has to represent what each instruction does to machine state. In this scalar subset it tracks five full-width registers, RAX, RDI, RSI, RDX, and RCX, plus ZF, SF, OF, and CF. The two arguments start in RDI and RSI. Before generating IR, HydIR checks which values are definitely initialized at each instruction. At a branch join, a value must be defined on every incoming route before it can be read. Every return route must define RAX.</p>
+
+      <p>HydIR gives each recovered instruction an LLVM basic block. A <code>phi</code> node chooses between values arriving from different predecessors. In this example, the comparison sets CF when RDI is below RSI. The <code>jae</code> branch takes the other case, and the <code>phi</code> at the return chooses the right RAX value for the route taken. The IR stays close to registers and flags; it is not trying to recreate the author's source code.</p>
+
+      <p>The useful lines from the generated <code>max2-lifted.ll</code> are short enough to inspect:</p>
+
+      <pre><code class="language-llvm"><span class="tok-var">%cf_out_40113b</span> = <span class="tok-keyword">icmp ult</span> <span class="tok-type">i64</span> <span class="tok-var">%rdi_in_40113b</span>, <span class="tok-var">%rsi_in_40113b</span>
+<span class="tok-var">%t_40113e_0</span> = <span class="tok-keyword">xor</span> <span class="tok-type">i1</span> <span class="tok-var">%cf_in_40113e</span>, <span class="tok-const">true</span>
+<span class="tok-keyword">br</span> <span class="tok-type">i1</span> <span class="tok-var">%t_40113e_0</span>, <span class="tok-keyword">label</span> <span class="tok-var">%b401147</span>, <span class="tok-keyword">label</span> <span class="tok-var">%b401144</span>
+<span class="tok-var">%rax_in_401147</span> = <span class="tok-keyword">phi</span> <span class="tok-type">i64</span> [<span class="tok-var">%rax_in_40113e</span>, <span class="tok-var">%b40113e</span>], [<span class="tok-var">%rax_out_401144</span>, <span class="tok-var">%b401144</span>]
+<span class="tok-keyword">ret</span> <span class="tok-type">i64</span> <span class="tok-var">%rax_in_401147</span></code></pre>
+
+      <p>The first line computes unsigned carry, the branch tests its inverse, and the <code>phi</code> selects RAX at the join. The full file also carries the other registers and flags; <code>cmp</code> computes ZF, SF, OF, and CF even though this branch uses CF. HydIR leaves <code>nsw</code> and <code>nuw</code> off wrapping arithmetic because the machine instruction did not promise that overflow was impossible.</p>
+
+      <p>The C output follows that same graph. It uses labels, gotos, and copies at branch edges. For this comparison, the carry expression compares the two inputs as unsigned values.</p>
+
+      <h2>Check the result against the fixture</h2>
+
+      <p>It helps to check more than the shape of the IR. <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-local.sh"><code>demo-local.sh</code></a> builds the assembly fixtures, lifts them, emits C, and compares the generated outputs with native execution. It runs LLVM's verifier when <code>opt</code> is available. The script also strips a copy of <code>hydir_max2</code> and tries the address-and-size path. <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-corpus.sh"><code>demo-corpus.sh</code></a> requires <code>opt</code> and adds 16 scalar functions. With the four distinct functions in the local demo, that makes 20 documented scalar fixtures.</p>
+
+      <pre><code class="language-shell"><span class="tok-keyword">bash</span> <span class="tok-string">scripts/demo-local.sh</span>
+<span class="tok-keyword">bash</span> <span class="tok-string">scripts/demo-corpus.sh</span></code></pre>
+
+      <p>For each output path, validation tries 1,008 controlled input pairs. It compares the lifted runner and compiled C runner with the original fixture, including stdout, stderr, and exit status. Here are fields from one recorded <code>hydir_max2</code> report:</p>
+
+      <pre><code class="language-json">{
+  <span class="tok-string">"cases_attempted"</span>: <span class="tok-number">1008</span>,
+  <span class="tok-string">"cases_matched"</span>: <span class="tok-number">1008</span>,
+  <span class="tok-string">"cases_mismatched"</span>: <span class="tok-number">0</span>,
+  <span class="tok-string">"result"</span>: <span class="tok-string">"pass"</span>,
+  <span class="tok-string">"sandbox"</span>: <span class="tok-string">"none; trusted fixtures only"</span>
+}</code></pre>
+
+      <p>The report records 1,008 matched input pairs. <code>opt -passes=verify</code> checks the LLVM IR structure, while the fixture comparison checks the recorded executions. The validation command uses <code>--trusted-fixture</code>. Run the demos on Linux x86-64, or use the repository's Docker runner on macOS.</p>
+
+      <h2>What happens beyond this function?</h2>
+
+      <p>HydIR's global-effect pass works over ELF function symbols and reports <code>hydir_max2</code> as <code>BOUNDED</code> in this demo ELF. It reports <code>_start</code> as <code>UNKNOWN EFFECTS</code>. These are separate per-function results in the same executable.</p>
+
+      <figure>
+        <a href="/assets/egui-effects.webp"><img src="/assets/egui-effects.webp" width="1440" height="121" alt="HydIR egui global-effects rows marking hydir_max2 bounded and _start unknown effects" loading="lazy"></a>
+        <figcaption>Per-function effect status in the max2 ELF.</figcaption>
+      </figure>
+
+      <p>A second fixture makes that distinction easier to see. The call view resolves direct edges from <code>_start</code> to <code>hydir_parent</code>, then from <code>hydir_parent</code> to <code>hydir_leaf</code>. It has no resolved edge for <code>hydir_indirect</code>. That absence means the view did not resolve an edge there; it is not evidence that no call can occur.</p>
+
+      <figure>
+        <a href="/assets/egui-program-calls.webp"><img src="/assets/egui-program-calls.webp" width="1440" height="529" alt="HydIR egui program-call graph with direct edges from _start to hydir_parent to hydir_leaf and a separate hydir_indirect node" loading="lazy"></a>
+        <figcaption>Only resolved direct calls become edges.</figcaption>
+      </figure>
+
+      <p>In the same fixture, <code>hydir_leaf</code> writes <code>hydir_counter</code> in <code>.data</code>. Because <code>hydir_parent</code> directly calls it, the parent's summary includes a possible write at <code>0x402000</code>. “Possible” matters here: this is a may-write result within the pass's bounded scope.</p>
+
+      <figure>
+        <a href="/assets/egui-propagated-write.webp"><img src="/assets/egui-propagated-write.webp" width="628" height="250" alt="HydIR egui global-effects view listing hydir_parent calling hydir_leaf and a possible write to .data address 0x402000" loading="lazy"></a>
+        <figcaption>The caller carries the callee's possible global write.</figcaption>
+      </figure>
+
+      <h2>And rebuilding an executable?</h2>
+      <p>HydIR has a separate route for that. <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-recompile.sh"><code>demo-recompile.sh</code></a> exercises three trusted, static freestanding fixtures. It requires complete supported text coverage, bounded mapped data, direct calls and branches, and checked read/write/exit syscall sites and buffers. The rebuilt executable goes into a new directory.</p>
+      <p>The script compares stdout, stderr, and exit status on selected inputs. Its report records those controlled fixture executions alongside the rebuilt artifacts.</p>
+    </article>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs.html">All blogs</a></p></footer>
+</body>
+</html>
