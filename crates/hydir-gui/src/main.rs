@@ -26,6 +26,7 @@ use std::{
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
     time::Duration,
@@ -65,6 +66,13 @@ enum Task {
     },
     Select(String),
     Disassemble,
+    Triton {
+        path: PathBuf,
+        symbol: String,
+    },
+    TritonConsole {
+        commands: Vec<String>,
+    },
     Analyze,
     RefreshAnnotations {
         binary_sha256: String,
@@ -137,6 +145,11 @@ enum Event {
         c: Result<String, String>,
     },
     Disassembled(Result<DisassemblyReport, String>),
+    Triton(Result<serde_json::Value, String>),
+    TritonConsole {
+        commands: Vec<String>,
+        result: Result<serde_json::Value, String>,
+    },
     Analyzed(Result<AnalysisReport, String>),
     AnnotationsLoaded {
         binary_sha256: String,
@@ -1189,6 +1202,80 @@ fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn hydirctl_path() -> PathBuf {
+    if let Ok(executable) = std::env::current_exe() {
+        let sibling = executable.with_file_name(if cfg!(windows) {
+            "hydirctl.exe"
+        } else {
+            "hydirctl"
+        });
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from(if cfg!(windows) { "hydirctl.exe" } else { "hydirctl" })
+}
+
+fn run_triton_cli(path: &Path, symbol: &str) -> Result<serde_json::Value, String> {
+    let path_text = path.display().to_string();
+    let output = Command::new(hydirctl_path())
+        .args(["triton", &path_text, symbol])
+        .output()
+        .map_err(|error| format!("Could not start hydirctl Triton command: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Triton analysis failed: {}", detail.trim()));
+    }
+    if output.stdout.len() > 1024 * 1024 {
+        return Err("Triton result exceeds the 1 MiB GUI limit".to_owned());
+    }
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Triton returned invalid JSON: {error}"))?;
+    if result.get("backend").and_then(serde_json::Value::as_str) != Some("triton") {
+        return Err("Triton result has an unexpected backend".to_owned());
+    }
+    Ok(result)
+}
+
+fn run_triton_console_cli(commands: &[String]) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "operation": "console",
+        "commands": commands,
+    });
+    let input = serde_json::to_vec(&request)
+        .map_err(|error| format!("Could not encode Triton console request: {error}"))?;
+    let mut child = Command::new(hydirctl_path())
+        .arg("triton-console")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not start the Triton console: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("Triton console stdin is unavailable".to_owned())?
+        .write_all(&input)
+        .map_err(|error| format!("Could not send Triton console command: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Could not read Triton console output: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Triton console failed: {}", detail.trim()));
+    }
+    if output.stdout.len() > 1024 * 1024 {
+        return Err("Triton console result exceeds the 1 MiB GUI limit".to_owned());
+    }
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Triton console returned invalid JSON: {error}"))?;
+    if result.get("operation").and_then(serde_json::Value::as_str) != Some("console") {
+        return Err("Triton console returned an unexpected operation".to_owned());
+    }
+    Ok(result)
+}
+
 fn attach_local_project(path: &Path, spec: &ProgramSpec) -> Result<LocalProject, String> {
     LocalProjectStore::open_default()?.open_binary(path, spec)
 }
@@ -1370,6 +1457,11 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::Remote(_) => Err("Whole-ELF disassembly is currently local-only.".to_owned()),
                 Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
             }),
+            Task::Triton { path, symbol } => Event::Triton(run_triton_cli(&path, &symbol)),
+            Task::TritonConsole { commands } => Event::TritonConsole {
+                result: run_triton_console_cli(&commands),
+                commands,
+            },
             Task::Analyze => Event::Analyzed(match &source {
                 Source::Local(bytes) => analyze_elf(bytes).map_err(|error| error.to_string()),
                 Source::Remote(access) => runtime.block_on(analyze_remote(access)),
@@ -1706,6 +1798,12 @@ enum Tab {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum ConsoleMode {
+    Activity,
+    Triton,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum GraphMode {
     Function,
     Program,
@@ -1759,6 +1857,13 @@ struct AnalystApp {
     c_error: Option<String>,
     analysis: Option<AnalysisReport>,
     disassembly_report: Option<DisassemblyReport>,
+    triton_result: Option<serde_json::Value>,
+    triton_console_result: Option<serde_json::Value>,
+    triton_console_commands: Vec<String>,
+    triton_console_input: String,
+    console_mode: ConsoleMode,
+    console_detached: bool,
+    console_height: f32,
     console_json: bool,
     annotations: Vec<AnalystAnnotation>,
     annotation_kind: AnnotationKind,
@@ -1842,6 +1947,13 @@ impl AnalystApp {
             c_error: None,
             analysis: None,
             disassembly_report: None,
+            triton_result: None,
+            triton_console_result: None,
+            triton_console_commands: Vec::new(),
+            triton_console_input: String::new(),
+            console_mode: ConsoleMode::Triton,
+            console_detached: false,
+            console_height: 220.0,
             console_json: false,
             annotations: Vec::new(),
             annotation_kind: AnnotationKind::Comment,
@@ -1936,6 +2048,7 @@ impl AnalystApp {
                     self.c_error = None;
                     self.analysis = None;
                     self.disassembly_report = None;
+                    self.triton_result = None;
                     self.console_json = false;
                     self.annotations.clear();
                     self.job = None;
@@ -2059,6 +2172,53 @@ impl AnalystApp {
                     Err(error) => {
                         self.failure = Some(error.clone());
                         self.status = "Whole-ELF disassembly failed".to_owned();
+                        self.history.push(error);
+                    }
+                },
+                Event::Triton(result) => match result {
+                    Ok(result) => {
+                        let digest_matches = self
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| result.get("binary_sha256").and_then(serde_json::Value::as_str).map(|digest| digest == spec.binary_sha256))
+                            .unwrap_or(false);
+                        if !digest_matches {
+                            self.failure = Some(
+                                "Triton binary digest does not match the open ELF.".to_owned(),
+                            );
+                            self.status = "Triton result discarded".to_owned();
+                        } else {
+                            let paths = result
+                                .get("paths")
+                                .and_then(serde_json::Value::as_array)
+                                .map_or(0, Vec::len);
+                            self.status = format!("Triton symbolic analysis complete ({paths} paths)");
+                            self.history.push(self.status.clone());
+                            self.triton_result = Some(result);
+                            self.console_mode = ConsoleMode::Activity;
+                            self.console_json = true;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.failure = Some(error.clone());
+                        self.status = "Triton analysis failed".to_owned();
+                        self.history.push(error);
+                    }
+                },
+                Event::TritonConsole { commands, result } => match result {
+                    Ok(result) => {
+                        self.triton_console_commands = commands;
+                        self.triton_console_result = Some(result);
+                        self.console_mode = ConsoleMode::Triton;
+                        self.status = "Triton console command completed".to_owned();
+                        self.failure = None;
+                    }
+                    Err(error) => {
+                        self.triton_console_input = commands.last().cloned().unwrap_or_default();
+                        self.console_mode = ConsoleMode::Triton;
+                        self.status = "Triton console command failed".to_owned();
+                        self.failure = Some(error.clone());
                         self.history.push(error);
                     }
                 },
@@ -2538,6 +2698,27 @@ impl AnalystApp {
         }
         disassemble.on_disabled_hover_text(
             "Open a local ELF first. Whole-ELF disassembly is currently local-only.",
+        );
+        let triton = ui.add_enabled(
+            !self.busy
+                && !self.remote
+                && self.spec.is_some()
+                && self.current_local_path.is_some()
+                && self.symbol.is_some(),
+            egui::Button::new("Run Triton"),
+        );
+        if triton.clicked() {
+            if let (Some(path), Some(symbol)) =
+                (self.current_local_path.clone(), self.symbol.clone())
+            {
+                self.enqueue(
+                    Task::Triton { path, symbol },
+                    "Running Triton symbolic analysis…",
+                );
+            }
+        }
+        triton.on_disabled_hover_text(
+            "Open a local ELF and select a function before running Triton.",
         );
         ui.separator();
         egui::CollapsingHeader::new("Ghidra bridge")
@@ -3369,28 +3550,74 @@ impl AnalystApp {
     fn console_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading(RichText::new("Console").size(14.0));
+            if ui
+                .selectable_label(self.console_mode == ConsoleMode::Activity, "Activity")
+                .clicked()
+            {
+                self.console_mode = ConsoleMode::Activity;
+            }
+            if ui
+                .selectable_label(self.console_mode == ConsoleMode::Triton, "Triton REPL")
+                .clicked()
+            {
+                self.console_mode = ConsoleMode::Triton;
+            }
+            if ui
+                .button(if self.console_detached { "Dock" } else { "Detach" })
+                .clicked()
+            {
+                self.console_detached = !self.console_detached;
+            }
             ui.label(RichText::new("LOCAL ANALYSIS OUTPUT · no shell execution").size(10.0).color(MUTED));
-            if self.disassembly_report.is_some() {
+            if self.console_mode == ConsoleMode::Activity
+                && (self.disassembly_report.is_some() || self.triton_result.is_some())
+            {
                 if ui
                     .button(if self.console_json { "Show activity" } else { "Show JSON" })
                     .clicked()
                 {
                     self.console_json = !self.console_json;
                 }
-                if ui.button("Copy JSON").clicked()
-                    && let Some(report) = &self.disassembly_report
-                    && let Ok(json) = serde_json::to_string_pretty(report)
+                if ui.button("Copy JSON").clicked() {
+                    if let Some(result) = &self.triton_result {
+                        if let Ok(json) = serde_json::to_string_pretty(result) {
+                            ui.ctx().copy_text(json);
+                        }
+                    } else if let Some(report) = &self.disassembly_report
+                        && let Ok(json) = serde_json::to_string_pretty(report)
+                    {
+                        ui.ctx().copy_text(json);
+                    }
+                }
+            } else if self.console_mode == ConsoleMode::Triton {
+                if ui.button("Clear").clicked() {
+                    self.triton_console_commands.clear();
+                    self.triton_console_result = None;
+                    self.triton_console_input.clear();
+                    self.failure = None;
+                }
+                if ui.button("Copy transcript").clicked()
+                    && let Some(result) = &self.triton_console_result
+                    && let Ok(json) = serde_json::to_string_pretty(result)
                 {
                     ui.ctx().copy_text(json);
                 }
             }
         });
-        egui::ScrollArea::vertical()
-            .id_salt("console_output")
-            .max_height(130.0)
-            .show(ui, |ui| {
+        if self.console_mode == ConsoleMode::Activity {
+            let available = (ui.available_height() - 4.0).max(70.0);
+            egui::ScrollArea::vertical()
+                .id_salt("console_output")
+                .max_height(available)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 if self.console_json {
-                    if let Some(report) = &self.disassembly_report
+                    if let Some(result) = &self.triton_result
+                        && let Ok(json) = serde_json::to_string_pretty(result)
+                    {
+                        ui.label(RichText::new("TRITON SYMBOLIC RESULT").color(ACCENT));
+                        ui.code(json);
+                    } else if let Some(report) = &self.disassembly_report
                         && let Ok(json) = serde_json::to_string_pretty(report)
                     {
                         ui.code(json);
@@ -3406,11 +3633,130 @@ impl AnalystApp {
                             ui.colored_label(BAD, warning);
                         }
                     }
+                    if let Some(result) = &self.triton_result {
+                        let paths = result
+                            .get("paths")
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(0, Vec::len);
+                        let rax = result
+                            .get("final_registers")
+                            .and_then(|registers| registers.get("rax"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unavailable");
+                        ui.label(RichText::new(format!(
+                            "Triton: {paths} path(s), final rax = {rax}"
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(ACCENT));
+                    }
                     for entry in self.history.iter().rev().take(8) {
                         ui.label(RichText::new(entry).size(11.0).color(MUTED));
                     }
                 }
+                });
+        } else {
+            self.triton_console_body(ui);
+        }
+    }
+
+    fn triton_console_body(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new(
+                "Restricted Triton Python subset · one statement per line · no filesystem, shell, network, or arbitrary imports",
+            )
+            .size(10.0)
+            .color(MUTED),
+        );
+        let transcript_height = (ui.available_height() - 42.0).max(70.0);
+        egui::ScrollArea::vertical()
+            .id_salt("triton_console_transcript")
+            .max_height(transcript_height)
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if let Some(result) = &self.triton_console_result {
+                    if let Some(entries) = result
+                        .get("entries")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        for entry in entries {
+                            let command = entry
+                                .get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            ui.label(
+                                RichText::new(format!(">>> {command}"))
+                                    .monospace()
+                                    .color(ACCENT),
+                            );
+                            if let Some(output) = entry
+                                .get("output")
+                                .and_then(serde_json::Value::as_array)
+                            {
+                                for line in output.iter().filter_map(serde_json::Value::as_str) {
+                                    ui.label(RichText::new(line).monospace().color(TEXT));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(
+                            ">>> from triton import *\n>>> ctx = TritonContext(ARCH.X86_64)",
+                        )
+                        .monospace()
+                        .color(MUTED),
+                    );
+                }
+                if let Some(failure) = &self.failure {
+                    ui.colored_label(BAD, failure);
+                } else if self.busy {
+                    ui.colored_label(ACCENT, "Evaluating Triton statement…");
+                }
             });
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(">>>").monospace().color(ACCENT));
+            let editor = ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::singleline(&mut self.triton_console_input)
+                    .hint_text("ctx.getModel(rcx_expr.getAst() == 0xdead)")
+                    .desired_width(f32::INFINITY),
+            );
+            submit = editor.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(
+                    !self.busy && !self.triton_console_input.trim().is_empty(),
+                    egui::Button::new("Run"),
+                )
+                .clicked()
+            {
+                submit = true;
+            }
+        });
+        if submit {
+            self.submit_triton_console();
+        }
+    }
+
+    fn submit_triton_console(&mut self) {
+        let command = self.triton_console_input.trim().to_owned();
+        if command.is_empty() {
+            return;
+        }
+        if self.triton_console_commands.len() >= 64 {
+            self.failure =
+                Some("Triton console is limited to 64 statements; clear it first".to_owned());
+            return;
+        }
+        let mut commands = self.triton_console_commands.clone();
+        commands.push(command);
+        self.triton_console_input.clear();
+        self.enqueue(
+            Task::TritonConsole { commands },
+            "Evaluating restricted Triton statement…",
+        );
     }
 
     fn graph_view(&mut self, ui: &mut egui::Ui) {
@@ -4037,21 +4383,79 @@ impl eframe::App for AnalystApp {
                     });
             });
         self.workbench.inspector_width = inspector.response.rect.width().clamp(220.0, 800.0);
-        egui::Panel::bottom("console")
-            .resizable(true)
-            .default_size(150.0)
-            .min_size(70.0)
-            .show(ui, |ui| self.console_view(ui));
+        if !self.console_detached {
+            let console = egui::Panel::bottom("console")
+                .resizable(true)
+                .default_size(self.console_height)
+                .min_size(100.0)
+                .show(ui, |ui| self.console_view(ui));
+            self.console_height = console.response.rect.height().clamp(100.0, 900.0);
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| self.main_view(ui));
         });
+        if self.console_detached {
+            egui::Window::new("HydIR Console")
+                .id(egui::Id::new("detached_console"))
+                .resizable(true)
+                .default_size(egui::vec2(860.0, 420.0))
+                .min_size(egui::vec2(420.0, 180.0))
+                .show(ui.ctx(), |ui| self.console_view(ui));
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.as_slice() == ["--probe-triton-console"] {
+        let commands = [
+            "from triton import *",
+            "ctx = TritonContext(ARCH.X86_64)",
+            "ctx.setConcreteRegisterValue(ctx.registers.rip, 0x40000)",
+            "ctx.symbolizeRegister(ctx.registers.rax, 'my_rax')",
+            "ctx.processing(Instruction(b'\\x48\\x35\\x34\\x12\\x00\\x00'))",
+            "ctx.processing(Instruction(b'\\x48\\x89\\xc1'))",
+            "rcx_expr = ctx.getSymbolicRegister(ctx.registers.rcx)",
+            "print(rcx_expr)",
+            "ctx.getModel(rcx_expr.getAst() == 0xdead)",
+            "hex(0xcc99 ^ 0x1234)",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        match run_triton_console_cli(&commands) {
+            Ok(result)
+                if result
+                    .get("entries")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|entries| {
+                        entries
+                            .get(8)
+                            .and_then(|entry| entry.get("output"))
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|output| {
+                                output.iter().any(|line| {
+                                    line.as_str()
+                                        .is_some_and(|line| line.contains("my_rax:64 = 0xcc99"))
+                                })
+                            })
+                    }) =>
+            {
+                println!("HydIR GUI Triton console probe passed");
+                return Ok(());
+            }
+            Ok(_) => {
+                eprintln!("HydIR GUI Triton console probe returned an unexpected model");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI Triton console probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, binary] = arguments.as_slice()
         && probe == "--probe-workbench"
     {

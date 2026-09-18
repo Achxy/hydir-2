@@ -37,9 +37,14 @@ recovery.
 For local ELF work, **Disassemble ELF** scans executable x86-64 sections with
 the native `iced-x86` decoder. Symbol and entry-point paths receive recursive
 control-flow recovery; uncovered bytes are shown as explicitly uncertain
-linear-sweep output or gaps. The docked Console pane shows status, warnings,
-and a JSON representation of the report. The operation never executes the
-binary.
+linear-sweep output or gaps. The Console pane shows status, warnings, and JSON
+reports; it can be resized from its top edge or detached into a movable,
+independently resizable window and docked again. Its Triton REPL accepts one
+statement at a time from a restricted Python-shaped subset covering x86-64
+contexts, concrete/symbolic registers, instruction processing, symbolic
+expressions, model queries, `print`, and integer `hex`/xor. It does not expose
+filesystem, shell, network, arbitrary imports, or general Python execution.
+Whole-ELF disassembly never executes the binary.
 
 ## Build and inspect
 
@@ -82,6 +87,12 @@ does not cover optimized compiler output, stack/buffer access, or high-level C s
 
 On macOS with Docker Desktop, `bash scripts/demo-linux-docker.sh` builds the
 pinned Linux x86-64 development image and runs the tests plus demo there.
+For a visual workbench demo, `bash scripts/demo-password-showcase.sh` builds a
+freestanding access-gate ELF with named scoring, comparison, meter, and policy
+functions. Open the generated ELF in the GUI, press **Disassemble ELF**, then
+explore `hydir_policy_route`, `hydir_password_score`, and the **Graph** view.
+The intentionally visible phrase and branchy flow are for demonstration only;
+this is not an authentication implementation. See [the access-gate demo](docs/PASSWORD_DEMO.md).
 On Linux x86-64, `bash scripts/demo-remote.sh` runs the separate-process,
 authenticated service/client fixture, including durable lift jobs, event
 replay, restart, cancellation, GUI create/upload logic, and cross-project

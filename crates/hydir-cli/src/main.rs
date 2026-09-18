@@ -1,7 +1,7 @@
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
-    MAX_BINARY_BYTES, extract_symbol_code, import_elf, lift_at, lift_symbol, recover_at_cfg,
-    recover_symbol_cfg,
+    extract_symbol_code, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
+    MAX_BINARY_BYTES,
 };
 use hydir_c::emit_structured_c;
 mod local;
@@ -17,7 +17,9 @@ use std::{
     fs,
     io::{Read, Write},
     path::Path,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 const HELP: &str = "HydIR native x86-64 ELF vertical slice
@@ -26,6 +28,7 @@ Usage:
   hydirctl doctor
   hydirctl inspect <elf>
   hydirctl triton <elf> <function-symbol>
+  hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl analyze-spec <linked-elf>
   hydirctl cfg <elf> <function-symbol>
@@ -60,6 +63,8 @@ directory, or the absolute HYDIR_LOCAL_DB path. --db overrides it for one
 command. ELF bytes are never written to that database.
 ";
 
+const EMBEDDED_TRITON_HELPER: &str = include_str!("../../../scripts/triton_bridge.py");
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("hydirctl: {err}");
@@ -84,7 +89,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .filter(|output| output.status.success())
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .and_then(|value| value.lines().next().map(str::to_owned));
-            let triton_python = env::var("HYDIR_TRITON_PYTHON").unwrap_or_else(|_| "python".to_owned());
+            let triton_python = configured_triton_python();
             let triton_helper = triton_helper_path();
             let triton_python_version = Command::new(&triton_python)
                 .arg("--version")
@@ -92,10 +97,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .ok()
                 .filter(|output| output.status.success())
                 .and_then(|output| {
-                    let bytes = if output.stdout.is_empty() { output.stderr } else { output.stdout };
+                    let bytes = if output.stdout.is_empty() {
+                        output.stderr
+                    } else {
+                        output.stdout
+                    };
                     String::from_utf8(bytes).ok()
                 })
                 .and_then(|value| value.lines().next().map(str::to_owned));
+            let triton_module_version = Command::new(&triton_python)
+                .args([
+                    "-c",
+                    "import triton; print(getattr(triton, '__version__', 'installed'))",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.lines().next().map(str::to_owned));
+            let triton_helper_available =
+                triton_helper.exists() || env::var_os("HYDIR_TRITON_HELPER").is_none();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -104,10 +125,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "host": format!("{}-{}", env::consts::ARCH, env::consts::OS),
                     "elf_parser": "object 0.39.1 (Cargo.lock)",
                     "decoder": "iced-x86 1.21.0 (Cargo.lock)",
-                    "triton_bridge": triton_helper.exists() && triton_python_version.is_some(),
+                    "triton_bridge": triton_helper_available && triton_module_version.is_some(),
                     "triton_python": triton_python,
                     "triton_python_version": triton_python_version,
-                    "triton_helper": triton_helper.display().to_string(),
+                    "triton_module_version": triton_module_version,
+                    "triton_helper": if triton_helper.exists() {
+                        triton_helper.display().to_string()
+                    } else if env::var_os("HYDIR_TRITON_HELPER").is_none() {
+                        "<embedded>".to_owned()
+                    } else {
+                        triton_helper.display().to_string()
+                    },
                     "native_elf_import": true,
                     "direct_cfg_scalar_llvm_lift": true,
                     "symbol_scoped_cfg_export": true,
@@ -147,6 +175,24 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "entry_address": address,
                 "code_hex": hex_encode(&code),
             });
+            let result = run_triton_bridge(&request)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Some("triton-console") if args.len() == 1 => {
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take((MAX_TRITON_REQUEST_BYTES + 1) as u64)
+                .read_to_end(&mut input)?;
+            if input.len() > MAX_TRITON_REQUEST_BYTES {
+                return Err("Triton console request exceeds 128 KiB limit".into());
+            }
+            let request: serde_json::Value = serde_json::from_slice(&input)
+                .map_err(|error| format!("invalid Triton console request: {error}"))?;
+            if request.get("operation").and_then(serde_json::Value::as_str)
+                != Some("console")
+            {
+                return Err("Triton console request must use operation=console".into());
+            }
             let result = run_triton_bridge(&request)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
@@ -455,7 +501,10 @@ fn read_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(bytes)
 }
 
+const MAX_TRITON_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_TRITON_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_TRITON_STDERR_BYTES: usize = 64 * 1024;
+const TRITON_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -472,39 +521,122 @@ fn triton_helper_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/triton_bridge.py")
 }
 
+fn configured_triton_python() -> String {
+    if let Ok(path) = env::var("HYDIR_TRITON_PYTHON") {
+        return path;
+    }
+    let mut candidates = vec!["python".to_owned(), "python3".to_owned()];
+    #[cfg(windows)]
+    if let Ok(output) = Command::new("py").args(["-0p"]).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            candidates.extend(text.lines().filter_map(|line| {
+                line.split_whitespace()
+                    .find(|token| token.to_ascii_lowercase().ends_with(".exe"))
+                    .map(str::to_owned)
+            }));
+        }
+    }
+    candidates
+        .iter()
+        .find(|candidate| {
+            Command::new(candidate)
+                .args(["-c", "import triton"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+        .cloned()
+        .unwrap_or_else(|| "python".to_owned())
+}
+
 fn run_triton_bridge(request: &serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
-    let python = env::var("HYDIR_TRITON_PYTHON").unwrap_or_else(|_| "python".to_owned());
+    let python = configured_triton_python();
     let helper = triton_helper_path();
-    if !helper.is_file() {
+    let use_embedded = !helper.is_file() && env::var_os("HYDIR_TRITON_HELPER").is_none();
+    if !helper.is_file() && !use_embedded {
         return Err(format!("Triton bridge helper not found: {}", helper.display()).into());
     }
-    let mut child = Command::new(&python)
-        .arg(&helper)
+    let input = serde_json::to_vec(request)?;
+    if input.len() > MAX_TRITON_REQUEST_BYTES {
+        return Err("Triton bridge request exceeds 128 KiB limit".into());
+    }
+    let mut command = Command::new(&python);
+    if use_embedded {
+        command.args(["-c", EMBEDDED_TRITON_HELPER]);
+    } else {
+        command.arg(&helper);
+    }
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| format!("unable to start Triton Python bridge {python:?}: {error}"))?;
-    let input = serde_json::to_vec(request)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Triton bridge stdout unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Triton bridge stderr unavailable")?;
+    let stdout_reader = thread::spawn(move || read_limited(stdout, MAX_TRITON_OUTPUT_BYTES));
+    let stderr_reader = thread::spawn(move || read_limited(stderr, MAX_TRITON_STDERR_BYTES));
     child
         .stdin
         .take()
         .ok_or("Triton bridge stdin unavailable")?
         .write_all(&input)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
+    let deadline = Instant::now() + TRITON_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("Triton bridge timed out after 30 seconds".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Triton bridge stdout reader panicked")??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Triton bridge stderr reader panicked")??;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
         return Err(format!("Triton bridge failed: {}", detail.trim()).into());
     }
-    if output.stdout.len() > MAX_TRITON_OUTPUT_BYTES {
+    if stdout.len() > MAX_TRITON_OUTPUT_BYTES {
         return Err("Triton bridge output exceeds 1 MiB limit".into());
     }
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let result: serde_json::Value = serde_json::from_slice(&stdout)
         .map_err(|error| format!("Triton bridge returned invalid JSON: {error}"))?;
     if result.get("binary_sha256") != request.get("binary_sha256") {
         return Err("Triton bridge binary identity mismatch".into());
     }
     Ok(result)
+}
+
+fn read_limited<R: Read>(mut reader: R, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len() <= limit {
+            let remaining = limit + 1 - output.len();
+            output.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+    }
 }
 
 fn write_new_or_identical(path: impl AsRef<Path>, content: &[u8]) -> Result<(), Box<dyn Error>> {
