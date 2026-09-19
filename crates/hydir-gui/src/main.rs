@@ -2167,7 +2167,6 @@ struct AnalystApp {
     triton_console_input: String,
     console_mode: ConsoleMode,
     console_visible: bool,
-    console_detached: bool,
     console_height: f32,
     console_json: bool,
     annotations: Vec<AnalystAnnotation>,
@@ -2267,7 +2266,6 @@ impl AnalystApp {
             triton_console_input: String::new(),
             console_mode: ConsoleMode::Triton,
             console_visible: false,
-            console_detached: true,
             console_height: 220.0,
             console_json: false,
             annotations: Vec::new(),
@@ -2565,9 +2563,6 @@ impl AnalystApp {
                             self.history.push(self.status.clone());
                             self.triton_result = Some(result);
                             self.console_mode = ConsoleMode::Activity;
-                            if !self.console_visible {
-                                self.console_detached = true;
-                            }
                             self.console_visible = true;
                             self.console_json = true;
                             self.failure = None;
@@ -2584,9 +2579,6 @@ impl AnalystApp {
                         self.triton_console_commands = commands;
                         self.triton_console_result = Some(result);
                         self.console_mode = ConsoleMode::Triton;
-                        if !self.console_visible {
-                            self.console_detached = true;
-                        }
                         self.console_visible = true;
                         self.status = "Triton console command completed".to_owned();
                         self.failure = None;
@@ -2594,9 +2586,6 @@ impl AnalystApp {
                     Err(error) => {
                         self.triton_console_input = commands.last().cloned().unwrap_or_default();
                         self.console_mode = ConsoleMode::Triton;
-                        if !self.console_visible {
-                            self.console_detached = true;
-                        }
                         self.console_visible = true;
                         self.status = "Triton console command failed".to_owned();
                         self.failure = Some(error.clone());
@@ -3073,12 +3062,7 @@ impl AnalystApp {
                             ))
                             .clicked()
                         {
-                            if self.console_visible {
-                                self.console_visible = false;
-                            } else {
-                                self.console_detached = true;
-                                self.console_visible = true;
-                            }
+                            self.console_visible = !self.console_visible;
                         }
                         if let Some(spec) = &self.spec {
                             ui.label(
@@ -4710,30 +4694,13 @@ impl AnalystApp {
             {
                 self.console_mode = ConsoleMode::Triton;
             }
-            let dock = ui.button(if self.console_detached {
-                "Dock to bottom"
-            } else {
-                "Float console"
-            });
-            if dock.clicked() {
-                self.console_detached = !self.console_detached;
-            }
-            dock.on_hover_text(if self.console_detached {
-                "Return the console to the resizable bottom panel."
-            } else {
-                "Turn the console into a draggable floating window."
-            });
             if ui.button("Hide").clicked() {
                 self.console_visible = false;
             }
             ui.label(
-                RichText::new(if self.console_detached {
-                    "FLOATING · drag the title bar to move"
-                } else {
-                    "DOCKED BOTTOM · drag the top border to resize"
-                })
-                .size(10.0)
-                .color(MUTED),
+                RichText::new("DOCKED BOTTOM · drag the top border to resize")
+                    .size(10.0)
+                    .color(MUTED),
             );
             if self.console_mode == ConsoleMode::Activity
                 && (self.disassembly_report.is_some() || self.triton_result.is_some())
@@ -4830,6 +4797,9 @@ impl AnalystApp {
         } else {
             self.triton_console_body(ui);
         }
+        // Resizable egui panels must consume the selected space. Otherwise
+        // their contents can pull the edge back after the resize drag ends.
+        ui.take_available_space();
     }
 
     fn triton_console_body(&mut self, ui: &mut egui::Ui) {
@@ -5708,11 +5678,12 @@ impl eframe::App for AnalystApp {
                     });
             });
         self.workbench.inspector_width = inspector.response.rect.width().clamp(220.0, 800.0);
-        if self.console_visible && !self.console_detached {
+        if self.console_visible {
             let console = egui::Panel::bottom("console")
                 .resizable(true)
                 .default_size(self.console_height)
                 .min_size(100.0)
+                .max_size(900.0)
                 .show(ui, |ui| self.console_view(ui));
             self.console_height = console.response.rect.height().clamp(100.0, 900.0);
         }
@@ -5721,16 +5692,6 @@ impl eframe::App for AnalystApp {
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| self.main_view(ui));
         });
-        if self.console_visible && self.console_detached {
-            egui::Window::new("HydIR Console")
-                .id(egui::Id::new("detached_console"))
-                .movable(true)
-                .resizable(true)
-                .default_pos(egui::pos2(96.0, 110.0))
-                .default_size(egui::vec2(860.0, 420.0))
-                .min_size(egui::vec2(420.0, 180.0))
-                .show(ui.ctx(), |ui| self.console_view(ui));
-        }
     }
 }
 
@@ -6435,12 +6396,13 @@ mod tests {
         let app = AnalystApp::new(&eframe::egui::Context::default());
         assert!(matches!(app.tab, Tab::RegionStudio));
         assert!(!app.console_visible);
-        assert!(app.console_detached);
+        assert_eq!(app.console_height, 220.0);
     }
 
     #[test]
     fn triton_activity_opens_the_explicitly_hideable_console() {
         let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        app.console_height = 360.0;
         let (sender, receiver) = mpsc::sync_channel(1);
         app.events = receiver;
         sender
@@ -6451,7 +6413,7 @@ mod tests {
             .unwrap();
         app.poll();
         assert!(app.console_visible);
-        assert!(app.console_detached);
+        assert_eq!(app.console_height, 360.0);
     }
 
     #[test]
