@@ -36,9 +36,10 @@ use std::{
     collections::HashMap,
     env,
     error::Error,
+    ffi::OsString,
     io::{Read, Write},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -51,6 +52,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
+use tonic_health::ServingStatus;
 use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
@@ -59,6 +61,85 @@ const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
 #[cfg(not(test))]
 const WORKER_DEADLINE: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct WorkerLaunchSpec {
+    program: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+fn worker_launch_spec(
+    executable: &Path,
+    action: &str,
+    symbol: Option<&str>,
+    isolation: &str,
+    bubblewrap: Option<&Path>,
+) -> Result<WorkerLaunchSpec, String> {
+    let mut worker_arguments = vec![OsString::from("worker"), OsString::from(action)];
+    if let Some(symbol) = symbol {
+        worker_arguments.push(OsString::from(symbol));
+    }
+    match isolation {
+        "process" => Ok(WorkerLaunchSpec {
+            program: executable.to_owned(),
+            arguments: worker_arguments,
+        }),
+        "bubblewrap" => {
+            if !cfg!(target_os = "linux") {
+                return Err("bubblewrap worker isolation requires Linux".to_owned());
+            }
+            let bubblewrap = bubblewrap
+                .ok_or("HYDIR_BWRAP_PATH must be an absolute path in bubblewrap isolation mode")?;
+            if !bubblewrap.is_absolute() || !executable.is_absolute() {
+                return Err("worker and bubblewrap executable paths must be absolute".to_owned());
+            }
+            let mut arguments = [
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-all",
+                "--cap-drop",
+                "ALL",
+                "--clearenv",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--dir",
+                "/work",
+                "--chdir",
+                "/work",
+                "--setenv",
+                "PATH",
+                "/usr/bin",
+                "--ro-bind",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+            arguments.push(executable.as_os_str().to_owned());
+            arguments.push(OsString::from("/hydird"));
+            arguments.push(OsString::from("--"));
+            arguments.push(OsString::from("/hydird"));
+            arguments.extend(worker_arguments);
+            Ok(WorkerLaunchSpec {
+                program: bubblewrap.to_owned(),
+                arguments,
+            })
+        }
+        _ => Err("HYDIR_WORKER_ISOLATION must be `process` or `bubblewrap`".to_owned()),
+    }
+}
 
 #[cfg(all(not(test), target_os = "linux"))]
 struct WorkerProcessGroup {
@@ -1029,13 +1110,17 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
 async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Result<Vec<u8>, Status> {
     let executable =
         env::current_exe().map_err(|_| Status::internal("worker executable unavailable"))?;
-    let mut command = Command::new(executable);
-    command.arg("worker").arg(action);
-    command.env_clear();
     if let Some(symbol) = symbol {
         valid_symbol(symbol)?;
-        command.arg(symbol);
     }
+    let isolation = env::var("HYDIR_WORKER_ISOLATION").unwrap_or_else(|_| "process".to_owned());
+    let bubblewrap = env::var_os("HYDIR_BWRAP_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/bwrap"));
+    let launch = worker_launch_spec(&executable, action, symbol, &isolation, Some(&bubblewrap))
+        .map_err(Status::failed_precondition)?;
+    let mut command = Command::new(launch.program);
+    command.args(launch.arguments).env_clear();
     #[cfg(target_os = "linux")]
     // SAFETY: the closure runs after fork and before exec, uses only libc's
     // async-signal-safe setrlimit calls, and captures no process state.
@@ -1049,6 +1134,8 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
                 (libc::RLIMIT_CPU, 25),
                 (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
                 (libc::RLIMIT_NOFILE, 64),
+                (libc::RLIMIT_NPROC, 32),
+                (libc::RLIMIT_STACK, 16 * 1024 * 1024),
                 (libc::RLIMIT_CORE, 0),
             ] {
                 let limit = libc::rlimit {
@@ -1059,6 +1146,12 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::umask(0o077);
             Ok(())
         });
     }
@@ -2537,8 +2630,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 return Err("hydird currently supports only authenticated loopback binding; TLS/non-loopback mode is not implemented".into());
             }
             let store = Store::open(Path::new(database))?;
+            let (health_reporter, health_service) = tonic_health::server::health_reporter();
+            health_reporter
+                .set_service_status("", ServingStatus::Serving)
+                .await;
             println!("hydird local RPC listening on {address}");
             Server::builder()
+                .add_service(health_service)
                 .add_service(HydirServer::new(store.clone()).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
                 .add_service(HydirV2Server::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
                 .add_service(interchange::interchange_service())
@@ -2554,6 +2652,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_launch_mode_is_explicit_and_argument_separated() {
+        let executable = Path::new(if cfg!(windows) {
+            "C:\\hydir\\hydird.exe"
+        } else {
+            "/opt/hydir/hydird"
+        });
+        let direct =
+            worker_launch_spec(executable, "lift", Some("hydir_symbol"), "process", None).unwrap();
+        assert_eq!(direct.program, executable);
+        assert_eq!(
+            direct.arguments,
+            ["worker", "lift", "hydir_symbol"].map(OsString::from)
+        );
+        assert!(
+            worker_launch_spec(executable, "lift", None, "unknown", None)
+                .unwrap_err()
+                .contains("process` or `bubblewrap")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_worker_has_no_network_and_minimal_read_only_mounts() {
+        let launch = worker_launch_spec(
+            Path::new("/opt/hydir/hydird"),
+            "inspect",
+            None,
+            "bubblewrap",
+            Some(Path::new("/usr/bin/bwrap")),
+        )
+        .unwrap();
+        let arguments = launch
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(arguments.iter().any(|value| value == "--unshare-all"));
+        assert!(arguments.iter().any(|value| value == "--clearenv"));
+        assert!(
+            arguments
+                .windows(3)
+                .any(|window| window == ["--cap-drop", "ALL", "--clearenv"])
+        );
+        assert_eq!(arguments.last().map(AsRef::as_ref), Some("inspect"));
+    }
 
     #[test]
     fn annotation_inputs_are_bounded_and_names_cannot_spoof_display_lines() {
