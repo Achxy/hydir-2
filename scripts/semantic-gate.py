@@ -21,7 +21,7 @@ FUNCTIONS = ("identity", "add", "max", "xor")
 ASSEMBLY_FUNCTIONS = (
     "leaf_add", "call_leaf_add", "mov_imm64", "cmp_imm", "test_imm",
     "identity_a", "identity_b", "zeroextend_a", "zeroextend_imm", "frame_balance",
-    "stack_slot_add", "stack_branch",
+    "stack_slot_add", "stack_branch", "dword_redzone_add", "dword_redzone_max_s",
     "nop_identity", "lea_scaled",
     "sub_ab", "sub_ba", "add3", "twice_a",
     "twice_b", "min_u", "min_s", "equal", "not_equal", "less_u",

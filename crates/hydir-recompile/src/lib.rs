@@ -759,7 +759,12 @@ fn shared_initialization_effect(instruction: &Instruction) -> Option<(u8, u8)> {
         ScalarOp::Ret
             | ScalarOp::CallDirect { .. }
             | ScalarOp::LoadStack64 { .. }
+            | ScalarOp::LoadStack32 { .. }
             | ScalarOp::StoreStack64 { .. }
+            | ScalarOp::StoreStack32 { .. }
+            | ScalarOp::AluStack32 { .. }
+            | ScalarOp::CmpRegStack32 { .. }
+            | ScalarOp::CmpStack32 { .. }
             | ScalarOp::SaveFramePointer
             | ScalarOp::RestoreFramePointer
             | ScalarOp::SetFramePointer

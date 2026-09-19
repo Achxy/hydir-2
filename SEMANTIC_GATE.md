@@ -4,7 +4,7 @@ Run `python3 scripts/semantic-gate.py` on native Linux x86-64 with Rust 1.96,
 Clang, GCC, and `opt` available. The GitHub Actions workflow
 `.github/workflows/semantic-gate.yml` runs the same command. It compiles four
 well-defined C functions with GCC and Clang at `-O0`, `-O1`, and `-O2`, and
-forty-two hand-written assembly functions, including every accepted x86-64
+forty-four hand-written assembly functions, including every accepted x86-64
 condition code. Each compiled binary is preserved
 under `target/semantic-gate/<timestamp>/`.
 
@@ -35,7 +35,7 @@ missing or malformed solver output is recorded as a refusal.
 after directed scalar, flag, branch, frame, memory-slot, call, and return
 instructions. These one-step checks test the expected architectural effects
 used when constructing fixtures; they do not alone prove HydIR's emitted IR.
-CI also requires all forty-two declared hand-assembly functions to match
+CI also requires all forty-four declared hand-assembly functions to match
 both backends. Optimized compiler outputs still count explicit refusals
 separately.
 Every accepted condition-code fixture must produce witnesses for both return
@@ -49,12 +49,15 @@ have seeds, but a sustained fuzz campaign has not yet been run.
 
 `hydir-semantics` is now the typed decoder used by the scalar CFG lifter and
 the overlapping register/immediate operations in the restricted rebuilder.
-It distinguishes 32-bit `mov` writes and their required zero extension.
-Balanced frame operations and bounded, nonoverlapping eight-byte stack locals
-can be represented in the scalar lift after stack proof. Each local read must
-follow a write on every path; other memory widths and unresolved aliases
-remain rejected. Stack-adjustment flags reaching a conditional branch also
-reject lifting. Direct calls have a typed target and return-address effect.
+It distinguishes 32-bit writes and their required zero extension. Balanced
+frame operations and bounded, nonoverlapping four- and eight-byte stack locals
+can be represented in the scalar lift after stack proof; leaf functions may
+use the 128-byte SysV red zone. Dword arithmetic and comparisons compute
+ZF/SF/OF/CF at 32-bit width before zero-extending register results. Each local
+read must follow a same-width write on every path; other memory widths and
+unresolved or mixed-width aliases remain rejected. Stack-adjustment flags
+reaching a conditional branch also reject lifting. Direct calls have a typed
+target and return-address effect.
 The scalar symbol lifter accepts a direct call only to a unique bounded
 scalar leaf symbol in the same linked ELF, with an aligned stack, no caller
 relocation, and definite arguments. It invalidates caller-saved registers and

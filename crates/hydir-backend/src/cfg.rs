@@ -3,8 +3,8 @@
 //! machine registers and arithmetic flags are joined with explicit phi nodes.
 //! Balanced frame-only stack operations may be erased after a separate stack
 //! proof when they cannot affect scalar return values or branch flags.
-//! Eight-byte stack locals use proven, nonoverlapping frame slots and SSA
-//! values. Calls and arbitrary x86 instructions remain unsupported.
+//! Four- and eight-byte stack locals use proven, nonoverlapping frame slots
+//! and SSA values. Calls and arbitrary x86 instructions remain unsupported.
 
 use super::{Result, error};
 use hydir_core::{Address, AddressKind, BlockSpec, EdgeKind, EdgeSpec, FunctionCfg, SPEC_VERSION};
@@ -264,7 +264,10 @@ impl Node {
             return Field::Rax.bit();
         }
         self.op.defs()
-            | if matches!(self.op, Op::StoreStack64 { .. }) {
+            | if matches!(
+                self.op,
+                Op::StoreStack64 { .. } | Op::StoreStack32 { .. } | Op::AluStack32 { .. }
+            ) {
                 Field::Slot(self.slot.expect("validated stack store")).bit()
             } else {
                 0
@@ -276,7 +279,14 @@ impl Node {
             return INPUTS;
         }
         self.op.reads()
-            | if matches!(self.op, Op::LoadStack64 { .. }) {
+            | if matches!(
+                self.op,
+                Op::LoadStack64 { .. }
+                    | Op::LoadStack32 { .. }
+                    | Op::AluStack32 { .. }
+                    | Op::CmpRegStack32 { .. }
+                    | Op::CmpStack32 { .. }
+            ) {
                 Field::Slot(self.slot.expect("validated stack load")).bit()
             } else {
                 0
@@ -376,7 +386,14 @@ fn recover(
         is_frame_op(node.op)
             || matches!(
                 node.op,
-                Op::LoadStack64 { .. } | Op::StoreStack64 { .. } | Op::CallDirect { .. }
+                Op::LoadStack64 { .. }
+                    | Op::LoadStack32 { .. }
+                    | Op::StoreStack64 { .. }
+                    | Op::StoreStack32 { .. }
+                    | Op::AluStack32 { .. }
+                    | Op::CmpRegStack32 { .. }
+                    | Op::CmpStack32 { .. }
+                    | Op::CallDirect { .. }
             )
     }) {
         let evidence = if allowed_calls.is_some_and(BTreeSet::is_empty) {
@@ -521,11 +538,117 @@ fn value_name(value: Value, ip: u64) -> String {
     }
 }
 
+fn value32_name(value: Value32, ip: u64) -> String {
+    match value {
+        Value32::Register(register) => input_name(register_field(register), ip),
+        Value32::Immediate(value) => value.to_string(),
+    }
+}
+
 fn temporary(body: &mut String, ip: u64, sequence: &mut usize, operation: &str) -> String {
     let name = format!("%t_{ip:x}_{}", *sequence);
     *sequence += 1;
     body.push_str(&format!("  {name} = {operation}\n"));
     name
+}
+
+fn mask32(body: &mut String, ip: u64, sequence: &mut usize, value: &str) -> String {
+    temporary(body, ip, sequence, &format!("and i64 {value}, 4294967295"))
+}
+
+fn sign32(body: &mut String, ip: u64, sequence: &mut usize, value: &str) -> String {
+    let bit = temporary(body, ip, sequence, &format!("and i64 {value}, 2147483648"));
+    temporary(body, ip, sequence, &format!("icmp ne i64 {bit}, 0"))
+}
+
+fn emit_flags32(
+    body: &mut String,
+    ip: u64,
+    lhs: &str,
+    rhs: &str,
+    result: &str,
+    kind: Option<Alu>,
+    sequence: &mut usize,
+) {
+    body.push_str(&format!(
+        "  {} = icmp eq i64 {result}, 0\n",
+        output_name(Field::Zf, ip)
+    ));
+    let lhs_negative = sign32(body, ip, sequence, lhs);
+    let rhs_negative = sign32(body, ip, sequence, rhs);
+    let result_negative = sign32(body, ip, sequence, result);
+    body.push_str(&format!(
+        "  {} = or i1 {result_negative}, false\n",
+        output_name(Field::Sf, ip)
+    ));
+    match kind {
+        None => {
+            body.push_str(&format!(
+                "  {} = and i1 false, false\n",
+                output_name(Field::Of, ip)
+            ));
+            body.push_str(&format!(
+                "  {} = and i1 false, false\n",
+                output_name(Field::Cf, ip)
+            ));
+        }
+        Some(kind @ (Alu::Add | Alu::Sub)) => {
+            let operands_differ = temporary(
+                body,
+                ip,
+                sequence,
+                &format!("xor i1 {lhs_negative}, {rhs_negative}"),
+            );
+            let lhs_result_differ = temporary(
+                body,
+                ip,
+                sequence,
+                &format!("xor i1 {lhs_negative}, {result_negative}"),
+            );
+            let overflow = if kind == Alu::Add {
+                let same_operands = temporary(
+                    body,
+                    ip,
+                    sequence,
+                    &format!("xor i1 {operands_differ}, true"),
+                );
+                temporary(
+                    body,
+                    ip,
+                    sequence,
+                    &format!("and i1 {same_operands}, {lhs_result_differ}"),
+                )
+            } else {
+                temporary(
+                    body,
+                    ip,
+                    sequence,
+                    &format!("and i1 {operands_differ}, {lhs_result_differ}"),
+                )
+            };
+            body.push_str(&format!(
+                "  {} = or i1 {overflow}, false\n",
+                output_name(Field::Of, ip)
+            ));
+            let carry_operation = if kind == Alu::Add {
+                format!("icmp ult i64 {result}, {lhs}")
+            } else {
+                format!("icmp ult i64 {lhs}, {rhs}")
+            };
+            let carry = temporary(body, ip, sequence, &carry_operation);
+            body.push_str(&format!(
+                "  {} = or i1 {carry}, false\n",
+                output_name(Field::Cf, ip)
+            ));
+        }
+        Some(Alu::And | Alu::Or | Alu::Xor) => {
+            body.push_str(&format!(
+                "  {} = and i1 false, false\n  {} = and i1 false, false\n",
+                output_name(Field::Of, ip),
+                output_name(Field::Cf, ip)
+            ));
+        }
+    }
 }
 
 fn emit_flags(
@@ -680,12 +803,28 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
                 input_name(slot, ip)
             ));
         }
+        Op::LoadStack32 { dst, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack load"));
+            let value = mask32(body, ip, &mut sequence, &input_name(slot, ip));
+            body.push_str(&format!(
+                "  {} = add i64 0, {value}\n",
+                output_name(register_field(dst), ip)
+            ));
+        }
         Op::StoreStack64 { src, .. } => {
             let slot = Field::Slot(node.slot.expect("validated stack store"));
             body.push_str(&format!(
                 "  {} = add i64 0, {}\n",
                 output_name(slot, ip),
                 input_name(register_field(src), ip)
+            ));
+        }
+        Op::StoreStack32 { src, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack store"));
+            let value = mask32(body, ip, &mut sequence, &value32_name(src, ip));
+            body.push_str(&format!(
+                "  {} = add i64 0, {value}\n",
+                output_name(slot, ip)
             ));
         }
         Op::Lea {
@@ -734,11 +873,100 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
             ));
             emit_flags(body, ip, &lhs, &rhs, &result, Some(kind), &mut sequence);
         }
+        Op::Alu32 { kind, dst, src } => {
+            let lhs = mask32(
+                body,
+                ip,
+                &mut sequence,
+                &input_name(register_field(dst), ip),
+            );
+            let rhs = mask32(body, ip, &mut sequence, &value32_name(src, ip));
+            let raw = temporary(
+                body,
+                ip,
+                &mut sequence,
+                &format!(
+                    "{} i64 {lhs}, {rhs}",
+                    match kind {
+                        Alu::Add => "add",
+                        Alu::Sub => "sub",
+                        Alu::And => "and",
+                        Alu::Or => "or",
+                        Alu::Xor => "xor",
+                    }
+                ),
+            );
+            let result = mask32(body, ip, &mut sequence, &raw);
+            body.push_str(&format!(
+                "  {} = add i64 0, {result}\n",
+                output_name(register_field(dst), ip)
+            ));
+            emit_flags32(body, ip, &lhs, &rhs, &result, Some(kind), &mut sequence);
+        }
+        Op::AluStack32 { kind, src, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack arithmetic"));
+            let lhs = mask32(body, ip, &mut sequence, &input_name(slot, ip));
+            let rhs = mask32(body, ip, &mut sequence, &value32_name(src, ip));
+            let raw = temporary(
+                body,
+                ip,
+                &mut sequence,
+                &format!(
+                    "{} i64 {lhs}, {rhs}",
+                    match kind {
+                        Alu::Add => "add",
+                        Alu::Sub => "sub",
+                        Alu::And => "and",
+                        Alu::Or => "or",
+                        Alu::Xor => "xor",
+                    }
+                ),
+            );
+            let result = mask32(body, ip, &mut sequence, &raw);
+            body.push_str(&format!(
+                "  {} = add i64 0, {result}\n",
+                output_name(slot, ip)
+            ));
+            emit_flags32(body, ip, &lhs, &rhs, &result, Some(kind), &mut sequence);
+        }
         Op::Cmp { lhs, rhs } => {
             let lhs = input_name(register_field(lhs), ip);
             let rhs = value_name(rhs, ip);
             let result = temporary(body, ip, &mut sequence, &format!("sub i64 {lhs}, {rhs}"));
             emit_flags(body, ip, &lhs, &rhs, &result, Some(Alu::Sub), &mut sequence);
+        }
+        Op::Cmp32 { lhs, rhs } => {
+            let lhs = mask32(
+                body,
+                ip,
+                &mut sequence,
+                &input_name(register_field(lhs), ip),
+            );
+            let rhs = mask32(body, ip, &mut sequence, &value32_name(rhs, ip));
+            let raw = temporary(body, ip, &mut sequence, &format!("sub i64 {lhs}, {rhs}"));
+            let result = mask32(body, ip, &mut sequence, &raw);
+            emit_flags32(body, ip, &lhs, &rhs, &result, Some(Alu::Sub), &mut sequence);
+        }
+        Op::CmpRegStack32 { lhs, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack comparison"));
+            let lhs = mask32(
+                body,
+                ip,
+                &mut sequence,
+                &input_name(register_field(lhs), ip),
+            );
+            let rhs = mask32(body, ip, &mut sequence, &input_name(slot, ip));
+            let raw = temporary(body, ip, &mut sequence, &format!("sub i64 {lhs}, {rhs}"));
+            let result = mask32(body, ip, &mut sequence, &raw);
+            emit_flags32(body, ip, &lhs, &rhs, &result, Some(Alu::Sub), &mut sequence);
+        }
+        Op::CmpStack32 { rhs, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack comparison"));
+            let lhs = mask32(body, ip, &mut sequence, &input_name(slot, ip));
+            let rhs = mask32(body, ip, &mut sequence, &value32_name(rhs, ip));
+            let raw = temporary(body, ip, &mut sequence, &format!("sub i64 {lhs}, {rhs}"));
+            let result = mask32(body, ip, &mut sequence, &raw);
+            emit_flags32(body, ip, &lhs, &rhs, &result, Some(Alu::Sub), &mut sequence);
         }
         Op::Test { lhs, rhs } => {
             let lhs = input_name(register_field(lhs), ip);
@@ -781,10 +1009,17 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
         Op::Mov { .. }
             | Op::Mov32 { .. }
             | Op::LoadStack64 { .. }
+            | Op::LoadStack32 { .. }
             | Op::StoreStack64 { .. }
+            | Op::StoreStack32 { .. }
             | Op::Lea { .. }
             | Op::Alu { .. }
+            | Op::Alu32 { .. }
+            | Op::AluStack32 { .. }
             | Op::Cmp { .. }
+            | Op::Cmp32 { .. }
+            | Op::CmpRegStack32 { .. }
+            | Op::CmpStack32 { .. }
             | Op::Test { .. }
     ) {
         body.push_str(&format!("  br label %b{:x}\n", node.successors[0]));
@@ -870,7 +1105,7 @@ pub(super) fn lift_cfg_with_calls(
         "Only resolved scalar leaf calls with aligned stack and defined ABI state are accepted."
     };
     Ok(format!(
-        "; HydIR raw direct-CFG lift; asserted prototype: u64(u64, u64)\n\
+        "; HydIR raw direct-CFG lift; physical SysV signature: u64(u64, u64, u64, u64, u64, u64)\n\
          ; Unmodeled memory aliases or widths, indirect edges, and unsupported partial registers are rejected. {call_scope}\n\
          target triple = \"x86_64-unknown-linux-gnu\"\n\n\
          define i64 @hydir_lifted(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\n{body}}}\n"
@@ -941,6 +1176,28 @@ mod tests {
         let ir = lift_cfg(&code, 0x1000).unwrap();
         assert!(ir.contains("%slot0_out_1008 = add i64 0, %rdi_in_1008"));
         assert!(ir.contains("%rax_out_100c = add i64 0, %slot0_in_100c"));
+    }
+
+    #[test]
+    fn lifts_typed_32_bit_red_zone_fibonacci() {
+        // GCC's leaf fibIterative from the pinned Irene3 x86-64 fixture. It
+        // uses five disjoint dword locals in the SysV red zone.
+        let code = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5, 0x89, 0x7d, 0xec, 0xc7, 0x45, 0xf0,
+            0x00, 0x00, 0x00, 0x00, 0xc7, 0x45, 0xf4, 0x01, 0x00, 0x00, 0x00, 0xc7, 0x45, 0xfc,
+            0x00, 0x00, 0x00, 0x00, 0xc7, 0x45, 0xf8, 0x02, 0x00, 0x00, 0x00, 0xeb, 0x1b, 0x8b,
+            0x55, 0xf0, 0x8b, 0x45, 0xf4, 0x01, 0xd0, 0x89, 0x45, 0xfc, 0x8b, 0x45, 0xf4, 0x89,
+            0x45, 0xf0, 0x8b, 0x45, 0xfc, 0x89, 0x45, 0xf4, 0x83, 0x45, 0xf8, 0x01, 0x8b, 0x45,
+            0xf8, 0x3b, 0x45, 0xec, 0x7e, 0xdd, 0x83, 0x7d, 0xec, 0x00, 0x7e, 0x05, 0x8b, 0x45,
+            0xf4, 0xeb, 0x03, 0x8b, 0x45, 0xf0, 0x5d, 0xc3,
+        ];
+        let ir = lift_cfg(&code, 0x11a9).unwrap();
+        assert!(ir.contains("%slot0_out_11b1"));
+        assert!(ir.contains("and i64 %rdi_in_11b1, 4294967295"));
+        assert!(ir.contains("and i64 %t_11d8_2, 4294967295"));
+        assert!(ir.contains("and i64 %t_11f0_3, 2147483648"));
+        assert!(ir.contains("br i1 %t_11f3_1, label %b11d2, label %b11f5"));
+        assert!(ir.contains("ret i64 %rax_in_1204"));
     }
 
     #[test]

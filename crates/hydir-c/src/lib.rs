@@ -805,6 +805,21 @@ mod tests {
     }
 
     #[test]
+    fn dword_red_zone_lift_round_trips_to_c() {
+        // push rbp; mov rbp,rsp; mov [rbp-4],edi; mov eax,[rbp-4];
+        // add eax,1; pop rbp; ret
+        let machine = [
+            0x55, 0x48, 0x89, 0xe5, 0x89, 0x7d, 0xfc, 0x8b, 0x45, 0xfc, 0x83, 0xc0, 0x01, 0x5d,
+            0xc3,
+        ];
+        let ir = hydir_backend::lift_cfg(&machine, 0x1000).unwrap();
+        let c = emit_structured_c(&ir).unwrap();
+        assert!(c.contains("UINT64_C(4294967295)"));
+        assert!(c.contains("v_slot0_out_1004"));
+        assert!(c.contains("return v_rax_in_100e;"));
+    }
+
+    #[test]
     fn unsupported_integer_conversion_fails_closed() {
         let llvm = "define i64 @hydir_lifted(i64 %arg0, i64 %arg1) {\nprologue:\n  %x = zext i16 %arg0 to i64\n  ret i64 %x\n}\n";
         assert!(
