@@ -255,6 +255,7 @@ struct Node {
     mnemonic: String,
     op: Op,
     successors: Vec<u64>,
+    call_target: Option<u64>,
     slot: Option<u8>,
 }
 
@@ -315,10 +316,12 @@ impl Node {
     }
 }
 
-fn recover(
+fn recover_bounded(
     code: &[u8],
     address: u64,
     allowed_calls: Option<&BTreeSet<u64>>,
+    boundary_exits: Option<&BTreeSet<u64>>,
+    prove_stack: bool,
 ) -> Result<BTreeMap<u64, Node>> {
     let end = address
         .checked_add(code.len() as u64)
@@ -357,6 +360,11 @@ fn recover(
                 "direct call at 0x{ip:x} to 0x{target:x} requires a resolved callee and ABI state proof"
             )));
         }
+        let call_target = if let Op::CallDirect { target } = op {
+            Some(target)
+        } else {
+            None
+        };
         let successors = match op {
             Op::Ret => vec![],
             Op::Jmp => vec![instruction.near_branch_target()],
@@ -365,8 +373,11 @@ fn recover(
         };
         for successor in successors.iter().rev() {
             if !(address..end).contains(successor) {
+                if boundary_exits.is_some_and(|exits| exits.contains(successor)) {
+                    continue;
+                }
                 return Err(error(format!(
-                    "control flow from 0x{ip:x} leaves symbol at 0x{successor:x}"
+                    "control flow from 0x{ip:x} leaves symbol at undeclared exit 0x{successor:x}"
                 )));
             }
             pending.push_back(*successor);
@@ -378,24 +389,27 @@ fn recover(
                 mnemonic: format!("{:?}", instruction.mnemonic()),
                 op,
                 successors,
+                call_target,
                 slot: None,
             },
         );
     }
-    if nodes.values().any(|node| {
-        is_frame_op(node.op)
-            || matches!(
-                node.op,
-                Op::LoadStack64 { .. }
-                    | Op::LoadStack32 { .. }
-                    | Op::StoreStack64 { .. }
-                    | Op::StoreStack32 { .. }
-                    | Op::AluStack32 { .. }
-                    | Op::CmpRegStack32 { .. }
-                    | Op::CmpStack32 { .. }
-                    | Op::CallDirect { .. }
-            )
-    }) {
+    if prove_stack
+        && nodes.values().any(|node| {
+            is_frame_op(node.op)
+                || matches!(
+                    node.op,
+                    Op::LoadStack64 { .. }
+                        | Op::LoadStack32 { .. }
+                        | Op::StoreStack64 { .. }
+                        | Op::StoreStack32 { .. }
+                        | Op::AluStack32 { .. }
+                        | Op::CmpRegStack32 { .. }
+                        | Op::CmpStack32 { .. }
+                        | Op::CallDirect { .. }
+                )
+        })
+    {
         let evidence = if allowed_calls.is_some_and(BTreeSet::is_empty) {
             super::stack::analyze_stack(code, address)?
         } else {
@@ -414,6 +428,98 @@ fn recover(
         reject_stack_flag_uses(&nodes, address)?;
     }
     Ok(nodes)
+}
+
+fn recover(
+    code: &[u8],
+    address: u64,
+    allowed_calls: Option<&BTreeSet<u64>>,
+) -> Result<BTreeMap<u64, Node>> {
+    recover_bounded(code, address, allowed_calls, None, true)
+}
+
+pub(super) fn recover_declared_region_cfg(
+    code: &[u8],
+    address: u64,
+    exits: &[Address],
+    address_kind: AddressKind,
+    symbol_name: &str,
+    binary_sha256: String,
+    provenance: &str,
+) -> Result<FunctionCfg> {
+    if code.is_empty() || code.len() > 4096 {
+        return Err(error("region must contain 1..=4096 bytes"));
+    }
+    let end = address
+        .checked_add(code.len() as u64)
+        .ok_or_else(|| error("region address range overflow"))?;
+    let declared = exits.iter().map(|exit| exit.0).collect::<BTreeSet<_>>();
+    if declared.iter().any(|exit| (address..end).contains(exit)) {
+        return Err(error("declared region exit lies inside selected bytes"));
+    }
+    let nodes = recover_bounded(code, address, None, Some(&declared), false)?;
+    let mut observed = nodes
+        .values()
+        .flat_map(|node| node.successors.iter().copied())
+        .filter(|successor| !(address..end).contains(successor))
+        .chain(
+            nodes
+                .values()
+                .filter_map(|node| node.call_target)
+                .filter(|target| declared.contains(target)),
+        )
+        .collect::<Vec<_>>();
+    observed.sort_unstable();
+    let mut expected = exits.iter().map(|exit| exit.0).collect::<Vec<_>>();
+    expected.sort_unstable();
+    if observed != expected {
+        return Err(error(format!(
+            "declared region exits are not exact; expected {expected:x?}, observed {observed:x?}"
+        )));
+    }
+
+    let mut blocks = Vec::with_capacity(nodes.len());
+    let mut edges = Vec::new();
+    for (ip, node) in nodes {
+        if let Some(target) = node.call_target {
+            edges.push(EdgeSpec {
+                source: Address(ip),
+                target: Address(target),
+                kind: EdgeKind::Call,
+            });
+        }
+        blocks.push(BlockSpec {
+            address: Address(ip),
+            bytes_hex: node.raw.iter().map(|byte| format!("{byte:02x}")).collect(),
+            mnemonic: node.mnemonic,
+        });
+        for (index, successor) in node.successors.into_iter().enumerate() {
+            let kind = match node.op {
+                Op::Jcc(_) if index == 0 => EdgeKind::Taken,
+                Op::Jcc(_) => EdgeKind::Fallthrough,
+                Op::Jmp => EdgeKind::Direct,
+                _ => EdgeKind::Fallthrough,
+            };
+            edges.push(EdgeSpec {
+                source: Address(ip),
+                target: Address(successor),
+                kind,
+            });
+        }
+    }
+    Ok(FunctionCfg {
+        schema_version: SPEC_VERSION,
+        binary_sha256,
+        symbol_name: symbol_name.to_owned(),
+        entry: Address(address),
+        address_kind,
+        symbol_size: code.len() as u64,
+        blocks,
+        edges,
+        provenance: provenance.to_owned(),
+        recovery_scope: "Exact direct control flow inside RegionSpec bytes with declared external exits and separately typed direct-call edges; semantic boundary state is not inferred"
+            .to_owned(),
+    })
 }
 
 pub(super) fn recover_function_cfg(
@@ -1115,6 +1221,80 @@ pub(super) fn lift_cfg_with_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_region_exit_is_preserved_and_must_be_exact() {
+        // mov rax,rdi; jmp 0x100a
+        let code = [0x48, 0x89, 0xf8, 0xeb, 0x05];
+        let cfg = recover_declared_region_cfg(
+            &code,
+            0x1000,
+            &[Address(0x100a)],
+            AddressKind::Virtual,
+            "region",
+            "0".repeat(64),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cfg.blocks.len(), 2);
+        assert_eq!(cfg.edges.last().unwrap().target, Address(0x100a));
+        assert!(cfg.recovery_scope.contains("declared external exits"));
+
+        assert!(
+            recover_declared_region_cfg(
+                &code,
+                0x1000,
+                &[],
+                AddressKind::Virtual,
+                "region",
+                "0".repeat(64),
+                "test",
+            )
+            .unwrap_err()
+            .0
+            .contains("undeclared exit")
+        );
+        assert!(
+            recover_declared_region_cfg(
+                &code,
+                0x1000,
+                &[Address(0x100a), Address(0x2000)],
+                AddressKind::Virtual,
+                "region",
+                "0".repeat(64),
+                "test",
+            )
+            .unwrap_err()
+            .0
+            .contains("declared region exits are not exact")
+        );
+    }
+
+    #[test]
+    fn region_cfg_records_call_target_separately_from_continuation_exit() {
+        // call 0x2000; jmp 0x100a
+        let code = [0xe8, 0xfb, 0x0f, 0x00, 0x00, 0xeb, 0x03];
+        let cfg = recover_declared_region_cfg(
+            &code,
+            0x1000,
+            &[Address(0x100a)],
+            AddressKind::Virtual,
+            "region",
+            "0".repeat(64),
+            "test",
+        )
+        .unwrap();
+        assert!(cfg.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Call
+                && edge.source == Address(0x1000)
+                && edge.target == Address(0x2000)
+        }));
+        assert!(cfg.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Direct
+                && edge.source == Address(0x1005)
+                && edge.target == Address(0x100a)
+        }));
+    }
 
     #[test]
     fn direct_call_needs_resolved_callee_contract() {

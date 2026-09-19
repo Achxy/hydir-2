@@ -99,6 +99,11 @@ nonoverlapping 32/64-bit stack locals (including the SysV leaf red zone),
 direct calls to uniquely bounded scalar leaf symbols. Other memory, unresolved
 calls, and unmodelled aliases remain explicit refusals.
 
+RegionSpec v3 CFG recovery is a separate structural stage. It requires decoded
+external edges to match the declared continuation exits exactly, records direct
+call targets with a distinct edge kind, and does not promote imported liveness
+or stack facts into semantic proof.
+
 The scripts record CFG, LLVM IR, C, and differential results as inspectable artifacts. These checks establish the documented subset only; they do not prove equivalence for arbitrary programs. The UI also keeps failures specific: an unsupported call can stop C generation without invalidating an already recovered CFG or LLVM lift.
 
 [![egui C output cutout refusing an unsupported call while retaining other analysis results](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
