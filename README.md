@@ -226,10 +226,30 @@ OIDC subjects are registered as deterministic opaque HydIR principals on first
 successful authentication. A database operator can resolve those principals
 for ACL administration with `hydird identity list-oidc <database.sqlite>`.
 
-The TLS/OIDC/SQLite mode is a secure authentication foundation, not the
-completed production deployment profile. Automatic discovery/key refresh,
-PostgreSQL, object storage, quotas, audit export, and Kubernetes packaging
-remain required before that profile is release-ready.
+The additive content-storage migration keeps existing inline SQLite objects
+readable and allows new binary/artifact payloads to be written to a verified,
+content-addressed filesystem store. Metadata remains revisioned in SQLite;
+each read rechecks both the recorded size and SHA-256 digest. The object root
+must be an absolute real directory and must not be group/world writable on
+Unix:
+
+```bash
+cargo run --locked --bin hydird -- serve-oidc-cas \
+  /path/to/hydird.sqlite 0.0.0.0:50051 \
+  /run/secrets/tls.crt /run/secrets/tls.key \
+  https://identity.example/tenant hydir-api /run/config/oidc-jwks.json \
+  /var/lib/hydir/objects
+```
+
+Filesystem objects are written through same-directory temporary files and an
+atomic rename. A failed database transaction can leave an unreferenced object,
+which is harmless in the immutable CAS and may be reclaimed by future storage
+maintenance tooling. Back up the SQLite database and object root together.
+
+The TLS/OIDC/SQLite/filesystem-CAS mode is a secure deployment foundation, not
+the completed production profile. Automatic discovery/key refresh, PostgreSQL,
+S3-compatible storage, quotas, audit export, and Kubernetes packaging remain
+required before that profile is release-ready.
 
 Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent `remote inspect`, `cfg`, `lift`, `decompile`, `artifact`, or `job-*` operations. Credential files must not be group- or world-readable.
 

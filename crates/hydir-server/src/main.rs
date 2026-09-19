@@ -71,6 +71,7 @@ include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
 const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
 const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
+const MAX_STORED_OBJECT_BYTES: usize = MAX_BINARY_BYTES;
 #[cfg(not(test))]
 const WORKER_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -360,6 +361,207 @@ PRAGMA user_version=8;
 COMMIT;
 ";
 
+const CONTENT_STORAGE_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+ALTER TABLE binaries ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'inline'
+    CHECK(storage_kind IN ('inline','filesystem-cas'));
+ALTER TABLE binaries ADD COLUMN storage_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE binaries ADD COLUMN content_size INTEGER NOT NULL DEFAULT 0;
+UPDATE binaries SET content_size=length(content);
+ALTER TABLE artifacts ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'inline'
+    CHECK(storage_kind IN ('inline','filesystem-cas'));
+ALTER TABLE artifacts ADD COLUMN storage_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE artifacts ADD COLUMN content_size INTEGER NOT NULL DEFAULT 0;
+UPDATE artifacts SET content_size=length(content);
+PRAGMA user_version=9;
+COMMIT;
+";
+
+#[derive(Clone)]
+enum ContentStorage {
+    Inline,
+    FilesystemCas(Arc<FilesystemCas>),
+}
+
+#[derive(Debug)]
+struct FilesystemCas {
+    root: PathBuf,
+}
+
+#[derive(Debug)]
+struct StagedContent {
+    digest: String,
+    inline: Vec<u8>,
+    storage_kind: &'static str,
+    storage_key: String,
+    content_size: i64,
+}
+
+impl ContentStorage {
+    fn stage(&self, content: &[u8]) -> Result<StagedContent, Status> {
+        if content.len() > MAX_STORED_OBJECT_BYTES {
+            return Err(Status::resource_exhausted(
+                "stored object exceeds size limit",
+            ));
+        }
+        let digest = sha256(content);
+        let content_size = i64::try_from(content.len())
+            .map_err(|_| Status::resource_exhausted("stored object exceeds size limit"))?;
+        match self {
+            Self::Inline => Ok(StagedContent {
+                digest,
+                inline: content.to_vec(),
+                storage_kind: "inline",
+                storage_key: String::new(),
+                content_size,
+            }),
+            Self::FilesystemCas(storage) => {
+                storage.put(&digest, content).map_err(Status::internal)?;
+                Ok(StagedContent {
+                    storage_key: digest.clone(),
+                    digest,
+                    inline: Vec::new(),
+                    storage_kind: "filesystem-cas",
+                    content_size,
+                })
+            }
+        }
+    }
+
+    fn load(
+        &self,
+        digest: &str,
+        inline: Vec<u8>,
+        storage_kind: &str,
+        storage_key: &str,
+        content_size: i64,
+    ) -> Result<Vec<u8>, Status> {
+        if content_size < 0 || content_size as usize > MAX_STORED_OBJECT_BYTES {
+            return Err(Status::data_loss("stored object size is invalid"));
+        }
+        let content = match storage_kind {
+            "inline" => inline,
+            "filesystem-cas" => match self {
+                Self::FilesystemCas(storage) => {
+                    storage.get(storage_key).map_err(Status::internal)?
+                }
+                Self::Inline => {
+                    return Err(Status::failed_precondition(
+                        "database references filesystem CAS objects; start hydird with that store",
+                    ));
+                }
+            },
+            _ => return Err(Status::data_loss("unknown stored object backend")),
+        };
+        if content.len() != content_size as usize || sha256(&content) != digest {
+            return Err(Status::data_loss(
+                "stored object failed size or digest validation",
+            ));
+        }
+        Ok(content)
+    }
+}
+
+impl FilesystemCas {
+    fn open(root: &Path) -> Result<Self, Box<dyn Error>> {
+        if !root.is_absolute() {
+            return Err("filesystem CAS root must be absolute".into());
+        }
+        std::fs::create_dir_all(root)?;
+        let metadata = std::fs::symlink_metadata(root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("filesystem CAS root must be a real directory".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err("filesystem CAS root must not be group/world writable".into());
+            }
+        }
+        Ok(Self {
+            root: root.to_owned(),
+        })
+    }
+
+    fn object_path(&self, digest: &str) -> Result<PathBuf, String> {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("filesystem CAS key must be SHA-256 hex".to_owned());
+        }
+        Ok(self
+            .root
+            .join(&digest[..2])
+            .join(&digest[2..4])
+            .join(digest))
+    }
+
+    fn put(&self, digest: &str, content: &[u8]) -> Result<(), String> {
+        if sha256(content) != digest {
+            return Err("filesystem CAS write digest mismatch".to_owned());
+        }
+        let destination = self.object_path(digest)?;
+        if destination.exists() {
+            return self.verify_existing(&destination, digest, content.len());
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "filesystem CAS object has no parent".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let temporary = parent.join(format!(".{}.{}.tmp", digest, Uuid::new_v4().simple()));
+        let write_result = (|| -> Result<(), String> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            file.write_all(content).map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            match std::fs::rename(&temporary, &destination) {
+                Ok(()) => Ok(()),
+                Err(_) if destination.exists() => {
+                    std::fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        write_result?;
+        self.verify_existing(&destination, digest, content.len())
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        let path = self.object_path(key)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_STORED_OBJECT_BYTES as u64
+        {
+            return Err("filesystem CAS object is not a bounded regular file".to_owned());
+        }
+        let content = std::fs::read(path).map_err(|error| error.to_string())?;
+        if sha256(&content) != key {
+            return Err("filesystem CAS object digest mismatch".to_owned());
+        }
+        Ok(content)
+    }
+
+    fn verify_existing(&self, path: &Path, digest: &str, size: usize) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != size as u64
+        {
+            return Err("filesystem CAS object metadata mismatch".to_owned());
+        }
+        let content = std::fs::read(path).map_err(|error| error.to_string())?;
+        if sha256(&content) != digest {
+            return Err("filesystem CAS object digest mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ProjectRole {
     Viewer,
@@ -547,16 +749,29 @@ struct Store {
     db: Arc<Mutex<Connection>>,
     workers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     authentication: AuthenticationMode,
+    content_storage: ContentStorage,
 }
 
 impl Store {
     fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
-        Self::open_with_auth(path, AuthenticationMode::StaticTokens)
+        Self::open_with_options(
+            path,
+            AuthenticationMode::StaticTokens,
+            ContentStorage::Inline,
+        )
     }
 
     fn open_with_auth(
         path: &Path,
         authentication: AuthenticationMode,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::open_with_options(path, authentication, ContentStorage::Inline)
+    }
+
+    fn open_with_options(
+        path: &Path,
+        authentication: AuthenticationMode,
+        content_storage: ContentStorage,
     ) -> Result<Self, Box<dyn Error>> {
         #[cfg(unix)]
         if path != Path::new(":memory:") {
@@ -583,7 +798,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 8 {
+        if version > 9 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -610,6 +825,9 @@ impl Store {
         if version <= 7 {
             connection.execute_batch(OIDC_IDENTITY_MIGRATION)?;
         }
+        if version <= 8 {
+            connection.execute_batch(CONTENT_STORAGE_MIGRATION)?;
+        }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
           FROM jobs WHERE state IN ('queued','running');
@@ -620,6 +838,7 @@ impl Store {
             db: Arc::new(Mutex::new(connection)),
             workers: Arc::new(Mutex::new(HashMap::new())),
             authentication,
+            content_storage,
         })
     }
 
@@ -912,12 +1131,14 @@ impl Store {
                 "project has no uploaded binary",
             ));
         }
-        self.connection()?.query_row(
-            "SELECT b.content FROM project_revisions r JOIN binaries b ON b.sha256=r.binary_sha256 \
+        let stored: (String, Vec<u8>, String, String, i64) = self.connection()?.query_row(
+            "SELECT b.sha256,b.content,b.storage_kind,b.storage_key,b.content_size FROM project_revisions r JOIN binaries b ON b.sha256=r.binary_sha256 \
              WHERE r.project_id=?1 AND r.revision=?2",
             params![id, revision as i64],
-            |row| row.get(0),
-        ).map_err(internal)
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).map_err(internal)?;
+        self.content_storage
+            .load(&stored.0, stored.1, &stored.2, &stored.3, stored.4)
     }
 
     fn binary_at_revision(
@@ -927,17 +1148,19 @@ impl Store {
         revision: u64,
     ) -> Result<Vec<u8>, Status> {
         self.require_project_role(principal, id, ProjectRole::Viewer)?;
-        self.connection()?
+        let stored: Option<(String, Vec<u8>, String, String, i64)> = self.connection()?
             .query_row(
-                "SELECT b.content FROM project_revisions r \
+                "SELECT b.sha256,b.content,b.storage_kind,b.storage_key,b.content_size FROM project_revisions r \
                  JOIN binaries b ON b.sha256=r.binary_sha256 \
                  WHERE r.project_id=?1 AND r.revision=?2",
                 params![id, revision as i64],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
-            .map_err(internal)?
-            .ok_or_else(|| Status::not_found("project revision not found"))
+            .map_err(internal)?;
+        let stored = stored.ok_or_else(|| Status::not_found("project revision not found"))?;
+        self.content_storage
+            .load(&stored.0, stored.1, &stored.2, &stored.3, stored.4)
     }
 
     fn store_artifact(
@@ -947,15 +1170,16 @@ impl Store {
         media_type: &str,
         content: &[u8],
     ) -> Result<String, Status> {
-        let digest = sha256(content);
-        self.connection()?
-            .execute(
-                "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) \
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![project_id, revision as i64, digest, media_type, content],
-            )
-            .map_err(internal)?;
-        Ok(digest)
+        let staged = self.content_storage.stage(content)?;
+        let connection = self.connection()?;
+        insert_artifact(
+            &connection,
+            project_id,
+            revision as i64,
+            media_type,
+            &staged,
+        )?;
+        Ok(staged.digest)
     }
 
     fn commit_patch_mutation(
@@ -973,7 +1197,8 @@ impl Store {
         let next = expected
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
-        let binary_sha256 = sha256(&patched);
+        let staged_binary = self.content_storage.stage(&patched)?;
+        let binary_sha256 = staged_binary.digest.clone();
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(internal)?;
         require_project_role_in(&tx, principal, project_id, ProjectRole::Operator)?;
@@ -1008,11 +1233,7 @@ impl Store {
         if current != expected {
             return Err(Status::aborted("stale project revision"));
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-            params![binary_sha256, patched],
-        )
-        .map_err(internal)?;
+        insert_binary(&tx, &staged_binary)?;
         tx.execute(
             "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
             params![project_id, next, binary_sha256],
@@ -1023,11 +1244,7 @@ impl Store {
             params![next, project_id],
         )
         .map_err(internal)?;
-        tx.execute(
-            "INSERT INTO artifacts(project_id,revision,sha256,media_type,content) SELECT ?1,?2,sha256,'application/x-elf',content FROM binaries WHERE sha256=?3",
-            params![project_id, next, binary_sha256],
-        )
-        .map_err(internal)?;
+        insert_artifact(&tx, project_id, next, "application/x-elf", &staged_binary)?;
         tx.execute(
             "INSERT INTO patch_requests(project_id,idempotency_key,expected_revision,patch_sha256,new_revision,binary_sha256) VALUES(?1,?2,?3,?4,?5,?6)",
             params![project_id, idempotency_key, expected, patch_digest, next, binary_sha256],
@@ -1110,11 +1327,9 @@ impl Store {
         }
         match result {
             Ok(content) => {
-                let digest = sha256(&content);
-                tx.execute(
-                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,'text/x-llvm-ir',?4)",
-                    params![project_id, revision as i64, digest, content],
-                ).map_err(internal)?;
+                let staged = self.content_storage.stage(&content)?;
+                let digest = staged.digest.clone();
+                insert_artifact(&tx, project_id, revision as i64, "text/x-llvm-ir", &staged)?;
                 tx.execute(
                     "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
                     params![digest, job_id],
@@ -1174,6 +1389,49 @@ fn insert_event(
         params![job_id, state, message, artifact_sha256],
     )
     .map_err(internal)?;
+    Ok(())
+}
+
+fn insert_binary(connection: &Connection, content: &StagedContent) -> Result<(), Status> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO binaries(sha256,content,storage_kind,storage_key,content_size) \
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                content.digest,
+                content.inline,
+                content.storage_kind,
+                content.storage_key,
+                content.content_size
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn insert_artifact(
+    connection: &Connection,
+    project_id: &str,
+    revision: i64,
+    media_type: &str,
+    content: &StagedContent,
+) -> Result<(), Status> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content,storage_kind,storage_key,content_size) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                project_id,
+                revision,
+                content.digest,
+                media_type,
+                content.inline,
+                content.storage_kind,
+                content.storage_key,
+                content.content_size
+            ],
+        )
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -1916,6 +2174,7 @@ impl Hydir for Store {
             ));
         }
         run_worker("inspect", None, input.content.clone()).await?;
+        let staged_binary = self.content_storage.stage(&input.content)?;
         let expected = i64::try_from(input.expected_revision)
             .map_err(|_| Status::invalid_argument("revision too large"))?;
         {
@@ -1947,11 +2206,7 @@ impl Hydir for Store {
             let next = current
                 .checked_add(1)
                 .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
-            tx.execute(
-                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![digest, input.content],
-            )
-            .map_err(internal)?;
+            insert_binary(&tx, &staged_binary)?;
             tx.execute(
                 "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
                 params![input.project_id, next, digest],
@@ -2216,11 +2471,12 @@ impl Hydir for Store {
         valid_symbol(&input.function_symbol)?;
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let content = run_worker("lift", Some(&input.function_symbol), bytes).await?;
-        let digest = sha256(&content);
-        self.connection()?.execute(
-            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-            params![input.project_id, input.expected_revision as i64, digest, "text/x-llvm-ir", content],
-        ).map_err(internal)?;
+        let digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            "text/x-llvm-ir",
+            &content,
+        )?;
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-llvm-ir".to_owned(),
@@ -2244,11 +2500,12 @@ impl Hydir for Store {
         valid_symbol(&input.function_symbol)?;
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let content = run_worker("decompile", Some(&input.function_symbol), bytes).await?;
-        let digest = sha256(&content);
-        self.connection()?.execute(
-            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-            params![input.project_id, input.expected_revision as i64, digest, "text/x-csrc", content],
-        ).map_err(internal)?;
+        let digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            "text/x-csrc",
+            &content,
+        )?;
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-csrc".to_owned(),
@@ -2309,7 +2566,14 @@ impl Hydir for Store {
         let parts = unpack_worker_parts::<4>(&packed)?;
         let report_json = String::from_utf8(parts[3].to_vec())
             .map_err(|_| Status::internal("transform report is not UTF-8"))?;
-        let digests = parts.map(sha256);
+        let staged_parts = parts
+            .iter()
+            .map(|part| self.content_storage.stage(part))
+            .collect::<Result<Vec<_>, _>>()?;
+        let digests = staged_parts
+            .iter()
+            .map(|part| part.digest.clone())
+            .collect::<Vec<_>>();
         let next = expected
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
@@ -2346,19 +2610,16 @@ impl Hydir for Store {
                 params![next, input.project_id],
             )
             .map_err(internal)?;
-            for (index, (media_type, part)) in [
-                ("text/x-llvm-ir", parts[0]),
-                ("text/x-llvm-ir", parts[1]),
-                ("text/x-llvm-ir", parts[2]),
-                ("application/json", parts[3]),
+            for (media_type, staged) in [
+                "text/x-llvm-ir",
+                "text/x-llvm-ir",
+                "text/x-llvm-ir",
+                "application/json",
             ]
             .into_iter()
-            .enumerate()
+            .zip(&staged_parts)
             {
-                tx.execute(
-                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-                    params![input.project_id, next, digests[index], media_type, part],
-                ).map_err(internal)?;
+                insert_artifact(&tx, &input.project_id, next, media_type, staged)?;
             }
             tx.execute(
                 "INSERT INTO transform_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision,raw_sha256,before_sha256,after_sha256,report_sha256,ir_text_changed,report_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -2414,9 +2675,12 @@ impl Hydir for Store {
         run_worker("inspect", None, parts[1].to_vec()).await?;
         let report_json = String::from_utf8(parts[2].to_vec())
             .map_err(|_| Status::internal("rebuild report is not UTF-8"))?;
-        let ir_sha256 = sha256(parts[0]);
-        let binary_sha256 = sha256(parts[1]);
-        let report_sha256 = sha256(parts[2]);
+        let staged_ir = self.content_storage.stage(parts[0])?;
+        let staged_binary = self.content_storage.stage(parts[1])?;
+        let staged_report = self.content_storage.stage(parts[2])?;
+        let ir_sha256 = staged_ir.digest.clone();
+        let binary_sha256 = staged_binary.digest.clone();
+        let report_sha256 = staged_report.digest.clone();
         let next = expected
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
@@ -2439,11 +2703,7 @@ impl Hydir for Store {
             if current != expected {
                 return Err(Status::aborted("stale project revision"));
             }
-            tx.execute(
-                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![binary_sha256, parts[1]],
-            )
-            .map_err(internal)?;
+            insert_binary(&tx, &staged_binary)?;
             tx.execute(
                 "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
                 params![input.project_id, next, binary_sha256],
@@ -2454,16 +2714,12 @@ impl Hydir for Store {
                 params![next, input.project_id],
             )
             .map_err(internal)?;
-            for (digest, media_type, content) in [
-                (&ir_sha256, "text/x-llvm-ir", parts[0]),
-                (&binary_sha256, "application/x-elf", parts[1]),
-                (&report_sha256, "application/json", parts[2]),
+            for (media_type, staged) in [
+                ("text/x-llvm-ir", &staged_ir),
+                ("application/x-elf", &staged_binary),
+                ("application/json", &staged_report),
             ] {
-                tx.execute(
-                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-                    params![input.project_id, next, digest, media_type, content],
-                )
-                .map_err(internal)?;
+                insert_artifact(&tx, &input.project_id, next, media_type, staged)?;
             }
             tx.execute(
                 "INSERT INTO rebuild_requests(project_id,idempotency_key,expected_revision,new_revision,binary_sha256,ir_sha256,report_sha256,report_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -2571,19 +2827,26 @@ impl Hydir for Store {
                 "artifact digest must be SHA-256 hex",
             ));
         }
-        let record: Option<(i64, String, Vec<u8>)> = self
+        let record: Option<(i64, String, Vec<u8>, String, String, i64)> = self
             .connection()?
             .query_row(
-                "SELECT a.revision,a.media_type,a.content FROM artifacts a \
+                "SELECT a.revision,a.media_type,a.content,a.storage_kind,a.storage_key,a.content_size FROM artifacts a \
              WHERE a.project_id=?1 AND a.sha256=?2 \
              ORDER BY a.revision DESC LIMIT 1",
                 params![input.project_id, input.sha256],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .optional()
             .map_err(internal)?;
-        let (revision, media_type, content) =
+        let (revision, media_type, inline, storage_kind, storage_key, content_size) =
             record.ok_or_else(|| Status::not_found("artifact not found"))?;
+        let content = self.content_storage.load(
+            &input.sha256,
+            inline,
+            &storage_kind,
+            &storage_key,
+            content_size,
+        )?;
         Ok(Response::new(ArtifactReply {
             sha256: input.sha256,
             media_type,
@@ -3148,6 +3411,12 @@ fn oidc_verifier(
     OidcVerifier::new(issuer.to_owned(), audience.to_owned(), keys).map_err(Into::into)
 }
 
+fn filesystem_content_storage(root: &Path) -> Result<ContentStorage, Box<dyn Error>> {
+    Ok(ContentStorage::FilesystemCas(Arc::new(
+        FilesystemCas::open(root)?,
+    )))
+}
+
 async fn serve_rpc(
     store: Store,
     address: SocketAddr,
@@ -3275,7 +3544,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("hydird TLS/OIDC RPC listening on {address}");
             serve_rpc(store, address, Some(tls)).await?;
         }
-        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird identity list-oidc <database.sqlite> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> | hydird serve-oidc <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json>".into()),
+        [serve, database, bind, certificate, private_key, issuer, audience, jwks, object_root]
+            if serve == "serve-oidc-cas" =>
+        {
+            if database == ":memory:" {
+                return Err("hydird serve-oidc-cas requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let verifier = oidc_verifier(issuer, audience, Path::new(jwks))?;
+            let content_storage = filesystem_content_storage(Path::new(object_root))?;
+            let store = Store::open_with_options(
+                Path::new(database),
+                AuthenticationMode::Oidc(Arc::new(verifier)),
+                content_storage,
+            )?;
+            println!("hydird TLS/OIDC RPC with filesystem CAS listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird identity list-oidc <database.sqlite> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> | hydird serve-oidc <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> | hydird serve-oidc-cas <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> <absolute-object-root>".into()),
     }
     Ok(())
 }
@@ -3489,6 +3776,103 @@ mod tests {
             .metadata_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
         request
+    }
+
+    #[tokio::test]
+    async fn filesystem_cas_is_digest_verified_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("cas.sqlite");
+        let object_root = directory.path().join("objects");
+        let storage = filesystem_content_storage(&object_root).unwrap();
+        let store =
+            Store::open_with_options(&database, AuthenticationMode::StaticTokens, storage.clone())
+                .unwrap();
+        let token = store.create_identity("cas-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "CAS project".to_owned(),
+                    idempotency_key: "cas-project".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = b"digest-bound-binary";
+        let staged = store.content_storage.stage(binary).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            insert_binary(&connection, &staged).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,1,?2)",
+                    params![project.project_id, staged.digest],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE projects SET current_revision=1 WHERE id=?1",
+                    [&project.project_id],
+                )
+                .unwrap();
+        }
+        let artifact = b"content-addressed artifact";
+        let artifact_digest = store
+            .store_artifact(&project.project_id, 1, "application/test", artifact)
+            .unwrap();
+        let inline_bytes: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT length(content) FROM artifacts WHERE sha256=?1",
+                [&artifact_digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inline_bytes, 0);
+        assert_eq!(
+            store
+                .current_binary("cas-analyst", &project.project_id, 1)
+                .unwrap(),
+            binary
+        );
+        drop(store);
+
+        let reopened =
+            Store::open_with_options(&database, AuthenticationMode::StaticTokens, storage).unwrap();
+        let found = reopened
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: artifact_digest.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(found.content, artifact);
+
+        let object_path = object_root
+            .join(&artifact_digest[..2])
+            .join(&artifact_digest[2..4])
+            .join(&artifact_digest);
+        std::fs::write(&object_path, b"corrupt").unwrap();
+        assert_eq!(
+            reopened
+                .get_artifact(authorized(
+                    ArtifactRequest {
+                        project_id: project.project_id,
+                        sha256: artifact_digest,
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
     }
 
     #[tokio::test]
@@ -3732,8 +4116,8 @@ mod tests {
         {
             let conn = store.connection().unwrap();
             conn.execute(
-                "INSERT INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![binary_sha256, fake_binary],
+                "INSERT INTO binaries(sha256,content,content_size) VALUES(?1,?2,?3)",
+                params![binary_sha256, fake_binary, fake_binary.len() as i64],
             )
             .unwrap();
             conn.execute(
@@ -4042,7 +4426,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=9;")
+            .execute_batch("PRAGMA user_version=10;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -4076,7 +4460,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
         assert_eq!(
             store
@@ -4249,8 +4633,8 @@ mod tests {
         {
             let conn = store.connection().unwrap();
             conn.execute(
-                "INSERT INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![sha256(bytes), bytes],
+                "INSERT INTO binaries(sha256,content,content_size) VALUES(?1,?2,?3)",
+                params![sha256(bytes), bytes, bytes.len() as i64],
             )
             .unwrap();
             conn.execute(
