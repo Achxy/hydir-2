@@ -1,0 +1,335 @@
+// Vendored interoperability schema from Anvill commit
+// 52f9638b023417c9bdbbb1791867cacc38c68888 (AGPL-3.0-only).
+// Source: https://github.com/lifting-bits/anvill/blob/52f9638b023417c9bdbbb1791867cacc38c68888/data_specifications/specification.proto
+syntax = "proto3";
+
+package specification;
+
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_X86 = 1;
+  ARCH_X86_AVX = 2;
+  ARCH_X86_AVX512 = 3;
+  ARCH_AMD64 = 4;
+  ARCH_AMD64_AVX = 5;
+  ARCH_ADM64_AVX512 = 6;
+  ARCH_AARCH64 = 7;
+  ARCH_AARCH32 = 8;
+  ARCH_SPARC32 = 9;
+  ARCH_SPARC64 = 10;
+  ARCH_PPC = 11;
+}
+
+enum OS {
+  OS_UNSPECIFIED = 0;
+  OS_LINUX = 1;
+  OS_MACOS = 2;
+  OS_WINDOWS = 3;
+  OS_SOLARIS = 4;
+}
+
+enum BaseType {
+  BT_BOOL = 0;
+  BT_CHAR = 1;
+  BT_SCHAR = 2;
+  BT_UCHAR = 3;
+  BT_I8 = 4;
+  BT_U8 = 5;
+  BT_I16 = 6;
+  BT_U16 = 7;
+  BT_I24 = 8;
+  BT_U24 = 9;
+  BT_I32 = 10;
+  BT_U32 = 11;
+  BT_I64 = 12;
+  BT_U64 = 13;
+  BT_I128 = 14;
+  BT_U128 = 15;
+  BT_FL16 = 16;
+  BT_FL32 = 17;
+  BT_FL64 = 18;
+  BT_FL80 = 19;
+  BT_FL96 = 20;
+  BT_FL128 = 21;
+  BT_M64 = 22;
+  BT_VOID = 23;
+  BT_PADDING = 24;
+}
+
+message TypeSpec {
+  message PointerType {
+    TypeSpec pointee = 1;
+    bool const = 2;
+  }
+
+  message VectorType {
+    TypeSpec base = 1;
+    uint32 size = 2;
+  }
+
+  message ArrayType {
+    TypeSpec base = 1;
+    uint32 size = 2;
+  }
+
+  message StructType {
+    repeated TypeSpec members = 1;
+    optional uint32 identifier = 2;
+  }
+
+  message FunctionType {
+    TypeSpec return_type = 1;
+    repeated TypeSpec arguments = 2;
+    bool is_variadic = 3;
+  }
+
+  oneof type {
+    BaseType base = 1;
+    PointerType pointer = 2;
+    VectorType vector = 3;
+    ArrayType array = 4;
+    StructType struct = 5;
+    FunctionType function = 6;
+    uint32 unknown = 7;
+    int64 alias = 8;
+  }
+}
+
+message Register {
+  string register_name = 1;
+  optional uint64 subreg_sz = 2;
+}
+
+message Memory {
+  optional string base_reg = 1;
+  int64 offset = 2;
+  uint64 size = 3;
+}
+
+message Variable {
+  repeated Value values = 1;
+  TypeSpec type = 2;
+}
+
+message Parameter {
+  optional string name = 1;
+  Variable repr_var = 2;
+}
+
+enum CallingConvention {
+  CALLING_CONVENTION_UNSPECIFIED = 0;
+  CALLING_CONVENTION_CDECL = 1;
+  CALLING_CONVENTION_STDCALL = 64;
+  CALLING_CONVENTION_FASTCALL = 65;
+  CALLING_CONVENTION_THISCALL = 70;
+  CALLING_CONVENTION_AMD64_SYSV = 78;
+  CALLING_CONVENTION_WIN64 = 79;
+  CALLING_CONVENTION_VECTORCALL = 80;
+}
+
+message ReturnStackPointer {
+  Register reg = 1;
+  optional int64 offset = 2;
+}
+
+enum FunctionLinkage {
+  FUNCTION_LINKAGE_NORMAL_UNSPECIFIED = 0;
+  FUNCTION_LINKAGE_DECL = 1;
+  FUNCTION_LINKAGE_EXTERNAL = 2;
+}
+
+message Callsite {
+  uint64 call_address = 1;
+  uint64 inside_function_address = 2;
+  Callable callable = 3;
+}
+
+message Callable {
+  Value return_address = 2;
+  repeated Parameter parameters = 3;
+  optional Variable return = 4;
+  bool is_variadic = 5;
+  bool is_noreturn = 6;
+  CallingConvention calling_convention = 7;
+  optional TypeSpec type = 8;
+  ReturnStackPointer return_stack_pointer = 10;
+}
+
+message Constant {
+  uint64 value = 1;
+  bool is_tainted_by_pc = 2;
+}
+
+message ValueDomain {
+  oneof inner {
+    HighSymbol symb = 1;
+    int64 stack_disp = 2;
+    Constant constant = 3;
+  }
+}
+
+message ValueMapping {
+  Variable target_value = 1;
+  ValueDomain curr_val = 2;
+}
+
+enum HighLoc {
+  HIGH_LOC_UNSPECIFIED = 0;
+  HIGH_LOC_PARAM = 1;
+  HIGH_LOC_LOCAL = 2;
+}
+
+message SymbolMapping {
+  HighSymbol high_loc = 1;
+  Variable low_loc = 2;
+}
+
+message HighSymbol {
+  string name = 1;
+  HighLoc location = 2;
+}
+
+message Value {
+  oneof inner_value {
+    Register reg = 1;
+    Memory mem = 2;
+  }
+}
+
+message BlockContext {
+  repeated ValueMapping symvals_at_entry = 1;
+  repeated ValueMapping symvals_at_exit = 2;
+  repeated Parameter live_at_entries = 3;
+  repeated Parameter live_at_exits = 4;
+}
+
+message CodeBlock {
+  uint64 address = 1;
+  string name = 2;
+  repeated uint64 incoming_blocks = 3;
+  repeated uint64 outgoing_blocks = 4;
+  uint32 size = 5;
+  map<string, uint64> context_assignments = 6;
+  uint64 uid = 7;
+}
+
+message Variables {
+  repeated Variable vars = 1;
+}
+
+message StackEffects {
+  map<uint64, Variables> allocations = 1;
+  map<uint64, Variables> frees = 2;
+  repeated Variable missed_allocs = 3;
+  repeated Variable missed_frees = 4;
+}
+
+message StackFrame {
+  uint64 frame_size = 1;
+  int64 return_address_offset = 2;
+  uint64 parameter_size = 3;
+  uint64 max_frame_depth = 4;
+  int64 parameter_offset = 5;
+}
+
+message TypeHint {
+  uint64 target_addr = 1;
+  Variable target_var = 2;
+}
+
+message RelativeAddress {
+  uint64 entry_vaddr = 1;
+  int64 displacement = 2;
+}
+
+message ProgramAddress {
+  oneof inner {
+    uint64 internal_address = 1;
+    RelativeAddress ext_address = 2;
+  }
+}
+
+message Function {
+  uint64 entry_address = 1;
+  uint64 entry_uid = 12;
+  FunctionLinkage func_linkage = 3;
+  Callable callable = 4;
+  map<uint64, CodeBlock> blocks = 5;
+  map<string, Variable> local_variables = 6;
+  map<uint64, BlockContext> block_context = 7;
+  StackEffects stack_effects = 8;
+  StackFrame frame = 9;
+  repeated Parameter in_scope_vars = 10;
+  repeated TypeHint type_hints = 11;
+  ProgramAddress binary_addr = 13;
+}
+
+message GlobalVariable {
+  TypeSpec type = 1;
+  uint64 address = 2;
+  ProgramAddress binary_address = 3;
+}
+
+message Symbol {
+  string name = 1;
+  uint64 address = 2;
+}
+
+message MemoryRange {
+  uint64 address = 1;
+  bool is_writeable = 2;
+  bool is_executable = 3;
+  bytes values = 4;
+}
+
+message JumpTarget {
+  uint64 address = 1;
+}
+
+message Jump {
+  uint64 address = 1;
+  repeated JumpTarget targets = 2;
+  bool stop = 3;
+}
+
+message Call {
+  uint64 address = 1;
+  optional uint64 return_address = 2;
+  bool is_tailcall = 3;
+  bool stop = 4;
+  bool noreturn = 5;
+  optional uint64 target_address = 6;
+}
+
+message Return {
+  uint64 address = 1;
+  bool stop = 2;
+}
+
+message Other {
+  uint64 address = 1;
+  bool stop = 2;
+}
+
+message ControlFlowOverrides {
+  repeated Jump jumps = 1;
+  repeated Call calls = 2;
+  repeated Return returns = 3;
+  repeated Other others = 4;
+}
+
+message Specification {
+  Arch arch = 1;
+  OS operating_system = 2;
+  repeated Function functions = 3;
+  repeated Callsite callsites = 4;
+  repeated GlobalVariable global_variables = 5;
+  repeated Symbol symbols = 6;
+  repeated MemoryRange memory_ranges = 7;
+  ControlFlowOverrides overrides = 8;
+  map<int64, TypeSpec> type_aliases = 9;
+  string image_name = 10;
+  uint64 image_base = 11;
+  repeated string required_globals = 12;
+  map<int64, string> type_names = 13;
+}

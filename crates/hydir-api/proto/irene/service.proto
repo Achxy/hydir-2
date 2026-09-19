@@ -1,0 +1,19 @@
+// Wire-compatible with Irene3 commit
+// d97aee937ebb6d1cb8a362748c56414404eb75ff (AGPL-3.0-only).
+syntax = "proto3";
+
+import "anvill/data_specifications/specification.proto";
+
+package irene.server;
+
+message Codegen {
+  string json = 1;
+}
+
+message SpecChunk {
+  bytes chunk = 1;
+}
+
+service Irene {
+  rpc ProcessSpecification(stream SpecChunk) returns (Codegen) {}
+}

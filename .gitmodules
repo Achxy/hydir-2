@@ -1,6 +1,0 @@
-[submodule "third_party/Triton"]
-	path = third_party/Triton
-	url = https://github.com/JonathanSalwan/Triton.git
-[submodule "third_party/hydir-reference"]
-	path = third_party/hydir-reference
-	url = https://github.com/trailofbits/irene3.git
