@@ -1,4 +1,4 @@
-/* Forty-four distinct, symbol-bounded u64(u64,u64) machine-code fixtures.
+/* Forty-five distinct, symbol-bounded u64(u64,u64) machine-code fixtures.
  * The validator sees only compiled ELF bytes; this source is oracle input. */
 .text
 
@@ -159,6 +159,15 @@ hydir_lea_scaled:
   lea 7(%rdi,%rsi,4), %rax
   ret
 .size hydir_lea_scaled, .-hydir_lea_scaled
+
+.globl hydir_lea_rip
+.type hydir_lea_rip,@function
+hydir_lea_rip:
+  lea .Lhydir_rip_anchor(%rip), %rax
+  ret
+.size hydir_lea_rip, .-hydir_lea_rip
+.Lhydir_rip_anchor:
+  .byte 0
 
 /* Every accepted conditional branch, with CMP defining all relevant flags. */
 .macro HYDIR_CONDITION suffix, jump

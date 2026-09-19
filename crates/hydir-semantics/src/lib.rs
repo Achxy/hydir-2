@@ -609,24 +609,29 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 && instruction.op0_kind() == OpKind::Register
                 && instruction.op1_kind() == OpKind::Memory =>
         {
-            if instruction.segment_prefix() != Register::None
-                || instruction.memory_base() == Register::RIP
-            {
-                return Err(format!("segment/RIP-relative LEA unsupported at 0x{ip:x}"));
+            if instruction.segment_prefix() != Register::None {
+                return Err(format!("segment-relative LEA unsupported at 0x{ip:x}"));
             }
-            let optional_register = |register| {
-                if register == Register::None {
-                    Ok(None)
-                } else {
-                    checked_register(register, ip).map(Some)
+            if instruction.is_ip_rel_memory_operand() {
+                Op::Mov {
+                    dst: register_dest()?,
+                    src: Value::Immediate(instruction.ip_rel_memory_address() as i64),
                 }
-            };
-            Op::Lea {
-                dst: register_dest()?,
-                base: optional_register(instruction.memory_base())?,
-                index: optional_register(instruction.memory_index())?,
-                scale: instruction.memory_index_scale(),
-                displacement: instruction.memory_displacement64() as i64,
+            } else {
+                let optional_register = |register| {
+                    if register == Register::None {
+                        Ok(None)
+                    } else {
+                        checked_register(register, ip).map(Some)
+                    }
+                };
+                Op::Lea {
+                    dst: register_dest()?,
+                    base: optional_register(instruction.memory_base())?,
+                    index: optional_register(instruction.memory_index())?,
+                    scale: instruction.memory_index_scale(),
+                    displacement: instruction.memory_displacement64() as i64,
+                }
             }
         }
         Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
@@ -833,6 +838,26 @@ mod tests {
         );
         assert_eq!(operation.effects().read_registers, R12);
         assert_eq!(operation.effects().write_registers, RBX);
+    }
+
+    #[test]
+    fn rip_relative_lea_forms_an_absolute_address_without_memory_effects() {
+        // lea rax,[rip+0x1234] at 0x1000 => 0x1007 + 0x1234
+        let mut decoder = Decoder::with_ip(
+            64,
+            &[0x48, 0x8d, 0x05, 0x34, 0x12, 0x00, 0x00],
+            0x1000,
+            DecoderOptions::NONE,
+        );
+        let op = classify(&decoder.decode()).unwrap();
+        assert_eq!(
+            op,
+            Op::Mov {
+                dst: Register::RAX,
+                src: Value::Immediate(0x223b),
+            }
+        );
+        assert_eq!(op.effects().memory, MemoryEffect::None);
     }
 
     #[test]

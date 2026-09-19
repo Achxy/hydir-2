@@ -1474,6 +1474,12 @@ mod tests {
     }
 
     #[test]
+    fn rip_relative_lea_lifts_as_pure_address_formation() {
+        let ir = lift_cfg(&[0x48, 0x8d, 0x05, 0x34, 0x12, 0x00, 0x00, 0xc3], 0x1000).unwrap();
+        assert!(ir.contains("%rax_out_1000 = add i64 0, 8763"));
+    }
+
+    #[test]
     fn recovers_diamond_with_phis() {
         // mov rax,rdi; cmp rdi,rsi; jae +3; mov rax,rsi; ret
         let code = [
