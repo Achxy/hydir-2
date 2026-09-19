@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hydir-sdk"
 version = "0.1.0"
-description = "Typed client for HydIR's authenticated loopback API subset"
+description = "Typed client for HydIR's authenticated local-or-TLS API subset"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
 dependencies = ["grpcio==1.84.0", "protobuf==7.36.1", "typing-extensions==4.16.0"]

@@ -22,30 +22,41 @@ MAX_BINARY_BYTES = 64 * 1024 * 1024
 
 
 class HydirClient:
-    """Authenticated loopback client with additive v1/v2 negotiation.
+    """Authenticated local-or-TLS client with additive v1/v2 negotiation.
 
     Mutations accept explicit project revisions. Pass the same idempotency key
     when retrying create-project or lift-job requests after an uncertain reply.
     """
 
-    def __init__(self, endpoint: str, token_file: str | os.PathLike[str], timeout: float = 30.0):
+    def __init__(
+        self,
+        endpoint: str,
+        token_file: str | os.PathLike[str],
+        timeout: float = 30.0,
+        root_certificates: bytes | None = None,
+    ):
         parsed = urlsplit(endpoint)
         if (
-            parsed.scheme != "http"
+            parsed.scheme not in {"http", "https"}
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.path
+            or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
             or parsed.port is None
+            or not parsed.hostname
         ):
-            raise ValueError("Endpoint must be explicit http://loopback-address:port")
+            raise ValueError(
+                "Endpoint must be an explicit http/https host and port without "
+                "credentials, path, query, or fragment"
+            )
+        address = None
         try:
-            address = ipaddress.ip_address(parsed.hostname or "")
-        except ValueError as error:
-            raise ValueError("Endpoint must use a numeric loopback address") from error
-        if not address.is_loopback:
-            raise ValueError("Plaintext non-loopback connections are refused")
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            pass
+        if parsed.scheme == "http" and (address is None or not address.is_loopback):
+            raise ValueError("Plaintext connections require a numeric loopback address")
         token_path = Path(token_file)
         if os.name == "posix" and token_path.stat().st_mode & 0o077:
             raise ValueError("Credential file must be private (chmod 600)")
@@ -54,14 +65,17 @@ class HydirClient:
             raise ValueError("Credential file must contain a 64-character hex token")
         self._metadata = (("authorization", "Bearer " + token),)
         self._timeout = timeout
-        target = f"[{address}]:{parsed.port}" if address.version == 6 else f"{address}:{parsed.port}"
-        self._channel = grpc.insecure_channel(
-            target,
-            options=(
-                ("grpc.max_receive_message_length", MAX_BINARY_BYTES + 1024),
-                ("grpc.max_send_message_length", MAX_BINARY_BYTES + 1024),
-            ),
+        host = parsed.hostname
+        target = f"[{host}]:{parsed.port}" if ":" in host else f"{host}:{parsed.port}"
+        options = (
+            ("grpc.max_receive_message_length", MAX_BINARY_BYTES + 1024),
+            ("grpc.max_send_message_length", MAX_BINARY_BYTES + 1024),
         )
+        if parsed.scheme == "https":
+            credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+            self._channel = grpc.secure_channel(target, credentials, options=options)
+        else:
+            self._channel = grpc.insecure_channel(target, options=options)
         self._stub = HydirStub(self._channel)
         self._stub_v2 = HydirV2Stub(self._channel)
 

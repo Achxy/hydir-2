@@ -283,13 +283,32 @@ enum Source {
 }
 
 fn validate_endpoint(endpoint: &str) -> Result<(), String> {
-    let address: SocketAddr = endpoint
-        .strip_prefix("http://")
-        .ok_or("Remote endpoint must be explicit http://loopback-host:port")?
+    let uri: tonic::codegen::http::Uri = endpoint
         .parse()
-        .map_err(|_| "Remote endpoint must be a numeric loopback address and port")?;
-    if !address.ip().is_loopback() {
-        return Err("Plaintext non-loopback remote connections are refused.".to_owned());
+        .map_err(|_| "Remote endpoint is not a valid URI.".to_owned())?;
+    let scheme = uri.scheme_str().ok_or("Remote endpoint has no scheme.")?;
+    let authority = uri
+        .authority()
+        .ok_or("Remote endpoint has no host authority.")?;
+    if authority.as_str().contains('@')
+        || uri
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+    {
+        return Err("Remote endpoint must not contain credentials, a path, or a query.".to_owned());
+    }
+    match scheme {
+        "http" => {
+            let address: SocketAddr = authority.as_str().parse().map_err(|_| {
+                "Plaintext endpoint must use a numeric loopback address and port.".to_owned()
+            })?;
+            if !address.ip().is_loopback() {
+                return Err("Plaintext non-loopback remote connections are refused.".to_owned());
+            }
+        }
+        "https" if !authority.host().is_empty() => {}
+        "https" => return Err("TLS endpoint has no host.".to_owned()),
+        _ => return Err("Remote endpoint scheme must be http or https.".to_owned()),
     }
     Ok(())
 }
@@ -2957,7 +2976,7 @@ impl AnalystApp {
                 ui.label(RichText::new("SERVICE ENDPOINT").size(10.0).color(MUTED));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.remote_endpoint)
-                        .hint_text("http://127.0.0.1:50051"),
+                        .hint_text("http://127.0.0.1:50051 or https://host:port"),
                 );
                 ui.label(RichText::new("PRIVATE CREDENTIAL FILE").size(10.0).color(MUTED));
                 ui.add(
@@ -5406,12 +5425,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_endpoint_requires_explicit_loopback() {
+    fn remote_endpoint_allows_tls_and_only_loopback_plaintext() {
         assert!(validate_endpoint("http://127.0.0.1:50051").is_ok());
         assert!(validate_endpoint("http://[::1]:50051").is_ok());
         assert!(validate_endpoint("http://0.0.0.0:50051").is_err());
         assert!(validate_endpoint("http://192.0.2.1:50051").is_err());
-        assert!(validate_endpoint("https://127.0.0.1:50051").is_err());
+        assert!(validate_endpoint("https://hydir.example:443").is_ok());
+        assert!(validate_endpoint("https://hydir.example/api").is_err());
+        assert!(validate_endpoint("https://user@hydir.example").is_err());
     }
 
     #[test]
