@@ -329,17 +329,32 @@ fn read_credential(path: &PathBuf) -> Result<String, String> {
         .map_err(|e| format!("Cannot read credential file: {e}"))?
         .trim()
         .to_owned();
-    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Credential file must contain a 64-character hex token.".to_owned());
+    if !valid_bearer_token(&token) {
+        return Err(
+            "Credential file must contain a bounded static token or compact JWT.".to_owned(),
+        );
     }
     Ok(token)
+}
+
+fn valid_bearer_token(token: &str) -> bool {
+    let static_token = token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let compact_jwt = token.len() <= 16 * 1024
+        && token.split('.').count() == 3
+        && token.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    static_token || compact_jwt
 }
 
 fn authorized<T>(value: T, token: &str) -> Request<T> {
     let mut request = Request::new(value);
     let credential = format!("Bearer {token}")
         .parse::<MetadataValue<_>>()
-        .expect("validated hex token");
+        .expect("validated ASCII bearer token");
     request.metadata_mut().insert("authorization", credential);
     request
 }
@@ -5343,7 +5358,10 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalystApp, Event, Tab, ir_slice, preview_patch_local, validate_endpoint};
+    use super::{
+        AnalystApp, Event, Tab, ir_slice, preview_patch_local, valid_bearer_token,
+        validate_endpoint,
+    };
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
@@ -5433,6 +5451,14 @@ mod tests {
         assert!(validate_endpoint("https://hydir.example:443").is_ok());
         assert!(validate_endpoint("https://hydir.example/api").is_err());
         assert!(validate_endpoint("https://user@hydir.example").is_err());
+    }
+
+    #[test]
+    fn remote_credentials_accept_static_tokens_and_compact_jwts() {
+        assert!(valid_bearer_token(&"a".repeat(64)));
+        assert!(valid_bearer_token("eyJhbGciOiJSUzI1NiJ9.e30.signature"));
+        assert!(!valid_bearer_token("header.payload."));
+        assert!(!valid_bearer_token("header.pay load.signature"));
     }
 
     #[test]

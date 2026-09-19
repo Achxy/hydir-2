@@ -61,8 +61,25 @@ class HydirClient:
         if os.name == "posix" and token_path.stat().st_mode & 0o077:
             raise ValueError("Credential file must be private (chmod 600)")
         token = token_path.read_text(encoding="ascii").strip()
-        if len(token) != 64 or any(character not in "0123456789abcdefABCDEF" for character in token):
-            raise ValueError("Credential file must contain a 64-character hex token")
+        is_static = len(token) == 64 and all(
+            character in "0123456789abcdefABCDEF" for character in token
+        )
+        segments = token.split(".")
+        is_compact_jwt = (
+            len(token) <= 16 * 1024
+            and len(segments) == 3
+            and all(
+                segment
+                and all(
+                    character.isascii()
+                    and (character.isalnum() or character in "-_")
+                    for character in segment
+                )
+                for segment in segments
+            )
+        )
+        if not (is_static or is_compact_jwt):
+            raise ValueError("Credential file must contain a bounded static token or compact JWT")
         self._metadata = (("authorization", "Bearer " + token),)
         self._timeout = timeout
         host = parsed.hostname

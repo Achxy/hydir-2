@@ -28,7 +28,11 @@ rusqlite.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+jsonwebtoken.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
 tempfile = "3.23"
+rsa = "0.9.10"
+rand = "0.8.5"

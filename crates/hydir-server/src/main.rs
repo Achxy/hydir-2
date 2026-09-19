@@ -30,13 +30,18 @@ use hydir_patch::{
 };
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
+};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 #[cfg(not(test))]
 use std::process::Stdio;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     error::Error,
     ffi::OsString,
@@ -343,6 +348,18 @@ PRAGMA user_version=7;
 COMMIT;
 ";
 
+const OIDC_IDENTITY_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE oidc_identities (
+    principal TEXT PRIMARY KEY REFERENCES identities(principal),
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    UNIQUE(issuer, subject)
+);
+PRAGMA user_version=8;
+COMMIT;
+";
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ProjectRole {
     Viewer,
@@ -369,6 +386,130 @@ impl ProjectRole {
             Self::Operator => "operator",
             Self::Admin => "admin",
         }
+    }
+}
+
+#[derive(Clone)]
+enum AuthenticationMode {
+    StaticTokens,
+    Oidc(Arc<OidcVerifier>),
+}
+
+struct OidcVerifier {
+    issuer: String,
+    audience: String,
+    keys: JwkSet,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcClaims {
+    sub: String,
+}
+
+struct OidcIdentity {
+    principal: String,
+    subject: String,
+}
+
+struct OidcIdentityRecord {
+    principal: String,
+    issuer: String,
+    subject: String,
+}
+
+impl OidcVerifier {
+    fn new(issuer: String, audience: String, keys: JwkSet) -> Result<Self, String> {
+        let uri: tonic::codegen::http::Uri = issuer
+            .parse()
+            .map_err(|_| "OIDC issuer must be a valid HTTPS URI")?;
+        if uri.scheme_str() != Some("https") || uri.authority().is_none() || uri.query().is_some() {
+            return Err("OIDC issuer must be an absolute HTTPS URI".to_owned());
+        }
+        if audience.is_empty() || audience.len() > 256 || audience.chars().any(char::is_control) {
+            return Err("OIDC audience must be 1..=256 non-control characters".to_owned());
+        }
+        if keys.keys.is_empty() || keys.keys.len() > 128 {
+            return Err("OIDC JWKS must contain 1..=128 keys".to_owned());
+        }
+        let mut key_ids = HashSet::new();
+        for key in &keys.keys {
+            let key_id = key
+                .common
+                .key_id
+                .as_deref()
+                .filter(|key_id| !key_id.is_empty() && key_id.len() <= 128)
+                .ok_or("every OIDC JWK requires a 1..=128 byte kid")?;
+            if !key_ids.insert(key_id) {
+                return Err("OIDC JWKS contains duplicate kid values".to_owned());
+            }
+            if !matches!(key.algorithm, AlgorithmParameters::RSA(_))
+                || key.common.key_algorithm != Some(KeyAlgorithm::RS256)
+                || key
+                    .common
+                    .public_key_use
+                    .as_ref()
+                    .is_some_and(|usage| usage != &PublicKeyUse::Signature)
+                || key
+                    .common
+                    .key_operations
+                    .as_ref()
+                    .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
+                || (key.common.public_key_use.is_some() && key.common.key_operations.is_some())
+            {
+                return Err(
+                    "OIDC JWKS keys must be RSA verification keys with alg RS256".to_owned(),
+                );
+            }
+            DecodingKey::from_jwk(key)
+                .map_err(|error| format!("OIDC JWK `{key_id}` is invalid: {error}"))?;
+        }
+        Ok(Self {
+            issuer,
+            audience,
+            keys,
+        })
+    }
+
+    fn verify(&self, token: &str) -> Result<OidcIdentity, String> {
+        if token.len() > 16 * 1024
+            || token.bytes().any(|byte| !byte.is_ascii_graphic())
+            || token.split('.').count() != 3
+        {
+            return Err("OIDC bearer token is not a bounded compact JWT".to_owned());
+        }
+        let header = decode_header(token).map_err(|_| "OIDC JWT header is invalid")?;
+        if header.alg != Algorithm::RS256 {
+            return Err("OIDC JWT algorithm must be RS256".to_owned());
+        }
+        let key_id = header.kid.as_deref().ok_or("OIDC JWT header has no kid")?;
+        let key = self
+            .keys
+            .find(key_id)
+            .ok_or("OIDC JWT kid is not present in the pinned JWKS")?;
+        let decoding_key = DecodingKey::from_jwk(key).map_err(|_| "OIDC JWT key is invalid")?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[self.audience.as_str()]);
+        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.validate_nbf = true;
+        validation.leeway = 30;
+        let claims = decode::<OidcClaims>(token, &decoding_key, &validation)
+            .map_err(|_| "OIDC JWT signature or claims are invalid")?
+            .claims;
+        if claims.sub.is_empty()
+            || claims.sub.len() > 512
+            || claims.sub.chars().any(char::is_control)
+        {
+            return Err("OIDC subject must be 1..=512 non-control characters".to_owned());
+        }
+        let principal = format!(
+            "oidc-{:x}",
+            Sha256::digest(format!("{}\0{}", self.issuer, claims.sub))
+        );
+        Ok(OidcIdentity {
+            principal,
+            subject: claims.sub,
+        })
     }
 }
 
@@ -405,10 +546,18 @@ fn require_project_role_in(
 struct Store {
     db: Arc<Mutex<Connection>>,
     workers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    authentication: AuthenticationMode,
 }
 
 impl Store {
     fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+        Self::open_with_auth(path, AuthenticationMode::StaticTokens)
+    }
+
+    fn open_with_auth(
+        path: &Path,
+        authentication: AuthenticationMode,
+    ) -> Result<Self, Box<dyn Error>> {
         #[cfg(unix)]
         if path != Path::new(":memory:") {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -434,7 +583,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 7 {
+        if version > 8 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -458,6 +607,9 @@ impl Store {
         if version <= 6 {
             connection.execute_batch(PROJECT_ACCESS_MIGRATION)?;
         }
+        if version <= 7 {
+            connection.execute_batch(OIDC_IDENTITY_MIGRATION)?;
+        }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
           FROM jobs WHERE state IN ('queued','running');
@@ -467,6 +619,7 @@ impl Store {
         Ok(Self {
             db: Arc::new(Mutex::new(connection)),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            authentication,
         })
     }
 
@@ -479,12 +632,13 @@ impl Store {
     fn create_identity(&self, principal: &str) -> Result<String, Box<dyn Error>> {
         if principal.is_empty()
             || principal.len() > 128
+            || principal.starts_with("oidc-")
             || !principal
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
             return Err(
-                "principal must be 1..=128 ASCII letters, digits, underscore, or hyphen".into(),
+                "principal must be 1..=128 ASCII letters, digits, underscore, or hyphen and must not use the reserved oidc- prefix".into(),
             );
         }
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -500,6 +654,9 @@ impl Store {
     }
 
     fn rotate_identity(&self, principal: &str) -> Result<String, Box<dyn Error>> {
+        if principal.starts_with("oidc-") {
+            return Err("OIDC identities cannot receive static credentials".into());
+        }
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let digest = sha256(token.as_bytes());
         let changed = self
@@ -516,24 +673,97 @@ impl Store {
         Ok(token)
     }
 
+    fn oidc_identities(&self) -> Result<Vec<OidcIdentityRecord>, Box<dyn Error>> {
+        let connection = self.db.lock().map_err(|_| "database lock poisoned")?;
+        let mut statement = connection.prepare(
+            "SELECT principal,issuer,subject FROM oidc_identities ORDER BY issuer,subject",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(OidcIdentityRecord {
+                    principal: row.get(0)?,
+                    issuer: row.get(1)?,
+                    subject: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     fn principal<T>(&self, request: &Request<T>) -> Result<String, Status> {
         let bearer = request
             .metadata()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| Status::unauthenticated("missing or invalid bearer credential"))?;
-        let digest = sha256(bearer.as_bytes());
-        self.connection()?
-            .query_row(
-                "SELECT principal FROM identities WHERE token_sha256=?1",
-                [digest],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(internal)?
-            .ok_or_else(|| Status::unauthenticated("invalid bearer credential"))
+        self.authenticate_bearer(bearer)
+    }
+
+    fn authenticate_bearer(&self, bearer: &str) -> Result<String, Status> {
+        match &self.authentication {
+            AuthenticationMode::StaticTokens => {
+                if bearer.len() != 64 || !bearer.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(Status::unauthenticated("invalid static bearer credential"));
+                }
+                let digest = sha256(bearer.as_bytes());
+                self.connection()?
+                    .query_row(
+                        "SELECT principal FROM identities WHERE token_sha256=?1",
+                        [digest],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                    .ok_or_else(|| Status::unauthenticated("invalid bearer credential"))
+            }
+            AuthenticationMode::Oidc(verifier) => {
+                let identity = verifier.verify(bearer).map_err(Status::unauthenticated)?;
+                let disabled_static_digest =
+                    sha256(format!("oidc-static-disabled\0{}", identity.principal).as_bytes());
+                let mut connection = self.connection()?;
+                let transaction = connection.transaction().map_err(internal)?;
+                let registered: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT issuer,subject FROM oidc_identities WHERE principal=?1",
+                        [&identity.principal],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if let Some(registered) = registered {
+                    if registered != (verifier.issuer.clone(), identity.subject) {
+                        return Err(Status::unauthenticated("OIDC identity mapping collision"));
+                    }
+                } else {
+                    let principal_exists: bool = transaction
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1)",
+                            [&identity.principal],
+                            |row| row.get(0),
+                        )
+                        .map_err(internal)?;
+                    if principal_exists {
+                        return Err(Status::unauthenticated(
+                            "OIDC principal collides with an existing local identity",
+                        ));
+                    }
+                    transaction
+                        .execute(
+                            "INSERT INTO identities(principal,token_sha256) VALUES(?1,?2)",
+                            params![identity.principal, disabled_static_digest],
+                        )
+                        .map_err(internal)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO oidc_identities(principal,issuer,subject) VALUES(?1,?2,?3)",
+                            params![identity.principal, verifier.issuer, identity.subject],
+                        )
+                        .map_err(internal)?;
+                }
+                transaction.commit().map_err(internal)?;
+                Ok(identity.principal)
+            }
+        }
     }
 
     fn require_project_role(
@@ -2572,12 +2802,13 @@ impl Hydir for Store {
         request: Request<JobEventRequest>,
     ) -> Result<Response<Self::StreamJobEventsStream>, Status> {
         let principal = self.principal(&request)?;
-        let token = request
+        let bearer = request
             .metadata()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| Status::unauthenticated("credential missing"))?;
-        let token_digest = sha256(token.strip_prefix("Bearer ").unwrap_or_default().as_bytes());
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or_else(|| Status::unauthenticated("credential missing"))?
+            .to_owned();
         let input = request.into_inner();
         self.job(&principal, &input.project_id, &input.job_id)?;
         let mut cursor = i64::try_from(input.after_sequence)
@@ -2587,15 +2818,10 @@ impl Hydir for Store {
         tokio::spawn(async move {
             loop {
                 let snapshot: Result<(Vec<JobEvent>, bool), Status> = (|| {
-                    let conn = store.connection()?;
-                    let credential_valid: bool = conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1 AND token_sha256=?2)",
-                        params![principal, token_digest],
-                        |row| row.get(0),
-                    ).map_err(internal)?;
-                    if !credential_valid {
+                    if store.authenticate_bearer(&bearer)? != principal {
                         return Err(Status::unauthenticated("credential was revoked"));
                     }
+                    let conn = store.connection()?;
                     let state: String = conn
                         .query_row(
                             "SELECT j.state FROM jobs j JOIN project_acls a ON a.project_id=j.project_id \
@@ -2911,6 +3137,17 @@ fn tls_config(certificate: &Path, private_key: &Path) -> Result<ServerTlsConfig,
         .timeout(Duration::from_secs(10)))
 }
 
+fn oidc_verifier(
+    issuer: &str,
+    audience: &str,
+    jwks_path: &Path,
+) -> Result<OidcVerifier, Box<dyn Error>> {
+    let bytes = read_tls_material(jwks_path, "OIDC JWKS", false)?;
+    let keys: JwkSet =
+        serde_json::from_slice(&bytes).map_err(|error| format!("OIDC JWKS JSON: {error}"))?;
+    OidcVerifier::new(issuer.to_owned(), audience.to_owned(), keys).map_err(Into::into)
+}
+
 async fn serve_rpc(
     store: Store,
     address: SocketAddr,
@@ -2961,6 +3198,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let token = store.rotate_identity(principal)?;
             println!("principal: {principal}\nnew credential (save securely; shown once): {token}");
         }
+        [identity, list, database] if identity == "identity" && list == "list-oidc" => {
+            let store = Store::open(Path::new(database))?;
+            let identities = store
+                .oidc_identities()?
+                .into_iter()
+                .map(|identity| {
+                    json!({
+                        "principal": identity.principal,
+                        "issuer": identity.issuer,
+                        "subject": identity.subject,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&identities)?);
+        }
         [access, grant, database, project, actor, principal, role]
             if access == "access" && grant == "grant" =>
         {
@@ -3007,7 +3259,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("hydird TLS RPC listening on {address}");
             serve_rpc(store, address, Some(tls)).await?;
         }
-        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem>".into()),
+        [serve, database, bind, certificate, private_key, issuer, audience, jwks]
+            if serve == "serve-oidc" =>
+        {
+            if database == ":memory:" {
+                return Err("hydird serve-oidc requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let verifier = oidc_verifier(issuer, audience, Path::new(jwks))?;
+            let store = Store::open_with_auth(
+                Path::new(database),
+                AuthenticationMode::Oidc(Arc::new(verifier)),
+            )?;
+            println!("hydird TLS/OIDC RPC listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird identity list-oidc <database.sqlite> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> | hydird serve-oidc <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json>".into()),
     }
     Ok(())
 }
@@ -3015,6 +3283,100 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_oidc_jwks_verifies_claims_and_provisions_stable_principal() {
+        use jsonwebtoken::{EncodingKey, Header, encode, jwk::Jwk};
+        use rand::rngs::OsRng;
+        use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey};
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct Claims<'a> {
+            sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
+            exp: u64,
+            nbf: u64,
+        }
+
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let private_der = private_key.to_pkcs1_der().unwrap();
+        let encoding_key = EncodingKey::from_rsa_der(private_der.as_bytes());
+        let mut jwk = Jwk::from_encoding_key(&encoding_key, Algorithm::RS256).unwrap();
+        jwk.common.key_id = Some("test-key".to_owned());
+        jwk.common.public_key_use = Some(PublicKeyUse::Signature);
+        let verifier = Arc::new(
+            OidcVerifier::new(
+                "https://identity.example/tenant".to_owned(),
+                "hydir-api".to_owned(),
+                JwkSet { keys: vec![jwk] },
+            )
+            .unwrap(),
+        );
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = Claims {
+            sub: "analyst@example",
+            iss: "https://identity.example/tenant",
+            aud: "hydir-api",
+            exp: now + 300,
+            nbf: now.saturating_sub(1),
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key".to_owned());
+        let token = encode(&header, &claims, &encoding_key).unwrap();
+        let store = Store::open_with_auth(
+            Path::new(":memory:"),
+            AuthenticationMode::Oidc(verifier.clone()),
+        )
+        .unwrap();
+        let principal = store.authenticate_bearer(&token).unwrap();
+        assert!(principal.starts_with("oidc-"));
+        assert!(store.rotate_identity(&principal).is_err());
+        assert_eq!(store.authenticate_bearer(&token).unwrap(), principal);
+        let registered: (String, String) = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT issuer,subject FROM oidc_identities WHERE principal=?1",
+                [&principal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            registered,
+            (
+                "https://identity.example/tenant".to_owned(),
+                "analyst@example".to_owned()
+            )
+        );
+
+        let wrong_audience = encode(
+            &header,
+            &Claims {
+                aud: "another-api",
+                ..claims
+            },
+            &encoding_key,
+        )
+        .unwrap();
+        assert!(store.authenticate_bearer(&wrong_audience).is_err());
+        let expired = encode(
+            &header,
+            &Claims {
+                exp: now.saturating_sub(31),
+                ..claims
+            },
+            &encoding_key,
+        )
+        .unwrap();
+        assert!(store.authenticate_bearer(&expired).is_err());
+        let mut unknown_header = Header::new(Algorithm::RS256);
+        unknown_header.kid = Some("unknown-key".to_owned());
+        let unknown_key = encode(&unknown_header, &claims, &encoding_key).unwrap();
+        assert!(store.authenticate_bearer(&unknown_key).is_err());
+        assert!(verifier.verify("not.a.jwt").is_err());
+    }
 
     #[test]
     fn tls_material_requires_absolute_bounded_pem_text() {
@@ -3680,7 +4042,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=8;")
+            .execute_batch("PRAGMA user_version=9;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -3714,7 +4076,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
         assert_eq!(
             store
