@@ -22,59 +22,6 @@ Start with a function you can name. HydIR opens little-endian x86-64 ELF files w
 
 The checked-in [`hydir_max2` walkthrough](https://hydir.wiki/articles/max2) shows the whole path on a 16-byte function. HydIR is an engineering workbench for a bounded subset, not a general decompiler: unsupported instructions or memory behavior, unresolved calls, unmodelled partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
 
-## Quick start
-
-Clone the repository with its submodules. Rust 1.96 is pinned in [`rust-toolchain.toml`](rust-toolchain.toml), and [`Cargo.lock`](Cargo.lock) fixes the Rust dependency graph. Run the tests, then open the workbench:
-
-```bash
-cargo test --locked --workspace
-cargo run --locked --bin hydir
-```
-
-For the presentation-ready PRISM binary and a complete Region Studio bundle
-on Windows:
-
-```powershell
-.\scripts\launch-prism-demo.cmd
-```
-
-The [PRISM presenter guide](docs/PRISM_DEMO.md) covers the six-minute path from
-digest-bound region recovery through physical-state IR, deterministic C,
-PatchLang/PatchIR, a real RX-segment trampoline, and verification evidence.
-
-Open a local binary directly:
-
-```bash
-cargo run --locked --bin hydir -- \
-  --open-local /path/to/program.elf function_name
-```
-
-If you want files you can keep or diff, take one function through the CLI:
-
-```bash
-cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
-cargo run --locked --bin hydirctl -- disassemble /path/to/program.elf
-cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
-cargo run --locked --bin hydirctl -- region /path/to/program.elf function_name
-cargo run --locked --bin hydirctl -- lift \
-  /path/to/program.elf function_name \
-  --assume-u64x2 --output lifted.ll
-cargo run --locked --bin hydirctl -- decompile \
-  /path/to/program.elf function_name \
-  --assume-u64x2 --output lifted.c
-```
-
-The [semantic evidence gate](SEMANTIC_GATE.md) records supported cases,
-explicit refusals, and semantic mismatches. The [HydIR compatibility report](HYDIR_COMPATIBILITY.md)
-defines the pinned reference experiment, while [MIRRORBALL_STUDY.md](MIRRORBALL_STUDY.md)
-tracks recovery-boundary evidence.
-
-The lift command asks you to assert a two-argument unsigned 64-bit ABI; HydIR does not guess the prototype. The full demo path needs Clang with x86-64 ELF and LLVM IR support. Native execution comparisons require Linux x86-64. On macOS with Docker Desktop:
-
-```bash
-bash scripts/demo-linux-docker.sh
-```
-
 ## Native analysis workbench
 
 The desktop workbench keeps the program tree, analysis views, inspector, and diagnostics visible at once. It can:
