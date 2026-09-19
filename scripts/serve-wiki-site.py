@@ -8,7 +8,7 @@ import argparse
 
 
 SITE = Path(__file__).resolve().parents[1] / "blog"
-ROUTES = {"/start", "/architecture", "/blogs", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function"}
+ROUTES = {"/start", "/architecture", "/blogs", "/articles/patchlang-patchir", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function"}
 
 
 class WikiHandler(SimpleHTTPRequestHandler):
