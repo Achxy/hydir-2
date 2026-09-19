@@ -1,8 +1,8 @@
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at,
-    lift_region_decision, lift_symbol, proven_stack_local_offsets, recover_at_cfg,
-    recover_region_cfg, recover_symbol_cfg, region_contract,
+    lift_physical_region, lift_region_decision, lift_symbol, proven_stack_local_offsets,
+    recover_at_cfg, recover_region_cfg, recover_symbol_cfg, region_contract,
 };
 use hydir_c::{
     build_decision_decompilation_unit, build_decompilation_unit, emit_decision_region_c,
@@ -42,6 +42,7 @@ Usage:
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
   hydirctl hydir-spec-region <hydir-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
+  hydirctl hydir-spec-lift <hydir-spec.pb> <linked-elf> <block-uid> [--output <physical-region-ir.json>]
   hydirctl hydir-spec-decompile <hydir-spec.pb> <linked-elf> <block-uid> [--output <unit.json>]
   hydirctl hydir-spec-report <hydir-spec.pb> <linked-elf>
   hydirctl cfg <elf> <function-symbol>
@@ -320,6 +321,34 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!();
             }
         }
+        Some("hydir-spec-lift") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let uid = parse_u64_auto(&args[3], "block UID")?;
+            let region = document.region_spec_for_elf(&elf, uid)?;
+            let json = serde_json::to_vec_pretty(&lift_physical_region(&region)?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
         Some("hydir-spec-decompile") if args.len() == 4 || args.len() == 6 => {
             let output = if args.len() == 6 {
                 if args[4] != "--output" {
@@ -367,7 +396,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut regions = Vec::new();
             let mut bound = 0usize;
             let mut cfg_recovered = 0usize;
-            let mut lifted = 0usize;
+            let mut physical_ir_lifted = 0usize;
+            let mut structured_ir_lifted = 0usize;
             let mut c_emitted = 0usize;
             for function in &document.specification().functions {
                 for uid in function.blocks.keys() {
@@ -375,7 +405,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         "uid": uid,
                         "bound": false,
                         "cfg_recovered": false,
-                        "lifted": false,
+                        "physical_ir_lifted": false,
+                        "structured_ir_lifted": false,
                         "c_emitted": false,
                     });
                     match document.region_spec_for_elf(&elf, *uid) {
@@ -395,12 +426,31 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                                 Err(error) => result["cfg_diagnostic"] = json!(error.to_string()),
                             }
+                            match lift_physical_region(&region) {
+                                Ok(physical_ir) => {
+                                    physical_ir_lifted += 1;
+                                    result["physical_ir_lifted"] = json!(true);
+                                    result["physical_ir_kind"] = json!("physical_v1");
+                                    result["physical_ir_instructions"] =
+                                        json!(physical_ir.instructions.len());
+                                    result["physical_ir_sha256"] = json!(format!(
+                                        "{:x}",
+                                        sha2::Sha256::digest(serde_json::to_vec(&physical_ir)?)
+                                    ));
+                                    result["lowering_ready"] = json!(physical_ir.lowering_ready);
+                                    result["unresolved_fact_count"] =
+                                        json!(physical_ir.unresolved_facts.len());
+                                }
+                                Err(error) => {
+                                    result["physical_ir_diagnostic"] = json!(error.to_string())
+                                }
+                            }
                             match lift_region_decision(&region) {
                                 Ok(decision_ir) => {
                                     let llvm = emit_decision_region_llvm(&decision_ir, &region)?;
-                                    lifted += 1;
-                                    result["lifted"] = json!(true);
-                                    result["region_ir_kind"] = json!("decision_v1");
+                                    structured_ir_lifted += 1;
+                                    result["structured_ir_lifted"] = json!(true);
+                                    result["structured_ir_kind"] = json!("decision_v1");
                                     result["llvm_sha256"] =
                                         json!(format!("{:x}", sha2::Sha256::digest(&llvm)));
                                     match emit_decision_region_c(&decision_ir, &region) {
@@ -424,13 +474,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "source_sha256": document.source_sha256(),
                     "binary_sha256": format!("{:x}", sha2::Sha256::digest(&elf)),
                     "total_regions": document.inventory().blocks,
                     "bound_regions": bound,
                     "cfg_recovered_regions": cfg_recovered,
-                    "lifted_regions": lifted,
+                    "physical_ir_regions": physical_ir_lifted,
+                    "structured_ir_regions": structured_ir_lifted,
                     "c_regions": c_emitted,
                     "regions": regions,
                 }))?

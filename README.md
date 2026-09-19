@@ -125,17 +125,21 @@ converted block-by-block into RegionSpec v3:
 cargo run --locked --bin hydirctl -- hydir-spec-inspect program.proto
 cargo run --locked --bin hydirctl -- hydir-spec-region \
   program.proto program.elf 26 --output region.json
+cargo run --locked --bin hydirctl -- hydir-spec-lift \
+  program.proto program.elf 26 --output physical-region-ir.json
 cargo run --locked --bin hydirctl -- hydir-spec-decompile \
   program.proto program.elf 35 --output decompilation-unit.json
 cargo run --locked --bin hydirctl -- hydir-spec-report \
   program.proto program.elf
 ```
 
-The first typed native RegionIR form covers side-effect-free conditional
-regions. It binds imported physical flag inputs, both exact continuation
-addresses, and every live output through an explicit pass-through mapping. Its
-LLVM-compatible text and deterministic C use aggregate results rather than an
-invented scalar function ABI; other region shapes continue to fail closed.
+`PhysicalRegionIR` v1 covers every instruction in the pinned 23-region corpus.
+It records typed operations and operands, exact successors, register/flag and
+memory effects, physical boundary locations, stack deltas, unresolved facts,
+and byte/digest provenance. This decoded artifact does not imply lowering or
+replacement safety. The structured decision form remains the narrower proven
+path: it binds imported flag inputs, both exact continuations, and unchanged
+live outputs before emitting LLVM-compatible text and deterministic C.
 
 The local server mounts both HydIR services and accepts the bounded streaming
 chunk convention. For non-empty programs it currently returns a fail-closed

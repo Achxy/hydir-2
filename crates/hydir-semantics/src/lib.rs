@@ -333,7 +333,7 @@ impl Op {
                 dst, base, index, ..
             } => {
                 effect.read_registers =
-                    base.map_or(0, register_bit) | index.map_or(0, register_bit);
+                    base.map_or(0, address_register_bit) | index.map_or(0, address_register_bit);
                 effect.write_registers = register_bit(dst);
             }
             Op::Alu { dst, src, .. } => {
@@ -1027,6 +1027,17 @@ mod tests {
                 src: Value::Immediate(0x223b),
             }
         );
+        assert_eq!(op.effects().memory, MemoryEffect::None);
+    }
+
+    #[test]
+    fn frame_based_lea_reads_the_physical_frame_pointer() {
+        // lea rax,[rbp-0xc]
+        let mut decoder =
+            Decoder::with_ip(64, &[0x48, 0x8d, 0x45, 0xf4], 0x1000, DecoderOptions::NONE);
+        let op = classify(&decoder.decode()).unwrap();
+        assert_eq!(op.effects().read_registers, RBP);
+        assert_eq!(op.effects().write_registers, RAX);
         assert_eq!(op.effects().memory, MemoryEffect::None);
     }
 

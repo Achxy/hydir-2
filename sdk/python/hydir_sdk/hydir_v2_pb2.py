@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ehydir_v2.proto\x12\x08hydir.v2\"\x11\n\x0f\x44iscoverRequest\"\x9d\x02\n\rDiscoverReply\x12\x13\n\x0b\x61pi_version\x18\x01 \x01(\r\x12\x1c\n\x14program_spec_version\x18\x02 \x01(\r\x12\x1b\n\x13region_spec_version\x18\x03 \x01(\r\x12\"\n\x1a\x64\x65\x63ompilation_unit_version\x18\x04 \x01(\r\x12\x1c\n\x14patch_bundle_version\x18\x05 \x01(\r\x12\x17\n\x0fstable_contract\x18\x06 \x01(\t\x12\x15\n\rcompile_patch\x18\x07 \x01(\x08\x12%\n\x1dstructural_patch_verification\x18\x08 \x01(\x08\x12#\n\x1b\x62\x65havior_patch_verification\x18\t \x01(\x08\"m\n\rRegionRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\"\xb4\x01\n\x0cPatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12\x12\n\npatch_json\x18\x04 \x01(\x0c\x12\x17\n\x0ftrusted_fixture\x18\x05 \x01(\x08\x12\x14\n\x0c\x61ssume_u64x2\x18\x06 \x01(\x08\x12\x19\n\x11\x61ssume_entry_only\x18\x07 \x01(\x08\"^\n\x12VerifyPatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x19\n\x11patch_bundle_json\x18\x03 \x01(\x0c\"^\n\rArtifactReply\x12\x0e\n\x06sha256\x18\x01 \x01(\t\x12\x12\n\nmedia_type\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x18\n\x10project_revision\x18\x04 \x01(\x04\"i\n\rMutationReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x03 \x01(\t\x12\x1b\n\x13patch_bundle_sha256\x18\x04 \x01(\t\"_\n\x11VerificationReply\x12\x1a\n\x12structurally_valid\x18\x01 \x01(\x08\x12\x19\n\x11\x62\x65havior_verified\x18\x02 \x01(\x08\x12\x13\n\x0breport_json\x18\x03 \x01(\t2\x97\x03\n\x07HydirV2\x12>\n\x08\x44iscover\x12\x19.hydir.v2.DiscoverRequest\x1a\x17.hydir.v2.DiscoverReply\x12=\n\tGetRegion\x12\x17.hydir.v2.RegionRequest\x1a\x17.hydir.v2.ArtifactReply\x12\x43\n\x0f\x44\x65\x63ompileRegion\x12\x17.hydir.v2.RegionRequest\x1a\x17.hydir.v2.ArtifactReply\x12?\n\x0c\x43ompilePatch\x12\x16.hydir.v2.PatchRequest\x1a\x17.hydir.v2.ArtifactReply\x12=\n\nApplyPatch\x12\x16.hydir.v2.PatchRequest\x1a\x17.hydir.v2.MutationReply\x12H\n\x0bVerifyPatch\x12\x1c.hydir.v2.VerifyPatchRequest\x1a\x1b.hydir.v2.VerificationReplyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ehydir_v2.proto\x12\x08hydir.v2\"\x11\n\x0f\x44iscoverRequest\"\xb9\x02\n\rDiscoverReply\x12\x13\n\x0b\x61pi_version\x18\x01 \x01(\r\x12\x1c\n\x14program_spec_version\x18\x02 \x01(\r\x12\x1b\n\x13region_spec_version\x18\x03 \x01(\r\x12\"\n\x1a\x64\x65\x63ompilation_unit_version\x18\x04 \x01(\r\x12\x1c\n\x14patch_bundle_version\x18\x05 \x01(\r\x12\x17\n\x0fstable_contract\x18\x06 \x01(\t\x12\x15\n\rcompile_patch\x18\x07 \x01(\x08\x12%\n\x1dstructural_patch_verification\x18\x08 \x01(\x08\x12#\n\x1b\x62\x65havior_patch_verification\x18\t \x01(\x08\x12\x1a\n\x12physical_region_ir\x18\n \x01(\x08\"m\n\rRegionRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0f\x66unction_symbol\x18\x03 \x01(\t\x12\x14\n\x0c\x61ssume_u64x2\x18\x04 \x01(\x08\"\xb4\x01\n\x0cPatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12\x12\n\npatch_json\x18\x04 \x01(\x0c\x12\x17\n\x0ftrusted_fixture\x18\x05 \x01(\x08\x12\x14\n\x0c\x61ssume_u64x2\x18\x06 \x01(\x08\x12\x19\n\x11\x61ssume_entry_only\x18\x07 \x01(\x08\"^\n\x12VerifyPatchRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x19\n\x11patch_bundle_json\x18\x03 \x01(\x0c\"^\n\rArtifactReply\x12\x0e\n\x06sha256\x18\x01 \x01(\t\x12\x12\n\nmedia_type\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x18\n\x10project_revision\x18\x04 \x01(\x04\"i\n\rMutationReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x03 \x01(\t\x12\x1b\n\x13patch_bundle_sha256\x18\x04 \x01(\t\"_\n\x11VerificationReply\x12\x1a\n\x12structurally_valid\x18\x01 \x01(\x08\x12\x19\n\x11\x62\x65havior_verified\x18\x02 \x01(\x08\x12\x13\n\x0breport_json\x18\x03 \x01(\t2\xd7\x03\n\x07HydirV2\x12>\n\x08\x44iscover\x12\x19.hydir.v2.DiscoverRequest\x1a\x17.hydir.v2.DiscoverReply\x12=\n\tGetRegion\x12\x17.hydir.v2.RegionRequest\x1a\x17.hydir.v2.ArtifactReply\x12>\n\nLiftRegion\x12\x17.hydir.v2.RegionRequest\x1a\x17.hydir.v2.ArtifactReply\x12\x43\n\x0f\x44\x65\x63ompileRegion\x12\x17.hydir.v2.RegionRequest\x1a\x17.hydir.v2.ArtifactReply\x12?\n\x0c\x43ompilePatch\x12\x16.hydir.v2.PatchRequest\x1a\x17.hydir.v2.ArtifactReply\x12=\n\nApplyPatch\x12\x16.hydir.v2.PatchRequest\x1a\x17.hydir.v2.MutationReply\x12H\n\x0bVerifyPatch\x12\x1c.hydir.v2.VerifyPatchRequest\x1a\x1b.hydir.v2.VerificationReplyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,19 +34,19 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_DISCOVERREQUEST']._serialized_start=28
   _globals['_DISCOVERREQUEST']._serialized_end=45
   _globals['_DISCOVERREPLY']._serialized_start=48
-  _globals['_DISCOVERREPLY']._serialized_end=333
-  _globals['_REGIONREQUEST']._serialized_start=335
-  _globals['_REGIONREQUEST']._serialized_end=444
-  _globals['_PATCHREQUEST']._serialized_start=447
-  _globals['_PATCHREQUEST']._serialized_end=627
-  _globals['_VERIFYPATCHREQUEST']._serialized_start=629
-  _globals['_VERIFYPATCHREQUEST']._serialized_end=723
-  _globals['_ARTIFACTREPLY']._serialized_start=725
-  _globals['_ARTIFACTREPLY']._serialized_end=819
-  _globals['_MUTATIONREPLY']._serialized_start=821
-  _globals['_MUTATIONREPLY']._serialized_end=926
-  _globals['_VERIFICATIONREPLY']._serialized_start=928
-  _globals['_VERIFICATIONREPLY']._serialized_end=1023
-  _globals['_HYDIRV2']._serialized_start=1026
-  _globals['_HYDIRV2']._serialized_end=1433
+  _globals['_DISCOVERREPLY']._serialized_end=361
+  _globals['_REGIONREQUEST']._serialized_start=363
+  _globals['_REGIONREQUEST']._serialized_end=472
+  _globals['_PATCHREQUEST']._serialized_start=475
+  _globals['_PATCHREQUEST']._serialized_end=655
+  _globals['_VERIFYPATCHREQUEST']._serialized_start=657
+  _globals['_VERIFYPATCHREQUEST']._serialized_end=751
+  _globals['_ARTIFACTREPLY']._serialized_start=753
+  _globals['_ARTIFACTREPLY']._serialized_end=847
+  _globals['_MUTATIONREPLY']._serialized_start=849
+  _globals['_MUTATIONREPLY']._serialized_end=954
+  _globals['_VERIFICATIONREPLY']._serialized_start=956
+  _globals['_VERIFICATIONREPLY']._serialized_end=1051
+  _globals['_HYDIRV2']._serialized_start=1054
+  _globals['_HYDIRV2']._serialized_end=1525
 # @@protoc_insertion_point(module_scope)

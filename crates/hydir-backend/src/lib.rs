@@ -14,9 +14,9 @@ pub use disasm::disassemble_elf;
 use hydir_core::{
     Address, AddressKind, AddressSpaceSpec, DisassemblyFlow, ExitStackRelation, FactProvenance,
     FactSource, FunctionCfg, FunctionSpec, ImportSpec, InteriorEntryEvidence, MappedSegmentSpec,
-    PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION, RecoveryState, RegionContract,
-    RegionDecisionIr, RelocationSpec, RelocationTargetSpec, SectionSpec, UncertaintySpec,
-    region_bytes,
+    PROGRAM_SPEC_VERSION, PhysicalRegionIr, ProgramSpec, REGION_SPEC_VERSION, RecoveryState,
+    RegionContract, RegionDecisionIr, RelocationSpec, RelocationTargetSpec, SectionSpec,
+    UncertaintySpec, region_bytes,
 };
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
@@ -87,6 +87,13 @@ pub fn recover_region_cfg(region: &RegionContract) -> Result<FunctionCfg> {
 /// continuation addresses.
 pub fn lift_region_decision(region: &RegionContract) -> Result<RegionDecisionIr> {
     cfg::lift_region_decision(region)
+}
+
+/// Decode a RegionSpec into typed physical-state RegionIR. This proves the
+/// instruction semantics and declared control flow while retaining unresolved
+/// boundary facts that still block SSA/C and patch lowering.
+pub fn lift_physical_region(region: &RegionContract) -> Result<PhysicalRegionIr> {
+    cfg::lift_physical_region(region)
 }
 
 fn parse_elf(bytes: &[u8]) -> Result<object::File<'_>> {

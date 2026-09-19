@@ -14,7 +14,8 @@ use hydir_api::v1::{
 use hydir_api::v2 as api_v2;
 use hydir_api::v2::hydir_v2_server::HydirV2Server;
 use hydir_backend::{
-    MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg, region_contract,
+    MAX_BINARY_BYTES, import_elf, lift_physical_region, lift_symbol, recover_symbol_cfg,
+    region_contract,
 };
 use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
@@ -911,6 +912,11 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("region", Some(symbol)) => region_contract(bytes, symbol)
             .map_err(|error| error.to_string())
             .and_then(|region| serde_json::to_vec(&region).map_err(|error| error.to_string())),
+        ("physical-region-ir", Some(symbol)) => {
+            let region = region_contract(bytes, symbol).map_err(|error| error.to_string())?;
+            let ir = lift_physical_region(&region).map_err(|error| error.to_string())?;
+            serde_json::to_vec(&ir).map_err(|error| error.to_string())
+        }
         ("lift", Some(symbol)) => lift_symbol(bytes, symbol)
             .map(String::into_bytes)
             .map_err(|error| error.to_string()),
@@ -2297,6 +2303,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
             compile_patch: true,
             structural_patch_verification: true,
             behavior_patch_verification: false,
+            physical_region_ir: true,
         }))
     }
 
@@ -2351,6 +2358,36 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
         Ok(Response::new(api_v2::ArtifactReply {
             sha256: digest,
             media_type: "application/vnd.hydir.decompilation-unit+json;version=1".to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn lift_region(
+        &self,
+        request: Request<api_v2::RegionRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let content =
+            run_worker("physical-region-ir", Some(&input.function_symbol), binary).await?;
+        let media_type = "application/vnd.hydir.physical-region-ir+json;version=1";
+        let digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            media_type,
+            &content,
+        )?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: media_type.to_owned(),
             content,
             project_revision: input.expected_revision,
         }))
@@ -2614,6 +2651,21 @@ mod tests {
         .into_inner();
         let parsed_region = hydir_core::parse_region_spec_json(&region.content).unwrap();
         assert_eq!(parsed_region.schema_version, REGION_SPEC_VERSION);
+
+        let physical_ir = api_v2::hydir_v2_server::HydirV2::lift_region(
+            &store,
+            authorized(region_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            physical_ir.media_type,
+            "application/vnd.hydir.physical-region-ir+json;version=1"
+        );
+        let physical_ir: hydir_core::PhysicalRegionIr =
+            serde_json::from_slice(&physical_ir.content).unwrap();
+        hydir_core::validate_physical_region_ir(&physical_ir, &parsed_region).unwrap();
 
         let decompilation = api_v2::hydir_v2_server::HydirV2::decompile_region(
             &store,

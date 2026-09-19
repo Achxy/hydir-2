@@ -4,6 +4,7 @@ package hydir.v2;
 service HydirV2 {
   rpc Discover (DiscoverRequest) returns (DiscoverReply);
   rpc GetRegion (RegionRequest) returns (ArtifactReply);
+  rpc LiftRegion (RegionRequest) returns (ArtifactReply);
   rpc DecompileRegion (RegionRequest) returns (ArtifactReply);
   rpc CompilePatch (PatchRequest) returns (ArtifactReply);
   rpc ApplyPatch (PatchRequest) returns (MutationReply);
@@ -21,6 +22,7 @@ message DiscoverReply {
   bool compile_patch = 7;
   bool structural_patch_verification = 8;
   bool behavior_patch_verification = 9;
+  bool physical_region_ir = 10;
 }
 
 message RegionRequest {
