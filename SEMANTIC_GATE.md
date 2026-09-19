@@ -4,7 +4,7 @@ Run `python3 scripts/semantic-gate.py` on native Linux x86-64 with Rust 1.96,
 Clang, GCC, and `opt` available. The GitHub Actions workflow
 `.github/workflows/semantic-gate.yml` runs the same command. It compiles four
 well-defined C functions with GCC and Clang at `-O0`, `-O1`, and `-O2`, and
-forty-four hand-written assembly functions, including every accepted x86-64
+forty-five hand-written assembly functions, including every accepted x86-64
 condition code. Each compiled binary is preserved
 under `target/semantic-gate/<timestamp>/`.
 
@@ -35,7 +35,7 @@ missing or malformed solver output is recorded as a refusal.
 after directed scalar, flag, branch, frame, memory-slot, call, and return
 instructions. These one-step checks test the expected architectural effects
 used when constructing fixtures; they do not alone prove HydIR's emitted IR.
-CI also requires all forty-four declared hand-assembly functions to match
+CI also requires all forty-five declared hand-assembly functions to match
 both backends. Optimized compiler outputs still count explicit refusals
 separately.
 Every accepted condition-code fixture must produce witnesses for both return
