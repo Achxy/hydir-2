@@ -1,26 +1,44 @@
 //! Reachable direct-control-flow recovery and a deliberately small scalar
 //! x86-64-to-LLVM lift. Each recovered instruction is an LLVM basic block;
 //! machine registers and arithmetic flags are joined with explicit phi nodes.
-//! This does not model guest memory, calls, or arbitrary x86 instructions.
+//! Balanced frame-only stack operations may be erased after a separate stack
+//! proof when they cannot affect scalar return values or branch flags.
+//! Eight-byte stack locals use proven, nonoverlapping frame slots and SSA
+//! values. Calls and arbitrary x86 instructions remain unsupported.
 
-use super::{Result, checked_register, error};
+use super::{Result, error};
 use hydir_core::{Address, AddressKind, BlockSpec, EdgeKind, EdgeSpec, FunctionCfg, SPEC_VERSION};
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use std::collections::{BTreeMap, VecDeque};
+use hydir_semantics::{Alu, Condition, Op, Value, Value32, classify};
+use iced_x86::{Decoder, DecoderOptions, Register};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-const ALL_FIELDS: [Field; 9] = [
+const ALL_FIELDS: [Field; 19] = [
     Field::Rax,
     Field::Rdi,
     Field::Rsi,
     Field::Rdx,
     Field::Rcx,
+    Field::R8,
+    Field::R9,
     Field::Zf,
     Field::Sf,
     Field::Of,
     Field::Cf,
+    Field::Slot(0),
+    Field::Slot(1),
+    Field::Slot(2),
+    Field::Slot(3),
+    Field::Slot(4),
+    Field::Slot(5),
+    Field::Slot(6),
+    Field::Slot(7),
 ];
-const FLAGS: u16 = Field::Zf.bit() | Field::Sf.bit() | Field::Of.bit() | Field::Cf.bit();
-const INPUTS: u16 = Field::Rdi.bit() | Field::Rsi.bit();
+const INPUTS: u32 = Field::Rdi.bit()
+    | Field::Rsi.bit()
+    | Field::Rdx.bit()
+    | Field::Rcx.bit()
+    | Field::R8.bit()
+    | Field::R9.bit();
 
 #[derive(Clone, Copy, Debug)]
 enum Field {
@@ -29,34 +47,54 @@ enum Field {
     Rsi,
     Rdx,
     Rcx,
+    R8,
+    R9,
     Zf,
     Sf,
     Of,
     Cf,
+    Slot(u8),
 }
 
 impl Field {
-    const fn bit(self) -> u16 {
-        1 << (self as u8)
+    const fn bit(self) -> u32 {
+        let index = match self {
+            Self::Rax => 0,
+            Self::Rdi => 1,
+            Self::Rsi => 2,
+            Self::Rdx => 3,
+            Self::Rcx => 4,
+            Self::R8 => 9,
+            Self::R9 => 10,
+            Self::Zf => 5,
+            Self::Sf => 6,
+            Self::Of => 7,
+            Self::Cf => 8,
+            Self::Slot(index) => 11 + index,
+        };
+        1 << index
     }
 
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Rax => "rax",
-            Self::Rdi => "rdi",
-            Self::Rsi => "rsi",
-            Self::Rdx => "rdx",
-            Self::Rcx => "rcx",
-            Self::Zf => "zf",
-            Self::Sf => "sf",
-            Self::Of => "of",
-            Self::Cf => "cf",
+            Self::Rax => "rax".into(),
+            Self::Rdi => "rdi".into(),
+            Self::Rsi => "rsi".into(),
+            Self::Rdx => "rdx".into(),
+            Self::Rcx => "rcx".into(),
+            Self::R8 => "r8".into(),
+            Self::R9 => "r9".into(),
+            Self::Zf => "zf".into(),
+            Self::Sf => "sf".into(),
+            Self::Of => "of".into(),
+            Self::Cf => "cf".into(),
+            Self::Slot(index) => format!("slot{index}"),
         }
     }
 
     fn ty(self) -> &'static str {
         match self {
-            Self::Rax | Self::Rdi | Self::Rsi | Self::Rdx | Self::Rcx => "i64",
+            Self::Rax | Self::Rdi | Self::Rsi | Self::Rdx | Self::Rcx | Self::R8 | Self::R9 | Self::Slot(_) => "i64",
             _ => "i1",
         }
     }
@@ -69,102 +107,75 @@ fn register_field(register: Register) -> Field {
         Register::RSI => Field::Rsi,
         Register::RDX => Field::Rdx,
         Register::RCX => Field::Rcx,
+        Register::R8 => Field::R8,
+        Register::R9 => Field::R9,
         _ => unreachable!("all registers were checked during classification"),
     }
 }
 
-#[derive(Clone, Copy)]
-enum Value {
-    Register(Register),
-    Immediate(i64),
+trait OpEffects {
+    fn defs(self) -> u32;
+    fn reads(self) -> u32;
 }
 
-#[derive(Clone, Copy)]
-enum Alu {
-    Add,
-    Sub,
-}
-
-#[derive(Clone, Copy)]
-enum Condition {
-    E,
-    Ne,
-    G,
-    Ge,
-    L,
-    Le,
-    A,
-    Ae,
-    B,
-    Be,
-    S,
-    Ns,
-    O,
-    No,
-}
-
-#[derive(Clone, Copy)]
-enum Op {
-    Mov {
-        dst: Register,
-        src: Value,
-    },
-    Lea {
-        dst: Register,
-        base: Option<Register>,
-        index: Option<Register>,
-        scale: u32,
-        displacement: i64,
-    },
-    Alu {
-        kind: Alu,
-        dst: Register,
-        src: Value,
-    },
-    Cmp {
-        lhs: Register,
-        rhs: Value,
-    },
-    Test {
-        lhs: Register,
-        rhs: Value,
-    },
-    Jcc(Condition),
-    Jmp,
-    Ret,
-    Nop,
-}
-
-impl Op {
-    fn defs(self) -> u16 {
-        match self {
-            Self::Mov { dst, .. } | Self::Lea { dst, .. } => register_field(dst).bit(),
-            Self::Alu { dst, .. } => register_field(dst).bit() | FLAGS,
-            Self::Cmp { .. } | Self::Test { .. } => FLAGS,
-            _ => 0,
+impl OpEffects for Op {
+    fn defs(self) -> u32 {
+        if is_frame_op(self) {
+            return 0;
         }
+        let effects = self.effects();
+        u32::from(effects.write_registers & 0x1f) | (u32::from(effects.write_flags) << 5)
     }
 
-    fn reads(self) -> u16 {
-        let value_bits = |value: Value| match value {
-            Value::Register(register) => register_field(register).bit(),
-            Value::Immediate(_) => 0,
-        };
-        match self {
-            Self::Mov { src, .. } => value_bits(src),
-            Self::Lea { base, index, .. } => {
-                base.map_or(0, |r| register_field(r).bit())
-                    | index.map_or(0, |r| register_field(r).bit())
-            }
-            Self::Alu { dst, src, .. } => register_field(dst).bit() | value_bits(src),
-            Self::Cmp { lhs, rhs } | Self::Test { lhs, rhs } => {
-                register_field(lhs).bit() | value_bits(rhs)
-            }
-            Self::Jcc(_) => FLAGS,
-            Self::Ret => Field::Rax.bit(),
-            Self::Jmp | Self::Nop => 0,
+    fn reads(self) -> u32 {
+        if is_frame_op(self) {
+            return 0;
+        }
+        if matches!(self, Op::Ret) {
+            return Field::Rax.bit();
+        }
+        let effects = self.effects();
+        u32::from(effects.read_registers & 0x1f) | (u32::from(effects.read_flags) << 5)
+    }
+}
+
+fn is_frame_op(op: Op) -> bool {
+    matches!(
+        op,
+        Op::SaveFramePointer
+            | Op::RestoreFramePointer
+            | Op::SetFramePointer
+            | Op::RestoreStackPointerFromFrame
+            | Op::AdjustStack { .. }
+            | Op::LeaveFrame
+    )
+}
+
+fn reject_stack_flag_uses(nodes: &BTreeMap<u64, Node>, entry: u64) -> Result<()> {
+    let mut pending = VecDeque::from([(entry, false)]);
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some((ip, mut stack_flags_live)) = pending.pop_front() {
+        if !visited.insert((ip, stack_flags_live)) {
+            continue;
+        }
+        let node = nodes
+            .get(&ip)
+            .ok_or_else(|| error("internal stack flag path leaves CFG"))?;
+        if stack_flags_live && matches!(node.op, Op::Jcc(_)) {
+            return Err(error(
+                "stack adjustment may set flags used by a conditional branch",
+            ));
+        }
+        if matches!(node.op, Op::AdjustStack { .. }) {
+            stack_flags_live = true;
+        } else if node.op.effects().write_flags != 0 {
+            stack_flags_live = false;
+        }
+        for successor in &node.successors {
+            pending.push_back((*successor, stack_flags_live));
         }
     }
+    Ok(())
 }
 
 struct Node {
@@ -172,125 +183,59 @@ struct Node {
     mnemonic: String,
     op: Op,
     successors: Vec<u64>,
+    slot: Option<u8>,
 }
 
-fn operand(instruction: &Instruction, index: u32) -> Result<Value> {
-    let ip = instruction.ip();
-    Ok(match instruction.op_kind(index) {
-        OpKind::Register => Value::Register(checked_register(instruction.op_register(index), ip)?),
-        OpKind::Immediate8to64 => Value::Immediate(instruction.immediate8to64()),
-        OpKind::Immediate32to64 => Value::Immediate(instruction.immediate32to64()),
-        OpKind::Immediate64 => Value::Immediate(instruction.immediate64() as i64),
-        _ => return Err(error(format!("operand kind unsupported at 0x{ip:x}"))),
-    })
-}
-
-fn classify(instruction: &Instruction) -> Result<Op> {
-    let ip = instruction.ip();
-    if instruction.has_lock_prefix()
-        || instruction.has_rep_prefix()
-        || instruction.has_repne_prefix()
-    {
-        return Err(error(format!("instruction prefix unsupported at 0x{ip:x}")));
-    }
-    let register_dest = || checked_register(instruction.op0_register(), ip);
-    let register_lhs = || checked_register(instruction.op0_register(), ip);
-    let op = match instruction.mnemonic() {
-        Mnemonic::Mov
-            if instruction.op_count() == 2 && instruction.op0_kind() == OpKind::Register =>
-        {
-            Op::Mov {
-                dst: register_dest()?,
-                src: operand(instruction, 1)?,
-            }
+impl Node {
+    fn defs(&self) -> u32 {
+        if matches!(self.op, Op::CallDirect { .. }) {
+            return Field::Rax.bit();
         }
-        Mnemonic::Lea
-            if instruction.op_count() == 2
-                && instruction.op0_kind() == OpKind::Register
-                && instruction.op1_kind() == OpKind::Memory =>
-        {
-            if instruction.segment_prefix() != Register::None
-                || instruction.memory_base() == Register::RIP
-            {
-                return Err(error(format!(
-                    "segment/RIP-relative LEA unsupported at 0x{ip:x}"
-                )));
-            }
-            let optional_register = |r| {
-                if r == Register::None {
-                    Ok(None)
-                } else {
-                    checked_register(r, ip).map(Some)
-                }
-            };
-            Op::Lea {
-                dst: register_dest()?,
-                base: optional_register(instruction.memory_base())?,
-                index: optional_register(instruction.memory_index())?,
-                scale: instruction.memory_index_scale(),
-                displacement: instruction.memory_displacement64() as i64,
-            }
-        }
-        Mnemonic::Add | Mnemonic::Sub
-            if instruction.op_count() == 2 && instruction.op0_kind() == OpKind::Register =>
-        {
-            Op::Alu {
-                kind: if instruction.mnemonic() == Mnemonic::Add {
-                    Alu::Add
-                } else {
-                    Alu::Sub
-                },
-                dst: register_dest()?,
-                src: operand(instruction, 1)?,
-            }
-        }
-        Mnemonic::Cmp | Mnemonic::Test
-            if instruction.op_count() == 2 && instruction.op0_kind() == OpKind::Register =>
-        {
-            let lhs = register_lhs()?;
-            let rhs = operand(instruction, 1)?;
-            if instruction.mnemonic() == Mnemonic::Cmp {
-                Op::Cmp { lhs, rhs }
+        self.op.defs()
+            | if matches!(self.op, Op::StoreStack64 { .. }) {
+                Field::Slot(self.slot.expect("validated stack store")).bit()
             } else {
-                Op::Test { lhs, rhs }
+                0
             }
-        }
-        Mnemonic::Jmp if instruction.flow_control() == FlowControl::UnconditionalBranch => Op::Jmp,
-        Mnemonic::Je => Op::Jcc(Condition::E),
-        Mnemonic::Jne => Op::Jcc(Condition::Ne),
-        Mnemonic::Jg => Op::Jcc(Condition::G),
-        Mnemonic::Jge => Op::Jcc(Condition::Ge),
-        Mnemonic::Jl => Op::Jcc(Condition::L),
-        Mnemonic::Jle => Op::Jcc(Condition::Le),
-        Mnemonic::Ja => Op::Jcc(Condition::A),
-        Mnemonic::Jae => Op::Jcc(Condition::Ae),
-        Mnemonic::Jb => Op::Jcc(Condition::B),
-        Mnemonic::Jbe => Op::Jcc(Condition::Be),
-        Mnemonic::Js => Op::Jcc(Condition::S),
-        Mnemonic::Jns => Op::Jcc(Condition::Ns),
-        Mnemonic::Jo => Op::Jcc(Condition::O),
-        Mnemonic::Jno => Op::Jcc(Condition::No),
-        Mnemonic::Ret if instruction.op_count() == 0 => Op::Ret,
-        Mnemonic::Nop if instruction.op_count() == 0 => Op::Nop,
-        _ => {
-            return Err(error(format!(
-                "unsupported {:?} at 0x{ip:x}",
-                instruction.mnemonic()
-            )));
-        }
-    };
-    if matches!(op, Op::Jcc(_) | Op::Jmp)
-        && !matches!(
-            instruction.op0_kind(),
-            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-        )
-    {
-        return Err(error(format!("non-direct branch unsupported at 0x{ip:x}")));
     }
-    Ok(op)
+
+    fn reads(&self) -> u32 {
+        if matches!(self.op, Op::CallDirect { .. }) {
+            return INPUTS;
+        }
+        self.op.reads()
+            | if matches!(self.op, Op::LoadStack64 { .. }) {
+                Field::Slot(self.slot.expect("validated stack load")).bit()
+            } else {
+                0
+            }
+    }
+
+    fn kills(&self) -> u32 {
+        if matches!(self.op, Op::CallDirect { .. }) {
+            (Field::Rax.bit()
+                | Field::Rdi.bit()
+                | Field::Rsi.bit()
+                | Field::Rdx.bit()
+                | Field::Rcx.bit()
+                | Field::R8.bit()
+                | Field::R9.bit()
+                | Field::Zf.bit()
+                | Field::Sf.bit()
+                | Field::Of.bit()
+                | Field::Cf.bit())
+                & !Field::Rax.bit()
+        } else {
+            0
+        }
+    }
 }
 
-fn recover(code: &[u8], address: u64) -> Result<BTreeMap<u64, Node>> {
+fn recover(
+    code: &[u8],
+    address: u64,
+    allowed_calls: Option<&BTreeSet<u64>>,
+) -> Result<BTreeMap<u64, Node>> {
     let end = address
         .checked_add(code.len() as u64)
         .ok_or_else(|| error("function address range overflow"))?;
@@ -320,7 +265,14 @@ fn recover(code: &[u8], address: u64) -> Result<BTreeMap<u64, Node>> {
             }
             *owner = Some(ip);
         }
-        let op = classify(&instruction)?;
+        let op = classify(&instruction).map_err(error)?;
+        if let Op::CallDirect { target } = op {
+            if allowed_calls.is_some_and(|allowed| !allowed.contains(&target)) {
+                return Err(error(format!(
+                    "direct call at 0x{ip:x} to 0x{target:x} requires a resolved callee and ABI state proof"
+                )));
+            }
+        }
         let successors = match op {
             Op::Ret => vec![],
             Op::Jmp => vec![instruction.near_branch_target()],
@@ -342,8 +294,33 @@ fn recover(code: &[u8], address: u64) -> Result<BTreeMap<u64, Node>> {
                 mnemonic: format!("{:?}", instruction.mnemonic()),
                 op,
                 successors,
+                slot: None,
             },
         );
+    }
+    if nodes.values().any(|node| {
+        is_frame_op(node.op)
+            || matches!(
+                node.op,
+                Op::LoadStack64 { .. } | Op::StoreStack64 { .. } | Op::CallDirect { .. }
+            )
+    }) {
+        let evidence = if allowed_calls.is_some_and(BTreeSet::is_empty) {
+            super::stack::analyze_stack(code, address)?
+        } else {
+            super::stack::analyze_stack_with_calls(code, address)?
+        };
+        for (ip, slot_offset) in evidence.slot_by_ip {
+            let index = evidence
+                .slots
+                .binary_search(&slot_offset)
+                .map_err(|_| error("internal stack-local slot is missing"))?;
+            nodes
+                .get_mut(&ip)
+                .ok_or_else(|| error("internal stack-local instruction is missing"))?
+                .slot = Some(index as u8);
+        }
+        reject_stack_flag_uses(&nodes, address)?;
     }
     Ok(nodes)
 }
@@ -359,7 +336,7 @@ pub(super) fn recover_function_cfg(
     if code.is_empty() || code.len() > 4096 {
         return Err(error("function must contain 1..=4096 bytes"));
     }
-    let nodes = recover(code, address)?;
+    let nodes = recover(code, address, Some(&BTreeSet::new()))?;
     let mut blocks = Vec::with_capacity(nodes.len());
     let mut edges = Vec::new();
     for (ip, node) in nodes {
@@ -397,7 +374,7 @@ pub(super) fn recover_function_cfg(
 }
 
 struct Flow {
-    incoming: BTreeMap<u64, u16>,
+    incoming: BTreeMap<u64, u32>,
     predecessors: BTreeMap<u64, Vec<u64>>,
 }
 
@@ -413,7 +390,7 @@ fn analyze(nodes: &BTreeMap<u64, Node>, address: u64) -> Result<Flow> {
         }
     }
     let all = ALL_FIELDS.iter().fold(0, |bits, field| bits | field.bit());
-    let mut incoming: BTreeMap<u64, u16> = nodes.keys().map(|ip| (*ip, all)).collect();
+    let mut incoming: BTreeMap<u64, u32> = nodes.keys().map(|ip| (*ip, all)).collect();
     let mut outgoing = incoming.clone();
     loop {
         let mut changed = false;
@@ -425,7 +402,7 @@ fn analyze(nodes: &BTreeMap<u64, Node>, address: u64) -> Result<Flow> {
             for predecessor in &predecessors[ip] {
                 bits &= outgoing[predecessor];
             }
-            let out = bits | node.op.defs();
+            let out = (bits & !node.kills()) | node.defs();
             if incoming[ip] != bits || outgoing[ip] != out {
                 incoming.insert(*ip, bits);
                 outgoing.insert(*ip, out);
@@ -437,7 +414,7 @@ fn analyze(nodes: &BTreeMap<u64, Node>, address: u64) -> Result<Flow> {
         }
     }
     for (ip, node) in nodes {
-        let missing = node.op.reads() & !incoming[ip];
+        let missing = node.reads() & !incoming[ip];
         if missing != 0 {
             let field = ALL_FIELDS
                 .iter()
@@ -593,6 +570,40 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
                 value_name(src, ip)
             ));
         }
+        Op::Mov32 { dst, src } => {
+            let value = match src {
+                Value32::Register(register) => {
+                    let source = input_name(register_field(register), ip);
+                    temporary(
+                        body,
+                        ip,
+                        &mut sequence,
+                        &format!("trunc i64 {source} to i32"),
+                    )
+                }
+                Value32::Immediate(value) => value.to_string(),
+            };
+            body.push_str(&format!(
+                "  {} = zext i32 {value} to i64\n",
+                output_name(register_field(dst), ip),
+            ));
+        }
+        Op::LoadStack64 { dst, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack load"));
+            body.push_str(&format!(
+                "  {} = add i64 0, {}\n",
+                output_name(register_field(dst), ip),
+                input_name(slot, ip)
+            ));
+        }
+        Op::StoreStack64 { src, .. } => {
+            let slot = Field::Slot(node.slot.expect("validated stack store"));
+            body.push_str(&format!(
+                "  {} = add i64 0, {}\n",
+                output_name(slot, ip),
+                input_name(register_field(src), ip)
+            ));
+        }
         Op::Lea {
             dst,
             base,
@@ -657,12 +668,38 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
             ));
         }
         Op::Jmp => body.push_str(&format!("  br label %b{:x}\n", node.successors[0])),
+        Op::CallDirect { target } => {
+            body.push_str(&format!(
+                "  {} = call i64 @hydir_callee_{target:x}(i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, i64 {})\n  br label %b{:x}\n",
+                output_name(Field::Rax, ip),
+                input_name(Field::Rdi, ip),
+                input_name(Field::Rsi, ip),
+                input_name(Field::Rdx, ip),
+                input_name(Field::Rcx, ip),
+                input_name(Field::R8, ip),
+                input_name(Field::R9, ip),
+                node.successors[0]
+            ));
+        }
         Op::Ret => body.push_str(&format!("  ret i64 {}\n", input_name(Field::Rax, ip))),
         Op::Nop => body.push_str(&format!("  br label %b{:x}\n", node.successors[0])),
+        Op::SaveFramePointer
+        | Op::RestoreFramePointer
+        | Op::SetFramePointer
+        | Op::RestoreStackPointerFromFrame
+        | Op::AdjustStack { .. }
+        | Op::LeaveFrame => body.push_str(&format!("  br label %b{:x}\n", node.successors[0])),
     }
     if matches!(
         node.op,
-        Op::Mov { .. } | Op::Lea { .. } | Op::Alu { .. } | Op::Cmp { .. } | Op::Test { .. }
+        Op::Mov { .. }
+            | Op::Mov32 { .. }
+            | Op::LoadStack64 { .. }
+            | Op::StoreStack64 { .. }
+            | Op::Lea { .. }
+            | Op::Alu { .. }
+            | Op::Cmp { .. }
+            | Op::Test { .. }
     ) {
         body.push_str(&format!("  br label %b{:x}\n", node.successors[0]));
     }
@@ -673,10 +710,28 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
 /// asserts the `u64(u64, u64)` SysV ABI contract; uninitialized register or
 /// flag reads on any recovered path are rejected before IR is emitted.
 pub fn lift_cfg(code: &[u8], address: u64) -> Result<String> {
+    lift_cfg_with_calls(code, address, &BTreeSet::new())
+}
+
+pub(super) fn discover_direct_calls(code: &[u8], address: u64) -> Result<BTreeSet<u64>> {
+    Ok(recover(code, address, None)?
+        .into_values()
+        .filter_map(|node| match node.op {
+            Op::CallDirect { target } => Some(target),
+            _ => None,
+        })
+        .collect())
+}
+
+pub(super) fn lift_cfg_with_calls(
+    code: &[u8],
+    address: u64,
+    allowed_calls: &BTreeSet<u64>,
+) -> Result<String> {
     if code.is_empty() || code.len() > 4096 {
         return Err(error("function must contain 1..=4096 bytes"));
     }
-    let nodes = recover(code, address)?;
+    let nodes = recover(code, address, Some(allowed_calls))?;
     let flow = analyze(&nodes, address)?;
     let mut body = format!("prologue:\n  br label %b{address:x}\n");
     for (ip, node) in &nodes {
@@ -703,7 +758,7 @@ pub fn lift_cfg(code: &[u8], address: u64) -> Result<String> {
             }
             for predecessor in &flow.predecessors[ip] {
                 let predecessor_node = &nodes[predecessor];
-                let name = if predecessor_node.op.defs() & field.bit() != 0 {
+                let name = if predecessor_node.defs() & field.bit() != 0 {
                     output_name(field, *predecessor)
                 } else {
                     input_name(field, *predecessor)
@@ -719,17 +774,158 @@ pub fn lift_cfg(code: &[u8], address: u64) -> Result<String> {
         }
         emit_node(&mut body, *ip, node);
     }
+    let call_scope = if allowed_calls.is_empty() {
+        "Calls are rejected."
+    } else {
+        "Only resolved scalar leaf calls with aligned stack and defined ABI state are accepted."
+    };
     Ok(format!(
         "; HydIR raw direct-CFG lift; asserted prototype: u64(u64, u64)\n\
-         ; Unmodeled memory, calls, indirect edges, and partial registers are rejected.\n\
+         ; Unmodeled memory aliases or widths, indirect edges, and unsupported partial registers are rejected. {call_scope}\n\
          target triple = \"x86_64-unknown-linux-gnu\"\n\n\
-         define i64 @hydir_lifted(i64 %arg0, i64 %arg1) {{\n{body}}}\n"
+         define i64 @hydir_lifted(i64 %arg0, i64 %arg1, i64 %arg2, i64 %arg3, i64 %arg4, i64 %arg5) {{\n{body}}}\n"
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_call_needs_resolved_callee_contract() {
+        let error = lift_cfg(&[0xe8, 0, 0, 0, 0, 0xc3], 0x1000).unwrap_err();
+        assert!(
+            error
+                .0
+                .contains("requires a resolved callee and ABI state proof")
+        );
+    }
+
+    #[test]
+    fn aligned_direct_call_defines_rax_and_invalidates_caller_saved_values() {
+        // sub rsp,8; call 0x2000; add rsp,8; ret
+        let code = [
+            0x48, 0x83, 0xec, 0x08, 0xe8, 0xf7, 0x0f, 0, 0, 0x48, 0x83, 0xc4, 0x08, 0xc3,
+        ];
+        let allowed = BTreeSet::from([0x2000]);
+        let ir = lift_cfg_with_calls(&code, 0x1000, &allowed).unwrap();
+        assert!(ir.contains("call i64 @hydir_callee_2000"));
+        let mut reads_clobbered = code.to_vec();
+        reads_clobbered.splice(13..13, [0x48, 0x89, 0xf8]); // mov rax,rdi
+        assert!(
+            lift_cfg_with_calls(&reads_clobbered, 0x1000, &allowed)
+                .unwrap_err()
+                .0
+                .contains("uninitialized RDI")
+        );
+        assert!(
+            lift_cfg_with_calls(&code[4..], 0x1004, &allowed)
+                .unwrap_err()
+                .0
+                .contains("unaligned stack")
+        );
+    }
+
+    #[test]
+    fn erases_proven_balanced_frame_without_stack_locals() {
+        // push rbp; mov rbp,rsp; sub rsp,32; lea rax,[rdi+rsi];
+        // add rsp,32; pop rbp; ret
+        let code = [
+            0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8d, 0x04, 0x37, 0x48, 0x83,
+            0xc4, 0x20, 0x5d, 0xc3,
+        ];
+        let ir = lift_cfg(&code, 0x1000).unwrap();
+        assert!(ir.contains("add i64 %rdi_in_1008, %rsi_in_1008"));
+        assert!(ir.contains("ret i64 %rax_in_1011"));
+        assert!(!ir.contains("%zf_out_1004"));
+    }
+
+    #[test]
+    fn lifts_initialized_bounded_stack_local() {
+        // push rbp; mov rbp,rsp; sub rsp,16; mov [rbp-8],rdi;
+        // mov rax,[rbp-8]; add rax,rsi; leave; ret
+        let code = [
+            0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x7d, 0xf8, 0x48, 0x8b,
+            0x45, 0xf8, 0x48, 0x01, 0xf0, 0xc9, 0xc3,
+        ];
+        let ir = lift_cfg(&code, 0x1000).unwrap();
+        assert!(ir.contains("%slot0_out_1008 = add i64 0, %rdi_in_1008"));
+        assert!(ir.contains("%rax_out_100c = add i64 0, %slot0_in_100c"));
+    }
+
+    #[test]
+    fn rejects_stack_local_read_before_write_and_partial_alias() {
+        // push rbp; mov rbp,rsp; sub rsp,16; mov rax,[rbp-8]; leave; ret
+        let uninitialized = [
+            0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x10, 0x48, 0x8b, 0x45, 0xf8, 0xc9, 0xc3,
+        ];
+        assert!(
+            lift_cfg(&uninitialized, 0x1000)
+                .unwrap_err()
+                .0
+                .contains("uninitialized SLOT")
+        );
+        // store [rbp-16] then read an overlapping eight-byte [rbp-12].
+        let alias = [
+            0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0x7d, 0xf0, 0x48, 0x8b,
+            0x45, 0xf4, 0xc9, 0xc3,
+        ];
+        assert!(
+            lift_cfg(&alias, 0x1000)
+                .unwrap_err()
+                .0
+                .contains("overlapping")
+        );
+    }
+
+    #[test]
+    fn joins_stack_local_written_on_both_branch_paths() {
+        // sub rsp,16; cmp rdi,rsi; jae left; mov [rsp],rsi; jmp join;
+        // left: mov [rsp],rdi; join: mov rax,[rsp]; add rsp,16; ret
+        let code = [
+            0x48, 0x83, 0xec, 0x10, 0x48, 0x39, 0xf7, 0x73, 0x06, 0x48, 0x89, 0x34, 0x24, 0xeb,
+            0x04, 0x48, 0x89, 0x3c, 0x24, 0x48, 0x8b, 0x04, 0x24, 0x48, 0x83, 0xc4, 0x10, 0xc3,
+        ];
+        let ir = lift_cfg(&code, 0x1000).unwrap();
+        assert!(ir.contains("%slot0_in_1013 = phi i64"));
+        assert!(ir.contains("%slot0_out_1009"));
+        assert!(ir.contains("%slot0_out_100f"));
+    }
+
+    #[test]
+    fn rejects_stack_local_written_on_only_one_branch() {
+        let code = [
+            0x48, 0x83, 0xec, 0x10, 0x48, 0x39, 0xf7, 0x73, 0x04, 0x48, 0x89, 0x34, 0x24, 0x48,
+            0x8b, 0x04, 0x24, 0x48, 0x83, 0xc4, 0x10, 0xc3,
+        ];
+        assert!(
+            lift_cfg(&code, 0x1000)
+                .unwrap_err()
+                .0
+                .contains("uninitialized SLOT")
+        );
+    }
+
+    #[test]
+    fn refuses_stack_adjustment_flags_at_branch() {
+        // sub rsp,8; je +0; add rsp,8; ret
+        let code = [0x48, 0x83, 0xec, 8, 0x74, 0, 0x48, 0x83, 0xc4, 8, 0xc3];
+        assert!(
+            lift_cfg(&code, 0x1000)
+                .unwrap_err()
+                .0
+                .contains("flags used by a conditional branch")
+        );
+    }
+
+    #[test]
+    fn mov32_zero_extends_register_result() {
+        // mov eax, edi; ret
+        let ir = lift_cfg(&[0x89, 0xf8, 0xc3], 0x1000).unwrap();
+        assert!(ir.contains("trunc i64 %rdi_in_1000 to i32"));
+        assert!(ir.contains("%rax_out_1000 = zext i32 %t_1000_0 to i64"));
+        assert!(!ir.contains("nsw"));
+    }
 
     #[test]
     fn recovers_diamond_with_phis() {

@@ -1,4 +1,6 @@
 /target/
+/fuzz/target/
+/fuzz/artifacts/
 /docs/
 *.swp
 .DS_Store

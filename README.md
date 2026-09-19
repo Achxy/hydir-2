@@ -19,7 +19,7 @@
 
 HydIR opens little-endian x86-64 ELF files without uploading them. The current native slice recovers bounded control flow, emits LLVM IR and scalar C for a deliberately small instruction set, runs differential checks against trusted fixtures, and exposes the same core through a desktop app, CLI, Python SDK, and authenticated loopback service.
 
-This is an engineering workbench, not a general decompiler. Unsupported instructions, memory behavior, calls, partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
+This is an engineering workbench, not a general decompiler. Unsupported instructions, memory behavior, unresolved calls, unmodelled partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
 
 ## Quick start
 
@@ -41,11 +41,21 @@ Or inspect it from the CLI:
 
 ```bash
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
+cargo run --locked --bin hydirctl -- disassemble /path/to/program.elf
 cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
+cargo run --locked --bin hydirctl -- region /path/to/program.elf function_name
 cargo run --locked --bin hydirctl -- lift \
   /path/to/program.elf function_name \
   --assume-u64x2 --output lifted.ll
+cargo run --locked --bin hydirctl -- decompile \
+  /path/to/program.elf function_name \
+  --assume-u64x2 --output lifted.c
 ```
+
+The [semantic evidence gate](SEMANTIC_GATE.md) records supported cases,
+explicit refusals, and semantic mismatches. The [IRENE-3 comparison](IRENE3_COMPARISON.md)
+defines the pinned compatibility experiment, while [MIRRORBALL_STUDY.md](MIRRORBALL_STUDY.md)
+tracks recovery-boundary evidence.
 
 Clang with x86-64 ELF and LLVM IR support is required for the full demo path. Native execution comparisons require Linux x86-64. On macOS with Docker Desktop:
 
@@ -82,6 +92,8 @@ The checked demo path covers 20 distinct scalar functions. Each function is lift
 bash scripts/demo-local.sh
 bash scripts/demo-corpus.sh
 ```
+
+The bounded scalar contract now also covers proven balanced frames, initialized eight-byte stack locals, 32-bit `mov` zero-extension, and direct calls to uniquely bounded scalar leaf symbols. Other memory, unresolved calls, and unmodelled aliases remain explicit refusals.
 
 The scripts record CFG, LLVM IR, C, and differential results as inspectable artifacts. These checks establish the documented subset only; they do not prove equivalence for arbitrary programs. The UI also keeps failures specific: an unsupported call can stop C generation without invalidating an already recovered CFG or LLVM lift.
 

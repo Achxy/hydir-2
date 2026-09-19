@@ -1,6 +1,52 @@
-/* Sixteen distinct, symbol-bounded u64(u64,u64) machine-code fixtures.
+/* Forty-two distinct, symbol-bounded u64(u64,u64) machine-code fixtures.
  * The validator sees only compiled ELF bytes; this source is oracle input. */
 .text
+
+.globl hydir_leaf_add
+.type hydir_leaf_add,@function
+hydir_leaf_add:
+  mov %rdi, %rax
+  add %rsi, %rax
+  ret
+.size hydir_leaf_add, .-hydir_leaf_add
+
+.globl hydir_call_leaf_add
+.type hydir_call_leaf_add,@function
+hydir_call_leaf_add:
+  sub $8, %rsp
+  call hydir_leaf_add
+  add $8, %rsp
+  ret
+.size hydir_call_leaf_add, .-hydir_call_leaf_add
+
+.globl hydir_mov_imm64
+.type hydir_mov_imm64,@function
+hydir_mov_imm64:
+  movabs $0xdeadbeef00000001, %rax
+  ret
+.size hydir_mov_imm64, .-hydir_mov_imm64
+
+.globl hydir_cmp_imm
+.type hydir_cmp_imm,@function
+hydir_cmp_imm:
+  mov $0, %rax
+  cmp $-1, %rdi
+  je .Lcmp_imm_done
+  mov $1, %rax
+.Lcmp_imm_done:
+  ret
+.size hydir_cmp_imm, .-hydir_cmp_imm
+
+.globl hydir_test_imm
+.type hydir_test_imm,@function
+hydir_test_imm:
+  mov $0, %rax
+  test $1, %rdi
+  je .Ltest_imm_done
+  mov $1, %rax
+.Ltest_imm_done:
+  ret
+.size hydir_test_imm, .-hydir_test_imm
 
 .globl hydir_identity_a
 .type hydir_identity_a,@function
@@ -15,6 +61,106 @@ hydir_identity_b:
   mov %rsi, %rax
   ret
 .size hydir_identity_b, .-hydir_identity_b
+
+.globl hydir_zeroextend_a
+.type hydir_zeroextend_a,@function
+hydir_zeroextend_a:
+  mov %edi, %eax
+  ret
+.size hydir_zeroextend_a, .-hydir_zeroextend_a
+
+.globl hydir_zeroextend_imm
+.type hydir_zeroextend_imm,@function
+hydir_zeroextend_imm:
+  mov $0xffffffff, %eax
+  ret
+.size hydir_zeroextend_imm, .-hydir_zeroextend_imm
+
+.globl hydir_frame_balance
+.type hydir_frame_balance,@function
+hydir_frame_balance:
+  push %rbp
+  mov %rsp, %rbp
+  sub $32, %rsp
+  lea (%rdi,%rsi), %rax
+  add $32, %rsp
+  pop %rbp
+  ret
+.size hydir_frame_balance, .-hydir_frame_balance
+
+.globl hydir_stack_slot_add
+.type hydir_stack_slot_add,@function
+hydir_stack_slot_add:
+  push %rbp
+  mov %rsp, %rbp
+  sub $16, %rsp
+  mov %rdi, -8(%rbp)
+  mov -8(%rbp), %rax
+  add %rsi, %rax
+  leave
+  ret
+.size hydir_stack_slot_add, .-hydir_stack_slot_add
+
+.globl hydir_stack_branch
+.type hydir_stack_branch,@function
+hydir_stack_branch:
+  sub $16, %rsp
+  cmp %rsi, %rdi
+  jae .Lstack_branch_left
+  mov %rsi, (%rsp)
+  jmp .Lstack_branch_join
+.Lstack_branch_left:
+  mov %rdi, (%rsp)
+.Lstack_branch_join:
+  mov (%rsp), %rax
+  add $16, %rsp
+  ret
+.size hydir_stack_branch, .-hydir_stack_branch
+
+.globl hydir_nop_identity
+.type hydir_nop_identity,@function
+hydir_nop_identity:
+  nop
+  mov %rdi, %rax
+  ret
+.size hydir_nop_identity, .-hydir_nop_identity
+
+.globl hydir_lea_scaled
+.type hydir_lea_scaled,@function
+hydir_lea_scaled:
+  lea 7(%rdi,%rsi,4), %rax
+  ret
+.size hydir_lea_scaled, .-hydir_lea_scaled
+
+/* Every accepted conditional branch, with CMP defining all relevant flags. */
+.macro HYDIR_CONDITION suffix, jump
+.globl hydir_cond_\suffix
+.type hydir_cond_\suffix,@function
+hydir_cond_\suffix:
+  mov $0, %rax
+  cmp %rsi, %rdi
+  \jump .Lcondition_true\@
+  ret
+.Lcondition_true\@:
+  mov $1, %rax
+  ret
+.size hydir_cond_\suffix, .-hydir_cond_\suffix
+.endm
+
+HYDIR_CONDITION e, je
+HYDIR_CONDITION ne, jne
+HYDIR_CONDITION g, jg
+HYDIR_CONDITION ge, jge
+HYDIR_CONDITION l, jl
+HYDIR_CONDITION le, jle
+HYDIR_CONDITION a, ja
+HYDIR_CONDITION ae, jae
+HYDIR_CONDITION b, jb
+HYDIR_CONDITION be, jbe
+HYDIR_CONDITION s, js
+HYDIR_CONDITION ns, jns
+HYDIR_CONDITION o, jo
+HYDIR_CONDITION no, jno
 
 .globl hydir_sub_ab
 .type hydir_sub_ab,@function

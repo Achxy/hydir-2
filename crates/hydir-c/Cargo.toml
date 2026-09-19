@@ -6,3 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+hydir-backend = { path = "../hydir-backend" }

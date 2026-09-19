@@ -89,6 +89,20 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertIn("bvadd", output["final_registers"]["rax"])
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_longer_symbol_uses_at_most_fifteen_opcode_bytes(self) -> None:
+        result = self.run_bridge(
+            {
+                "schema_version": 1,
+                "binary_sha256": "0" * 64,
+                "function_symbol": "long_add",
+                "entry_address": 0x401000,
+                "code_hex": "90" * 20 + "4889f84801f0c3",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["paths"][0]["input_witness"], [0, 0])
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_symbolic_max2_merges_both_paths(self) -> None:
         result = self.run_bridge(
             {
@@ -103,8 +117,48 @@ class TritonBridgeTests(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertEqual(len(output["paths"]), 2)
         self.assertIn("ite", output["final_registers"]["rax"])
-        self.assertIn("ref!0", output["final_registers"]["rax"])
-        self.assertIn("ref!1", output["final_registers"]["rax"])
+        self.assertIn("arg0", output["final_registers"]["rax"])
+        self.assertIn("arg1", output["final_registers"]["rax"])
+        self.assertNotIn("ref!", output["final_registers"]["rax"])
+        witnesses = [path["input_witness"] for path in output["paths"]]
+        self.assertEqual(len(witnesses), 2)
+        self.assertTrue(any(a < b for a, b in witnesses))
+        self.assertTrue(any(a >= b for a, b in witnesses))
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_nested_branch_witnesses_satisfy_each_path(self) -> None:
+        result = self.run_bridge(
+            {
+                "schema_version": 1,
+                "binary_sha256": "0" * 64,
+                "function_symbol": "nested",
+                "entry_address": 0x401000,
+                "code_hex": "4889f84839f772034889f04883ff0074044883c001c3",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        witnesses = {tuple(path["input_witness"])
+                     for path in json.loads(result.stdout)["paths"]}
+        self.assertEqual(len(witnesses), 4)
+        self.assertEqual({(a < b, a == 0) for a, b in witnesses},
+                         {(False, False), (False, True), (True, False), (True, True)})
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_direct_jump_after_branch_keeps_distinct_stack_values(self) -> None:
+        result = self.run_bridge(
+            {
+                "schema_version": 1,
+                "binary_sha256": "0" * 64,
+                "function_symbol": "stack_branch",
+                "entry_address": 0x401000,
+                "code_hex": "4883ec104839f7730648893424eb0448893c24488b04244883c410c3",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = json.loads(result.stdout)["paths"]
+        self.assertEqual(len(paths), 2)
+        self.assertNotEqual(paths[0]["rax"], paths[1]["rax"])
+        self.assertNotIn("ref!", paths[0]["rax"] + paths[1]["rax"])
 
     def test_non_hex_digest_fails(self) -> None:
         result = self.run_bridge(

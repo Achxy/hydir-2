@@ -3,7 +3,7 @@
 //! It accepts only side-effect-free two-argument return expressions that fit
 //! one of the exact, independently encoded x86-64 replacements below.
 
-use hydir_backend::lift_symbol;
+use hydir_backend::{lift_symbol, region_contract};
 use object::{Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,6 +50,9 @@ pub struct PatchedBinary {
     pub function_size: u64,
     pub replacement_bytes: Vec<u8>,
     pub original_region: Vec<u8>,
+    pub region_bytes_sha256: String,
+    pub region_exit: u64,
+    pub exit_rsp_delta: i64,
 }
 
 struct Parser<'a> {
@@ -243,6 +246,25 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
     lift_symbol(bytes, &patch.document.function_symbol).map_err(|error| {
         format!("original function is outside the scalar lift contract: {error}")
     })?;
+    let contract = region_contract(bytes, &patch.document.function_symbol)
+        .map_err(|error| format!("region contract unavailable: {error}"))?;
+    if !contract.observed_interior_entries.is_empty() {
+        return Err("patch target has an observed entry into its interior".to_owned());
+    }
+    if contract.exits.len() != 1 || contract.stack_delta != Some(8) {
+        return Err(
+            "patch requires one proven near-return exit and restored entry stack".to_owned(),
+        );
+    }
+    if !contract.relocations.is_empty()
+        || contract.unresolved_facts.iter().any(|fact| {
+            fact.starts_with("scalar_cfg:")
+                || fact.starts_with("scalar_lift:")
+                || fact.starts_with("stack_and_exits:")
+        })
+    {
+        return Err("patch region has unresolved scalar, stack, or relocation facts".to_owned());
+    }
     let file = object::File::parse(bytes).map_err(|error| format!("ELF parse failed: {error}"))?;
     if file.format() != BinaryFormat::Elf
         || file.architecture() != Architecture::X86_64
@@ -310,6 +332,12 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
         .get(file_start..file_end)
         .ok_or("patch function bytes unavailable")?
         .to_vec();
+    if format!("{:x}", Sha256::digest(&original_region)) != contract.bytes_sha256
+        || symbol.address() != contract.entry.0
+        || symbol.size() != contract.byte_length
+    {
+        return Err("patch region bytes or symbol extent changed after contract export".to_owned());
+    }
     let mut content = bytes.to_vec();
     content[file_start..file_start + replacement_bytes.len()].copy_from_slice(&replacement_bytes);
     content[file_start + replacement_bytes.len()..file_end].fill(0x90);
@@ -322,6 +350,9 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
         function_size: symbol.size(),
         replacement_bytes,
         original_region,
+        region_bytes_sha256: contract.bytes_sha256,
+        region_exit: contract.exits[0].0,
+        exit_rsp_delta: contract.stack_delta.expect("proven above"),
     })
 }
 
@@ -368,5 +399,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn patch_rejects_known_interior_entry() {
+        for binary in [
+            include_bytes!("../../../fuzz/corpus/elf_import/interior_entry.elf").as_slice(),
+            include_bytes!("../../../fuzz/corpus/elf_import/interior_call.elf").as_slice(),
+        ] {
+            let patch = ValidatedPatch {
+                document: PatchDocument {
+                    schema_version: PATCH_SCHEMA_VERSION,
+                    binary_sha256: format!("{:x}", Sha256::digest(binary)),
+                    function_symbol: "hydir_outer".to_owned(),
+                    prototype: "u64(u64,u64)".to_owned(),
+                    replacement: "return arg0;".to_owned(),
+                },
+                expression: ReturnExpression::Atom(Atom::Arg0),
+            };
+            assert!(patch_binary(binary, &patch)
+                .unwrap_err()
+                .contains("observed entry into its interior"));
+        }
     }
 }
