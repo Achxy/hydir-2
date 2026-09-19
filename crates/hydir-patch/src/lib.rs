@@ -1,7 +1,15 @@
-//! Versioned, fail-closed whole-function patching for a tiny scalar ABI slice.
+//! Versioned, fail-closed PatchLang and whole-function patching.
 //!
-//! It accepts only side-effect-free two-argument return expressions that fit
-//! one of the exact, independently encoded x86-64 replacements below.
+//! The source-located PatchLang frontend is broader than the current scalar
+//! x86-64 backend. Valid programs outside that lowering contract are refused
+//! explicitly rather than silently simplified.
+
+mod patchlang;
+
+pub use patchlang::{
+    PATCH_LANG_VERSION, PatchExpression, PatchExpressionKind, PatchProgram, PatchStatement,
+    PatchType, lower_scalar_return, parse_patch_program,
+};
 
 use hydir_backend::{import_elf, lift_symbol, region_contract};
 use hydir_core::{Address, PATCH_BUNDLE_VERSION};
@@ -59,7 +67,7 @@ pub struct PatchedBinary {
     pub bundle: PatchBundle,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct SourceRange {
     pub start_line: u32,
     pub start_column: u32,
@@ -72,6 +80,8 @@ pub struct PatchIr {
     pub schema_version: u32,
     pub prototype: String,
     pub expression: ReturnExpression,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<PatchStatement>,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub exits: Vec<Address>,
@@ -149,119 +159,11 @@ pub struct PatchBundle {
     pub stable_verified: bool,
 }
 
-struct Parser<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn skip_space(&mut self) {
-        while self.bytes.get(self.at).is_some_and(u8::is_ascii_whitespace) {
-            self.at += 1;
-        }
-    }
-
-    fn error(&self, message: &str) -> String {
-        let before = &self.bytes[..self.at.min(self.bytes.len())];
-        let line = before.iter().filter(|byte| **byte == b'\n').count() + 1;
-        let column = before
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(before.len() + 1, |index| before.len() - index);
-        format!("replacement:{line}:{column}: {message}")
-    }
-
-    fn keyword(&mut self, keyword: &[u8]) -> Result<(), String> {
-        self.skip_space();
-        if self.bytes.get(self.at..self.at + keyword.len()) != Some(keyword) {
-            return Err(self.error("expected `return`"));
-        }
-        self.at += keyword.len();
-        if self
-            .bytes
-            .get(self.at)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            return Err(self.error("expected whitespace after `return`"));
-        }
-        Ok(())
-    }
-
-    fn atom(&mut self) -> Result<Atom, String> {
-        self.skip_space();
-        let start = self.at;
-        while self
-            .bytes
-            .get(self.at)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            self.at += 1;
-        }
-        let token = self.bytes.get(start..self.at).unwrap_or_default();
-        match token {
-            b"arg0" => Ok(Atom::Arg0),
-            b"arg1" => Ok(Atom::Arg1),
-            b"" => Err(self.error("expected arg0, arg1, or an unsigned literal")),
-            _ => {
-                let token = std::str::from_utf8(token)
-                    .map_err(|_| self.error("non-ASCII literal is unsupported"))?;
-                let number = if let Some(hex) = token.strip_prefix("0x") {
-                    u64::from_str_radix(hex, 16)
-                } else {
-                    token.parse::<u64>()
-                }
-                .map_err(|_| {
-                    self.error("expected an exact u64 decimal or 0x hexadecimal literal")
-                })?;
-                Ok(Atom::Constant(number))
-            }
-        }
-    }
-}
-
-/// Parse a narrow C-compatible `return atom [+|- atom];` statement.
+/// Parse PatchLang, then lower the accepted program through the legacy scalar
+/// compatibility adapter.
 pub fn parse_return_expression(source: &str) -> Result<ReturnExpression, String> {
-    if source.len() > 256 || !source.is_ascii() {
-        return Err("replacement must be at most 256 ASCII bytes".to_owned());
-    }
-    let mut parser = Parser {
-        bytes: source.as_bytes(),
-        at: 0,
-    };
-    parser.keyword(b"return")?;
-    let left = parser.atom()?;
-    parser.skip_space();
-    let operation = match parser.bytes.get(parser.at) {
-        Some(b'+') => {
-            parser.at += 1;
-            Some(b'+')
-        }
-        Some(b'-') => {
-            parser.at += 1;
-            Some(b'-')
-        }
-        _ => None,
-    };
-    let expression = if let Some(operation) = operation {
-        let right = parser.atom()?;
-        if operation == b'+' {
-            ReturnExpression::Add(left, right)
-        } else {
-            ReturnExpression::Sub(left, right)
-        }
-    } else {
-        ReturnExpression::Atom(left)
-    };
-    parser.skip_space();
-    if parser.bytes.get(parser.at) != Some(&b';') {
-        return Err(parser.error("expected `;` after return expression"));
-    }
-    parser.at += 1;
-    parser.skip_space();
-    if parser.at != parser.bytes.len() {
-        return Err(parser.error("unexpected tokens after return statement"));
-    }
-    Ok(expression)
+    let program = parse_patch_program(source)?;
+    lower_scalar_return(&program)
 }
 
 pub fn parse_patch_json(bytes: &[u8]) -> Result<ValidatedPatch, String> {
@@ -333,6 +235,14 @@ pub fn validate_patch_bundle(bundle: &PatchBundle) -> Result<(), String> {
         || bundle.boundary_adapters.is_empty()
     {
         return Err("PatchBundle PatchIR or boundary adapter is incomplete".to_owned());
+    }
+    if !bundle.typed_patch_ir.statements.is_empty()
+        && !matches!(
+            bundle.typed_patch_ir.statements.last(),
+            Some(PatchStatement::Return { .. })
+        )
+    {
+        return Err("PatchBundle PatchIR must end in a return terminator".to_owned());
     }
     let original = decode_hex(&bundle.original_region_hex, "original region")?;
     let compiled = decode_hex(&bundle.compiled_bytes_hex, "compiled bytes")?;
@@ -420,6 +330,10 @@ fn encode(expression: ReturnExpression) -> Result<Vec<u8>, String> {
 /// format, original liftability, exact symbol extent, relocation absence,
 /// and replacement fit. It never mutates the source slice.
 pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinary, String> {
+    let patch_program = parse_patch_program(&patch.document.replacement)?;
+    if lower_scalar_return(&patch_program)? != patch.expression {
+        return Err("validated patch expression differs from its PatchLang source".to_owned());
+    }
     let digest = format!("{:x}", Sha256::digest(bytes));
     if digest != patch.document.binary_sha256 {
         return Err("patch binary hash does not match the supplied ELF".to_owned());
@@ -545,13 +459,6 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
             "/builtin-x86_64-scalar-v1"
         ))
     );
-    let last_line = patch.document.replacement.lines().count().max(1) as u32;
-    let last_column = patch
-        .document
-        .replacement
-        .lines()
-        .last()
-        .map_or(1, |line| line.chars().count() as u32 + 1);
     let bundle = PatchBundle {
         schema_version: PATCH_BUNDLE_VERSION,
         source: patch.document.clone(),
@@ -559,16 +466,12 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
             schema_version: 1,
             prototype: patch.document.prototype.clone(),
             expression: patch.expression,
+            statements: patch_program.statements,
             inputs: vec!["rdi:u64(arg0)".to_owned(), "rsi:u64(arg1)".to_owned()],
             outputs: vec!["rax:u64(return)".to_owned()],
             exits: contract.exits.clone(),
             memory_effects: Vec::new(),
-            source_range: SourceRange {
-                start_line: 1,
-                start_column: 1,
-                end_line: last_line,
-                end_column: last_column,
-            },
+            source_range: patch_program.source_range,
         },
         region_digest: contract.bytes_sha256.clone(),
         original_region_hex,
@@ -723,6 +626,11 @@ mod tests {
             result.original_region
         );
         assert!(!result.bundle.stable_verified);
+        assert_eq!(result.bundle.typed_patch_ir.statements.len(), 1);
+        assert!(matches!(
+            result.bundle.typed_patch_ir.statements.last(),
+            Some(PatchStatement::Return { .. })
+        ));
         let serialized = serde_json::to_vec(&result.bundle).unwrap();
         let parsed = parse_patch_bundle_json(&serialized).unwrap();
         assert_eq!(parsed.patched_sha256, result.patched_sha256);
@@ -733,5 +641,13 @@ mod tests {
                 .any(|evidence| evidence.check == "patched_elf_reimport"
                     && evidence.status == VerificationStatus::Passed)
         );
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
+        legacy["typed_patch_ir"]
+            .as_object_mut()
+            .unwrap()
+            .remove("statements");
+        let parsed_legacy = parse_patch_bundle_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(parsed_legacy.typed_patch_ir.statements.is_empty());
     }
 }
