@@ -30,6 +30,17 @@ cargo test --locked --workspace
 cargo run --locked --bin hydir
 ```
 
+For the presentation-ready PRISM binary and a complete Region Studio bundle
+on Windows:
+
+```powershell
+.\scripts\launch-prism-demo.cmd
+```
+
+The [PRISM presenter guide](docs/PRISM_DEMO.md) covers the six-minute path from
+digest-bound region recovery through physical-state IR, deterministic C,
+PatchLang/PatchIR, a real RX-segment trampoline, and verification evidence.
+
 Open a local binary directly:
 
 ```bash
