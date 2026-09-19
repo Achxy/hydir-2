@@ -7,8 +7,11 @@ use egui_graph_egui::Direction as GraphDirection;
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
     AnnotationRequest, ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest,
-    JobReply, JobRequest, PatchRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest,
-    TransformRequest, UploadBinaryRequest, hydir_client::HydirClient,
+    JobReply, JobRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest, TransformRequest,
+    UploadBinaryRequest, hydir_client::HydirClient,
+};
+use hydir_api::v2::{
+    PatchRequest as PatchRequestV2, VerifyPatchRequest, hydir_v2_client::HydirV2Client,
 };
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_symbol, recover_symbol_cfg,
@@ -18,7 +21,10 @@ use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, DisassemblyReport, FactSource, FunctionCfg,
     FunctionSpec, ProgramSpec, overlay_analyst_assumptions, parse_program_spec_json,
 };
-use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
+use hydir_patch::{
+    PatchBundle, PatchDocument, PlacementStrategy, parse_patch_bundle_json, parse_patch_json,
+    patch_binary,
+};
 use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
@@ -120,6 +126,10 @@ enum Task {
         replacement: String,
         key: String,
     },
+    PreviewPatch {
+        symbol: String,
+        replacement: String,
+    },
     ExportRebuiltRemote {
         digest: String,
         path: PathBuf,
@@ -208,6 +218,10 @@ enum Event {
         revision: u64,
         spec: ProgramSpec,
         binary_sha256: String,
+    },
+    PatchPreview {
+        bundle: PatchBundle,
+        verification_report: String,
     },
     ArtifactExported {
         path: PathBuf,
@@ -320,6 +334,17 @@ async fn remote_client(access: &RemoteAccess) -> Result<HydirClient<Channel>, St
         .await
         .map_err(|e| format!("Cannot connect to HydIR service: {e}"))?;
     Ok(HydirClient::new(channel).max_decoding_message_size(MAX_BINARY_BYTES + 1024))
+}
+
+async fn remote_v2_client(access: &RemoteAccess) -> Result<HydirV2Client<Channel>, String> {
+    let channel = Channel::from_shared(access.endpoint.clone())
+        .map_err(|e| format!("Invalid endpoint: {e}"))?
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .connect()
+        .await
+        .map_err(|e| format!("Cannot connect to HydIR v2 service: {e}"))?;
+    Ok(HydirV2Client::new(channel).max_decoding_message_size(2 * 1024 * 1024 + 1024))
 }
 
 async fn open_remote(
@@ -1101,14 +1126,90 @@ fn patch_local(
     Ok((patched.content, spec, patched.patched_sha256))
 }
 
+fn preview_patch_local(
+    binary: &[u8],
+    symbol: &str,
+    replacement: &str,
+) -> Result<(PatchBundle, String), String> {
+    let digest = format!("{:x}", Sha256::digest(binary));
+    let document = patch_document(&digest, symbol, replacement)?;
+    let validated = parse_patch_json(&document)?;
+    let result = patch_binary(binary, &validated)?;
+    Ok((
+        result.bundle,
+        "Structural verification passed locally. Behavior execution was not run.".to_owned(),
+    ))
+}
+
+async fn preview_patch_remote(
+    access: &RemoteAccess,
+    symbol: &str,
+    replacement: &str,
+) -> Result<(PatchBundle, String), String> {
+    let mut legacy = remote_client(access).await?;
+    let current = legacy
+        .get_project(authorized(
+            ProjectRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Could not verify current project before preview: {error}"))?
+        .into_inner();
+    if current.revision != access.revision || current.binary_sha256.is_empty() {
+        return Err("Remote project revision changed; reopen it before previewing.".to_owned());
+    }
+    let patch_json = patch_document(&current.binary_sha256, symbol, replacement)?;
+    let request = PatchRequestV2 {
+        project_id: access.project_id.clone(),
+        expected_revision: access.revision,
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+        patch_json,
+        trusted_fixture: true,
+        assume_u64x2: true,
+        assume_entry_only: true,
+    };
+    let mut client = remote_v2_client(access).await?;
+    let artifact = client
+        .compile_patch(authorized(request, &access.token))
+        .await
+        .map_err(|error| format!("Remote PatchLang preview failed: {error}"))?
+        .into_inner();
+    if artifact.project_revision != access.revision
+        || artifact.media_type != "application/vnd.hydir.patch-bundle+json;version=2"
+        || format!("{:x}", Sha256::digest(&artifact.content)) != artifact.sha256
+    {
+        return Err("Remote PatchBundle preview failed digest/type/revision checks.".to_owned());
+    }
+    let bundle = parse_patch_bundle_json(&artifact.content)?;
+    let verification = client
+        .verify_patch(authorized(
+            VerifyPatchRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                patch_bundle_json: artifact.content,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote PatchBundle verification failed: {error}"))?
+        .into_inner();
+    if !verification.structurally_valid {
+        return Err("Remote service rejected the PatchBundle structure.".to_owned());
+    }
+    Ok((bundle, verification.report_json))
+}
+
 async fn patch_remote(
     access: &RemoteAccess,
     symbol: &str,
     replacement: &str,
     key: &str,
 ) -> Result<(u64, ProgramSpec, String), String> {
-    let mut client = remote_client(access).await?;
-    let current = client
+    let mut legacy = remote_client(access).await?;
+    let current = legacy
         .get_project(authorized(
             ProjectRequest {
                 project_id: access.project_id.clone(),
@@ -1123,13 +1224,14 @@ async fn patch_remote(
         return Err("Remote project revision changed; reopen it before patching.".to_owned());
     }
     let document = patch_document(&current.binary_sha256, symbol, replacement)?;
+    let mut client = remote_v2_client(access).await?;
     let reply = client
         .apply_patch(authorized(
-            PatchRequest {
+            PatchRequestV2 {
                 project_id: access.project_id.clone(),
                 expected_revision: access.revision,
-                patch_json: document,
                 idempotency_key: key.to_owned(),
+                patch_json: document,
                 trusted_fixture: true,
                 assume_u64x2: true,
                 assume_entry_only: true,
@@ -1141,17 +1243,18 @@ async fn patch_remote(
         .into_inner();
     if reply.project_id != access.project_id
         || Some(reply.revision) != access.revision.checked_add(1)
-        || reply.binary_sha256 != reply.artifact_sha256
+        || reply.binary_sha256.len() != 64
+        || reply.patch_bundle_sha256.len() != 64
     {
         return Err(
             "Patch returned an unexpected project, revision, or artifact digest.".to_owned(),
         );
     }
-    let artifact = client
+    let artifact = legacy
         .get_artifact(authorized(
             ArtifactRequest {
                 project_id: access.project_id.clone(),
-                sha256: reply.artifact_sha256.clone(),
+                sha256: reply.binary_sha256.clone(),
             },
             &access.token,
         ))
@@ -1170,7 +1273,7 @@ async fn patch_remote(
     if spec.binary_sha256 != reply.binary_sha256 {
         return Err("Patched ELF model digest differs from project.".to_owned());
     }
-    let project = client
+    let project = legacy
         .get_project(authorized(
             ProjectRequest {
                 project_id: access.project_id.clone(),
@@ -1706,6 +1809,27 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 },
                 _ => Event::Failed("Open a local ELF before rebuilding.".to_owned()),
             },
+            Task::PreviewPatch {
+                symbol,
+                replacement,
+            } => match &source {
+                Source::Local(bytes) => preview_patch_local(bytes, &symbol, &replacement)
+                    .map(|(bundle, verification_report)| Event::PatchPreview {
+                        bundle,
+                        verification_report,
+                    })
+                    .unwrap_or_else(Event::Failed),
+                Source::Remote(access) => runtime
+                    .block_on(preview_patch_remote(access, &symbol, &replacement))
+                    .map(|(bundle, verification_report)| Event::PatchPreview {
+                        bundle,
+                        verification_report,
+                    })
+                    .unwrap_or_else(Event::Failed),
+                Source::None => Event::Failed(
+                    "Open a local ELF or remote project before previewing a patch.".to_owned(),
+                ),
+            },
             Task::PatchLocal {
                 symbol,
                 replacement,
@@ -1833,6 +1957,8 @@ struct AnalystApp {
     local_rebuild_output_dir: String,
     rebuilt_exported_path: Option<PathBuf>,
     patch_replacement: String,
+    patch_preview: Option<PatchBundle>,
+    patch_verification_report: Option<String>,
     patch_output_path: String,
     patch_digest: Option<String>,
     patch_exported_path: Option<PathBuf>,
@@ -1923,6 +2049,8 @@ impl AnalystApp {
             local_rebuild_output_dir: String::new(),
             rebuilt_exported_path: None,
             patch_replacement: "return arg0 - arg1;".to_owned(),
+            patch_preview: None,
+            patch_verification_report: None,
             patch_output_path: String::new(),
             patch_digest: None,
             patch_exported_path: None,
@@ -2059,6 +2187,8 @@ impl AnalystApp {
                     self.rebuilt_exported_path = None;
                     self.patch_digest = None;
                     self.patch_exported_path = None;
+                    self.patch_preview = None;
+                    self.patch_verification_report = None;
                     self.rebuild_output_path.clear();
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
@@ -2473,6 +2603,23 @@ impl AnalystApp {
                         "Loading rebuilt local project annotations…",
                     );
                 }
+                Event::PatchPreview {
+                    bundle,
+                    verification_report,
+                } => {
+                    let placement = match bundle.placement_plan.strategy {
+                        PlacementStrategy::InPlace => "in-place",
+                        PlacementStrategy::EntryTrampoline => "RX-segment trampoline",
+                    };
+                    self.status = format!(
+                        "Patch preview verified · {placement} · {} compiled bytes",
+                        bundle.placement_plan.replacement_size
+                    );
+                    self.history.push(self.status.clone());
+                    self.patch_preview = Some(bundle);
+                    self.patch_verification_report = Some(verification_report);
+                    self.failure = None;
+                }
                 Event::LocalPatched {
                     spec,
                     revision,
@@ -2500,6 +2647,8 @@ impl AnalystApp {
                     self.rebuilt_exported_path = None;
                     self.patch_digest = Some(binary_sha256.clone());
                     self.patch_exported_path = Some(output_path.clone());
+                    self.patch_preview = None;
+                    self.patch_verification_report = None;
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
                     self.status = format!(
@@ -2539,6 +2688,8 @@ impl AnalystApp {
                     self.rebuilt_exported_path = None;
                     self.patch_digest = Some(binary_sha256.clone());
                     self.patch_exported_path = None;
+                    self.patch_preview = None;
+                    self.patch_verification_report = None;
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
                     self.status = format!(
@@ -3154,13 +3305,19 @@ impl AnalystApp {
             });
         }
         ui.separator();
-        ui.heading(RichText::new("Scalar patch v1").size(14.0));
-        ui.label(RichText::new("Whole-function, entry-only u64(u64,u64) return expression. The replacement must fit the original symbol. This intentionally changes behavior; no equivalence is claimed.").size(11.0).color(MUTED));
-        ui.label(RichText::new("REPLACEMENT").size(10.0).color(MUTED));
-        ui.add(
-            egui::TextEdit::singleline(&mut self.patch_replacement)
-                .hint_text("return arg0 - arg1;"),
+        ui.heading(RichText::new("HydIR PatchLang").size(14.0));
+        ui.label(RichText::new("Source-located u64 declarations, assignments, arithmetic, and a final return. HydIR previews PatchIR and chooses in-place or a reversible RX-segment trampoline. Behavior changes are intentional; equivalence is not claimed.").size(11.0).color(MUTED));
+        ui.label(RichText::new("PATCH SOURCE").size(10.0).color(MUTED));
+        let editor = ui.add(
+            egui::TextEdit::multiline(&mut self.patch_replacement)
+                .font(egui::TextStyle::Monospace)
+                .desired_rows(5)
+                .hint_text("u64 result = arg0;\nresult = result - arg1;\nreturn result;"),
         );
+        if editor.changed() {
+            self.patch_preview = None;
+            self.patch_verification_report = None;
+        }
         ui.checkbox(
             &mut self.entry_only_assertion,
             "I assert no control flow enters this function interior",
@@ -3179,19 +3336,42 @@ impl AnalystApp {
                 .hint_text("/absolute/path/to/patched.elf"),
         );
         let selected_symbol = self.symbol.clone();
-        let patch_ready = self.spec.is_some()
+        let preview_ready = self.spec.is_some()
             && selected_symbol.is_some()
             && self.trusted_fixture
             && self.entry_only_assertion
             && !self.patch_replacement.trim().is_empty()
-            && !self.busy
+            && !self.busy;
+        let preview = ui.add_enabled(preview_ready, egui::Button::new("Compile & verify preview"));
+        if preview.clicked()
+            && let Some(symbol) = selected_symbol.clone()
+        {
+            self.enqueue(
+                Task::PreviewPatch {
+                    symbol,
+                    replacement: self.patch_replacement.trim().to_owned(),
+                },
+                "Compiling and structurally verifying PatchLang preview…",
+            );
+        }
+        preview.on_disabled_hover_text("Select a function and assert the trusted-fixture and entry-only contracts before previewing.");
+        let preview_current = self.patch_preview.as_ref().is_some_and(|bundle| {
+            bundle.source.replacement == self.patch_replacement.trim()
+                && Some(bundle.source.function_symbol.as_str()) == selected_symbol.as_deref()
+                && self
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.binary_sha256 == bundle.source.binary_sha256)
+        });
+        let patch_ready = preview_ready
+            && preview_current
             && (self.remote || !self.patch_output_path.trim().is_empty());
         let patch = ui.add_enabled(
             patch_ready,
             egui::Button::new(if self.remote {
-                "Apply scalar patch remotely"
+                "Apply verified patch remotely"
             } else {
-                "Apply scalar patch locally"
+                "Apply verified patch locally"
             }),
         );
         if patch.clicked()
@@ -3210,9 +3390,68 @@ impl AnalystApp {
                     output_path: PathBuf::from(self.patch_output_path.trim()),
                 }
             };
-            self.enqueue(task, "Validating and applying bounded scalar patch…");
+            self.enqueue(task, "Applying the verified HydIR patch…");
         }
-        patch.on_disabled_hover_text("Select a function, enter a supported return expression, assert trusted fixture and entry-only control flow, and provide a new output file for local patching.");
+        patch.on_disabled_hover_text("Compile a current verified preview first; local apply also requires a new output path.");
+        if let Some(bundle) = &self.patch_preview {
+            let placement = match bundle.placement_plan.strategy {
+                PlacementStrategy::InPlace => "in-place",
+                PlacementStrategy::EntryTrampoline => "entry trampoline to appended RX segment",
+            };
+            ui.separator();
+            ui.label(
+                RichText::new(if preview_current {
+                    "CURRENT VERIFIED PREVIEW"
+                } else {
+                    "STALE PREVIEW · COMPILE AGAIN"
+                })
+                .size(10.0)
+                .color(if preview_current { GOOD } else { BAD }),
+            );
+            field(ui, "PLACEMENT", placement);
+            field(
+                ui,
+                "REGION / CODE",
+                &format!(
+                    "{} bytes / {} bytes",
+                    bundle.placement_plan.original_size,
+                    bundle.placement_plan.replacement_size
+                ),
+            );
+            field(
+                ui,
+                "PATCHIR",
+                &format!("{} typed statements", bundle.typed_patch_ir.statements.len()),
+            );
+            if let Some(segment) = &bundle.placement_plan.executable_segment {
+                field(
+                    ui,
+                    "RX SEGMENT",
+                    &format!(
+                        "file 0x{:x} · VA 0x{:x} · {} bytes",
+                        segment.file_offset, segment.virtual_address.0, segment.file_size
+                    ),
+                );
+            }
+            egui::CollapsingHeader::new("Byte-level patch delta").show(ui, |ui| {
+                field(ui, "ORIGINAL REGION", &bundle.original_region_hex);
+                field(ui, "COMPILED CODE", &bundle.compiled_bytes_hex);
+                if let Some(entry) = &bundle.placement_plan.entry_bytes_hex {
+                    field(ui, "NEW ENTRY", entry);
+                }
+            });
+            egui::CollapsingHeader::new("Verification evidence").show(ui, |ui| {
+                for evidence in &bundle.verification_evidence {
+                    ui.label(format!(
+                        "{} · {:?} · {}",
+                        evidence.check, evidence.status, evidence.details
+                    ));
+                }
+                if let Some(report) = &self.patch_verification_report {
+                    ui.code(report);
+                }
+            });
+        }
         if let Some(digest) = &self.patch_digest {
             field(ui, "PATCHED ELF SHA-256", digest);
             if let Some(path) = &self.patch_exported_path {
@@ -5085,7 +5324,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalystApp, Event, Tab, ir_slice, validate_endpoint};
+    use super::{AnalystApp, Event, Tab, ir_slice, preview_patch_local, validate_endpoint};
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
@@ -5173,6 +5412,20 @@ mod tests {
         assert!(validate_endpoint("http://0.0.0.0:50051").is_err());
         assert!(validate_endpoint("http://192.0.2.1:50051").is_err());
         assert!(validate_endpoint("https://127.0.0.1:50051").is_err());
+    }
+
+    #[test]
+    fn local_patch_preview_exposes_verified_trampoline_plan_without_writing() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
+        let (bundle, report) =
+            preview_patch_local(binary, "hydir_nop_identity", "return 0x0123456789abcdef;")
+                .unwrap();
+        assert_eq!(
+            bundle.placement_plan.strategy,
+            hydir_patch::PlacementStrategy::EntryTrampoline
+        );
+        assert!(bundle.placement_plan.executable_segment.is_some());
+        assert!(report.contains("Structural verification passed"));
     }
 
     #[test]
