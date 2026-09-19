@@ -1,10 +1,13 @@
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
-    MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at, lift_cfg,
-    lift_symbol, proven_stack_local_offsets, recover_at_cfg, recover_region_cfg,
-    recover_symbol_cfg, region_contract,
+    MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at,
+    lift_region_decision, lift_symbol, proven_stack_local_offsets, recover_at_cfg,
+    recover_region_cfg, recover_symbol_cfg, region_contract,
 };
-use hydir_c::{build_decompilation_unit, emit_structured_c};
+use hydir_c::{
+    build_decision_decompilation_unit, build_decompilation_unit, emit_decision_region_c,
+    emit_decision_region_llvm, emit_structured_c,
+};
 use hydir_core::{
     CallingConvention, ScalarType, annotation_address_in_spec, parse_program_spec_json,
 };
@@ -39,6 +42,7 @@ Usage:
   hydirctl analyze-spec <linked-elf>
   hydirctl irene3-inspect <anvill-spec.pb> [--canonical-output <canonical.pb>]
   hydirctl irene3-region <anvill-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
+  hydirctl irene3-decompile-region <anvill-spec.pb> <linked-elf> <block-uid> [--output <unit.json>]
   hydirctl irene3-compat-report <anvill-spec.pb> <linked-elf>
   hydirctl cfg <elf> <function-symbol>
   hydirctl region <linked-elf> <function-symbol>
@@ -316,6 +320,40 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!();
             }
         }
+        Some("irene3-decompile-region") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let uid = parse_u64_auto(&args[3], "block UID")?;
+            let region = document.region_spec_for_elf(&elf, uid)?;
+            let decision_ir = lift_region_decision(&region)?;
+            let unit = build_decision_decompilation_unit(
+                region,
+                decision_ir,
+                concat!("hydir/", env!("CARGO_PKG_VERSION")),
+            )?;
+            let json = serde_json::to_vec_pretty(&unit)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
         Some("irene3-compat-report") if args.len() == 3 => {
             let metadata = fs::metadata(&args[1])?;
             if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
@@ -357,13 +395,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 }
                                 Err(error) => result["cfg_diagnostic"] = json!(error.to_string()),
                             }
-                            match lift_cfg(document.block_bytes(*uid)?, region.entry.0) {
-                                Ok(llvm) => {
+                            match lift_region_decision(&region) {
+                                Ok(decision_ir) => {
+                                    let llvm = emit_decision_region_llvm(&decision_ir, &region)?;
                                     lifted += 1;
                                     result["lifted"] = json!(true);
+                                    result["region_ir_kind"] = json!("decision_v1");
                                     result["llvm_sha256"] =
                                         json!(format!("{:x}", sha2::Sha256::digest(&llvm)));
-                                    match emit_structured_c(&llvm) {
+                                    match emit_decision_region_c(&decision_ir, &region) {
                                         Ok(c) => {
                                             c_emitted += 1;
                                             result["c_emitted"] = json!(true);

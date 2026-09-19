@@ -7,8 +7,8 @@
 
 use hydir_core::{
     Address, DECOMPILATION_UNIT_VERSION, DecompilationDiagnostic, DecompilationUnit,
-    DiagnosticSeverity, FactProvenance, FactSource, RegionSpec, StatementAddressProvenance,
-    validate_decompilation_unit,
+    DiagnosticSeverity, FactProvenance, FactSource, RegionDecisionIr, RegionPredicate, RegionSpec,
+    StatementAddressProvenance, validate_decompilation_unit, validate_region_decision_ir,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -555,6 +555,331 @@ uint64_t hydir_lifted(uint64_t arg0, uint64_t arg1) {\n\
     Ok(fallback)
 }
 
+fn decision_integer_type(width_bits: u16) -> Result<(&'static str, &'static str), String> {
+    match width_bits {
+        1 => Ok(("i1", "uint8_t")),
+        8 => Ok(("i8", "uint8_t")),
+        16 => Ok(("i16", "uint16_t")),
+        32 => Ok(("i32", "uint32_t")),
+        64 => Ok(("i64", "uint64_t")),
+        other => Err(format!(
+            "decision RegionIR cannot render {other}-bit physical state"
+        )),
+    }
+}
+
+fn decision_flag_input(ir: &RegionDecisionIr, name: &str) -> Result<usize, String> {
+    ir.physical_inputs
+        .iter()
+        .position(|input| input.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("decision RegionIR lacks required {name} input"))
+}
+
+fn emit_decision_llvm_predicate(
+    ir: &RegionDecisionIr,
+    body: &mut String,
+) -> Result<String, String> {
+    let mut flag = |name: &str| -> Result<String, String> {
+        let index = decision_flag_input(ir, name)?;
+        match ir.physical_inputs[index].width_bits {
+            1 => Ok(format!("%in{index}")),
+            8 => {
+                let value = format!("%flag_{}", name.to_ascii_lowercase());
+                body.push_str(&format!("  {value} = trunc i8 %in{index} to i1\n"));
+                Ok(value)
+            }
+            width => Err(format!(
+                "decision RegionIR {name} input has unsupported width {width}"
+            )),
+        }
+    };
+    let mut sequence = 0usize;
+    let temporary = |body: &mut String, sequence: &mut usize, operation: String| {
+        let name = format!("%predicate_{sequence}");
+        *sequence += 1;
+        body.push_str(&format!("  {name} = {operation}\n"));
+        name
+    };
+    let predicate = match ir.predicate {
+        RegionPredicate::Equal => flag("ZF")?,
+        RegionPredicate::NotEqual => {
+            let zf = flag("ZF")?;
+            temporary(body, &mut sequence, format!("xor i1 {zf}, true"))
+        }
+        RegionPredicate::Signed => flag("SF")?,
+        RegionPredicate::NotSigned => {
+            let sf = flag("SF")?;
+            temporary(body, &mut sequence, format!("xor i1 {sf}, true"))
+        }
+        RegionPredicate::Overflow => flag("OF")?,
+        RegionPredicate::NotOverflow => {
+            let of = flag("OF")?;
+            temporary(body, &mut sequence, format!("xor i1 {of}, true"))
+        }
+        RegionPredicate::Below => flag("CF")?,
+        RegionPredicate::AboveOrEqual => {
+            let cf = flag("CF")?;
+            temporary(body, &mut sequence, format!("xor i1 {cf}, true"))
+        }
+        RegionPredicate::BelowOrEqual | RegionPredicate::Above => {
+            let cf = flag("CF")?;
+            let zf = flag("ZF")?;
+            let either = temporary(body, &mut sequence, format!("or i1 {cf}, {zf}"));
+            if ir.predicate == RegionPredicate::Above {
+                temporary(body, &mut sequence, format!("xor i1 {either}, true"))
+            } else {
+                either
+            }
+        }
+        RegionPredicate::Less | RegionPredicate::GreaterOrEqual => {
+            let sf = flag("SF")?;
+            let of = flag("OF")?;
+            let less = temporary(body, &mut sequence, format!("xor i1 {sf}, {of}"));
+            if ir.predicate == RegionPredicate::GreaterOrEqual {
+                temporary(body, &mut sequence, format!("xor i1 {less}, true"))
+            } else {
+                less
+            }
+        }
+        RegionPredicate::LessOrEqual | RegionPredicate::Greater => {
+            let zf = flag("ZF")?;
+            let sf = flag("SF")?;
+            let of = flag("OF")?;
+            let less = temporary(body, &mut sequence, format!("xor i1 {sf}, {of}"));
+            if ir.predicate == RegionPredicate::LessOrEqual {
+                temporary(body, &mut sequence, format!("or i1 {zf}, {less}"))
+            } else {
+                let nonzero = temporary(body, &mut sequence, format!("xor i1 {zf}, true"));
+                let same_sign = temporary(body, &mut sequence, format!("xor i1 {less}, true"));
+                temporary(
+                    body,
+                    &mut sequence,
+                    format!("and i1 {nonzero}, {same_sign}"),
+                )
+            }
+        }
+    };
+    Ok(predicate)
+}
+
+fn emit_decision_llvm_exit(
+    body: &mut String,
+    label: &str,
+    exit: Address,
+    ir: &RegionDecisionIr,
+) -> Result<(), String> {
+    body.push_str(&format!("{label}:\n"));
+    let mut value = format!("%{label}_result_0");
+    body.push_str(&format!(
+        "  {value} = insertvalue %hydir_region_result poison, i64 {}, 0\n",
+        exit.0
+    ));
+    for (index, binding) in ir.pass_through.iter().enumerate() {
+        let input_index = usize::try_from(binding.input_index)
+            .map_err(|_| "decision RegionIR input index overflows")?;
+        let output_index = usize::try_from(binding.output_index)
+            .map_err(|_| "decision RegionIR output index overflows")?;
+        let (llvm_type, _) = decision_integer_type(ir.physical_outputs[output_index].width_bits)?;
+        let next = format!("%{label}_result_{}", index + 1);
+        body.push_str(&format!(
+            "  {next} = insertvalue %hydir_region_result {value}, {llvm_type} %in{input_index}, {}\n",
+            output_index + 1
+        ));
+        value = next;
+    }
+    body.push_str(&format!("  ret %hydir_region_result {value}\n"));
+    Ok(())
+}
+
+/// Render LLVM 17-compatible text for a validated typed decision RegionIR.
+pub fn emit_decision_region_llvm(
+    ir: &RegionDecisionIr,
+    region: &RegionSpec,
+) -> Result<String, String> {
+    validate_region_decision_ir(ir, region)?;
+    let output_types = ir
+        .physical_outputs
+        .iter()
+        .map(|output| decision_integer_type(output.width_bits).map(|types| types.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_parameters = ir
+        .physical_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            decision_integer_type(input.width_bits).map(|types| format!("{} %in{index}", types.0))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut body = String::new();
+    for address in &ir.instruction_addresses {
+        body.push_str(&format!("  ; 0x{:x}\n", address.0));
+    }
+    let predicate = emit_decision_llvm_predicate(ir, &mut body)?;
+    body.push_str(&format!(
+        "  br i1 {predicate}, label %exit_true, label %exit_false\n"
+    ));
+    emit_decision_llvm_exit(&mut body, "exit_true", ir.true_exit, ir)?;
+    emit_decision_llvm_exit(&mut body, "exit_false", ir.false_exit, ir)?;
+    let mut result_types = vec!["i64"];
+    result_types.extend(output_types);
+    Ok(format!(
+        "; HydIR typed decision RegionIR v1; all physical outputs are explicit pass-through bindings.\n\
+         target triple = \"x86_64-unknown-linux-gnu\"\n\n\
+         %hydir_region_result = type {{ {} }}\n\n\
+         define %hydir_region_result @hydir_region({}) {{\nentry:\n{body}}}\n",
+        result_types.join(", "),
+        input_parameters.join(", ")
+    ))
+}
+
+fn decision_c_flag(ir: &RegionDecisionIr, name: &str) -> Result<String, String> {
+    let index = decision_flag_input(ir, name)?;
+    Ok(format!("((in{index} & UINT8_C(1)) != 0)"))
+}
+
+fn decision_c_comment(value: &str) -> String {
+    value.replace("*/", "* /").replace(['\r', '\n'], " ")
+}
+
+fn decision_c_predicate(ir: &RegionDecisionIr) -> Result<String, String> {
+    let flag = |name| decision_c_flag(ir, name);
+    Ok(match ir.predicate {
+        RegionPredicate::Equal => flag("ZF")?,
+        RegionPredicate::NotEqual => format!("!{}", flag("ZF")?),
+        RegionPredicate::Signed => flag("SF")?,
+        RegionPredicate::NotSigned => format!("!{}", flag("SF")?),
+        RegionPredicate::Overflow => flag("OF")?,
+        RegionPredicate::NotOverflow => format!("!{}", flag("OF")?),
+        RegionPredicate::Below => flag("CF")?,
+        RegionPredicate::AboveOrEqual => format!("!{}", flag("CF")?),
+        RegionPredicate::BelowOrEqual => format!("({} || {})", flag("CF")?, flag("ZF")?),
+        RegionPredicate::Above => format!("(!{} && !{})", flag("CF")?, flag("ZF")?),
+        RegionPredicate::Less => format!("({} != {})", flag("SF")?, flag("OF")?),
+        RegionPredicate::GreaterOrEqual => format!("({} == {})", flag("SF")?, flag("OF")?),
+        RegionPredicate::LessOrEqual => {
+            format!("({} || ({} != {}))", flag("ZF")?, flag("SF")?, flag("OF")?)
+        }
+        RegionPredicate::Greater => {
+            format!("(!{} && ({} == {}))", flag("ZF")?, flag("SF")?, flag("OF")?)
+        }
+    })
+}
+
+fn emit_decision_c_return(
+    output: &mut String,
+    exit: Address,
+    ir: &RegionDecisionIr,
+) -> Result<(), String> {
+    output.push_str(&format!(
+        "    return (hydir_region_result){{ .exit_address = UINT64_C({})",
+        exit.0
+    ));
+    for binding in &ir.pass_through {
+        output.push_str(&format!(
+            ", .out{} = in{}",
+            binding.output_index, binding.input_index
+        ));
+    }
+    output.push_str(" };\n");
+    Ok(())
+}
+
+/// Render deterministic C for a validated typed decision RegionIR.
+pub fn emit_decision_region_c(
+    ir: &RegionDecisionIr,
+    region: &RegionSpec,
+) -> Result<String, String> {
+    validate_region_decision_ir(ir, region)?;
+    let mut output = String::from(
+        "/* HydIR typed decision RegionIR v1; explicit continuations and pass-through state. */\n#include <stdint.h>\n\ntypedef struct {\n  uint64_t exit_address;\n",
+    );
+    for (index, physical) in ir.physical_outputs.iter().enumerate() {
+        let (_, c_type) = decision_integer_type(physical.width_bits)?;
+        output.push_str(&format!(
+            "  {c_type} out{index}; /* {} */\n",
+            decision_c_comment(&physical.name)
+        ));
+    }
+    output.push_str("} hydir_region_result;\n\nhydir_region_result hydir_region(");
+    let parameters = ir
+        .physical_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, physical)| {
+            decision_integer_type(physical.width_bits).map(|types| {
+                format!(
+                    "{} in{index} /* {} */",
+                    types.1,
+                    decision_c_comment(&physical.name)
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    output.push_str(&parameters.join(", "));
+    output.push_str(") {\n");
+    for address in &ir.instruction_addresses {
+        output.push_str(&format!("  /* 0x{:x} */\n", address.0));
+    }
+    output.push_str(&format!("  if ({}) {{\n", decision_c_predicate(ir)?));
+    emit_decision_c_return(&mut output, ir.true_exit, ir)?;
+    output.push_str("  } else {\n");
+    emit_decision_c_return(&mut output, ir.false_exit, ir)?;
+    output.push_str("  }\n}\n");
+    Ok(output)
+}
+
+/// Package a typed decision RegionIR and its deterministic C view. Unlike the
+/// legacy scalar unit, this unit contains a native CIR payload and has no
+/// implicit SysV function-signature assumption.
+pub fn build_decision_decompilation_unit(
+    region: RegionSpec,
+    ir: RegionDecisionIr,
+    engine_version: &str,
+) -> Result<DecompilationUnit, String> {
+    validate_region_decision_ir(&ir, &region)?;
+    let region_ir_llvm = emit_decision_region_llvm(&ir, &region)?;
+    let c_source = emit_decision_region_c(&ir, &region)?;
+    let c_line = c_source
+        .lines()
+        .position(|line| line.trim_start().starts_with("if ("))
+        .and_then(|index| u32::try_from(index + 1).ok())
+        .ok_or_else(|| "decision C output lacks its condition statement".to_owned())?;
+    let statement_provenance = vec![StatementAddressProvenance {
+        c_start_line: c_line,
+        c_end_line: c_line,
+        addresses: ir.instruction_addresses.clone(),
+        provenance: FactProvenance {
+            source: FactSource::NativeAnalysis,
+            scope: "typed decision C emitted from all RegionDecisionIR instructions".to_owned(),
+        },
+    }];
+    let mut diagnostics = Vec::new();
+    if !region.unresolved_facts.is_empty() {
+        diagnostics.push(DecompilationDiagnostic {
+            code: "region_contract_incomplete".to_owned(),
+            severity: DiagnosticSeverity::Warning,
+            message: format!(
+                "RegionSpec retains {} unresolved fact(s); decompilation is available but replacement is not authorized",
+                region.unresolved_facts.len()
+            ),
+            blocks_stable_operation: true,
+        });
+    }
+    let unit = DecompilationUnit {
+        schema_version: DECOMPILATION_UNIT_VERSION,
+        binary_sha256: region.binary_sha256.clone(),
+        region,
+        region_ir_llvm,
+        cir: Some(serde_json::to_string_pretty(&ir).map_err(|error| error.to_string())?),
+        c_source,
+        statement_provenance,
+        diagnostics,
+        engine_version: engine_version.to_owned(),
+    };
+    validate_decompilation_unit(&unit)?;
+    Ok(unit)
+}
+
 fn block_address(label: &str, prefix: &str, suffix: &str) -> Option<Address> {
     let value = label.trim().strip_prefix(prefix)?.strip_suffix(suffix)?;
     (!value.is_empty())
@@ -825,7 +1150,90 @@ fn trace_return(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_decompilation_unit, emit_c, emit_structured_c};
+    use super::{
+        build_decision_decompilation_unit, build_decompilation_unit, emit_c,
+        emit_decision_region_c, emit_decision_region_llvm, emit_structured_c,
+    };
+    use hydir_core::{
+        Address, AddressKind, FactProvenance, FactSource, PhysicalLocationKind,
+        PhysicalLocationSpec, REGION_SPEC_VERSION, RegionSpec,
+    };
+    use sha2::{Digest, Sha256};
+
+    fn decision_location(name: &str) -> PhysicalLocationSpec {
+        PhysicalLocationSpec {
+            name: name.to_owned(),
+            kind: PhysicalLocationKind::Register,
+            width_bits: 8,
+            type_name: Some("u8".to_owned()),
+            provenance: FactProvenance {
+                source: FactSource::InterchangeImport,
+                scope: "test physical state".to_owned(),
+            },
+        }
+    }
+
+    fn decision_region() -> RegionSpec {
+        let code = [0x7f, 0x05];
+        let inputs = ["AL", "OF", "SF", "ZF"]
+            .into_iter()
+            .map(decision_location)
+            .collect::<Vec<_>>();
+        RegionSpec {
+            schema_version: REGION_SPEC_VERSION,
+            binary_sha256: "0".repeat(64),
+            symbol_name: "decision".to_owned(),
+            address_kind: AddressKind::Virtual,
+            entry: Address(0x1000),
+            byte_length: code.len() as u64,
+            bytes_sha256: format!("{:x}", Sha256::digest(code)),
+            bytes_hex: "7f05".to_owned(),
+            exits: vec![Address(0x1007), Address(0x1002)],
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            observed_interior_entries: Vec::new(),
+            live_in: None,
+            live_out: None,
+            physical_live_in: inputs.clone(),
+            physical_live_out: vec![inputs[0].clone()],
+            stack_delta: Some(0),
+            stack_entry_alignment: None,
+            exit_stack_relations: Vec::new(),
+            global_references: Vec::new(),
+            variable_locations: Vec::new(),
+            assumptions: Vec::new(),
+            unresolved_facts: vec!["test uncertainty".to_owned()],
+            replacement_ready: false,
+            provenance: FactProvenance {
+                source: FactSource::InterchangeImport,
+                scope: "test region".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn decision_region_emits_explicit_llvm_c_and_cir() {
+        assert_eq!(super::decision_c_comment("AL*/\ncode"), "AL* / code");
+        let region = decision_region();
+        let ir = hydir_backend::lift_region_decision(&region).unwrap();
+        let llvm = emit_decision_region_llvm(&ir, &region).unwrap();
+        assert!(llvm.contains("%hydir_region_result = type { i64, i8 }"));
+        assert!(llvm.contains("insertvalue %hydir_region_result"));
+        assert!(llvm.contains("br i1 %predicate_3"));
+        let c = emit_decision_region_c(&ir, &region).unwrap();
+        assert!(c.contains("uint64_t exit_address;"));
+        assert!(c.contains(".out0 = in0"));
+        assert!(c.contains("in3") && c.contains("in2") && c.contains("in1"));
+        let unit = build_decision_decompilation_unit(region, ir, "hydir-test").unwrap();
+        assert!(unit.cir.is_some());
+        assert_eq!(unit.statement_provenance.len(), 1);
+        assert!(
+            !unit
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cir_unavailable")
+        );
+    }
 
     #[test]
     fn emits_parallel_phi_edge_copies() {

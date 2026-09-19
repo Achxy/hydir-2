@@ -7,7 +7,11 @@
 //! and SSA values. Calls and arbitrary x86 instructions remain unsupported.
 
 use super::{Result, error};
-use hydir_core::{Address, AddressKind, BlockSpec, EdgeKind, EdgeSpec, FunctionCfg, SPEC_VERSION};
+use hydir_core::{
+    Address, AddressKind, BlockSpec, EdgeKind, EdgeSpec, FunctionCfg, REGION_DECISION_IR_VERSION,
+    RegionDecisionIr, RegionPassThroughBinding, RegionPredicate, RegionSpec, SPEC_VERSION,
+    region_bytes, validate_region_decision_ir,
+};
 use hydir_semantics::{Alu, Condition, Op, Value, Value32, classify};
 use iced_x86::{Decoder, DecoderOptions, Register};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -567,6 +571,131 @@ pub(super) fn recover_declared_region_cfg(
         recovery_scope: "Exact direct control flow inside RegionSpec bytes with declared external exits and separately typed direct-call edges; semantic boundary state is not inferred"
             .to_owned(),
     })
+}
+
+fn region_predicate(condition: Condition) -> RegionPredicate {
+    match condition {
+        Condition::E => RegionPredicate::Equal,
+        Condition::Ne => RegionPredicate::NotEqual,
+        Condition::S => RegionPredicate::Signed,
+        Condition::Ns => RegionPredicate::NotSigned,
+        Condition::O => RegionPredicate::Overflow,
+        Condition::No => RegionPredicate::NotOverflow,
+        Condition::B => RegionPredicate::Below,
+        Condition::Ae => RegionPredicate::AboveOrEqual,
+        Condition::Be => RegionPredicate::BelowOrEqual,
+        Condition::A => RegionPredicate::Above,
+        Condition::L => RegionPredicate::Less,
+        Condition::Ge => RegionPredicate::GreaterOrEqual,
+        Condition::Le => RegionPredicate::LessOrEqual,
+        Condition::G => RegionPredicate::Greater,
+    }
+}
+
+pub(super) fn lift_region_decision(region: &RegionSpec) -> Result<RegionDecisionIr> {
+    let code = region_bytes(region).map_err(error)?;
+    let end = region
+        .entry
+        .0
+        .checked_add(region.byte_length)
+        .ok_or_else(|| error("region address range overflow"))?;
+    if !region.calls.is_empty() || !region.observed_interior_entries.is_empty() {
+        return Err(error(
+            "decision RegionIR requires no calls or observed interior entries",
+        ));
+    }
+    let declared = region
+        .exits
+        .iter()
+        .map(|exit| exit.0)
+        .collect::<BTreeSet<_>>();
+    let nodes = recover_bounded(&code, region.entry.0, None, Some(&declared), None, false)?;
+    let mut decision = None;
+    for (ip, node) in &nodes {
+        match node.op {
+            Op::Nop => {}
+            Op::Jcc(condition) if decision.is_none() => {
+                decision = Some((*ip, condition, node.successors.clone()));
+            }
+            _ => {
+                return Err(error(format!(
+                    "decision RegionIR rejects state-changing or non-conditional instruction at 0x{ip:x}"
+                )));
+            }
+        }
+    }
+    let (decision_ip, condition, successors) =
+        decision.ok_or_else(|| error("decision RegionIR requires one conditional branch"))?;
+    if successors.len() != 2
+        || successors
+            .iter()
+            .any(|successor| (region.entry.0..end).contains(successor))
+    {
+        return Err(error(
+            "decision RegionIR requires two direct external continuations",
+        ));
+    }
+    let mut observed = successors.clone();
+    observed.sort_unstable();
+    let mut expected = declared.into_iter().collect::<Vec<_>>();
+    expected.sort_unstable();
+    if observed != expected {
+        return Err(error(format!(
+            "decision RegionIR exits are not exact; expected {expected:x?}, observed {observed:x?}"
+        )));
+    }
+    let predicate = region_predicate(condition);
+    for flag in predicate.required_flags() {
+        if !region
+            .physical_live_in
+            .iter()
+            .any(|location| location.name.eq_ignore_ascii_case(flag))
+        {
+            return Err(error(format!(
+                "decision RegionIR requires imported physical input {flag}"
+            )));
+        }
+    }
+    let mut pass_through = Vec::with_capacity(region.physical_live_out.len());
+    for (output_index, output) in region.physical_live_out.iter().enumerate() {
+        let input_index = region
+            .physical_live_in
+            .iter()
+            .position(|input| {
+                input.name == output.name
+                    && input.kind == output.kind
+                    && input.width_bits == output.width_bits
+                    && input.type_name == output.type_name
+            })
+            .ok_or_else(|| {
+                error(format!(
+                    "decision RegionIR cannot prove live output {} is an unchanged input",
+                    output.name
+                ))
+            })?;
+        pass_through.push(RegionPassThroughBinding {
+            output_index: u32::try_from(output_index)
+                .map_err(|_| error("decision RegionIR output index overflows"))?,
+            input_index: u32::try_from(input_index)
+                .map_err(|_| error("decision RegionIR input index overflows"))?,
+        });
+    }
+    let ir = RegionDecisionIr {
+        schema_version: REGION_DECISION_IR_VERSION,
+        binary_sha256: region.binary_sha256.clone(),
+        region_bytes_sha256: region.bytes_sha256.clone(),
+        entry: region.entry,
+        instruction_addresses: nodes.keys().copied().map(Address).collect(),
+        predicate,
+        true_exit: Address(successors[0]),
+        false_exit: Address(successors[1]),
+        physical_inputs: region.physical_live_in.clone(),
+        physical_outputs: region.physical_live_out.clone(),
+        pass_through,
+    };
+    debug_assert_eq!(decision_ip, ir.instruction_addresses.last().unwrap().0);
+    validate_region_decision_ir(&ir, region).map_err(error)?;
+    Ok(ir)
 }
 
 pub(super) fn recover_function_cfg(
@@ -1277,6 +1406,10 @@ pub(super) fn lift_cfg_with_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydir_core::{
+        FactProvenance, FactSource, PhysicalLocationKind, PhysicalLocationSpec, REGION_SPEC_VERSION,
+    };
+    use sha2::{Digest, Sha256};
 
     fn test_region_metadata() -> RegionCfgMetadata<'static> {
         RegionCfgMetadata {
@@ -1285,6 +1418,97 @@ mod tests {
             binary_sha256: "0".repeat(64),
             provenance: "test",
         }
+    }
+
+    fn imported_location(name: &str, width_bits: u16) -> PhysicalLocationSpec {
+        PhysicalLocationSpec {
+            name: name.to_owned(),
+            kind: PhysicalLocationKind::Register,
+            width_bits,
+            type_name: Some(format!("u{width_bits}")),
+            provenance: FactProvenance {
+                source: FactSource::InterchangeImport,
+                scope: "test Anvill physical state".to_owned(),
+            },
+        }
+    }
+
+    fn decision_region() -> RegionSpec {
+        let code = [0x7f, 0x05]; // jg 0x1007; fallthrough 0x1002
+        let inputs = vec![
+            imported_location("AL", 8),
+            imported_location("OF", 8),
+            imported_location("SF", 8),
+            imported_location("ZF", 8),
+        ];
+        RegionSpec {
+            schema_version: REGION_SPEC_VERSION,
+            binary_sha256: "0".repeat(64),
+            symbol_name: "decision".to_owned(),
+            address_kind: AddressKind::Virtual,
+            entry: Address(0x1000),
+            byte_length: code.len() as u64,
+            bytes_sha256: format!("{:x}", Sha256::digest(code)),
+            bytes_hex: code.iter().map(|byte| format!("{byte:02x}")).collect(),
+            exits: vec![Address(0x1007), Address(0x1002)],
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            observed_interior_entries: Vec::new(),
+            live_in: None,
+            live_out: None,
+            physical_live_in: inputs.clone(),
+            physical_live_out: vec![inputs[0].clone()],
+            stack_delta: Some(0),
+            stack_entry_alignment: None,
+            exit_stack_relations: Vec::new(),
+            global_references: Vec::new(),
+            variable_locations: Vec::new(),
+            assumptions: Vec::new(),
+            unresolved_facts: vec!["test uncertainty".to_owned()],
+            replacement_ready: false,
+            provenance: FactProvenance {
+                source: FactSource::InterchangeImport,
+                scope: "test Anvill region".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn decision_region_ir_has_explicit_exits_and_pass_through_state() {
+        let region = decision_region();
+        let ir = lift_region_decision(&region).unwrap();
+        assert_eq!(ir.predicate, RegionPredicate::Greater);
+        assert_eq!(ir.true_exit, Address(0x1007));
+        assert_eq!(ir.false_exit, Address(0x1002));
+        assert_eq!(ir.pass_through.len(), 1);
+        assert_eq!(ir.pass_through[0].input_index, 0);
+        validate_region_decision_ir(&ir, &region).unwrap();
+
+        let mut wrong_exit = ir.clone();
+        wrong_exit.true_exit = Address(0x2000);
+        assert!(
+            validate_region_decision_ir(&wrong_exit, &region)
+                .unwrap_err()
+                .contains("exits")
+        );
+        let mut wrong_binding = ir;
+        wrong_binding.pass_through[0].input_index = 1;
+        assert!(
+            validate_region_decision_ir(&wrong_binding, &region)
+                .unwrap_err()
+                .contains("pass-through")
+        );
+
+        let mut missing_flag = region;
+        missing_flag
+            .physical_live_in
+            .retain(|location| location.name != "OF");
+        assert!(
+            lift_region_decision(&missing_flag)
+                .unwrap_err()
+                .0
+                .contains("physical input OF")
+        );
     }
 
     #[test]

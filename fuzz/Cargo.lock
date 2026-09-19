@@ -407,6 +407,7 @@ name = "hydir-c"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "serde_json",
 ]
 
 [[package]]

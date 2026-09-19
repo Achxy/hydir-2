@@ -15,7 +15,8 @@ use hydir_core::{
     Address, AddressKind, AddressSpaceSpec, DisassemblyFlow, ExitStackRelation, FactProvenance,
     FactSource, FunctionCfg, FunctionSpec, ImportSpec, InteriorEntryEvidence, MappedSegmentSpec,
     PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION, RecoveryState, RegionContract,
-    RelocationSpec, RelocationTargetSpec, SectionSpec, UncertaintySpec, region_bytes,
+    RegionDecisionIr, RelocationSpec, RelocationTargetSpec, SectionSpec, UncertaintySpec,
+    region_bytes,
 };
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
@@ -79,6 +80,13 @@ pub fn recover_region_cfg(region: &RegionContract) -> Result<FunctionCfg> {
             ),
         },
     )
+}
+
+/// Lift the first conservative RegionIR form: a side-effect-free conditional
+/// region with explicit physical inputs, pass-through outputs, and two exact
+/// continuation addresses.
+pub fn lift_region_decision(region: &RegionContract) -> Result<RegionDecisionIr> {
+    cfg::lift_region_decision(region)
 }
 
 fn parse_elf(bytes: &[u8]) -> Result<object::File<'_>> {
