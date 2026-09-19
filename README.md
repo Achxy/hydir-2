@@ -106,6 +106,8 @@ call targets with a distinct edge kind, and does not promote imported liveness
 or stack facts into semantic proof. MachineIR preserves mapped/TLS memory and
 non-frame register-save effects, while the scalar lift refuses them until a
 physical-state and memory contract is available.
+Imported call-site `stop`/`noreturn` facts are kept distinct, source-attributed,
+and may suppress a region fallthrough only at their exact instruction address.
 
 The scripts record CFG, LLVM IR, C, and differential results as inspectable artifacts. These checks establish the documented subset only; they do not prove equivalence for arbitrary programs. The UI also keeps failures specific: an unsupported call can stop C generation without invalidating an already recovered CFG or LLVM lift.
 

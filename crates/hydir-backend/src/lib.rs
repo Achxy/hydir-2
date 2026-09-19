@@ -58,17 +58,26 @@ fn error(message: impl Into<String>) -> HydirError {
 /// live-state and stack facts are not promoted to native semantic proof.
 pub fn recover_region_cfg(region: &RegionContract) -> Result<FunctionCfg> {
     let code = region_bytes(region).map_err(error)?;
+    let terminal_call_sites = region
+        .calls
+        .iter()
+        .filter(|call| call.noreturn || call.stops_flow)
+        .map(|call| call.source.0)
+        .collect::<std::collections::BTreeSet<_>>();
     cfg::recover_declared_region_cfg(
         &code,
         region.entry.0,
         &region.exits,
-        region.address_kind,
-        &region.symbol_name,
-        region.binary_sha256.clone(),
-        &format!(
-            "{}; HydIR declared-exit RegionSpec CFG recovery",
-            region.provenance.scope
-        ),
+        &terminal_call_sites,
+        cfg::RegionCfgMetadata {
+            address_kind: region.address_kind,
+            symbol_name: &region.symbol_name,
+            binary_sha256: region.binary_sha256.clone(),
+            provenance: &format!(
+                "{}; HydIR declared-exit RegionSpec CFG recovery",
+                region.provenance.scope
+            ),
+        },
     )
 }
 
@@ -925,6 +934,7 @@ pub fn region_contract(bytes: &[u8], name: &str) -> Result<RegionContract> {
         bytes_sha256: format!("{:x}", Sha256::digest(&code)),
         bytes_hex: code.iter().map(|byte| format!("{byte:02x}")).collect(),
         exits,
+        calls: Vec::new(),
         relocations,
         observed_interior_entries: observed_entries.into_values().collect(),
         live_in: None,

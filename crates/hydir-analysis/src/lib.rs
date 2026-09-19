@@ -289,6 +289,10 @@ fn analyze_inputs(inputs: &[FunctionInput], regions: &[GlobalRegion]) -> Analysi
                     .map(|(source, target)| CallSpec {
                         source: *source,
                         target: *target,
+                        return_address: None,
+                        is_tailcall: false,
+                        stops_flow: false,
+                        noreturn: false,
                         provenance: analysis_site_provenance(),
                     })
                     .collect(),
