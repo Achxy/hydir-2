@@ -11,15 +11,18 @@ use hydir_api::v1::{
     UploadBinaryRequest, hydir_client::HydirClient,
 };
 use hydir_api::v2::{
-    PatchRequest as PatchRequestV2, VerifyPatchRequest, hydir_v2_client::HydirV2Client,
+    ArtifactReply as ArtifactReplyV2, PatchRequest as PatchRequestV2, RegionRequest,
+    VerifyPatchRequest, hydir_v2_client::HydirV2Client,
 };
 use hydir_backend::{
-    MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_symbol, recover_symbol_cfg,
+    MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_physical_region, lift_symbol,
+    recover_symbol_cfg, region_contract,
 };
-use hydir_c::emit_structured_c;
+use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
-    Address, AnalystAnnotation, AnnotationKind, DisassemblyReport, FactSource, FunctionCfg,
-    FunctionSpec, ProgramSpec, overlay_analyst_assumptions, parse_program_spec_json,
+    Address, AnalystAnnotation, AnnotationKind, DecompilationUnit, DisassemblyReport, FactSource,
+    FunctionCfg, FunctionSpec, PhysicalRegionIr, ProgramSpec, RegionSpec,
+    overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
@@ -48,6 +51,8 @@ const MUTED: Color32 = Color32::from_rgb(157, 169, 170);
 const ACCENT: Color32 = Color32::from_rgb(224, 170, 93);
 const GOOD: Color32 = Color32::from_rgb(124, 190, 152);
 const BAD: Color32 = Color32::from_rgb(232, 139, 124);
+const INFO: Color32 = Color32::from_rgb(104, 177, 216);
+const VIOLET: Color32 = Color32::from_rgb(180, 145, 222);
 const PINNED_OPT: &str = "/usr/bin/opt-14";
 const PINNED_CLANG: &str = "/usr/bin/clang-14";
 
@@ -155,6 +160,7 @@ enum Event {
         cfg: Result<FunctionCfg, String>,
         ir: Result<String, String>,
         c: Result<String, String>,
+        region_artifacts: Box<RegionArtifacts>,
     },
     Disassembled(Result<DisassemblyReport, String>),
     Triton(Result<serde_json::Value, String>),
@@ -229,6 +235,12 @@ enum Event {
     },
     MutationUncertain(String),
     Failed(String),
+}
+
+struct RegionArtifacts {
+    region: Result<RegionSpec, String>,
+    physical_ir: Result<PhysicalRegionIr, String>,
+    decompilation: Result<DecompilationUnit, String>,
 }
 
 #[derive(Clone)]
@@ -379,6 +391,49 @@ async fn remote_v2_client(access: &RemoteAccess) -> Result<HydirV2Client<Channel
         .await
         .map_err(|e| format!("Cannot connect to HydIR v2 service: {e}"))?;
     Ok(HydirV2Client::new(channel).max_decoding_message_size(2 * 1024 * 1024 + 1024))
+}
+
+fn decode_v2_artifact<T: serde::de::DeserializeOwned>(
+    artifact: ArtifactReplyV2,
+    access: &RemoteAccess,
+    expected_media_type: &str,
+) -> Result<T, String> {
+    if artifact.project_revision != access.revision
+        || artifact.media_type != expected_media_type
+        || format!("{:x}", Sha256::digest(&artifact.content)) != artifact.sha256
+    {
+        return Err(format!(
+            "Remote {expected_media_type} artifact failed revision, digest, or media-type verification."
+        ));
+    }
+    serde_json::from_slice(&artifact.content)
+        .map_err(|error| format!("Invalid remote {expected_media_type} artifact: {error}"))
+}
+
+fn local_region_artifacts(
+    bytes: &[u8],
+    symbol: &str,
+    ir: &Result<String, String>,
+) -> RegionArtifacts {
+    let region = region_contract(bytes, symbol).map_err(|error| error.to_string());
+    let physical_ir = region
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|region| lift_physical_region(region).map_err(|error| error.to_string()));
+    let decompilation = region.as_ref().map_err(Clone::clone).and_then(|region| {
+        ir.as_ref().map_err(Clone::clone).and_then(|ir| {
+            build_decompilation_unit(
+                region.clone(),
+                ir.clone(),
+                concat!("hydir-gui/", env!("CARGO_PKG_VERSION")),
+            )
+        })
+    });
+    RegionArtifacts {
+        region,
+        physical_ir,
+        decompilation,
+    }
 }
 
 async fn open_remote(
@@ -563,10 +618,22 @@ async fn select_remote(
     Result<FunctionCfg, String>,
     Result<String, String>,
     Result<String, String>,
+    Result<RegionSpec, String>,
+    Result<PhysicalRegionIr, String>,
+    Result<DecompilationUnit, String>,
 ) {
     let mut client = match remote_client(access).await {
         Ok(client) => client,
-        Err(error) => return (Err(error.clone()), Err(error.clone()), Err(error)),
+        Err(error) => {
+            return (
+                Err(error.clone()),
+                Err(error.clone()),
+                Err(error.clone()),
+                Err(error.clone()),
+                Err(error.clone()),
+                Err(error),
+            );
+        }
     };
     let request = FunctionRequest {
         project_id: access.project_id.clone(),
@@ -623,7 +690,59 @@ async fn select_remote(
             }
             String::from_utf8(artifact.content).map_err(|e| format!("Invalid UTF-8 C: {e}"))
         });
-    (cfg, ir, c)
+    let mut client_v2 = match remote_v2_client(access).await {
+        Ok(client) => client,
+        Err(error) => {
+            return (
+                cfg,
+                ir,
+                c,
+                Err(error.clone()),
+                Err(error.clone()),
+                Err(error),
+            );
+        }
+    };
+    let region_request = RegionRequest {
+        project_id: access.project_id.clone(),
+        expected_revision: access.revision,
+        function_symbol: symbol.to_owned(),
+        assume_u64x2: true,
+    };
+    let region = client_v2
+        .get_region(authorized(region_request.clone(), &access.token))
+        .await
+        .map_err(|error| format!("Remote RegionSpec recovery failed: {error}"))
+        .and_then(|reply| {
+            decode_v2_artifact(
+                reply.into_inner(),
+                access,
+                "application/vnd.hydir.region-spec+json;version=3",
+            )
+        });
+    let physical_ir = client_v2
+        .lift_region(authorized(region_request.clone(), &access.token))
+        .await
+        .map_err(|error| format!("Remote PhysicalRegionIR recovery failed: {error}"))
+        .and_then(|reply| {
+            decode_v2_artifact(
+                reply.into_inner(),
+                access,
+                "application/vnd.hydir.physical-region-ir+json;version=1",
+            )
+        });
+    let decompilation = client_v2
+        .decompile_region(authorized(region_request, &access.token))
+        .await
+        .map_err(|error| format!("Remote DecompilationUnit recovery failed: {error}"))
+        .and_then(|reply| {
+            decode_v2_artifact(
+                reply.into_inner(),
+                access,
+                "application/vnd.hydir.decompilation-unit+json;version=1",
+            )
+        });
+    (cfg, ir, c, region, physical_ir, decompilation)
 }
 
 async fn analyze_remote(access: &RemoteAccess) -> Result<AnalysisReport, String> {
@@ -1567,16 +1686,29 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         .as_ref()
                         .map_err(Clone::clone)
                         .and_then(|ir| emit_structured_c(ir));
+                    let region_artifacts = local_region_artifacts(bytes, &symbol, &ir);
                     Event::Selected {
                         cfg: recover_symbol_cfg(bytes, &symbol).map_err(|e| e.to_string()),
                         ir,
                         c,
+                        region_artifacts: Box::new(region_artifacts),
                         symbol,
                     }
                 }
                 Source::Remote(access) => {
-                    let (cfg, ir, c) = runtime.block_on(select_remote(access, &symbol));
-                    Event::Selected { symbol, cfg, ir, c }
+                    let (cfg, ir, c, region, physical_ir, decompilation) =
+                        runtime.block_on(select_remote(access, &symbol));
+                    Event::Selected {
+                        symbol,
+                        cfg,
+                        ir,
+                        c,
+                        region_artifacts: Box::new(RegionArtifacts {
+                            region,
+                            physical_ir,
+                            decompilation,
+                        }),
+                    }
                 }
                 Source::None => {
                     Event::Failed("Open a local ELF or remote project first.".to_owned())
@@ -1943,6 +2075,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
+    RegionStudio,
     Bytes,
     Graph,
     Cfg,
@@ -1950,6 +2083,14 @@ enum Tab {
     Passes,
     C,
     Analysis,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RegionStudioMode {
+    Contract,
+    MachineIr,
+    DecompilePatch,
+    Evidence,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2012,6 +2153,12 @@ struct AnalystApp {
     ir: Option<String>,
     c: Option<String>,
     c_error: Option<String>,
+    region: Option<RegionSpec>,
+    region_error: Option<String>,
+    physical_region_ir: Option<PhysicalRegionIr>,
+    physical_region_error: Option<String>,
+    decompilation: Option<DecompilationUnit>,
+    decompilation_error: Option<String>,
     analysis: Option<AnalysisReport>,
     disassembly_report: Option<DisassemblyReport>,
     triton_result: Option<serde_json::Value>,
@@ -2032,6 +2179,7 @@ struct AnalystApp {
     last_job_poll: std::time::Instant,
     selected_address: Option<u64>,
     tab: Tab,
+    region_studio_mode: RegionStudioMode,
     graph_mode: GraphMode,
     busy: bool,
     status: String,
@@ -2104,6 +2252,12 @@ impl AnalystApp {
             ir: None,
             c: None,
             c_error: None,
+            region: None,
+            region_error: None,
+            physical_region_ir: None,
+            physical_region_error: None,
+            decompilation: None,
+            decompilation_error: None,
             analysis: None,
             disassembly_report: None,
             triton_result: None,
@@ -2123,7 +2277,8 @@ impl AnalystApp {
             job_symbol: None,
             last_job_poll: std::time::Instant::now(),
             selected_address: None,
-            tab: Tab::Bytes,
+            tab: Tab::RegionStudio,
+            region_studio_mode: RegionStudioMode::Contract,
             graph_mode: GraphMode::Function,
             busy: false,
             status: "No project open".to_owned(),
@@ -2186,6 +2341,8 @@ impl AnalystApp {
                     spec,
                 } => {
                     let binary_sha256 = spec.binary_sha256.clone();
+                    let default_symbol =
+                        spec.functions.first().map(|function| function.name.clone());
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.current_local_path = if remote {
@@ -2205,6 +2362,7 @@ impl AnalystApp {
                     self.ir = None;
                     self.c = None;
                     self.c_error = None;
+                    self.clear_region_artifacts();
                     self.analysis = None;
                     self.disassembly_report = None;
                     self.triton_result = None;
@@ -2227,7 +2385,7 @@ impl AnalystApp {
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
                     self.failure = None;
-                    if let Some(symbol) = self.initial_symbol.take() {
+                    if let Some(symbol) = self.initial_symbol.take().or(default_symbol) {
                         self.select(symbol);
                     }
                     self.enqueue(
@@ -2263,7 +2421,13 @@ impl AnalystApp {
                     self.history.push(self.status.clone());
                     self.failure = None;
                 }
-                Event::Selected { symbol, cfg, ir, c } => {
+                Event::Selected {
+                    symbol,
+                    cfg,
+                    ir,
+                    c,
+                    region_artifacts,
+                } => {
                     if self.symbol.as_deref() != Some(&symbol) {
                         continue;
                     }
@@ -2288,6 +2452,41 @@ impl AnalystApp {
                             self.c_error = Some(error);
                         }
                     }
+                    let RegionArtifacts {
+                        region,
+                        physical_ir,
+                        decompilation,
+                    } = *region_artifacts;
+                    match region {
+                        Ok(value) => {
+                            self.region = Some(value);
+                            self.region_error = None;
+                        }
+                        Err(error) => {
+                            self.region = None;
+                            self.region_error = Some(error);
+                        }
+                    }
+                    match physical_ir {
+                        Ok(value) => {
+                            self.physical_region_ir = Some(value);
+                            self.physical_region_error = None;
+                        }
+                        Err(error) => {
+                            self.physical_region_ir = None;
+                            self.physical_region_error = Some(error);
+                        }
+                    }
+                    match decompilation {
+                        Ok(value) => {
+                            self.decompilation = Some(value);
+                            self.decompilation_error = None;
+                        }
+                        Err(error) => {
+                            self.decompilation = None;
+                            self.decompilation_error = Some(error);
+                        }
+                    }
                     self.failure = ir_error.or(cfg_error);
                     self.status = if self.ir.is_some() {
                         format!(
@@ -2304,6 +2503,7 @@ impl AnalystApp {
                         format!("{symbol} is outside the current recovery contract")
                     };
                     self.history.push(self.status.clone());
+                    self.tab = Tab::RegionStudio;
                 }
                 Event::Disassembled(result) => match result {
                     Ok(report) => {
@@ -2451,6 +2651,7 @@ impl AnalystApp {
                     self.ir = None;
                     self.c = None;
                     self.c_error = None;
+                    self.clear_region_artifacts();
                     self.job = None;
                     self.job_symbol = None;
                     self.transform_before = None;
@@ -2494,6 +2695,7 @@ impl AnalystApp {
                     self.project_revision = Some(revision);
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
+                    self.clear_region_artifacts();
                     self.transform_before = Some(before);
                     self.transform_after = Some(after.clone());
                     self.transform_report = Some(report);
@@ -2539,6 +2741,7 @@ impl AnalystApp {
                     }
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
+                    self.clear_region_artifacts();
                     self.tab = Tab::Passes;
                     self.status =
                         format!("Local pass experiment saved to {}", output_dir.display());
@@ -2565,6 +2768,7 @@ impl AnalystApp {
                     self.ir = Some(ir);
                     self.c = None;
                     self.c_error = None;
+                    self.clear_region_artifacts();
                     self.analysis = None;
                     self.annotations.clear();
                     self.job = None;
@@ -2610,6 +2814,7 @@ impl AnalystApp {
                     self.ir = Some(ir);
                     self.c = None;
                     self.c_error = None;
+                    self.clear_region_artifacts();
                     self.analysis = None;
                     self.annotations.clear();
                     self.job = None;
@@ -2671,6 +2876,7 @@ impl AnalystApp {
                     self.ir = None;
                     self.c = None;
                     self.c_error = None;
+                    self.clear_region_artifacts();
                     self.analysis = None;
                     self.annotations.clear();
                     self.transform_before = None;
@@ -2712,6 +2918,7 @@ impl AnalystApp {
                     self.ir = None;
                     self.c = None;
                     self.c_error = None;
+                    self.clear_region_artifacts();
                     self.analysis = None;
                     self.annotations.clear();
                     self.transform_before = None;
@@ -2759,6 +2966,7 @@ impl AnalystApp {
                     self.cfg = None;
                     self.ir = None;
                     self.c = None;
+                    self.clear_region_artifacts();
                     self.analysis = None;
                     self.annotations.clear();
                     self.rebuilt_binary_sha256 = None;
@@ -2787,12 +2995,23 @@ impl AnalystApp {
             .find(|function| &function.name == symbol)
     }
 
+    fn clear_region_artifacts(&mut self) {
+        self.region = None;
+        self.region_error = None;
+        self.physical_region_ir = None;
+        self.physical_region_error = None;
+        self.decompilation = None;
+        self.decompilation_error = None;
+        self.region_studio_mode = RegionStudioMode::Contract;
+    }
+
     fn select(&mut self, name: String) {
         self.symbol = Some(name.clone());
         self.cfg = None;
         self.ir = None;
         self.c = None;
         self.c_error = None;
+        self.clear_region_artifacts();
         self.selected_address = None;
         self.enqueue(
             Task::Select(name),
@@ -2808,7 +3027,12 @@ impl AnalystApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("HYDIR").size(19.0).strong().color(ACCENT));
                     ui.separator();
-                    ui.label(RichText::new("NATIVE ANALYSIS").size(11.0).color(MUTED));
+                    ui.label(
+                        RichText::new("REGION DECOMPILATION · VERIFIED PATCHING")
+                            .size(11.0)
+                            .strong()
+                            .color(MUTED),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(if self.remote {
@@ -3671,6 +3895,7 @@ impl AnalystApp {
     fn main_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (tab, label) in [
+                (Tab::RegionStudio, "Region Studio"),
                 (Tab::Bytes, "Disassembly"),
                 (Tab::Graph, "Graph"),
                 (Tab::Cfg, "CFG"),
@@ -3687,6 +3912,7 @@ impl AnalystApp {
         });
         ui.separator();
         match self.tab {
+            Tab::RegionStudio => self.region_studio(ui),
             Tab::Bytes => self.disassembly(ui),
             Tab::Graph => self.graph_view(ui),
             Tab::Cfg => self.cfg_view(ui),
@@ -3695,6 +3921,620 @@ impl AnalystApp {
             Tab::Analysis => self.analysis_view(ui),
             Tab::C => self.c_view(ui),
         }
+    }
+
+    fn region_studio(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.heading(
+                    RichText::new("HydIR Region Studio")
+                        .size(22.0)
+                        .strong()
+                        .color(ACCENT),
+                );
+                ui.label(
+                    RichText::new(
+                        "Native region decompilation, physical-state inspection, PatchLang compilation, and reversible ELF placement",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (label, color) = if self.busy {
+                    ("WORKING", ACCENT)
+                } else if self.region.is_some() {
+                    ("DIGEST-BOUND", GOOD)
+                } else if self.symbol.is_some() {
+                    ("FAIL-CLOSED", BAD)
+                } else {
+                    ("AWAITING REGION", MUTED)
+                };
+                ui.label(RichText::new(label).size(11.0).strong().color(color));
+            });
+        });
+        ui.add_space(8.0);
+
+        let contract_ready = self.region.is_some();
+        let machine_ready = self.physical_region_ir.is_some();
+        let c_ready = self.decompilation.is_some() || self.c.is_some();
+        let patch_ready = self.patch_preview.is_some();
+        let applied = self.patch_digest.is_some();
+        ui.columns(5, |columns| {
+            stage_card(
+                &mut columns[0],
+                "01",
+                "REGION CONTRACT",
+                if contract_ready { "BOUND" } else { "PENDING" },
+                contract_ready,
+            );
+            stage_card(
+                &mut columns[1],
+                "02",
+                "PHYSICAL IR",
+                if machine_ready {
+                    "RECOVERED"
+                } else {
+                    "BLOCKED"
+                },
+                machine_ready,
+            );
+            stage_card(
+                &mut columns[2],
+                "03",
+                "DECOMPILE",
+                if c_ready { "AVAILABLE" } else { "BLOCKED" },
+                c_ready,
+            );
+            stage_card(
+                &mut columns[3],
+                "04",
+                "PATCH PLAN",
+                if patch_ready {
+                    "VERIFIED"
+                } else {
+                    "NOT COMPILED"
+                },
+                patch_ready,
+            );
+            stage_card(
+                &mut columns[4],
+                "05",
+                "OUTPUT ELF",
+                if applied { "SAVED" } else { "UNCHANGED" },
+                applied,
+            );
+        });
+        ui.add_space(8.0);
+
+        if self.spec.is_none() {
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(egui::Stroke::new(1.0, MUTED))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.heading("Open a Linux x86-64 ELF to begin");
+                    ui.label(
+                        RichText::new(
+                            "HydIR keeps the input immutable and derives every displayed artifact from its SHA-256-bound bytes.",
+                        )
+                        .color(MUTED),
+                    );
+                    ui.label("Use the Program panel on the left, or reopen your saved local ELF.");
+                });
+            return;
+        }
+        if self.symbol.is_none() {
+            let first = self
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.functions.first())
+                .map(|function| function.name.clone());
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(egui::Stroke::new(1.0, ACCENT))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.heading("Choose a function-sized region");
+                    ui.label(
+                        RichText::new(
+                            "Select any symbol from the function navigator. HydIR will recover the boundary contract, physical operations, deterministic C, and patch eligibility together.",
+                        )
+                        .color(MUTED),
+                    );
+                    if let Some(name) = first
+                        && ui
+                            .add_enabled(!self.busy, egui::Button::new(format!("Open first region · {name}")))
+                            .clicked()
+                    {
+                        self.select(name);
+                    }
+                });
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            for (mode, label) in [
+                (RegionStudioMode::Contract, "Contract & safety"),
+                (RegionStudioMode::MachineIr, "Physical state IR"),
+                (RegionStudioMode::DecompilePatch, "C ↔ PatchLang"),
+                (RegionStudioMode::Evidence, "Evidence & provenance"),
+            ] {
+                if ui
+                    .add(egui::Button::selectable(
+                        self.region_studio_mode == mode,
+                        label,
+                    ))
+                    .clicked()
+                {
+                    self.region_studio_mode = mode;
+                }
+            }
+        });
+        ui.separator();
+        match self.region_studio_mode {
+            RegionStudioMode::Contract => self.region_contract_view(ui),
+            RegionStudioMode::MachineIr => self.physical_region_view(ui),
+            RegionStudioMode::DecompilePatch => self.decompile_patch_view(ui),
+            RegionStudioMode::Evidence => self.region_evidence_view(ui),
+        }
+    }
+
+    fn region_contract_view(&mut self, ui: &mut egui::Ui) {
+        let Some(region) = &self.region else {
+            ui.colored_label(
+                BAD,
+                self.region_error
+                    .as_deref()
+                    .unwrap_or("RegionSpec recovery did not produce an artifact."),
+            );
+            return;
+        };
+        ui.columns(2, |columns| {
+            egui::Frame::new()
+                .fill(PANEL)
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[0], |ui| {
+                    ui.heading(RichText::new(&region.symbol_name).monospace().color(ACCENT));
+                    field(ui, "REGION", &format!("0x{:016x} + {} bytes", region.entry.0, region.byte_length));
+                    field(ui, "REGION SHA-256", &region.bytes_sha256);
+                    field(ui, "EXITS", &format_addresses(&region.exits));
+                    field(ui, "DIRECT CALL CONTRACTS", &region.calls.len().to_string());
+                    field(ui, "RELOCATIONS", &region.relocations.len().to_string());
+                    field(
+                        ui,
+                        "STACK",
+                        &region.stack_delta.map_or_else(
+                            || "unresolved".to_owned(),
+                            |delta| format!("RSP {delta:+} at return · entry alignment {}", region.stack_entry_alignment.map_or_else(|| "unknown".to_owned(), |value| value.to_string())),
+                        ),
+                    );
+                    ui.separator();
+                    ui.label(RichText::new("PHYSICAL LIVE-IN").size(10.0).strong().color(INFO));
+                    physical_location_chips(ui, &region.physical_live_in);
+                    ui.label(RichText::new("PHYSICAL LIVE-OUT").size(10.0).strong().color(VIOLET));
+                    physical_location_chips(ui, &region.physical_live_out);
+                });
+            egui::Frame::new()
+                .fill(PANEL)
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[1], |ui| {
+                    let stable = region.replacement_ready && region.unresolved_facts.is_empty();
+                    ui.heading(
+                        RichText::new(if stable {
+                            "Replacement boundary proven"
+                        } else {
+                            "Safety gate is holding"
+                        })
+                        .color(if stable { GOOD } else { BAD }),
+                    );
+                    ui.label(
+                        RichText::new(if stable {
+                            "The region contract contains the required boundary state."
+                        } else {
+                            "HydIR recovered useful semantics but will not promote missing facts into assumptions."
+                        })
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    if region.unresolved_facts.is_empty() {
+                        ui.colored_label(GOOD, "✓ No unresolved RegionSpec facts");
+                    } else {
+                        for fact in &region.unresolved_facts {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(BAD, "●");
+                                ui.label(fact);
+                            });
+                        }
+                    }
+                    if !region.observed_interior_entries.is_empty() {
+                        ui.separator();
+                        ui.colored_label(BAD, "OBSERVED INTERIOR ENTRIES");
+                        for entry in &region.observed_interior_entries {
+                            ui.label(format!("0x{:016x} · {}", entry.entry.0, entry.reason));
+                        }
+                    }
+                });
+        });
+    }
+
+    fn physical_region_view(&mut self, ui: &mut egui::Ui) {
+        let Some(ir) = &self.physical_region_ir else {
+            ui.colored_label(
+                BAD,
+                self.physical_region_error
+                    .as_deref()
+                    .unwrap_or("PhysicalRegionIR recovery did not produce an artifact."),
+            );
+            ui.label(
+                RichText::new("The RegionSpec remains available; unsupported semantics do not erase recovered evidence.")
+                    .color(MUTED),
+            );
+            return;
+        };
+        ui.horizontal_wrapped(|ui| {
+            metric_badge(ui, "INSTRUCTIONS", &ir.instructions.len().to_string(), INFO);
+            metric_badge(ui, "INPUTS", &ir.physical_inputs.len().to_string(), INFO);
+            metric_badge(
+                ui,
+                "OUTPUTS",
+                &ir.physical_outputs.len().to_string(),
+                VIOLET,
+            );
+            metric_badge(ui, "EXITS", &ir.exits.len().to_string(), ACCENT);
+            metric_badge(ui, "CALLS", &ir.calls.len().to_string(), ACCENT);
+            metric_badge(
+                ui,
+                "LOWERING",
+                if ir.lowering_ready { "READY" } else { "GATED" },
+                if ir.lowering_ready { GOOD } else { BAD },
+            );
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("ADDRESS / BYTES")
+                    .size(10.0)
+                    .strong()
+                    .color(MUTED),
+            );
+            ui.add_space(115.0);
+            ui.label(
+                RichText::new("MACHINE OPERATION")
+                    .size(10.0)
+                    .strong()
+                    .color(MUTED),
+            );
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("physical_region_ir")
+            .show(ui, |ui| {
+                for instruction in &ir.instructions {
+                    let selected = self.selected_address == Some(instruction.address.0);
+                    let operation = format!("{:?}", instruction.operation);
+                    let response = egui::Frame::new()
+                        .fill(if selected { Color32::from_rgb(63, 55, 43) } else { PANEL })
+                        .inner_margin(egui::Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "0x{:016x}  {:<18}",
+                                        instruction.address.0, instruction.bytes_hex
+                                    ))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(if selected { ACCENT } else { TEXT }),
+                                );
+                                ui.label(RichText::new(&instruction.mnemonic).monospace().strong());
+                                ui.label(RichText::new(operation).monospace().size(11.0).color(INFO));
+                            });
+                            ui.label(
+                                RichText::new(format!(
+                                    "reads {:?} · writes {:?} · flags {:?}/{:?} · memory {:?} · control {:?} · next {}",
+                                    instruction.effects.read_registers,
+                                    instruction.effects.written_registers,
+                                    instruction.effects.read_flags,
+                                    instruction.effects.written_flags,
+                                    instruction.effects.memory,
+                                    instruction.effects.control,
+                                    format_addresses(&instruction.successors),
+                                ))
+                                .monospace()
+                                .size(10.0)
+                                .color(MUTED),
+                            );
+                        });
+                    if response.response.interact(egui::Sense::click()).clicked() {
+                        self.selected_address = Some(instruction.address.0);
+                    }
+                }
+            });
+    }
+
+    fn decompile_patch_view(&mut self, ui: &mut egui::Ui) {
+        let c_source = self
+            .decompilation
+            .as_ref()
+            .map(|unit| unit.c_source.clone())
+            .or_else(|| self.c.clone());
+        ui.columns(2, |columns| {
+            columns[0].heading(RichText::new("Deterministic C").color(INFO));
+            columns[0].label(
+                RichText::new("Read-only decompilation · machine-address provenance retained")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+            egui::Frame::new()
+                .fill(Color32::from_rgb(17, 21, 24))
+                .inner_margin(egui::Margin::same(12))
+                .show(&mut columns[0], |ui| {
+                    egui::ScrollArea::both()
+                        .id_salt("region_studio_c")
+                        .max_height(430.0)
+                        .show(ui, |ui| {
+                            if let Some(source) = &c_source {
+                                ui.code(source);
+                            } else {
+                                ui.colored_label(
+                                    BAD,
+                                    self.decompilation_error
+                                        .as_deref()
+                                        .or(self.c_error.as_deref())
+                                        .unwrap_or("Structured C is unavailable for this region."),
+                                );
+                            }
+                        });
+                });
+
+            columns[1].heading(RichText::new("HydIR PatchLang").color(VIOLET));
+            columns[1].label(
+                RichText::new("Typed replacement source · compiled to PatchIR and native bytes")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+            let editor = columns[1].add(
+                egui::TextEdit::multiline(&mut self.patch_replacement)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(12)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("u64 result = arg0 - arg1;\nreturn result;"),
+            );
+            if editor.changed() {
+                self.patch_preview = None;
+                self.patch_verification_report = None;
+            }
+            columns[1].horizontal(|ui| {
+                if ui.small_button("Identity template").clicked() {
+                    self.patch_replacement = "return arg0;".to_owned();
+                    self.patch_preview = None;
+                }
+                if ui.small_button("Subtract template").clicked() {
+                    self.patch_replacement = "u64 result = arg0 - arg1;\nreturn result;".to_owned();
+                    self.patch_preview = None;
+                }
+            });
+            columns[1].checkbox(
+                &mut self.trusted_fixture,
+                "Trusted fixture; authorize compiler processing",
+            );
+            columns[1].checkbox(
+                &mut self.entry_only_assertion,
+                "Assert no control flow enters the region interior",
+            );
+            columns[1].label(RichText::new("OUTPUT ELF · NEW FILE ONLY").size(10.0).color(MUTED));
+            columns[1].add(
+                egui::TextEdit::singleline(&mut self.patch_output_path)
+                    .hint_text("C:\\path\\to\\patched.elf")
+                    .desired_width(f32::INFINITY),
+            );
+            let selected_symbol = self.symbol.clone();
+            let preview_ready = self.spec.is_some()
+                && selected_symbol.is_some()
+                && self.trusted_fixture
+                && self.entry_only_assertion
+                && !self.patch_replacement.trim().is_empty()
+                && !self.busy;
+            columns[1].horizontal(|ui| {
+                let preview = ui.add_enabled(
+                    preview_ready,
+                    egui::Button::new("Compile + verify plan"),
+                );
+                if preview.clicked()
+                    && let Some(symbol) = selected_symbol.clone()
+                {
+                    self.enqueue(
+                        Task::PreviewPatch {
+                            symbol,
+                            replacement: self.patch_replacement.trim().to_owned(),
+                        },
+                        "Compiling PatchLang and verifying placement…",
+                    );
+                }
+                preview.on_disabled_hover_text(
+                    "Select a region and explicitly accept the trusted-fixture and entry-only contracts.",
+                );
+                let preview_current = self.patch_preview.as_ref().is_some_and(|bundle| {
+                    bundle.source.replacement == self.patch_replacement.trim()
+                        && Some(bundle.source.function_symbol.as_str()) == selected_symbol.as_deref()
+                        && self.spec.as_ref().is_some_and(|spec| {
+                            spec.binary_sha256 == bundle.source.binary_sha256
+                        })
+                });
+                let apply_ready = preview_ready
+                    && preview_current
+                    && (self.remote || !self.patch_output_path.trim().is_empty());
+                let apply = ui.add_enabled(
+                    apply_ready,
+                    egui::Button::new(if self.remote {
+                        "Apply as new revision"
+                    } else {
+                        "Apply to copy"
+                    }),
+                );
+                if apply.clicked()
+                    && let Some(symbol) = selected_symbol.clone()
+                {
+                    let task = if self.remote {
+                        Task::PatchRemote {
+                            symbol,
+                            replacement: self.patch_replacement.trim().to_owned(),
+                            key: uuid::Uuid::new_v4().to_string(),
+                        }
+                    } else {
+                        Task::PatchLocal {
+                            symbol,
+                            replacement: self.patch_replacement.trim().to_owned(),
+                            output_path: PathBuf::from(self.patch_output_path.trim()),
+                        }
+                    };
+                    self.enqueue(task, "Applying the verified HydIR patch…");
+                }
+                apply.on_disabled_hover_text(
+                    "Compile a current verified plan first. Local apply requires a new output path.",
+                );
+            });
+        });
+        self.patch_plan_summary(ui);
+    }
+
+    fn patch_plan_summary(&self, ui: &mut egui::Ui) {
+        let Some(bundle) = &self.patch_preview else {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Compile the PatchLang source to reveal PatchIR, byte delta, placement strategy, and structural verification evidence.",
+                )
+                .color(MUTED),
+            );
+            return;
+        };
+        let placement = match bundle.placement_plan.strategy {
+            PlacementStrategy::InPlace => "IN-PLACE REPLACEMENT",
+            PlacementStrategy::EntryTrampoline => "ENTRY TRAMPOLINE → NEW RX SEGMENT",
+        };
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(PANEL)
+            .stroke(egui::Stroke::new(1.0, GOOD))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(GOOD, "✓ STRUCTURALLY VERIFIED");
+                    ui.separator();
+                    ui.label(RichText::new(placement).strong().color(ACCENT));
+                    ui.separator();
+                    ui.label(format!(
+                        "{} region bytes → {} compiled bytes · {} PatchIR statements",
+                        bundle.placement_plan.original_size,
+                        bundle.placement_plan.replacement_size,
+                        bundle.typed_patch_ir.statements.len(),
+                    ));
+                });
+                if let Some(segment) = &bundle.placement_plan.executable_segment {
+                    ui.label(
+                        RichText::new(format!(
+                            "RX segment: file 0x{:x} · VA 0x{:x} · {} bytes",
+                            segment.file_offset, segment.virtual_address.0, segment.file_size,
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                }
+                egui::CollapsingHeader::new("Byte-level delta")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        field(ui, "ORIGINAL REGION", &bundle.original_region_hex);
+                        field(ui, "COMPILED CODE", &bundle.compiled_bytes_hex);
+                        if let Some(entry) = &bundle.placement_plan.entry_bytes_hex {
+                            field(ui, "NEW ENTRY", entry);
+                        }
+                    });
+            });
+    }
+
+    fn region_evidence_view(&mut self, ui: &mut egui::Ui) {
+        ui.columns(2, |columns| {
+            columns[0].heading(RichText::new("Artifact provenance").color(INFO));
+            if let Some(region) = &self.region {
+                field(&mut columns[0], "BINARY SHA-256", &region.binary_sha256);
+                field(&mut columns[0], "REGION SHA-256", &region.bytes_sha256);
+                field(
+                    &mut columns[0],
+                    "ADDRESS MODEL",
+                    &format!("{:?}", region.address_kind),
+                );
+                field(
+                    &mut columns[0],
+                    "FACT SOURCE",
+                    &format!("{:?}", region.provenance.source),
+                );
+                field(&mut columns[0], "RECOVERY SCOPE", &region.provenance.scope);
+            }
+            if let Some(unit) = &self.decompilation {
+                columns[0].separator();
+                field(&mut columns[0], "ENGINE", &unit.engine_version);
+                field(
+                    &mut columns[0],
+                    "STATEMENT MAPPINGS",
+                    &unit.statement_provenance.len().to_string(),
+                );
+                for mapping in &unit.statement_provenance {
+                    columns[0].label(
+                        RichText::new(format!(
+                            "C {}–{} ← {}",
+                            mapping.c_start_line,
+                            mapping.c_end_line,
+                            format_addresses(&mapping.addresses),
+                        ))
+                        .monospace()
+                        .size(11.0),
+                    );
+                }
+            }
+
+            columns[1].heading(RichText::new("Release gates").color(VIOLET));
+            if let Some(unit) = &self.decompilation {
+                for diagnostic in &unit.diagnostics {
+                    let color = if diagnostic.blocks_stable_operation {
+                        BAD
+                    } else {
+                        ACCENT
+                    };
+                    columns[1].label(
+                        RichText::new(format!("{} · {:?}", diagnostic.code, diagnostic.severity))
+                            .strong()
+                            .color(color),
+                    );
+                    columns[1].label(RichText::new(&diagnostic.message).color(MUTED));
+                    columns[1].add_space(5.0);
+                }
+            } else if let Some(error) = &self.decompilation_error {
+                columns[1].colored_label(BAD, error);
+            }
+            if let Some(bundle) = &self.patch_preview {
+                columns[1].separator();
+                columns[1].label(RichText::new("PATCH VERIFICATION").strong().color(GOOD));
+                for evidence in &bundle.verification_evidence {
+                    let passed = format!("{:?}", evidence.status).eq_ignore_ascii_case("passed");
+                    columns[1].label(
+                        RichText::new(format!(
+                            "{} {} · {}",
+                            if passed { "✓" } else { "!" },
+                            evidence.check,
+                            evidence.details,
+                        ))
+                        .color(if passed { GOOD } else { BAD }),
+                    );
+                }
+                if let Some(report) = &self.patch_verification_report {
+                    egui::CollapsingHeader::new("Verification report JSON")
+                        .show(&mut columns[1], |ui| ui.code(report));
+                }
+            }
+        });
     }
 
     fn disassembly(&mut self, ui: &mut egui::Ui) {
@@ -4676,6 +5516,88 @@ impl AnalystApp {
     }
 }
 
+fn stage_card(ui: &mut egui::Ui, number: &str, title: &str, status: &str, ready: bool) {
+    egui::Frame::new()
+        .fill(if ready {
+            Color32::from_rgb(29, 48, 42)
+        } else {
+            PANEL
+        })
+        .stroke(egui::Stroke::new(1.0, if ready { GOOD } else { MUTED }))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_height(54.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(number)
+                        .monospace()
+                        .size(10.0)
+                        .strong()
+                        .color(if ready { GOOD } else { MUTED }),
+                );
+                ui.label(RichText::new(title).size(10.0).strong());
+            });
+            ui.label(RichText::new(status).size(11.0).strong().color(if ready {
+                GOOD
+            } else {
+                MUTED
+            }));
+        });
+}
+
+fn metric_badge(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{label}  {value}"))
+                    .monospace()
+                    .size(10.0)
+                    .strong()
+                    .color(color),
+            );
+        });
+}
+
+fn format_addresses(addresses: &[Address]) -> String {
+    if addresses.is_empty() {
+        "none".to_owned()
+    } else {
+        addresses
+            .iter()
+            .map(|address| format!("0x{:x}", address.0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn physical_location_chips(ui: &mut egui::Ui, locations: &[hydir_core::PhysicalLocationSpec]) {
+    if locations.is_empty() {
+        ui.label(RichText::new("unresolved").color(BAD));
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for location in locations {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(37, 45, 50))
+                .stroke(egui::Stroke::new(1.0, MUTED))
+                .inner_margin(egui::Margin::symmetric(7, 3))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {:?} · {}b",
+                            location.name, location.kind, location.width_bits
+                        ))
+                        .monospace()
+                        .size(10.0),
+                    );
+                });
+        }
+    });
+}
+
 fn field(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
     ui.label(RichText::new(value).size(12.0));
@@ -5265,10 +6187,14 @@ fn main() -> eframe::Result<()> {
                 project_id.clone(),
             )
             .await?;
-            let (cfg, ir, c) = select_remote(&access, symbol).await;
+            let (cfg, ir, c, region, physical_ir, decompilation) =
+                select_remote(&access, symbol).await;
             let cfg = cfg?;
             let ir = ir?;
             let c = c?;
+            let region = region?;
+            let physical_ir = physical_ir?;
+            let decompilation = decompilation?;
             if !c.contains("uint64_t hydir_lifted(") {
                 return Err(
                     "Remote C artifact did not contain the expected lifted function.".to_owned(),
@@ -5277,6 +6203,12 @@ fn main() -> eframe::Result<()> {
             let analysis = analyze_remote(&access).await?;
             if analysis.binary_sha256 != spec.binary_sha256 {
                 return Err("Remote analysis model digest differs from open project.".to_owned());
+            }
+            if region.binary_sha256 != spec.binary_sha256
+                || physical_ir.region_bytes_sha256 != region.bytes_sha256
+                || decompilation.region.bytes_sha256 != region.bytes_sha256
+            {
+                return Err("Remote Region Studio artifacts are not digest-bound.".to_owned());
             }
             let started =
                 start_remote_job(&access, symbol, &uuid::Uuid::new_v4().to_string()).await?;
@@ -5336,7 +6268,7 @@ fn main() -> eframe::Result<()> {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("HydIR · Native Analysis")
+            .with_title("HydIR · Region Studio")
             .with_inner_size([1400.0, 850.0]),
         ..Default::default()
     };
@@ -5359,9 +6291,10 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, Event, Tab, ir_slice, preview_patch_local, valid_bearer_token,
-        validate_endpoint,
+        AnalystApp, Event, Tab, ir_slice, local_region_artifacts, preview_patch_local,
+        valid_bearer_token, validate_endpoint,
     };
+    use hydir_backend::lift_symbol;
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
@@ -5440,6 +6373,23 @@ mod tests {
             ir_slice(ir, 0x1000).unwrap(),
             "b1000:\n  ; 0x1000: 90\n  br label %b1001"
         );
+    }
+
+    #[test]
+    fn local_region_studio_artifacts_are_digest_bound_and_presentable() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
+        let ir = lift_symbol(binary, "hydir_max2").map_err(|error| error.to_string());
+        let artifacts = local_region_artifacts(binary, "hydir_max2", &ir);
+        let region = artifacts.region.unwrap();
+        let physical = artifacts.physical_ir.unwrap();
+        let decompilation = artifacts.decompilation.unwrap();
+        assert_eq!(physical.binary_sha256, region.binary_sha256);
+        assert_eq!(physical.region_bytes_sha256, region.bytes_sha256);
+        assert_eq!(decompilation.region.bytes_sha256, region.bytes_sha256);
+        assert!(!physical.instructions.is_empty());
+        assert!(decompilation.c_source.contains("uint64_t hydir_lifted("));
+        let app = AnalystApp::new(&eframe::egui::Context::default());
+        assert!(matches!(app.tab, Tab::RegionStudio));
     }
 
     #[test]
