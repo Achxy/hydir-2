@@ -15,7 +15,7 @@ use hydir_core::{
     Address, AddressKind, AddressSpaceSpec, DisassemblyFlow, ExitStackRelation, FactProvenance,
     FactSource, FunctionCfg, FunctionSpec, ImportSpec, InteriorEntryEvidence, MappedSegmentSpec,
     PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION, RecoveryState, RegionContract,
-    RelocationSpec, RelocationTargetSpec, SectionSpec, UncertaintySpec,
+    RelocationSpec, RelocationTargetSpec, SectionSpec, UncertaintySpec, region_bytes,
 };
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
@@ -51,6 +51,25 @@ const MAX_METADATA_NAME_BYTES: usize = 4096;
 
 fn error(message: impl Into<String>) -> HydirError {
     HydirError(message.into())
+}
+
+/// Recover exact direct control flow for a RegionSpec while preserving its
+/// declared external exits. This is a structural artifact only: imported
+/// live-state and stack facts are not promoted to native semantic proof.
+pub fn recover_region_cfg(region: &RegionContract) -> Result<FunctionCfg> {
+    let code = region_bytes(region).map_err(error)?;
+    cfg::recover_declared_region_cfg(
+        &code,
+        region.entry.0,
+        &region.exits,
+        region.address_kind,
+        &region.symbol_name,
+        region.binary_sha256.clone(),
+        &format!(
+            "{}; HydIR declared-exit RegionSpec CFG recovery",
+            region.provenance.scope
+        ),
+    )
 }
 
 fn parse_elf(bytes: &[u8]) -> Result<object::File<'_>> {

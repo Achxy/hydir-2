@@ -1,7 +1,8 @@
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at, lift_cfg,
-    lift_symbol, proven_stack_local_offsets, recover_at_cfg, recover_symbol_cfg, region_contract,
+    lift_symbol, proven_stack_local_offsets, recover_at_cfg, recover_region_cfg,
+    recover_symbol_cfg, region_contract,
 };
 use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
@@ -327,6 +328,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let elf = read_binary(&args[2])?;
             let mut regions = Vec::new();
             let mut bound = 0usize;
+            let mut cfg_recovered = 0usize;
             let mut lifted = 0usize;
             let mut c_emitted = 0usize;
             for function in &document.specification().functions {
@@ -334,6 +336,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     let mut result = json!({
                         "uid": uid,
                         "bound": false,
+                        "cfg_recovered": false,
                         "lifted": false,
                         "c_emitted": false,
                     });
@@ -343,6 +346,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                             result["bound"] = json!(true);
                             result["entry"] = json!(format!("0x{:016x}", region.entry.0));
                             result["bytes"] = json!(region.byte_length);
+                            match recover_region_cfg(&region) {
+                                Ok(cfg) => {
+                                    cfg_recovered += 1;
+                                    result["cfg_recovered"] = json!(true);
+                                    result["cfg_sha256"] = json!(format!(
+                                        "{:x}",
+                                        sha2::Sha256::digest(serde_json::to_vec(&cfg)?)
+                                    ));
+                                }
+                                Err(error) => result["cfg_diagnostic"] = json!(error.to_string()),
+                            }
                             match lift_cfg(document.block_bytes(*uid)?, region.entry.0) {
                                 Ok(llvm) => {
                                     lifted += 1;
@@ -375,6 +389,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "binary_sha256": format!("{:x}", sha2::Sha256::digest(&elf)),
                     "total_regions": document.inventory().blocks,
                     "bound_regions": bound,
+                    "cfg_recovered_regions": cfg_recovered,
                     "lifted_regions": lifted,
                     "c_regions": c_emitted,
                     "regions": regions,

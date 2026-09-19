@@ -722,6 +722,13 @@ pub fn validate_region_spec(spec: &RegionSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Decode the exact bytes carried by a validated RegionSpec. Consumers use
+/// this instead of reparsing the hexadecimal field with divergent limits.
+pub fn region_bytes(spec: &RegionSpec) -> Result<Vec<u8>, String> {
+    validate_region_spec(spec)?;
+    decode_hex(&spec.bytes_hex)
+}
+
 fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("{label} SHA-256 must be 64 hexadecimal characters"));
@@ -941,6 +948,7 @@ pub struct EdgeSpec {
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     Direct,
+    Call,
     Taken,
     Fallthrough,
 }
