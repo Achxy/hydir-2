@@ -6,8 +6,9 @@
 //! accepted; unfamiliar LLVM syntax is an error, never an ignored operation.
 
 use hydir_core::{
-    DECOMPILATION_UNIT_VERSION, DecompilationDiagnostic, DecompilationUnit, DiagnosticSeverity,
-    RegionSpec, validate_decompilation_unit,
+    Address, DECOMPILATION_UNIT_VERSION, DecompilationDiagnostic, DecompilationUnit,
+    DiagnosticSeverity, FactProvenance, FactSource, RegionSpec, StatementAddressProvenance,
+    validate_decompilation_unit,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -554,30 +555,116 @@ uint64_t hydir_lifted(uint64_t arg0, uint64_t arg1) {\n\
     Ok(fallback)
 }
 
+fn block_address(label: &str, prefix: &str, suffix: &str) -> Option<Address> {
+    let value = label.trim().strip_prefix(prefix)?.strip_suffix(suffix)?;
+    (!value.is_empty())
+        .then(|| u64::from_str_radix(value, 16).ok().map(Address))
+        .flatten()
+}
+
+fn address_in_region(region: &RegionSpec, address: Address) -> bool {
+    region
+        .entry
+        .0
+        .checked_add(region.byte_length)
+        .is_some_and(|end| (region.entry.0..end).contains(&address.0))
+}
+
+fn generated_statement_provenance(
+    region: &RegionSpec,
+    raw_llvm: &str,
+    c_source: &str,
+) -> Vec<StatementAddressProvenance> {
+    let provenance = |address: Address| FactProvenance {
+        source: FactSource::NativeAnalysis,
+        scope: format!(
+            "deterministic C emitted from verified RegionIR instruction block 0x{:x}",
+            address.0
+        ),
+    };
+    let mut mappings = Vec::new();
+    let mut current = None;
+    for (index, line) in c_source.lines().enumerate() {
+        if let Some(address) = block_address(line, "L_b", ": {") {
+            current = address_in_region(region, address).then_some(address);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || matches!(trimmed, "{" | "}") {
+            continue;
+        }
+        if let Some(address) = current {
+            let line = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            mappings.push(StatementAddressProvenance {
+                c_start_line: line,
+                c_end_line: line,
+                addresses: vec![address],
+                provenance: provenance(address),
+            });
+        }
+    }
+    if !mappings.is_empty() {
+        return mappings;
+    }
+
+    // A proven structuring rewrite may collapse several direct-CFG blocks
+    // into one source statement. Preserve the many-to-one relationship.
+    let addresses = raw_llvm
+        .lines()
+        .filter_map(|line| block_address(line, "b", ":"))
+        .filter(|address| address_in_region(region, *address))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return mappings;
+    }
+    if let Some((index, _)) = c_source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.trim_start().starts_with("return "))
+    {
+        let line = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        mappings.push(StatementAddressProvenance {
+            c_start_line: line,
+            c_end_line: line,
+            provenance: FactProvenance {
+                source: FactSource::NativeAnalysis,
+                scope: "structured C statement proven from all contributing RegionIR instruction blocks"
+                    .to_owned(),
+            },
+            addresses,
+        });
+    }
+    mappings
+}
+
 /// Package the current native region lift and deterministic C view without
-/// claiming that the dedicated CIR or statement-level provenance already
-/// exists. Those missing facts remain machine-readable release blockers.
+/// claiming that the dedicated CIR already exists. Machine block labels are
+/// retained as validated statement/address provenance in the generated view.
 pub fn build_decompilation_unit(
     region: RegionSpec,
     raw_llvm: String,
     engine_version: &str,
 ) -> Result<DecompilationUnit, String> {
     let c_source = emit_structured_c(&raw_llvm)?;
-    let mut diagnostics = vec![
-        DecompilationDiagnostic {
+    let statement_provenance = generated_statement_provenance(&region, &raw_llvm, &c_source);
+    let mut diagnostics = vec![DecompilationDiagnostic {
             code: "cir_unavailable".to_owned(),
             severity: DiagnosticSeverity::Warning,
             message: "Dedicated structured CIR is not yet emitted; c_source is derived from the verified LLVM-compatible RegionIR"
                 .to_owned(),
             blocks_stable_operation: true,
-        },
-        DecompilationDiagnostic {
+        }];
+    if statement_provenance.is_empty() {
+        diagnostics.push(DecompilationDiagnostic {
             code: "statement_provenance_unavailable".to_owned(),
             severity: DiagnosticSeverity::Warning,
-            message: "Statement-to-address provenance has not yet been established".to_owned(),
+            message: "The verified RegionIR did not retain a selected-region instruction label that could be mapped into C"
+                .to_owned(),
             blocks_stable_operation: true,
-        },
-    ];
+        });
+    }
     if !region.unresolved_facts.is_empty() {
         diagnostics.push(DecompilationDiagnostic {
             code: "region_contract_incomplete".to_owned(),
@@ -596,7 +683,7 @@ pub fn build_decompilation_unit(
         region_ir_llvm: raw_llvm,
         cir: None,
         c_source,
-        statement_provenance: Vec::new(),
+        statement_provenance,
         diagnostics,
         engine_version: engine_version.to_owned(),
     };
@@ -852,10 +939,46 @@ mod tests {
         assert_eq!(unit.schema_version, hydir_core::DECOMPILATION_UNIT_VERSION);
         assert_eq!(unit.binary_sha256, unit.region.binary_sha256);
         assert!(unit.cir.is_none());
+        assert!(!unit.statement_provenance.is_empty());
+        assert!(unit.statement_provenance.iter().all(|mapping| {
+            mapping.addresses.iter().all(|address| {
+                (unit.region.entry.0..unit.region.entry.0 + unit.region.byte_length)
+                    .contains(&address.0)
+            })
+        }));
         assert!(
-            unit.diagnostics
+            !unit
+                .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "statement_provenance_unavailable")
         );
+        let mut invalid = unit.clone();
+        invalid.statement_provenance[0].addresses = vec![hydir_core::Address(
+            invalid.region.entry.0 + invalid.region.byte_length,
+        )];
+        assert!(
+            hydir_core::validate_decompilation_unit(&invalid)
+                .unwrap_err()
+                .contains("invalid statement provenance")
+        );
+    }
+
+    #[test]
+    fn direct_cfg_c_lines_retain_instruction_addresses() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
+        let region = hydir_backend::region_contract(binary, "hydir_frame_balance").unwrap();
+        let ir = hydir_backend::lift_symbol(binary, "hydir_frame_balance").unwrap();
+        let unit = build_decompilation_unit(region, ir, "hydir-test").unwrap();
+        assert!(unit.statement_provenance.len() > 1);
+        assert!(
+            unit.statement_provenance
+                .iter()
+                .all(|mapping| mapping.addresses.len() == 1)
+        );
+        assert!(unit.statement_provenance.iter().any(|mapping| {
+            mapping
+                .addresses
+                .contains(&hydir_core::Address(unit.region.entry.0))
+        }));
     }
 }
