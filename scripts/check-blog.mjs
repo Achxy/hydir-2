@@ -90,7 +90,8 @@ for (const { page, name, ref } of refs) {
   }
 }
 
-JSON.parse(readFileSync(resolve(site, 'vercel.json'), 'utf8'));
+const cname = readFileSync(resolve(site, 'CNAME'), 'utf8').trim();
+if (cname !== 'hydir.wiki') errors.push(`blog/CNAME must contain only hydir.wiki, found: ${cname}`);
 
 if (errors.length) {
   for (const error of errors) console.error(error);
