@@ -22,6 +22,28 @@ function attrs(tag) {
   return Object.fromEntries([...tag.matchAll(/([\w-]+)="([^"]*)"/g)].map((match) => [match[1], match[2]]));
 }
 
+function resolveLocalFile(pathname) {
+  const target = resolve(site, `.${pathname}`);
+  const rel = relative(site, target);
+  if (rel === '..' || rel.startsWith(`..${sep}`)) return { escaped: true };
+
+  const candidates = pathname.endsWith('/')
+    ? [join(target, 'index.html')]
+    : extname(pathname)
+      ? [target]
+      : [target, `${target}.html`, join(target, 'index.html')];
+
+  for (const file of candidates) {
+    try {
+      const info = statSync(file);
+      if (info.isFile()) return { file, info };
+    } catch {
+      // Try the next source-file representation of this public route.
+    }
+  }
+  return {};
+}
+
 walk(site);
 if (!pages.includes(resolve(site, 'index.html'))) errors.push('blog/index.html is missing');
 
@@ -67,21 +89,16 @@ for (const { page, name, ref } of refs) {
     continue;
   }
   const pathname = decodeURIComponent(url.pathname);
-  const target = resolve(site, `.${pathname}`);
-  const rel = relative(site, target);
-  if (rel === '..' || rel.startsWith(`..${sep}`)) {
+  const resolved = resolveLocalFile(pathname);
+  if (resolved.escaped) {
     errors.push(`${relative(repo, page)}: reference escapes blog/: ${ref}`);
     continue;
   }
-  const file = pathname.endsWith('/') ? join(target, 'index.html') : target;
-  let info;
-  try {
-    info = statSync(file);
-  } catch {
+  if (!resolved.file) {
     errors.push(`${relative(repo, page)}: missing local file ${ref}`);
     continue;
   }
-  if (!info.isFile()) errors.push(`${relative(repo, page)}: reference is not a file: ${ref}`);
+  const { file, info } = resolved;
   if (name === 'img' && extname(file) === '.webp' && info.size > 300_000) {
     errors.push(`${relative(repo, page)}: WebP exceeds 300 KB: ${ref}`);
   }

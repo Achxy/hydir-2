@@ -1,2 +1,3 @@
 User-agent: *
 Allow: /
+Sitemap: https://hydir.wiki/sitemap.xml
