@@ -834,10 +834,12 @@ fn emit_shared_scalar(i: &Instruction, function: &Function) -> R<Option<String>>
             src: ScalarValue::Immediate(value),
         } => {
             let dst = reg(dst)?;
-            let operation = if matches!(kind, Alu::Add) {
-                "add"
-            } else {
-                "sub"
+            let operation = match kind {
+                Alu::Add => "add",
+                Alu::Sub => "sub",
+                Alu::And => "and",
+                Alu::Or => "or",
+                Alu::Xor => "xor",
             };
             out.push_str(&format!("  %old_{ip:x} = load i64, i64* @{dst}\n  %v_{ip:x} = {operation} i64 %old_{ip:x}, {}\n  %z_{ip:x} = icmp eq i64 %v_{ip:x}, 0\n  store i1 %z_{ip:x}, i1* @zf\n  store i64 %v_{ip:x}, i64* @{dst}\n", value as u64));
         }

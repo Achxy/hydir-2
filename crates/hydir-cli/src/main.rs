@@ -3,7 +3,7 @@ use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at, lift_symbol,
     proven_stack_local_offsets, recover_at_cfg, recover_symbol_cfg, region_contract,
 };
-use hydir_c::emit_structured_c;
+use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
     CallingConvention, ScalarType, annotation_address_in_spec, parse_program_spec_json,
 };
@@ -42,6 +42,7 @@ Usage:
   hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
+  hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
   hydirctl transform <elf> <function-symbol> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory> [--opt <path>]
@@ -316,6 +317,36 @@ fn run() -> Result<(), Box<dyn Error>> {
                 write_new_or_identical(path, c.as_bytes())?;
             } else {
                 print!("{c}");
+            }
+        }
+        Some("decompile-unit") if args.len() == 4 || args.len() == 6 => {
+            if args[3] != "--assume-u64x2" {
+                return Err(
+                    "decompile-unit requires explicit --assume-u64x2 prototype assertion".into(),
+                );
+            }
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[1])?;
+            let region = region_contract(&bytes, &args[2])?;
+            let raw_llvm = lift_symbol(&bytes, &args[2])?;
+            let unit = build_decompilation_unit(
+                region,
+                raw_llvm,
+                concat!("hydir/", env!("CARGO_PKG_VERSION")),
+            )?;
+            let json = serde_json::to_vec_pretty(&unit)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
             }
         }
         Some("decompile-at") if args.len() == 5 || args.len() == 7 => {
@@ -688,15 +719,15 @@ fn configured_triton_python() -> String {
     }
     let mut candidates = vec!["python".to_owned(), "python3".to_owned()];
     #[cfg(windows)]
-    if let Ok(output) = Command::new("py").args(["-0p"]).output() {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            candidates.extend(text.lines().filter_map(|line| {
-                line.split_whitespace()
-                    .find(|token| token.to_ascii_lowercase().ends_with(".exe"))
-                    .map(str::to_owned)
-            }));
-        }
+    if let Ok(output) = Command::new("py").args(["-0p"]).output()
+        && output.status.success()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        candidates.extend(text.lines().filter_map(|line| {
+            line.split_whitespace()
+                .find(|token| token.to_ascii_lowercase().ends_with(".exe"))
+                .map(str::to_owned)
+        }));
     }
     candidates
         .iter()

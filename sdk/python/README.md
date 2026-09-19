@@ -1,4 +1,4 @@
-# HydIR Python SDK (API v1 subset)
+# HydIR Python SDK (compatible v1 plus additive v2)
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback discovery, project creation,
@@ -6,6 +6,13 @@ explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
 durable lift jobs and event streams, a named allowlisted LLVM 14 pass
 experiment, restricted whole-executable rebuilding, and verified artifact
 download. There is no remote execution endpoint.
+
+`negotiate_api()` prefers `hydir.v2` discovery and falls back to v1 only when
+the endpoint reports `UNIMPLEMENTED`. v2 methods expose digest-checked
+`RegionSpec` v3 and `DecompilationUnit` v1 JSON, compile scalar patch v1 into
+reversible `PatchBundle` v2, apply it with revision/idempotency protection, and
+request structural bundle verification. Behavioral verification remains false
+until a separate execution gate supplies evidence.
 
 `decompile(project_id, revision, symbol, assume_u64x2=True)` returns C11
 from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
@@ -76,15 +83,16 @@ does not infer signatures. No sample is uploaded without a call to
 and `export_artifact` refuses to overwrite an existing path. The client
 rejects plaintext non-loopback endpoints and non-private credential files.
 
-Generated `hydir_pb2.py` and `hydir_pb2_grpc.py` correspond to
-`crates/hydir-api/proto/hydir.proto`, produced with `grpcio-tools==1.84.0`.
+Generated `hydir*_pb2.py` and `hydir*_pb2_grpc.py` correspond to the v1 and v2
+schemas in `crates/hydir-api/proto/`, produced with `grpcio-tools==1.84.0`.
 Regenerate after API changes with:
 
 ```sh
 python -m grpc_tools.protoc -I../../crates/hydir-api/proto \
   --python_out=hydir_sdk --grpc_python_out=hydir_sdk \
-  ../../crates/hydir-api/proto/hydir.proto
+  ../../crates/hydir-api/proto/hydir.proto \
+  ../../crates/hydir-api/proto/hydir_v2.proto
 ```
 
-After regeneration, change `import hydir_pb2` in the generated gRPC file to
-`from . import hydir_pb2` so the package imports correctly.
+After regeneration, change generated sibling imports to relative imports (for
+example, `from . import hydir_v2_pb2`) so the package imports correctly.

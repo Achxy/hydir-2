@@ -66,36 +66,37 @@ fn collect_call_candidates(
 ) -> Vec<FunctionCandidate> {
     let known: BTreeSet<u64> = seeds.iter().map(|seed| seed.address).collect();
     let mut candidates = BTreeMap::<u64, FunctionCandidate>::new();
-    if entry != 0 && !known.contains(&entry) {
-        if let Some((_, _, section)) = executable.iter().find(|(_, _, section)| {
+    if entry != 0
+        && !known.contains(&entry)
+        && let Some((_, _, section)) = executable.iter().find(|(_, _, section)| {
             section.address <= entry
                 && section
                     .address
                     .checked_add(section.bytes.len() as u64)
                     .is_some_and(|end| entry < end)
-        }) {
-            let offset = (entry - section.address) as usize;
-            candidates.insert(
-                entry,
-                FunctionCandidate {
-                    entry: Address(entry),
-                    evidence_site: Address(entry),
-                    evidence_bytes_hex: section.bytes[offset..]
-                        .iter()
-                        .take(16)
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect(),
-                    reason: "ELF entry point in executable section".to_owned(),
-                    extent: None,
-                    recovery_state: RecoveryState::NotAttempted,
-                    provenance: FactProvenance {
-                        source: FactSource::ElfMetadata,
-                        scope: "entry address only; function extent and return behavior unproven"
-                            .to_owned(),
-                    },
+        })
+    {
+        let offset = (entry - section.address) as usize;
+        candidates.insert(
+            entry,
+            FunctionCandidate {
+                entry: Address(entry),
+                evidence_site: Address(entry),
+                evidence_bytes_hex: section.bytes[offset..]
+                    .iter()
+                    .take(16)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                reason: "ELF entry point in executable section".to_owned(),
+                extent: None,
+                recovery_state: RecoveryState::NotAttempted,
+                provenance: FactProvenance {
+                    source: FactSource::ElfMetadata,
+                    scope: "entry address only; function extent and return behavior unproven"
+                        .to_owned(),
                 },
-            );
-        }
+            },
+        );
     }
     for instruction in instructions.values() {
         if instruction.function.is_none() || instruction.flow != DisassemblyFlow::Call {

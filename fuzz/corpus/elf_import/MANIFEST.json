@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "toolchain": {
+    "clang": "22.1.8",
+    "lld": "22.1.8",
+    "llvm_revision": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"
+  },
+  "common_arguments": [
+    "--target=x86_64-unknown-linux-gnu",
+    "-nostdlib",
+    "-fuse-ld=lld",
+    "-no-pie",
+    "-Wl,--build-id=none"
+  ],
+  "fixtures": [
+    {
+      "file": "max2.elf",
+      "source": "tests/fixtures/max2.S",
+      "entry": "hydir_max2",
+      "length": 1048,
+      "sha256": "48b09f9d8580403f4aa51435dfc5955f10715609c1487a123d07c9c6bff38d7d"
+    },
+    {
+      "file": "frame.elf",
+      "source": "tests/fixtures/scalar_corpus.S",
+      "entry": "hydir_frame_balance",
+      "length": 3312,
+      "sha256": "86e289c9ac20fd7031021877b617863b4c6087f05aa5f4a402f0b8c598ff0532"
+    },
+    {
+      "file": "stack.elf",
+      "source": "tests/fixtures/scalar_corpus.S",
+      "entry": "hydir_stack_branch",
+      "length": 3312,
+      "sha256": "5e2f4266a51b4c010f266d8e005e6c11783d6d58a82a09a2baa884a828dd12b9"
+    },
+    {
+      "file": "interior_entry.elf",
+      "source": "tests/fixtures/interior_entry.S",
+      "entry": "_start",
+      "length": 1128,
+      "sha256": "d808c757125322467338a877f8df32ad8415b8fdca74ad594fdde104c3c3455f"
+    },
+    {
+      "file": "interior_call.elf",
+      "source": "tests/fixtures/interior_call.S",
+      "entry": "_start",
+      "length": 1104,
+      "sha256": "321806c9a4e730b1c2f62c2883947c5abd5cc2f844c27db3f75e8457c50b0057"
+    }
+  ]
+}

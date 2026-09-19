@@ -10,14 +10,16 @@ use hydir_api::v1::{
     JobReply, JobRequest, PatchRequest, ProjectRequest, RebuildRequest, StartLiftJobRequest,
     TransformRequest, UploadBinaryRequest, hydir_client::HydirClient,
 };
-use hydir_backend::{MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_symbol, recover_symbol_cfg};
+use hydir_backend::{
+    MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_symbol, recover_symbol_cfg,
+};
 use hydir_c::emit_structured_c;
 use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, DisassemblyReport, FactSource, FunctionCfg,
     FunctionSpec, ProgramSpec, overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
-use hydir_project::{LocalProject, LocalProjectStore, WorkbenchSettings};
+use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
@@ -1213,7 +1215,11 @@ fn hydirctl_path() -> PathBuf {
             return sibling;
         }
     }
-    PathBuf::from(if cfg!(windows) { "hydirctl.exe" } else { "hydirctl" })
+    PathBuf::from(if cfg!(windows) {
+        "hydirctl.exe"
+    } else {
+        "hydirctl"
+    })
 }
 
 fn run_triton_cli(path: &Path, symbol: &str) -> Result<serde_json::Value, String> {
@@ -1288,11 +1294,7 @@ fn add_local_annotation(
     project: &LocalProject,
     bytes: &[u8],
     binary_sha256: &str,
-    kind: AnnotationKind,
-    address: Option<u64>,
-    scope: &str,
-    value: &str,
-    key: &str,
+    input: LocalAnnotationInput<'_>,
 ) -> Result<(LocalProject, ProgramSpec, Vec<AnalystAnnotation>), String> {
     let mut spec =
         import_elf(bytes).map_err(|error| format!("Local ELF import failed: {error}"))?;
@@ -1300,15 +1302,7 @@ fn add_local_annotation(
         return Err("Local annotation binary differs from the selected ELF".to_owned());
     }
     let mut store = LocalProjectStore::open_default()?;
-    let updated = store.add_annotation(
-        project,
-        &spec,
-        kind,
-        address.map(Address),
-        value,
-        scope,
-        key,
-    )?;
+    let updated = store.add_annotation(project, &spec, input)?;
     let annotations = store.list_annotations(&updated)?;
     overlay_analyst_assumptions(&mut spec, &annotations);
     Ok((updated, spec, annotations))
@@ -1360,8 +1354,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 .and_then(|text| {
                     serde_json::from_str::<GhidraGraph>(&text)
                         .map_err(|error| format!("Invalid Ghidra graph JSON: {error}"))
-                })
-            {
+                }) {
                 Ok(graph) => Event::GhidraGraphLoaded(Ok(graph)),
                 Err(error) => Event::GhidraGraphLoaded(Err(error)),
             },
@@ -1454,7 +1447,9 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
             },
             Task::Disassemble => Event::Disassembled(match &source {
                 Source::Local(bytes) => disassemble_elf(bytes).map_err(|error| error.to_string()),
-                Source::Remote(_) => Err("Whole-ELF disassembly is currently local-only.".to_owned()),
+                Source::Remote(_) => {
+                    Err("Whole-ELF disassembly is currently local-only.".to_owned())
+                }
                 Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
             }),
             Task::Triton { path, symbol } => Event::Triton(run_triton_cli(&path, &symbol)),
@@ -1512,11 +1507,13 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                                 project,
                                 bytes,
                                 &binary_sha256,
-                                kind,
-                                address,
-                                &scope,
-                                &value,
-                                &key,
+                                LocalAnnotationInput {
+                                    kind,
+                                    address: address.map(Address),
+                                    scope: &scope,
+                                    value: &value,
+                                    idempotency_key: &key,
+                                },
                             )
                         });
                     match result {
@@ -1644,7 +1641,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::Local(bytes) => match transform_local(bytes, &symbol, &passes, &output_dir)
                 {
                     Ok((before, after, report)) => {
-                            let c = emit_structured_c(&after);
+                        let c = emit_structured_c(&after);
                         Event::LocalTransformed {
                             before,
                             after,
@@ -2077,7 +2074,8 @@ impl AnalystApp {
                 Event::GhidraGraphLoaded(result) => match result {
                     Ok(graph) => {
                         if graph.schema_version != 1 || graph.source != "ghidra" {
-                            self.failure = Some("Unsupported Ghidra graph schema or source".to_owned());
+                            self.failure =
+                                Some("Unsupported Ghidra graph schema or source".to_owned());
                         } else {
                             self.status = format!("Loaded Ghidra graph for {}", graph.program);
                             self.history.push(self.status.clone());
@@ -2152,8 +2150,7 @@ impl AnalystApp {
                             .unwrap_or(false);
                         if !digest_matches {
                             self.failure = Some(
-                                "Disassembly binary digest does not match the open ELF."
-                                    .to_owned(),
+                                "Disassembly binary digest does not match the open ELF.".to_owned(),
                             );
                             self.status = "Disassembly discarded".to_owned();
                         } else {
@@ -2180,7 +2177,12 @@ impl AnalystApp {
                         let digest_matches = self
                             .spec
                             .as_ref()
-                            .and_then(|spec| result.get("binary_sha256").and_then(serde_json::Value::as_str).map(|digest| digest == spec.binary_sha256))
+                            .and_then(|spec| {
+                                result
+                                    .get("binary_sha256")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|digest| digest == spec.binary_sha256)
+                            })
                             .unwrap_or(false);
                         if !digest_matches {
                             self.failure = Some(
@@ -2192,7 +2194,8 @@ impl AnalystApp {
                                 .get("paths")
                                 .and_then(serde_json::Value::as_array)
                                 .map_or(0, Vec::len);
-                            self.status = format!("Triton symbolic analysis complete ({paths} paths)");
+                            self.status =
+                                format!("Triton symbolic analysis complete ({paths} paths)");
                             self.history.push(self.status.clone());
                             self.triton_result = Some(result);
                             self.console_mode = ConsoleMode::Activity;
@@ -2707,15 +2710,14 @@ impl AnalystApp {
                 && self.symbol.is_some(),
             egui::Button::new("Run Triton"),
         );
-        if triton.clicked() {
-            if let (Some(path), Some(symbol)) =
+        if triton.clicked()
+            && let (Some(path), Some(symbol)) =
                 (self.current_local_path.clone(), self.symbol.clone())
-            {
-                self.enqueue(
-                    Task::Triton { path, symbol },
-                    "Running Triton symbolic analysis…",
-                );
-            }
+        {
+            self.enqueue(
+                Task::Triton { path, symbol },
+                "Running Triton symbolic analysis…",
+            );
         }
         triton.on_disabled_hover_text(
             "Open a local ELF and select a function before running Triton.",
@@ -3256,7 +3258,7 @@ impl AnalystApp {
                     ),
                 );
             }
-                field(ui, "MEMORY/CALLS", "Unsupported by this lift");
+            field(ui, "MEMORY/CALLS", "Unsupported by this lift");
             if let Some(summary) = self.analysis.as_ref().and_then(|report| {
                 report.functions.iter().find(|summary| {
                     summary.name == function.name && summary.entry == function.address
@@ -3313,9 +3315,10 @@ impl AnalystApp {
             field(
                 ui,
                 "BRANCH TARGET",
-                &instruction
-                    .branch_target
-                    .map_or_else(|| "none".to_owned(), |target| format!("0x{:016x}", target.0)),
+                &instruction.branch_target.map_or_else(
+                    || "none".to_owned(),
+                    |target| format!("0x{:016x}", target.0),
+                ),
             );
             field(ui, "PROVENANCE", &instruction.provenance);
         }
@@ -3563,17 +3566,29 @@ impl AnalystApp {
                 self.console_mode = ConsoleMode::Triton;
             }
             if ui
-                .button(if self.console_detached { "Dock" } else { "Detach" })
+                .button(if self.console_detached {
+                    "Dock"
+                } else {
+                    "Detach"
+                })
                 .clicked()
             {
                 self.console_detached = !self.console_detached;
             }
-            ui.label(RichText::new("LOCAL ANALYSIS OUTPUT · no shell execution").size(10.0).color(MUTED));
+            ui.label(
+                RichText::new("LOCAL ANALYSIS OUTPUT · no shell execution")
+                    .size(10.0)
+                    .color(MUTED),
+            );
             if self.console_mode == ConsoleMode::Activity
                 && (self.disassembly_report.is_some() || self.triton_result.is_some())
             {
                 if ui
-                    .button(if self.console_json { "Show activity" } else { "Show JSON" })
+                    .button(if self.console_json {
+                        "Show activity"
+                    } else {
+                        "Show JSON"
+                    })
                     .clicked()
                 {
                     self.console_json = !self.console_json;
@@ -3611,49 +3626,51 @@ impl AnalystApp {
                 .max_height(available)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                if self.console_json {
-                    if let Some(result) = &self.triton_result
-                        && let Ok(json) = serde_json::to_string_pretty(result)
-                    {
-                        ui.label(RichText::new("TRITON SYMBOLIC RESULT").color(ACCENT));
-                        ui.code(json);
-                    } else if let Some(report) = &self.disassembly_report
-                        && let Ok(json) = serde_json::to_string_pretty(report)
-                    {
-                        ui.code(json);
-                    }
-                } else {
-                    if let Some(failure) = &self.failure {
-                        ui.colored_label(BAD, failure);
+                    if self.console_json {
+                        if let Some(result) = &self.triton_result
+                            && let Ok(json) = serde_json::to_string_pretty(result)
+                        {
+                            ui.label(RichText::new("TRITON SYMBOLIC RESULT").color(ACCENT));
+                            ui.code(json);
+                        } else if let Some(report) = &self.disassembly_report
+                            && let Ok(json) = serde_json::to_string_pretty(report)
+                        {
+                            ui.code(json);
+                        }
                     } else {
-                        ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
-                    }
-                    if let Some(report) = &self.disassembly_report {
-                        for warning in report.warnings.iter().take(8) {
-                            ui.colored_label(BAD, warning);
+                        if let Some(failure) = &self.failure {
+                            ui.colored_label(BAD, failure);
+                        } else {
+                            ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
+                        }
+                        if let Some(report) = &self.disassembly_report {
+                            for warning in report.warnings.iter().take(8) {
+                                ui.colored_label(BAD, warning);
+                            }
+                        }
+                        if let Some(result) = &self.triton_result {
+                            let paths = result
+                                .get("paths")
+                                .and_then(serde_json::Value::as_array)
+                                .map_or(0, Vec::len);
+                            let rax = result
+                                .get("final_registers")
+                                .and_then(|registers| registers.get("rax"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unavailable");
+                            ui.label(
+                                RichText::new(format!(
+                                    "Triton: {paths} path(s), final rax = {rax}"
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(ACCENT),
+                            );
+                        }
+                        for entry in self.history.iter().rev().take(8) {
+                            ui.label(RichText::new(entry).size(11.0).color(MUTED));
                         }
                     }
-                    if let Some(result) = &self.triton_result {
-                        let paths = result
-                            .get("paths")
-                            .and_then(serde_json::Value::as_array)
-                            .map_or(0, Vec::len);
-                        let rax = result
-                            .get("final_registers")
-                            .and_then(|registers| registers.get("rax"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unavailable");
-                        ui.label(RichText::new(format!(
-                            "Triton: {paths} path(s), final rax = {rax}"
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(ACCENT));
-                    }
-                    for entry in self.history.iter().rev().take(8) {
-                        ui.label(RichText::new(entry).size(11.0).color(MUTED));
-                    }
-                }
                 });
         } else {
             self.triton_console_body(ui);
@@ -3676,9 +3693,8 @@ impl AnalystApp {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if let Some(result) = &self.triton_console_result {
-                    if let Some(entries) = result
-                        .get("entries")
-                        .and_then(serde_json::Value::as_array)
+                    if let Some(entries) =
+                        result.get("entries").and_then(serde_json::Value::as_array)
                     {
                         for entry in entries {
                             let command = entry
@@ -3690,9 +3706,8 @@ impl AnalystApp {
                                     .monospace()
                                     .color(ACCENT),
                             );
-                            if let Some(output) = entry
-                                .get("output")
-                                .and_then(serde_json::Value::as_array)
+                            if let Some(output) =
+                                entry.get("output").and_then(serde_json::Value::as_array)
                             {
                                 for line in output.iter().filter_map(serde_json::Value::as_str) {
                                     ui.label(RichText::new(line).monospace().color(TEXT));
@@ -3763,7 +3778,10 @@ impl AnalystApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("GRAPH SCOPE").size(10.0).color(MUTED));
             if ui
-                .selectable_label(self.graph_mode == GraphMode::Function, "Selected function CFG")
+                .selectable_label(
+                    self.graph_mode == GraphMode::Function,
+                    "Selected function CFG",
+                )
                 .clicked()
             {
                 self.graph_mode = GraphMode::Function;
@@ -3803,7 +3821,9 @@ impl AnalystApp {
         match self.graph_mode {
             GraphMode::Function => {
                 let Some(cfg) = &self.cfg else {
-                    ui.label(RichText::new("Select a function to build its CFG graph.").color(MUTED));
+                    ui.label(
+                        RichText::new("Select a function to build its CFG graph.").color(MUTED),
+                    );
                     return;
                 };
                 for block in &cfg.blocks {
@@ -3822,7 +3842,9 @@ impl AnalystApp {
             }
             GraphMode::Program => {
                 let Some(spec) = &self.spec else {
-                    ui.label(RichText::new("Open an ELF to build its function graph.").color(MUTED));
+                    ui.label(
+                        RichText::new("Open an ELF to build its function graph.").color(MUTED),
+                    );
                     return;
                 };
                 for function in &spec.functions {
@@ -3834,14 +3856,20 @@ impl AnalystApp {
                 }
                 let Some(report) = &self.analysis else {
                     ui.label(
-                        RichText::new("Run Global effects / Analyze to populate bounded call edges.")
-                            .color(MUTED),
+                        RichText::new(
+                            "Run Global effects / Analyze to populate bounded call edges.",
+                        )
+                        .color(MUTED),
                     );
                     return;
                 };
                 for summary in &report.functions {
                     for callee in &summary.direct_callees {
-                        if spec.functions.iter().any(|function| function.name == *callee) {
+                        if spec
+                            .functions
+                            .iter()
+                            .any(|function| function.name == *callee)
+                        {
                             let source = NodeId::new(("function", summary.name.as_str()));
                             let target = NodeId::new(("function", callee.as_str()));
                             if source != target {
@@ -3861,7 +3889,9 @@ impl AnalystApp {
                             && call.source.0 < function.address.0.saturating_add(function.size)
                     });
                     let target = call.target.and_then(|address| {
-                        spec.functions.iter().find(|function| function.address == address)
+                        spec.functions
+                            .iter()
+                            .find(|function| function.address == address)
                     });
                     if let (Some(source), Some(target)) = (source, target)
                         && !edges.contains(&(
@@ -3878,20 +3908,32 @@ impl AnalystApp {
             }
             GraphMode::Ghidra => {
                 let Some(graph) = &self.ghidra_graph else {
-                    ui.label(RichText::new("Load a Ghidra JSON export to show its graph.").color(MUTED));
+                    ui.label(
+                        RichText::new("Load a Ghidra JSON export to show its graph.").color(MUTED),
+                    );
                     return;
                 };
                 let selected = self
                     .symbol
                     .as_deref()
-                    .and_then(|name| graph.functions.iter().find(|function| function.name == name))
+                    .and_then(|name| {
+                        graph
+                            .functions
+                            .iter()
+                            .find(|function| function.name == name)
+                    })
                     .or_else(|| graph.functions.first());
                 let Some(function) = selected else {
-                    ui.label(RichText::new("The Ghidra export contains no functions.").color(MUTED));
+                    ui.label(
+                        RichText::new("The Ghidra export contains no functions.").color(MUTED),
+                    );
                     return;
                 };
-                let block_addresses: std::collections::HashSet<&str> =
-                    function.blocks.iter().map(|block| block.address.as_str()).collect();
+                let block_addresses: std::collections::HashSet<&str> = function
+                    .blocks
+                    .iter()
+                    .map(|block| block.address.as_str())
+                    .collect();
                 for block in &function.blocks {
                     nodes.push((
                         NodeId::new(("ghidra-block", block.address.as_str())),
@@ -3930,11 +3972,27 @@ impl AnalystApp {
         let layout_nodes = nodes
             .iter()
             .map(|(id, _, _)| (*id, egui_graph_egui::vec2(node_size[0], node_size[1])));
-        let layout = layout_from_sizes(layout_nodes, edges.iter().copied(), GraphDirection::LeftToRight);
-        let min_x = layout.values().map(|position| position.x).fold(f32::INFINITY, f32::min);
-        let min_y = layout.values().map(|position| position.y).fold(f32::INFINITY, f32::min);
-        let max_x = layout.values().map(|position| position.x).fold(f32::NEG_INFINITY, f32::max);
-        let max_y = layout.values().map(|position| position.y).fold(f32::NEG_INFINITY, f32::max);
+        let layout = layout_from_sizes(
+            layout_nodes,
+            edges.iter().copied(),
+            GraphDirection::LeftToRight,
+        );
+        let min_x = layout
+            .values()
+            .map(|position| position.x)
+            .fold(f32::INFINITY, f32::min);
+        let min_y = layout
+            .values()
+            .map(|position| position.y)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = layout
+            .values()
+            .map(|position| position.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_y = layout
+            .values()
+            .map(|position| position.y)
+            .fold(f32::NEG_INFINITY, f32::max);
         let canvas_size = egui::vec2(
             (max_x - min_x + node_size[0] + 80.0).max(ui.available_width()),
             (max_y - min_y + node_size[1] + 80.0).max(260.0),
@@ -3952,10 +4010,24 @@ impl AnalystApp {
                         .get(id)
                         .map(|position| offset + egui::vec2(position.x, position.y))
                         .unwrap_or(canvas.min);
-                    let rect = egui::Rect::from_min_size(position, egui::vec2(node_size[0], node_size[1]));
+                    let rect =
+                        egui::Rect::from_min_size(position, egui::vec2(node_size[0], node_size[1]));
                     rects.insert(*id, rect);
-                    painter.rect_filled(rect, 6.0, if *selected { Color32::from_rgb(82, 66, 45) } else { PANEL });
-                    painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, if *selected { ACCENT } else { MUTED }), egui::StrokeKind::Outside);
+                    painter.rect_filled(
+                        rect,
+                        6.0,
+                        if *selected {
+                            Color32::from_rgb(82, 66, 45)
+                        } else {
+                            PANEL
+                        },
+                    );
+                    painter.rect_stroke(
+                        rect,
+                        6.0,
+                        egui::Stroke::new(1.0, if *selected { ACCENT } else { MUTED }),
+                        egui::StrokeKind::Outside,
+                    );
                     painter.text(
                         rect.left_top() + egui::vec2(10.0, 9.0),
                         egui::Align2::LEFT_TOP,
@@ -3963,23 +4035,39 @@ impl AnalystApp {
                         egui::FontId::monospace(11.0),
                         TEXT,
                     );
-                    let response = ui.interact(rect, ui.id().with(("graph-node", id.value())), egui::Sense::click());
-                    if response.clicked() && self.graph_mode == GraphMode::Function {
-                        if let Some(address) = label.strip_prefix("0x").and_then(|value| value.split('\n').next()).and_then(|value| u64::from_str_radix(value, 16).ok()) {
-                            self.selected_address = Some(address);
-                        }
+                    let response = ui.interact(
+                        rect,
+                        ui.id().with(("graph-node", id.value())),
+                        egui::Sense::click(),
+                    );
+                    if response.clicked()
+                        && self.graph_mode == GraphMode::Function
+                        && let Some(address) = label
+                            .strip_prefix("0x")
+                            .and_then(|value| value.split('\n').next())
+                            .and_then(|value| u64::from_str_radix(value, 16).ok())
+                    {
+                        self.selected_address = Some(address);
                     }
                 }
                 for (source, target) in &edges {
-                    if let (Some(source_rect), Some(target_rect)) = (rects.get(source), rects.get(target)) {
+                    if let (Some(source_rect), Some(target_rect)) =
+                        (rects.get(source), rects.get(target))
+                    {
                         let start = source_rect.right_center();
                         let end = target_rect.left_center();
                         painter.line_segment([start, end], egui::Stroke::new(1.5, ACCENT));
                         let direction = (end - start).normalized();
                         let tip = end;
-                        let left = tip - direction * 10.0 + egui::vec2(-direction.y, direction.x) * 4.0;
-                        let right = tip - direction * 10.0 - egui::vec2(-direction.y, direction.x) * 4.0;
-                        painter.add(egui::Shape::convex_polygon(vec![tip, left, right], ACCENT, egui::Stroke::NONE));
+                        let left =
+                            tip - direction * 10.0 + egui::vec2(-direction.y, direction.x) * 4.0;
+                        let right =
+                            tip - direction * 10.0 - egui::vec2(-direction.y, direction.x) * 4.0;
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![tip, left, right],
+                            ACCENT,
+                            egui::Stroke::NONE,
+                        ));
                     }
                 }
             });
@@ -4513,15 +4601,18 @@ fn main() -> eframe::Result<()> {
             let spec = import_elf(&bytes).map_err(|error| error.to_string())?;
             let project = attach_local_project(&path, &spec)?;
             let statement = "GUI local analyst assertion; not independently validated";
+            let idempotency_key = uuid::Uuid::new_v4().to_string();
             let (updated, overlaid, annotations) = add_local_annotation(
                 &project,
                 &bytes,
                 &spec.binary_sha256,
-                AnnotationKind::Assumption,
-                None,
-                "trusted fixture only",
-                statement,
-                &uuid::Uuid::new_v4().to_string(),
+                LocalAnnotationInput {
+                    kind: AnnotationKind::Assumption,
+                    address: None,
+                    scope: "trusted fixture only",
+                    value: statement,
+                    idempotency_key: &idempotency_key,
+                },
             )?;
             let reopened = attach_local_project(&path, &spec)?;
             let persisted = list_local_annotations(&reopened)?;
@@ -5026,6 +5117,9 @@ mod tests {
             reference_recovery: RecoveryState::NotAttempted,
             assumptions: Vec::new(),
             typed_model: Default::default(),
+            memory_facts: Vec::new(),
+            uncertainties: Vec::new(),
+            provenance: Vec::new(),
             recovery_scope: "test".to_owned(),
             unresolved_control_flow: true,
         });

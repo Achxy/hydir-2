@@ -1321,6 +1321,7 @@ name = "hydir-c"
 version = "0.1.0"
 dependencies = [
  "hydir-backend",
+ "hydir-core",
 ]
 
 [[package]]
@@ -1351,6 +1352,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1382,6 +1384,7 @@ name = "hydir-patch"
 version = "0.1.0"
 dependencies = [
  "hydir-backend",
+ "hydir-core",
  "object",
  "serde",
  "serde_json",

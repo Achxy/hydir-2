@@ -5,6 +5,10 @@
 //! copies. Only the exact instruction subset emitted by `hydir-backend` is
 //! accepted; unfamiliar LLVM syntax is an error, never an ignored operation.
 
+use hydir_core::{
+    DECOMPILATION_UNIT_VERSION, DecompilationDiagnostic, DecompilationUnit, DiagnosticSeverity,
+    RegionSpec, validate_decompilation_unit,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
@@ -330,9 +334,11 @@ fn parse_function_header(line: &str) -> Option<String> {
     } else {
         args.split(", ").collect()
     };
-    if params.iter().enumerate().all(|(index, param)| {
-        *param == format!("i64 %arg{index}")
-    }) {
+    if params
+        .iter()
+        .enumerate()
+        .all(|(index, param)| *param == format!("i64 %arg{index}"))
+    {
         Some(name.to_owned())
     } else {
         None
@@ -366,7 +372,7 @@ fn emit_single_c(
                 .ok_or_else(|| format!("invalid scalar function header: {line}"))?;
             let args = line
                 .strip_prefix(&format!("define i64 @{header}("))
-                .and_then(|rest| rest.strip_suffix(" {") )
+                .and_then(|rest| rest.strip_suffix(" {"))
                 .and_then(|rest| rest.strip_suffix(')'))
                 .unwrap_or_default();
             argument_names = if args.is_empty() {
@@ -548,6 +554,56 @@ uint64_t hydir_lifted(uint64_t arg0, uint64_t arg1) {\n\
     Ok(fallback)
 }
 
+/// Package the current native region lift and deterministic C view without
+/// claiming that the dedicated CIR or statement-level provenance already
+/// exists. Those missing facts remain machine-readable release blockers.
+pub fn build_decompilation_unit(
+    region: RegionSpec,
+    raw_llvm: String,
+    engine_version: &str,
+) -> Result<DecompilationUnit, String> {
+    let c_source = emit_structured_c(&raw_llvm)?;
+    let mut diagnostics = vec![
+        DecompilationDiagnostic {
+            code: "cir_unavailable".to_owned(),
+            severity: DiagnosticSeverity::Warning,
+            message: "Dedicated structured CIR is not yet emitted; c_source is derived from the verified LLVM-compatible RegionIR"
+                .to_owned(),
+            blocks_stable_operation: true,
+        },
+        DecompilationDiagnostic {
+            code: "statement_provenance_unavailable".to_owned(),
+            severity: DiagnosticSeverity::Warning,
+            message: "Statement-to-address provenance has not yet been established".to_owned(),
+            blocks_stable_operation: true,
+        },
+    ];
+    if !region.unresolved_facts.is_empty() {
+        diagnostics.push(DecompilationDiagnostic {
+            code: "region_contract_incomplete".to_owned(),
+            severity: DiagnosticSeverity::Warning,
+            message: format!(
+                "RegionSpec retains {} unresolved fact(s)",
+                region.unresolved_facts.len()
+            ),
+            blocks_stable_operation: true,
+        });
+    }
+    let unit = DecompilationUnit {
+        schema_version: DECOMPILATION_UNIT_VERSION,
+        binary_sha256: region.binary_sha256.clone(),
+        region,
+        region_ir_llvm: raw_llvm,
+        cir: None,
+        c_source,
+        statement_provenance: Vec::new(),
+        diagnostics,
+        engine_version: engine_version.to_owned(),
+    };
+    validate_decompilation_unit(&unit)?;
+    Ok(unit)
+}
+
 /// Match every operation, edge, and returned value of the supported idiom.
 /// A partial text match could silently replace a different valid function.
 fn matches_unsigned_max(raw_llvm: &str) -> bool {
@@ -682,7 +738,7 @@ fn trace_return(
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_c, emit_structured_c};
+    use super::{build_decompilation_unit, emit_c, emit_structured_c};
 
     #[test]
     fn emits_parallel_phi_edge_copies() {
@@ -770,5 +826,21 @@ mod tests {
             "  %x = call i64 @hydir_callee_2000(i64 %arg0, i64 %arg1)\n  ret i64 %x",
         );
         assert!(emit_c(&format!("{recursive}{main}")).is_err());
+    }
+
+    #[test]
+    fn decompilation_unit_is_digest_bound_and_explicitly_incomplete() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
+        let region = hydir_backend::region_contract(binary, "hydir_max2").unwrap();
+        let ir = hydir_backend::lift_symbol(binary, "hydir_max2").unwrap();
+        let unit = build_decompilation_unit(region, ir, "hydir-test").unwrap();
+        assert_eq!(unit.schema_version, hydir_core::DECOMPILATION_UNIT_VERSION);
+        assert_eq!(unit.binary_sha256, unit.region.binary_sha256);
+        assert!(unit.cir.is_none());
+        assert!(
+            unit.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "statement_provenance_unavailable")
+        );
     }
 }
