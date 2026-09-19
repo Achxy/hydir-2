@@ -135,6 +135,14 @@ pub enum RelocationTargetSpec {
 pub struct CallSpec {
     pub source: Address,
     pub target: Option<Address>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_address: Option<Address>,
+    #[serde(default)]
+    pub is_tailcall: bool,
+    #[serde(default)]
+    pub stops_flow: bool,
+    #[serde(default)]
+    pub noreturn: bool,
     pub provenance: FactProvenance,
 }
 
@@ -583,6 +591,8 @@ pub struct RegionContract {
     pub bytes_sha256: String,
     pub bytes_hex: String,
     pub exits: Vec<Address>,
+    #[serde(default)]
+    pub calls: Vec<CallSpec>,
     pub relocations: Vec<RelocationSpec>,
     #[serde(default)]
     pub observed_interior_entries: Vec<InteriorEntryEvidence>,
@@ -695,6 +705,16 @@ pub fn validate_region_spec(spec: &RegionSpec) -> Result<(), String> {
         })
     {
         return Err("RegionSpec stack alignment residue must be below 16".to_owned());
+    }
+    let region_end = spec
+        .entry
+        .0
+        .checked_add(spec.byte_length)
+        .ok_or_else(|| "RegionSpec address range overflows".to_owned())?;
+    if spec.calls.iter().any(|call| {
+        !(spec.entry.0..region_end).contains(&call.source.0) || call.provenance.scope.is_empty()
+    }) {
+        return Err("RegionSpec contains an invalid call contract".to_owned());
     }
     for location in spec
         .physical_live_in
@@ -1067,6 +1087,7 @@ mod tests {
             bytes_sha256: format!("{:x}", Sha256::digest(code)),
             bytes_hex: "c3".to_owned(),
             exits: vec![Address(0x401000)],
+            calls: Vec::new(),
             relocations: Vec::new(),
             observed_interior_entries: Vec::new(),
             live_in: None,
@@ -1089,6 +1110,7 @@ mod tests {
         let mut legacy = serde_json::to_value(&spec).unwrap();
         legacy["schema_version"] = serde_json::json!(2);
         for field in [
+            "calls",
             "physical_live_in",
             "physical_live_out",
             "stack_entry_alignment",

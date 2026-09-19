@@ -321,6 +321,7 @@ fn recover_bounded(
     address: u64,
     allowed_calls: Option<&BTreeSet<u64>>,
     boundary_exits: Option<&BTreeSet<u64>>,
+    terminal_call_sites: Option<&BTreeSet<u64>>,
     prove_stack: bool,
 ) -> Result<BTreeMap<u64, Node>> {
     let end = address
@@ -390,6 +391,11 @@ fn recover_bounded(
         };
         let successors = match op {
             Op::Ret => vec![],
+            Op::CallDirect { .. }
+                if terminal_call_sites.is_some_and(|sites| sites.contains(&ip)) =>
+            {
+                vec![]
+            }
             Op::Jmp => vec![instruction.near_branch_target()],
             Op::Jcc(_) => vec![instruction.near_branch_target(), next],
             _ => vec![next],
@@ -458,17 +464,22 @@ fn recover(
     address: u64,
     allowed_calls: Option<&BTreeSet<u64>>,
 ) -> Result<BTreeMap<u64, Node>> {
-    recover_bounded(code, address, allowed_calls, None, true)
+    recover_bounded(code, address, allowed_calls, None, None, true)
+}
+
+pub(super) struct RegionCfgMetadata<'a> {
+    pub address_kind: AddressKind,
+    pub symbol_name: &'a str,
+    pub binary_sha256: String,
+    pub provenance: &'a str,
 }
 
 pub(super) fn recover_declared_region_cfg(
     code: &[u8],
     address: u64,
     exits: &[Address],
-    address_kind: AddressKind,
-    symbol_name: &str,
-    binary_sha256: String,
-    provenance: &str,
+    terminal_call_sites: &BTreeSet<u64>,
+    metadata: RegionCfgMetadata<'_>,
 ) -> Result<FunctionCfg> {
     if code.is_empty() || code.len() > 4096 {
         return Err(error("region must contain 1..=4096 bytes"));
@@ -480,7 +491,20 @@ pub(super) fn recover_declared_region_cfg(
     if declared.iter().any(|exit| (address..end).contains(exit)) {
         return Err(error("declared region exit lies inside selected bytes"));
     }
-    let nodes = recover_bounded(code, address, None, Some(&declared), false)?;
+    if terminal_call_sites
+        .iter()
+        .any(|site| !(address..end).contains(site))
+    {
+        return Err(error("terminal call site lies outside selected region"));
+    }
+    let nodes = recover_bounded(
+        code,
+        address,
+        None,
+        Some(&declared),
+        Some(terminal_call_sites),
+        false,
+    )?;
     let mut observed = nodes
         .values()
         .flat_map(|node| node.successors.iter().copied())
@@ -532,14 +556,14 @@ pub(super) fn recover_declared_region_cfg(
     }
     Ok(FunctionCfg {
         schema_version: SPEC_VERSION,
-        binary_sha256,
-        symbol_name: symbol_name.to_owned(),
+        binary_sha256: metadata.binary_sha256,
+        symbol_name: metadata.symbol_name.to_owned(),
         entry: Address(address),
-        address_kind,
+        address_kind: metadata.address_kind,
         symbol_size: code.len() as u64,
         blocks,
         edges,
-        provenance: provenance.to_owned(),
+        provenance: metadata.provenance.to_owned(),
         recovery_scope: "Exact direct control flow inside RegionSpec bytes with declared external exits and separately typed direct-call edges; semantic boundary state is not inferred"
             .to_owned(),
     })
@@ -1254,6 +1278,15 @@ pub(super) fn lift_cfg_with_calls(
 mod tests {
     use super::*;
 
+    fn test_region_metadata() -> RegionCfgMetadata<'static> {
+        RegionCfgMetadata {
+            address_kind: AddressKind::Virtual,
+            symbol_name: "region",
+            binary_sha256: "0".repeat(64),
+            provenance: "test",
+        }
+    }
+
     #[test]
     fn declared_region_exit_is_preserved_and_must_be_exact() {
         // mov rax,rdi; jmp 0x100a
@@ -1262,10 +1295,8 @@ mod tests {
             &code,
             0x1000,
             &[Address(0x100a)],
-            AddressKind::Virtual,
-            "region",
-            "0".repeat(64),
-            "test",
+            &BTreeSet::new(),
+            test_region_metadata(),
         )
         .unwrap();
         assert_eq!(cfg.blocks.len(), 2);
@@ -1277,10 +1308,8 @@ mod tests {
                 &code,
                 0x1000,
                 &[],
-                AddressKind::Virtual,
-                "region",
-                "0".repeat(64),
-                "test",
+                &BTreeSet::new(),
+                test_region_metadata(),
             )
             .unwrap_err()
             .0
@@ -1291,10 +1320,8 @@ mod tests {
                 &code,
                 0x1000,
                 &[Address(0x100a), Address(0x2000)],
-                AddressKind::Virtual,
-                "region",
-                "0".repeat(64),
-                "test",
+                &BTreeSet::new(),
+                test_region_metadata(),
             )
             .unwrap_err()
             .0
@@ -1310,10 +1337,8 @@ mod tests {
             &code,
             0x1000,
             &[Address(0x100a)],
-            AddressKind::Virtual,
-            "region",
-            "0".repeat(64),
-            "test",
+            &BTreeSet::new(),
+            test_region_metadata(),
         )
         .unwrap();
         assert!(cfg.edges.iter().any(|edge| {
@@ -1326,6 +1351,23 @@ mod tests {
                 && edge.source == Address(0x1005)
                 && edge.target == Address(0x100a)
         }));
+    }
+
+    #[test]
+    fn imported_terminal_call_contract_suppresses_fallthrough() {
+        // call 0x2000, with the call site explicitly declared terminal.
+        let cfg = recover_declared_region_cfg(
+            &[0xe8, 0xfb, 0x0f, 0x00, 0x00],
+            0x1000,
+            &[],
+            &BTreeSet::from([0x1000]),
+            test_region_metadata(),
+        )
+        .unwrap();
+        assert_eq!(cfg.blocks.len(), 1);
+        assert_eq!(cfg.edges.len(), 1);
+        assert_eq!(cfg.edges[0].kind, EdgeKind::Call);
+        assert_eq!(cfg.edges[0].target, Address(0x2000));
     }
 
     #[test]
