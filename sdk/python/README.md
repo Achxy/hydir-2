@@ -9,10 +9,15 @@ download. There is no remote execution endpoint.
 
 `negotiate_api()` prefers `hydir.v2` discovery and falls back to v1 only when
 the endpoint reports `UNIMPLEMENTED`. v2 methods expose digest-checked
-`RegionSpec` v3 and `DecompilationUnit` v1 JSON, compile scalar patch v1 into
+`RegionSpec` v3, `PhysicalRegionIR` v1, and `DecompilationUnit` v1 JSON, compile scalar patch v1 into
 reversible `PatchBundle` v2, apply it with revision/idempotency protection, and
 request structural bundle verification. Behavioral verification remains false
 until a separate execution gate supplies evidence.
+
+`lift_region(...)` returns exact decoded operations, successors, physical
+register/flag/memory effects, boundary locations, and unresolved proof facts.
+Its `lowering_ready` field must be true before a caller treats it as patchable;
+successful decoding alone is not a C or replacement-safety claim.
 
 `decompile(project_id, revision, symbol, assume_u64x2=True)` returns C11
 from the bounded scalar LLVM lift; it is not a general or Rellic-compatible

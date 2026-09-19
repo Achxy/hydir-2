@@ -44,6 +44,11 @@ class HydirV2Stub:
                 request_serializer=hydir__v2__pb2.RegionRequest.SerializeToString,
                 response_deserializer=hydir__v2__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.LiftRegion = channel.unary_unary(
+                '/hydir.v2.HydirV2/LiftRegion',
+                request_serializer=hydir__v2__pb2.RegionRequest.SerializeToString,
+                response_deserializer=hydir__v2__pb2.ArtifactReply.FromString,
+                _registered_method=True)
         self.DecompileRegion = channel.unary_unary(
                 '/hydir.v2.HydirV2/DecompileRegion',
                 request_serializer=hydir__v2__pb2.RegionRequest.SerializeToString,
@@ -76,6 +81,12 @@ class HydirV2Servicer:
         raise NotImplementedError('Method not implemented!')
 
     def GetRegion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LiftRegion(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -115,6 +126,11 @@ def add_HydirV2Servicer_to_server(servicer, server):
             ),
             'GetRegion': grpc.unary_unary_rpc_method_handler(
                     servicer.GetRegion,
+                    request_deserializer=hydir__v2__pb2.RegionRequest.FromString,
+                    response_serializer=hydir__v2__pb2.ArtifactReply.SerializeToString,
+            ),
+            'LiftRegion': grpc.unary_unary_rpc_method_handler(
+                    servicer.LiftRegion,
                     request_deserializer=hydir__v2__pb2.RegionRequest.FromString,
                     response_serializer=hydir__v2__pb2.ArtifactReply.SerializeToString,
             ),
@@ -191,6 +207,33 @@ class HydirV2:
             request,
             target,
             '/hydir.v2.HydirV2/GetRegion',
+            hydir__v2__pb2.RegionRequest.SerializeToString,
+            hydir__v2__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LiftRegion(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v2.HydirV2/LiftRegion',
             hydir__v2__pb2.RegionRequest.SerializeToString,
             hydir__v2__pb2.ArtifactReply.FromString,
             options,

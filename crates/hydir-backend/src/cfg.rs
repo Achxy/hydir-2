@@ -8,11 +8,17 @@
 
 use super::{Result, error};
 use hydir_core::{
-    Address, AddressKind, BlockSpec, EdgeKind, EdgeSpec, FunctionCfg, REGION_DECISION_IR_VERSION,
-    RegionDecisionIr, RegionPassThroughBinding, RegionPredicate, RegionSpec, SPEC_VERSION,
-    region_bytes, validate_region_decision_ir,
+    Address, AddressKind, BlockSpec, EdgeKind, EdgeSpec, FunctionCfg, PHYSICAL_REGION_IR_VERSION,
+    PhysicalRegionEffects, PhysicalRegionInstruction, PhysicalRegionIr, PhysicalRegionOperation,
+    REGION_DECISION_IR_VERSION, RegionAluOperation, RegionControlEffect, RegionDecisionIr,
+    RegionMemoryAddress, RegionMemoryClass, RegionMemoryEffect, RegionPassThroughBinding,
+    RegionPredicate, RegionSpec, RegionValue, SPEC_VERSION, region_bytes,
+    validate_physical_region_ir, validate_region_decision_ir,
 };
-use hydir_semantics::{Alu, Condition, Op, Value, Value32, classify};
+use hydir_semantics::{
+    Alu, Condition, ControlEffect, Effects, MemoryAddress, MemoryEffect, Op, Value, Value32,
+    classify,
+};
 use iced_x86::{Decoder, DecoderOptions, Register};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -590,6 +596,383 @@ fn region_predicate(condition: Condition) -> RegionPredicate {
         Condition::Le => RegionPredicate::LessOrEqual,
         Condition::G => RegionPredicate::Greater,
     }
+}
+
+fn register_name(register: Register) -> String {
+    format!("{register:?}")
+}
+
+fn region_value(value: Value, width_bits: u16) -> RegionValue {
+    match value {
+        Value::Register(register) => RegionValue::Register {
+            name: register_name(register),
+            width_bits,
+        },
+        Value::Immediate(value) => RegionValue::Immediate { value, width_bits },
+    }
+}
+
+fn region_value32(value: Value32) -> RegionValue {
+    match value {
+        Value32::Register(register) => RegionValue::Register {
+            name: register_name(register),
+            width_bits: 32,
+        },
+        Value32::Immediate(value) => RegionValue::Immediate {
+            value: i64::from(value),
+            width_bits: 32,
+        },
+    }
+}
+
+fn region_alu(operation: Alu) -> RegionAluOperation {
+    match operation {
+        Alu::Add => RegionAluOperation::Add,
+        Alu::Sub => RegionAluOperation::Subtract,
+        Alu::And => RegionAluOperation::And,
+        Alu::Or => RegionAluOperation::Or,
+        Alu::Xor => RegionAluOperation::Xor,
+    }
+}
+
+fn stack_address(base: Register, displacement: i64, width_bits: u16) -> RegionMemoryAddress {
+    RegionMemoryAddress {
+        class: RegionMemoryClass::Stack,
+        segment: None,
+        base: Some(register_name(base)),
+        index: None,
+        scale: 1,
+        displacement,
+        absolute: None,
+        width_bits,
+    }
+}
+
+fn mapped_address(address: MemoryAddress, width_bits: u16) -> RegionMemoryAddress {
+    RegionMemoryAddress {
+        class: RegionMemoryClass::Mapped,
+        segment: address.segment.map(register_name),
+        base: address.base.map(register_name),
+        index: address.index.map(register_name),
+        scale: address.scale,
+        displacement: address.displacement,
+        absolute: address.absolute,
+        width_bits,
+    }
+}
+
+fn operation_for(op: Op, successors: &[u64]) -> Result<PhysicalRegionOperation> {
+    let successor = |index: usize| {
+        successors
+            .get(index)
+            .copied()
+            .map(Address)
+            .ok_or_else(|| error("decoded control operation lacks a successor"))
+    };
+    Ok(match op {
+        Op::Mov { dst, src } => PhysicalRegionOperation::Move {
+            destination: register_name(dst),
+            source: region_value(src, 64),
+            width_bits: 64,
+        },
+        Op::Mov32 { dst, src } => PhysicalRegionOperation::Move {
+            destination: register_name(dst),
+            source: region_value32(src),
+            width_bits: 32,
+        },
+        Op::LoadStack64 {
+            dst,
+            base,
+            displacement,
+        } => PhysicalRegionOperation::Load {
+            destination: register_name(dst),
+            address: stack_address(base, displacement, 64),
+        },
+        Op::LoadStack32 {
+            dst,
+            base,
+            displacement,
+        } => PhysicalRegionOperation::Load {
+            destination: register_name(dst),
+            address: stack_address(base, displacement, 32),
+        },
+        Op::StoreStack64 {
+            base,
+            displacement,
+            src,
+        } => PhysicalRegionOperation::Store {
+            address: stack_address(base, displacement, 64),
+            source: RegionValue::Register {
+                name: register_name(src),
+                width_bits: 64,
+            },
+        },
+        Op::StoreStack32 {
+            base,
+            displacement,
+            src,
+        } => PhysicalRegionOperation::Store {
+            address: stack_address(base, displacement, 32),
+            source: region_value32(src),
+        },
+        Op::LoadMemory64 { dst, address } => PhysicalRegionOperation::Load {
+            destination: register_name(dst),
+            address: mapped_address(address, 64),
+        },
+        Op::LoadMemory32 { dst, address } => PhysicalRegionOperation::Load {
+            destination: register_name(dst),
+            address: mapped_address(address, 32),
+        },
+        Op::StoreMemory64 { address, src } => PhysicalRegionOperation::Store {
+            address: mapped_address(address, 64),
+            source: RegionValue::Register {
+                name: register_name(src),
+                width_bits: 64,
+            },
+        },
+        Op::StoreMemory32 { address, src } => PhysicalRegionOperation::Store {
+            address: mapped_address(address, 32),
+            source: region_value32(src),
+        },
+        Op::Lea {
+            dst,
+            base,
+            index,
+            scale,
+            displacement,
+        } => PhysicalRegionOperation::LoadEffectiveAddress {
+            destination: register_name(dst),
+            base: base.map(register_name),
+            index: index.map(register_name),
+            scale,
+            displacement,
+        },
+        Op::Alu { kind, dst, src } => PhysicalRegionOperation::Alu {
+            operation: region_alu(kind),
+            destination: register_name(dst),
+            source: region_value(src, 64),
+            width_bits: 64,
+        },
+        Op::Alu32 { kind, dst, src } => PhysicalRegionOperation::Alu {
+            operation: region_alu(kind),
+            destination: register_name(dst),
+            source: region_value32(src),
+            width_bits: 32,
+        },
+        Op::AluStack32 {
+            kind,
+            base,
+            displacement,
+            src,
+        } => PhysicalRegionOperation::AluMemory {
+            operation: region_alu(kind),
+            address: stack_address(base, displacement, 32),
+            source: region_value32(src),
+        },
+        Op::AluRegMemory64 { kind, dst, address } => PhysicalRegionOperation::AluRegisterMemory {
+            operation: region_alu(kind),
+            destination: register_name(dst),
+            address: mapped_address(address, 64),
+        },
+        Op::Cmp { lhs, rhs } => PhysicalRegionOperation::Compare {
+            left: RegionValue::Register {
+                name: register_name(lhs),
+                width_bits: 64,
+            },
+            right: region_value(rhs, 64),
+            width_bits: 64,
+        },
+        Op::Cmp32 { lhs, rhs } => PhysicalRegionOperation::Compare {
+            left: RegionValue::Register {
+                name: register_name(lhs),
+                width_bits: 32,
+            },
+            right: region_value32(rhs),
+            width_bits: 32,
+        },
+        Op::CmpRegStack32 {
+            lhs,
+            base,
+            displacement,
+        } => PhysicalRegionOperation::CompareMemory {
+            register: Some(register_name(lhs)),
+            address: stack_address(base, displacement, 32),
+            value: None,
+        },
+        Op::CmpStack32 {
+            base,
+            displacement,
+            rhs,
+        } => PhysicalRegionOperation::CompareMemory {
+            register: None,
+            address: stack_address(base, displacement, 32),
+            value: Some(region_value32(rhs)),
+        },
+        Op::Test { lhs, rhs } => PhysicalRegionOperation::Test {
+            left: RegionValue::Register {
+                name: register_name(lhs),
+                width_bits: 64,
+            },
+            right: region_value(rhs, 64),
+            width_bits: 64,
+        },
+        Op::SaveRegister { register } => PhysicalRegionOperation::SaveRegister {
+            register: register_name(register),
+        },
+        Op::RestoreRegister { register } => PhysicalRegionOperation::RestoreRegister {
+            register: register_name(register),
+        },
+        Op::SaveFramePointer => PhysicalRegionOperation::SaveFramePointer,
+        Op::RestoreFramePointer => PhysicalRegionOperation::RestoreFramePointer,
+        Op::SetFramePointer => PhysicalRegionOperation::SetFramePointer,
+        Op::RestoreStackPointerFromFrame => PhysicalRegionOperation::RestoreStackPointerFromFrame,
+        Op::AdjustStack { kind, amount } => PhysicalRegionOperation::AdjustStack {
+            operation: region_alu(kind),
+            amount,
+        },
+        Op::LeaveFrame => PhysicalRegionOperation::LeaveFrame,
+        Op::Jcc(condition) => PhysicalRegionOperation::ConditionalBranch {
+            predicate: region_predicate(condition),
+            true_target: successor(0)?,
+            false_target: successor(1)?,
+        },
+        Op::Jmp => PhysicalRegionOperation::Branch {
+            target: successor(0)?,
+        },
+        Op::CallDirect { target } => PhysicalRegionOperation::Call {
+            target: Address(target),
+        },
+        Op::Ret => PhysicalRegionOperation::Return,
+        Op::Nop => PhysicalRegionOperation::Nop,
+    })
+}
+
+fn register_effect_names(bits: u16) -> Vec<String> {
+    [
+        (hydir_semantics::RAX, "RAX"),
+        (hydir_semantics::RDI, "RDI"),
+        (hydir_semantics::RSI, "RSI"),
+        (hydir_semantics::RDX, "RDX"),
+        (hydir_semantics::RCX, "RCX"),
+        (hydir_semantics::RSP, "RSP"),
+        (hydir_semantics::RBP, "RBP"),
+        (hydir_semantics::R8, "R8"),
+        (hydir_semantics::R9, "R9"),
+        (hydir_semantics::RBX, "RBX"),
+        (hydir_semantics::R10, "R10"),
+        (hydir_semantics::R11, "R11"),
+        (hydir_semantics::R12, "R12"),
+        (hydir_semantics::R13, "R13"),
+        (hydir_semantics::R14, "R14"),
+        (hydir_semantics::R15, "R15"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| bits & bit != 0)
+    .map(|(_, name)| name.to_owned())
+    .collect()
+}
+
+fn flag_effect_names(bits: u8) -> Vec<String> {
+    [
+        (hydir_semantics::ZF, "ZF"),
+        (hydir_semantics::SF, "SF"),
+        (hydir_semantics::OF, "OF"),
+        (hydir_semantics::CF, "CF"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| bits & bit != 0)
+    .map(|(_, name)| name.to_owned())
+    .collect()
+}
+
+fn physical_effects(effects: Effects) -> PhysicalRegionEffects {
+    let memory = match effects.memory {
+        MemoryEffect::None => RegionMemoryEffect::None,
+        MemoryEffect::ReadReturnAddress => RegionMemoryEffect::ReadReturnAddress,
+        MemoryEffect::WriteSavedFramePointer => RegionMemoryEffect::WriteSavedFramePointer,
+        MemoryEffect::ReadSavedFramePointer => RegionMemoryEffect::ReadSavedFramePointer,
+        MemoryEffect::WriteSavedRegister => RegionMemoryEffect::WriteSavedRegister,
+        MemoryEffect::ReadSavedRegister => RegionMemoryEffect::ReadSavedRegister,
+        MemoryEffect::ReadStackLocal => RegionMemoryEffect::ReadStackLocal,
+        MemoryEffect::WriteStackLocal => RegionMemoryEffect::WriteStackLocal,
+        MemoryEffect::ReadWriteStackLocal => RegionMemoryEffect::ReadWriteStackLocal,
+        MemoryEffect::ReadMappedMemory => RegionMemoryEffect::ReadMappedMemory,
+        MemoryEffect::WriteMappedMemory => RegionMemoryEffect::WriteMappedMemory,
+        MemoryEffect::WriteReturnAddress => RegionMemoryEffect::WriteReturnAddress,
+    };
+    let control = match effects.control {
+        ControlEffect::Next => RegionControlEffect::Next,
+        ControlEffect::DirectBranch => RegionControlEffect::DirectBranch,
+        ControlEffect::ConditionalBranch => RegionControlEffect::ConditionalBranch,
+        ControlEffect::DirectCall => RegionControlEffect::DirectCall,
+        ControlEffect::Return => RegionControlEffect::Return,
+    };
+    PhysicalRegionEffects {
+        read_registers: register_effect_names(effects.read_registers),
+        written_registers: register_effect_names(effects.write_registers),
+        read_flags: flag_effect_names(effects.read_flags),
+        written_flags: flag_effect_names(effects.write_flags),
+        memory,
+        control,
+    }
+}
+
+pub(super) fn lift_physical_region(region: &RegionSpec) -> Result<PhysicalRegionIr> {
+    if !region.observed_interior_entries.is_empty() {
+        return Err(error(
+            "PhysicalRegionIR requires explicit multi-entry recovery for observed interior entries",
+        ));
+    }
+    let code = region_bytes(region).map_err(error)?;
+    let declared = region
+        .exits
+        .iter()
+        .map(|exit| exit.0)
+        .collect::<BTreeSet<_>>();
+    let terminal_call_sites = region
+        .calls
+        .iter()
+        .filter(|call| call.noreturn || call.stops_flow)
+        .map(|call| call.source.0)
+        .collect::<BTreeSet<_>>();
+    let nodes = recover_bounded(
+        &code,
+        region.entry.0,
+        None,
+        Some(&declared),
+        Some(&terminal_call_sites),
+        false,
+    )?;
+    let instructions = nodes
+        .into_iter()
+        .map(|(address, node)| {
+            let operation = operation_for(node.op, &node.successors)?;
+            Ok(PhysicalRegionInstruction {
+                address: Address(address),
+                bytes_hex: node.raw.iter().map(|byte| format!("{byte:02x}")).collect(),
+                mnemonic: node.mnemonic,
+                operation,
+                effects: physical_effects(node.op.effects()),
+                successors: node.successors.into_iter().map(Address).collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ir = PhysicalRegionIr {
+        schema_version: PHYSICAL_REGION_IR_VERSION,
+        binary_sha256: region.binary_sha256.clone(),
+        region_bytes_sha256: region.bytes_sha256.clone(),
+        entry: region.entry,
+        instructions,
+        exits: region.exits.clone(),
+        calls: region.calls.clone(),
+        physical_inputs: region.physical_live_in.clone(),
+        physical_outputs: region.physical_live_out.clone(),
+        stack_delta: region.stack_delta,
+        unresolved_facts: region.unresolved_facts.clone(),
+        lowering_ready: false,
+    };
+    validate_physical_region_ir(&ir, region).map_err(error)?;
+    Ok(ir)
 }
 
 pub(super) fn lift_region_decision(region: &RegionSpec) -> Result<RegionDecisionIr> {
@@ -1508,6 +1891,50 @@ mod tests {
                 .unwrap_err()
                 .0
                 .contains("physical input OF")
+        );
+    }
+
+    #[test]
+    fn physical_region_ir_preserves_state_changes_effects_and_exact_bytes() {
+        // mov eax,edi; add eax,1; jmp 0x100c
+        let code = [0x89, 0xf8, 0x83, 0xc0, 0x01, 0xeb, 0x05];
+        let mut region = decision_region();
+        region.symbol_name = "stateful".to_owned();
+        region.byte_length = code.len() as u64;
+        region.bytes_sha256 = format!("{:x}", Sha256::digest(code));
+        region.bytes_hex = code.iter().map(|byte| format!("{byte:02x}")).collect();
+        region.exits = vec![Address(0x100c)];
+        region.physical_live_in = vec![imported_location("RDI", 64)];
+        region.physical_live_out = vec![imported_location("RAX", 64)];
+
+        let ir = lift_physical_region(&region).unwrap();
+        assert_eq!(ir.instructions.len(), 3);
+        assert!(matches!(
+            ir.instructions[0].operation,
+            PhysicalRegionOperation::Move { width_bits: 32, .. }
+        ));
+        assert!(matches!(
+            ir.instructions[1].operation,
+            PhysicalRegionOperation::Alu {
+                operation: RegionAluOperation::Add,
+                width_bits: 32,
+                ..
+            }
+        ));
+        assert_eq!(ir.instructions[1].effects.written_registers, vec!["RAX"]);
+        assert_eq!(
+            ir.instructions[1].effects.written_flags,
+            vec!["ZF", "SF", "OF", "CF"]
+        );
+        assert_eq!(ir.instructions[2].successors, vec![Address(0x100c)]);
+        validate_physical_region_ir(&ir, &region).unwrap();
+
+        let mut tampered = ir;
+        tampered.instructions[0].bytes_hex = "90".to_owned();
+        assert!(
+            validate_physical_region_ir(&tampered, &region)
+                .unwrap_err()
+                .contains("bytes differ")
         );
     }
 

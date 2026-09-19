@@ -69,6 +69,24 @@ class ClientBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.get_region("project", 4, "symbol", assume_u64x2=False)
 
+    def test_v2_physical_region_ir_is_checked_and_requires_prototype(self):
+        content = json.dumps({
+            "schema_version": 1,
+            "binary_sha256": "a" * 64,
+            "lowering_ready": False,
+        }).encode("utf-8")
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            client._call = lambda *_: proto_v2.ArtifactReply(
+                sha256=__import__("hashlib").sha256(content).hexdigest(),
+                media_type="application/vnd.hydir.physical-region-ir+json;version=1",
+                content=content,
+                project_revision=4,
+            )
+            ir = client.lift_region("project", 4, "symbol", assume_u64x2=True)
+            self.assertFalse(ir["lowering_ready"])
+            with self.assertRaises(ValueError):
+                client.lift_region("project", 4, "symbol", assume_u64x2=False)
+
     def test_v2_patch_compile_requires_all_assertions_before_network_use(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):

@@ -870,6 +870,413 @@ pub struct InteriorEntryEvidence {
     pub provenance: FactProvenance,
 }
 
+pub const PHYSICAL_REGION_IR_VERSION: u32 = 1;
+
+/// Storage addressed by one machine operation. Stack storage remains distinct
+/// from mapped process memory so later lowering cannot silently exchange them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionMemoryClass {
+    Stack,
+    Mapped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegionMemoryAddress {
+    pub class: RegionMemoryClass,
+    pub segment: Option<String>,
+    pub base: Option<String>,
+    pub index: Option<String>,
+    pub scale: u32,
+    pub displacement: i64,
+    pub absolute: Option<u64>,
+    pub width_bits: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RegionValue {
+    Register { name: String, width_bits: u16 },
+    Immediate { value: i64, width_bits: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionAluOperation {
+    Add,
+    Subtract,
+    And,
+    Or,
+    Xor,
+}
+
+/// A typed, operand-complete projection of one decoded machine operation.
+/// This is deliberately lower-level than SSA/CIR: it preserves effects that
+/// are not yet safe to structure or compile away.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PhysicalRegionOperation {
+    Move {
+        destination: String,
+        source: RegionValue,
+        width_bits: u16,
+    },
+    Load {
+        destination: String,
+        address: RegionMemoryAddress,
+    },
+    Store {
+        address: RegionMemoryAddress,
+        source: RegionValue,
+    },
+    LoadEffectiveAddress {
+        destination: String,
+        base: Option<String>,
+        index: Option<String>,
+        scale: u32,
+        displacement: i64,
+    },
+    Alu {
+        operation: RegionAluOperation,
+        destination: String,
+        source: RegionValue,
+        width_bits: u16,
+    },
+    AluMemory {
+        operation: RegionAluOperation,
+        address: RegionMemoryAddress,
+        source: RegionValue,
+    },
+    AluRegisterMemory {
+        operation: RegionAluOperation,
+        destination: String,
+        address: RegionMemoryAddress,
+    },
+    Compare {
+        left: RegionValue,
+        right: RegionValue,
+        width_bits: u16,
+    },
+    CompareMemory {
+        register: Option<String>,
+        address: RegionMemoryAddress,
+        value: Option<RegionValue>,
+    },
+    Test {
+        left: RegionValue,
+        right: RegionValue,
+        width_bits: u16,
+    },
+    SaveRegister {
+        register: String,
+    },
+    RestoreRegister {
+        register: String,
+    },
+    SaveFramePointer,
+    RestoreFramePointer,
+    SetFramePointer,
+    RestoreStackPointerFromFrame,
+    AdjustStack {
+        operation: RegionAluOperation,
+        amount: i64,
+    },
+    LeaveFrame,
+    ConditionalBranch {
+        predicate: RegionPredicate,
+        true_target: Address,
+        false_target: Address,
+    },
+    Branch {
+        target: Address,
+    },
+    Call {
+        target: Address,
+    },
+    Return,
+    Nop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionMemoryEffect {
+    None,
+    ReadReturnAddress,
+    WriteSavedFramePointer,
+    ReadSavedFramePointer,
+    WriteSavedRegister,
+    ReadSavedRegister,
+    ReadStackLocal,
+    WriteStackLocal,
+    ReadWriteStackLocal,
+    ReadMappedMemory,
+    WriteMappedMemory,
+    WriteReturnAddress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionControlEffect {
+    Next,
+    DirectBranch,
+    ConditionalBranch,
+    DirectCall,
+    Return,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PhysicalRegionEffects {
+    pub read_registers: Vec<String>,
+    pub written_registers: Vec<String>,
+    pub read_flags: Vec<String>,
+    pub written_flags: Vec<String>,
+    pub memory: RegionMemoryEffect,
+    pub control: RegionControlEffect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PhysicalRegionInstruction {
+    pub address: Address,
+    pub bytes_hex: String,
+    pub mnemonic: String,
+    pub operation: PhysicalRegionOperation,
+    pub effects: PhysicalRegionEffects,
+    pub successors: Vec<Address>,
+}
+
+/// General physical-state RegionIR. Construction proves exact decoding and
+/// control flow, but it does not claim that imported boundary facts are
+/// complete enough for SSA, C emission, or patch lowering.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhysicalRegionIr {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub region_bytes_sha256: String,
+    pub entry: Address,
+    pub instructions: Vec<PhysicalRegionInstruction>,
+    pub exits: Vec<Address>,
+    pub calls: Vec<CallSpec>,
+    pub physical_inputs: Vec<PhysicalLocationSpec>,
+    pub physical_outputs: Vec<PhysicalLocationSpec>,
+    pub stack_delta: Option<i64>,
+    pub unresolved_facts: Vec<String>,
+    pub lowering_ready: bool,
+}
+
+pub fn validate_physical_region_ir(
+    ir: &PhysicalRegionIr,
+    region: &RegionSpec,
+) -> Result<(), String> {
+    validate_region_spec(region)?;
+    if ir.schema_version != PHYSICAL_REGION_IR_VERSION {
+        return Err(format!(
+            "unsupported PhysicalRegionIR schema version {}",
+            ir.schema_version
+        ));
+    }
+    if ir.binary_sha256 != region.binary_sha256
+        || ir.region_bytes_sha256 != region.bytes_sha256
+        || ir.entry != region.entry
+    {
+        return Err("PhysicalRegionIR is not digest-bound to its RegionSpec".to_owned());
+    }
+    if ir.exits != region.exits
+        || ir.stack_delta != region.stack_delta
+        || ir.unresolved_facts != region.unresolved_facts
+    {
+        return Err("PhysicalRegionIR boundary contract differs from its RegionSpec".to_owned());
+    }
+    if ir.lowering_ready {
+        return Err(
+            "PhysicalRegionIR v1 records semantics but cannot authorize lowering".to_owned(),
+        );
+    }
+    let same_call = |left: &CallSpec, right: &CallSpec| {
+        left.source == right.source
+            && left.target == right.target
+            && left.return_address == right.return_address
+            && left.is_tailcall == right.is_tailcall
+            && left.stops_flow == right.stops_flow
+            && left.noreturn == right.noreturn
+    };
+    if ir.calls.len() != region.calls.len()
+        || !ir
+            .calls
+            .iter()
+            .zip(&region.calls)
+            .all(|(left, right)| same_call(left, right))
+    {
+        return Err("PhysicalRegionIR call contracts differ from its RegionSpec".to_owned());
+    }
+    let same_location = |left: &PhysicalLocationSpec, right: &PhysicalLocationSpec| {
+        left.name == right.name
+            && left.kind == right.kind
+            && left.width_bits == right.width_bits
+            && left.type_name == right.type_name
+    };
+    if ir.physical_inputs.len() != region.physical_live_in.len()
+        || ir.physical_outputs.len() != region.physical_live_out.len()
+        || !ir
+            .physical_inputs
+            .iter()
+            .zip(&region.physical_live_in)
+            .all(|(left, right)| same_location(left, right))
+        || !ir
+            .physical_outputs
+            .iter()
+            .zip(&region.physical_live_out)
+            .all(|(left, right)| same_location(left, right))
+    {
+        return Err("PhysicalRegionIR physical state differs from its RegionSpec".to_owned());
+    }
+    if ir.instructions.is_empty() || ir.instructions.len() > 4096 {
+        return Err("PhysicalRegionIR must contain 1..=4096 instructions".to_owned());
+    }
+    let region_bytes = decode_hex(&region.bytes_hex)?;
+    let region_end = region
+        .entry
+        .0
+        .checked_add(region.byte_length)
+        .ok_or_else(|| "PhysicalRegionIR address range overflows".to_owned())?;
+    let addresses = ir
+        .instructions
+        .iter()
+        .map(|instruction| instruction.address)
+        .collect::<std::collections::BTreeSet<_>>();
+    if addresses.len() != ir.instructions.len() || !addresses.contains(&region.entry) {
+        return Err(
+            "PhysicalRegionIR instruction addresses are not unique and entry-rooted".to_owned(),
+        );
+    }
+    let exits = region
+        .exits
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut covered = std::collections::BTreeSet::new();
+    for instruction in &ir.instructions {
+        let bytes = decode_hex(&instruction.bytes_hex)?;
+        if bytes.is_empty() || bytes.len() > 15 {
+            return Err("PhysicalRegionIR instruction has an invalid x86 byte length".to_owned());
+        }
+        let offset = instruction
+            .address
+            .0
+            .checked_sub(region.entry.0)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| "PhysicalRegionIR instruction precedes its region".to_owned())?;
+        let finish = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| "PhysicalRegionIR instruction range overflows".to_owned())?;
+        if finish > region_bytes.len() || region_bytes[offset..finish] != bytes {
+            return Err("PhysicalRegionIR instruction bytes differ from its RegionSpec".to_owned());
+        }
+        for byte in instruction.address.0..instruction.address.0 + bytes.len() as u64 {
+            if !covered.insert(byte) {
+                return Err("PhysicalRegionIR instructions overlap".to_owned());
+            }
+        }
+        if instruction
+            .successors
+            .iter()
+            .any(|successor| !addresses.contains(successor) && !exits.contains(successor))
+        {
+            return Err(
+                "PhysicalRegionIR successor is neither an instruction nor a declared exit"
+                    .to_owned(),
+            );
+        }
+        let expected_control = match instruction.operation {
+            PhysicalRegionOperation::ConditionalBranch { .. } => {
+                RegionControlEffect::ConditionalBranch
+            }
+            PhysicalRegionOperation::Branch { .. } => RegionControlEffect::DirectBranch,
+            PhysicalRegionOperation::Call { .. } => RegionControlEffect::DirectCall,
+            PhysicalRegionOperation::Return => RegionControlEffect::Return,
+            _ => RegionControlEffect::Next,
+        };
+        if instruction.effects.control != expected_control {
+            return Err("PhysicalRegionIR operation/control effect mismatch".to_owned());
+        }
+        let memory_for = |class, read, write| match (class, read, write) {
+            (RegionMemoryClass::Stack, true, false) => RegionMemoryEffect::ReadStackLocal,
+            (RegionMemoryClass::Stack, false, true) => RegionMemoryEffect::WriteStackLocal,
+            (RegionMemoryClass::Stack, true, true) => RegionMemoryEffect::ReadWriteStackLocal,
+            (RegionMemoryClass::Mapped, true, false) => RegionMemoryEffect::ReadMappedMemory,
+            (RegionMemoryClass::Mapped, false, true) => RegionMemoryEffect::WriteMappedMemory,
+            _ => RegionMemoryEffect::None,
+        };
+        let expected_memory = match &instruction.operation {
+            PhysicalRegionOperation::Load { address, .. }
+            | PhysicalRegionOperation::CompareMemory { address, .. } => {
+                memory_for(address.class, true, false)
+            }
+            PhysicalRegionOperation::Store { address, .. } => {
+                memory_for(address.class, false, true)
+            }
+            PhysicalRegionOperation::AluMemory { address, .. } => {
+                memory_for(address.class, true, true)
+            }
+            PhysicalRegionOperation::AluRegisterMemory { address, .. } => {
+                memory_for(address.class, true, false)
+            }
+            PhysicalRegionOperation::SaveRegister { .. } => RegionMemoryEffect::WriteSavedRegister,
+            PhysicalRegionOperation::RestoreRegister { .. } => {
+                RegionMemoryEffect::ReadSavedRegister
+            }
+            PhysicalRegionOperation::SaveFramePointer => RegionMemoryEffect::WriteSavedFramePointer,
+            PhysicalRegionOperation::RestoreFramePointer | PhysicalRegionOperation::LeaveFrame => {
+                RegionMemoryEffect::ReadSavedFramePointer
+            }
+            PhysicalRegionOperation::Call { .. } => RegionMemoryEffect::WriteReturnAddress,
+            PhysicalRegionOperation::Return => RegionMemoryEffect::ReadReturnAddress,
+            _ => RegionMemoryEffect::None,
+        };
+        if instruction.effects.memory != expected_memory {
+            return Err("PhysicalRegionIR operation/memory effect mismatch".to_owned());
+        }
+        let next = instruction
+            .address
+            .0
+            .checked_add(bytes.len() as u64)
+            .map(Address)
+            .ok_or_else(|| "PhysicalRegionIR instruction successor overflows".to_owned())?;
+        let expected_successors = match &instruction.operation {
+            PhysicalRegionOperation::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => vec![*true_target, *false_target],
+            PhysicalRegionOperation::Branch { target } => vec![*target],
+            PhysicalRegionOperation::Return => Vec::new(),
+            PhysicalRegionOperation::Call { .. } if instruction.successors.is_empty() => Vec::new(),
+            _ => vec![next],
+        };
+        if expected_successors != instruction.successors {
+            return Err("PhysicalRegionIR operation/successor mismatch".to_owned());
+        }
+        if !(region.entry.0..region_end).contains(&instruction.address.0) {
+            return Err("PhysicalRegionIR instruction lies outside its region".to_owned());
+        }
+    }
+    for call in &ir.calls {
+        let instruction = ir
+            .instructions
+            .iter()
+            .find(|instruction| instruction.address == call.source)
+            .ok_or_else(|| "PhysicalRegionIR call contract has no instruction".to_owned())?;
+        if !matches!(instruction.operation, PhysicalRegionOperation::Call { .. }) {
+            return Err("PhysicalRegionIR call contract source is not a call".to_owned());
+        }
+        if (call.stops_flow || call.noreturn) != instruction.successors.is_empty() {
+            return Err(
+                "PhysicalRegionIR terminal call contract disagrees with control flow".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub const REGION_DECISION_IR_VERSION: u32 = 1;
 
 /// A condition consumed by a side-effect-free region decision. Flag names are

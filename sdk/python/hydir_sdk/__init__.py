@@ -131,6 +131,28 @@ class HydirClient:
             schema_version=3,
         )
 
+    def lift_region(
+        self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
+    ) -> dict:
+        """Return digest-checked PhysicalRegionIR without claiming C/patch readiness."""
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub_v2.LiftRegion,
+            proto_v2.RegionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.physical-region-ir+json;version=1",
+            schema_version=1,
+        )
+
     def decompile_region(
         self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
     ) -> dict:
