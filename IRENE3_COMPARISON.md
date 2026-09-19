@@ -45,12 +45,16 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
   `interchange_import`; native proof gaps keep every imported region
   `replacement_ready=false`.
 - The native semantic compatibility report currently binds 23/23 regions but
-  lifts 0/23 as isolated regions. Measured blockers are external block exits,
-  32-bit memory operands, general loads/stores and pushes, frame state entering
-  mid-function regions, RIP-relative addressing, and resolved-call contracts.
-  CET `ENDBR64` and RBX/R10-R15 register effects are now modeled, including a
-  fix to data-flow accounting for R8/R9 and the extended registers; those are
-  no longer reported as unknown instructions or silently omitted effects.
+  lifts 0/23 as isolated regions. The remaining per-block blockers are explicit
+  external exits, frame state entering mid-function regions, general mapped/TLS
+  memory, RIP-relative addressing, an RBX save, and resolved-call contracts.
+  This result is deliberately separate from whole-function lifting: the pinned
+  92-byte `fibIterative` function now lifts completely with typed dword red-zone
+  locals, 32-bit arithmetic/comparisons and flags. LLVM `opt -passes=verify`
+  accepts the output, generated C compiles with Clang 22.1.8, and 63 cases
+  (`n=-16..46`, with nonzero high input bits) match an independent Fibonacci
+  oracle. CET `ENDBR64` and RBX/R10-R15 register effects are also modeled,
+  including corrected data-flow accounting for all six SysV integer arguments.
 - Rust workspace tests, fuzz-target compilation, warnings-as-errors Clippy,
   protocol tests, and Python SDK boundary tests pass locally. The Triton oracle,
   native Linux semantic/differential gates, Ghidra workflow, and upstream Irene3
