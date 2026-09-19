@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 hydir-backend = { path = "../crates/hydir-backend" }
 hydir-c = { path = "../crates/hydir-c" }
+hydir-irene3 = { path = "../crates/hydir-irene3" }
 
 [[bin]]
 name = "elf_import"
@@ -31,6 +32,13 @@ bench = false
 [[bin]]
 name = "c_output"
 path = "fuzz_targets/c_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anvill_spec"
+path = "fuzz_targets/anvill_spec.rs"
 test = false
 doc = false
 bench = false

@@ -1,5 +1,7 @@
 //! Local-only, authenticated HydIR RPC slice. No sample execution endpoint.
 
+mod compat;
+
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_api::v1::{
     AnnotationRequest, ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply,
@@ -2502,6 +2504,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Server::builder()
                 .add_service(HydirServer::new(store.clone()).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
                 .add_service(HydirV2Server::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
+                .add_service(compat::irene_service())
+                .add_service(compat::patch_lang_service())
                 .serve(address)
                 .await?;
         }

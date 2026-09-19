@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hydir-core", "crates/hydir-semantics", "crates/hydir-project", "crates/hydir-backend", "crates/hydir-analysis", "crates/hydir-c", "crates/hydir-patch", "crates/hydir-transform", "crates/hydir-recompile", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-server", "crates/hydir-gui"]
+members = ["crates/hydir-core", "crates/hydir-semantics", "crates/hydir-project", "crates/hydir-backend", "crates/hydir-analysis", "crates/hydir-c", "crates/hydir-patch", "crates/hydir-transform", "crates/hydir-recompile", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-irene3", "crates/hydir-server", "crates/hydir-gui"]
 resolver = "2"
 
 [workspace.package]
@@ -18,7 +18,7 @@ tonic = "=0.14.6"
 tonic-prost = "=0.14.6"
 prost = "0.14"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 libc = "0.2"
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 uuid = { version = "=1.26.1", features = ["v4"] }

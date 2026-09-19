@@ -770,6 +770,14 @@ fn shared_initialization_effect(instruction: &Instruction) -> Option<(u8, u8)> {
         return None;
     }
     let effect = op.effects();
+    let supported_registers = hydir_semantics::RAX
+        | hydir_semantics::RDI
+        | hydir_semantics::RSI
+        | hydir_semantics::RDX
+        | hydir_semantics::RCX;
+    if (effect.read_registers | effect.write_registers) & !supported_registers != 0 {
+        return None;
+    }
     if effect.read_flags & !hydir_semantics::ZF != 0 {
         return None;
     }
@@ -959,6 +967,17 @@ mod tests {
     #[test]
     fn llvm_byte_encoding_is_exact() {
         assert_eq!(llvm_bytes(&[0, 10, 255]), "\\00\\0A\\FF");
+    }
+
+    #[test]
+    fn narrow_rebuilder_does_not_mask_extended_register_effects() {
+        let mut decoder = Decoder::with_ip(
+            64,
+            &[0x4d, 0x89, 0xca], // mov r10,r9
+            0x1000,
+            DecoderOptions::NONE,
+        );
+        assert!(shared_initialization_effect(&decoder.decode()).is_none());
     }
     #[test]
     fn rejects_non_elf() {

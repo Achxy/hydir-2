@@ -1333,6 +1333,7 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-irene3",
  "hydir-patch",
  "hydir-project",
  "hydir-recompile",
@@ -1377,6 +1378,18 @@ dependencies = [
  "tokio",
  "tonic",
  "uuid",
+]
+
+[[package]]
+name = "hydir-irene3"
+version = "0.1.0"
+dependencies = [
+ "hydir-api",
+ "hydir-backend",
+ "hydir-core",
+ "object",
+ "prost",
+ "sha2",
 ]
 
 [[package]]
@@ -1431,10 +1444,12 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-irene3",
  "hydir-patch",
  "hydir-recompile",
  "hydir-transform",
  "libc",
+ "prost",
  "rusqlite",
  "serde_json",
  "sha2",

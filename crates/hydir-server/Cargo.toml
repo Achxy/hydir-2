@@ -14,6 +14,7 @@ hydir-api = { path = "../hydir-api" }
 hydir-backend = { path = "../hydir-backend" }
 hydir-c = { path = "../hydir-c" }
 hydir-core = { path = "../hydir-core" }
+hydir-irene3 = { path = "../hydir-irene3" }
 hydir-patch = { path = "../hydir-patch" }
 hydir-transform = { path = "../hydir-transform" }
 hydir-recompile = { path = "../hydir-recompile" }
@@ -28,4 +29,5 @@ sha2.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+prost.workspace = true
 tempfile = "3.23"

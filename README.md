@@ -99,6 +99,35 @@ The scripts record CFG, LLVM IR, C, and differential results as inspectable arti
 
 [![egui C output cutout refusing an unsupported call while retaining other analysis results](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
 
+## Irene3 interoperability checkpoint
+
+HydIR compiles the exact pinned Anvill, `irene.server.Irene`, and
+`irene3.server.PatchLangServer` protobuf contracts. Anvill specifications are
+decoded under explicit inventory, nesting, value, chunk, and total-size limits;
+the original bytes are retained for lossless forwarding. A specification can
+be bound to its matching ELF and converted block-by-block into RegionSpec v3:
+
+```bash
+cargo run --locked --bin hydirctl -- irene3-inspect program.proto
+cargo run --locked --bin hydirctl -- irene3-region \
+  program.proto program.elf 26 --output region.json
+cargo run --locked --bin hydirctl -- irene3-compat-report \
+  program.proto program.elf
+```
+
+The local server mounts both upstream service names and accepts Irene3's
+streaming chunk convention. For non-empty programs it currently returns a
+fail-closed precondition error instead of fabricating C or PatchLang while
+physical adapters and typed PatchIR remain incomplete. The pinned upstream
+repository is a test-only submodule and is not linked into HydIR:
+
+```bash
+git submodule update --init third_party/irene3-reference
+```
+
+Measured compatibility and remaining semantic blockers are recorded in
+[IRENE3_COMPARISON.md](IRENE3_COMPARISON.md).
+
 ## Symbolic exploration with Triton
 
 The optional Triton bridge explores bounded direct-control-flow paths inside one selected x86-64 function and returns symbolic expressions. It is separate from the LLVM lift and does not establish whole-program equivalence. Use a Python interpreter with the Triton bindings available; `doctor` reports whether HydIR can import them.

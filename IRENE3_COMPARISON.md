@@ -10,6 +10,9 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
   was recovered through rescue branch
   `rescue/irene3-port-pre-integration-20260919` onto
   `feature/irene3-native-port`.
+- `third_party/irene3-reference` records the exact upstream commit as a
+  test-only Git submodule. Its nested dependencies are not initialized by the
+  HydIR build and it is not a runtime dependency.
 - All five checked-in ELF seeds were regenerated with pinned Clang/LLD 22.1.8.
   Their sources, entry points, lengths, hashes, and common command arguments are
   recorded in `fuzz/corpus/elf_import/MANIFEST.json` and enforced by a Rust test.
@@ -20,6 +23,34 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
 - Preserved `hydir.v1` and additive `hydir.v2` services run together. v2 covers
   region/decompilation artifacts, patch compilation/application, and structural
   verification. Python clients negotiate v2 with v1 fallback.
+- The exact pinned `irene.server.Irene`,
+  `irene3.server.PatchLangServer`, and Anvill protobuf schemas are now compiled
+  into the Rust API. The local server mounts both upstream service names,
+  accepts the upstream 2,000,000-byte streaming convention, bounds the total
+  specification to 64 MiB, and refuses non-empty semantic output until region
+  live-state and adapter proofs exist.
+- The public pinned x86-64 Fibonacci Anvill fixture parses and validates
+  natively: source SHA-256 `acb261fcea612eb5951cecc0b5a16f76fe78af57e2e55895b8756effa4ffbd89`,
+  21,168 bytes, 7 functions, 23 blocks, 27 memory ranges, 5 globals, and 71
+  symbols. All 23 block extents resolve to one exact executable memory range.
+  Its target is `ARCH_AMD64` / `OS_LINUX`. Original wire bytes are retained
+  losslessly; the decoded pinned-schema view has deterministic canonical
+  re-encoding.
+- Binding that fixture to its matching 16,184-byte upstream ELF succeeds for
+  all 23 regions and emits validated `RegionSpec` v3 artifacts with rebased ELF
+  addresses, exact bytes/digests, CFG exits, imported physical live state,
+  variable locations, and stack relations. UID 26 binds to `0x11a9`, 11 bytes,
+  region SHA-256 `f3d11c178e965e08a1bec6d110d7e93714fbf3c8b62c376d1fa52d52d1fc17aa`,
+  successor `0x11b4`, and RSP delta -8. Imported evidence is explicitly marked
+  `interchange_import`; native proof gaps keep every imported region
+  `replacement_ready=false`.
+- The native semantic compatibility report currently binds 23/23 regions but
+  lifts 0/23 as isolated regions. Measured blockers are external block exits,
+  32-bit memory operands, general loads/stores and pushes, frame state entering
+  mid-function regions, RIP-relative addressing, and resolved-call contracts.
+  CET `ENDBR64` and RBX/R10-R15 register effects are now modeled, including a
+  fix to data-flow accounting for R8/R9 and the extended registers; those are
+  no longer reported as unknown instructions or silently omitted effects.
 - Rust workspace tests, fuzz-target compilation, warnings-as-errors Clippy,
   protocol tests, and Python SDK boundary tests pass locally. The Triton oracle,
   native Linux semantic/differential gates, Ghidra workflow, and upstream Irene3
@@ -29,7 +60,8 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
 
 - IRENE-3 source: `trailofbits/irene3` commit
   `d97aee937ebb6d1cb8a362748c56414404eb75ff`; repository license:
-  AGPL-3.0. Keep its build and dependencies outside the HydIR source tree.
+  AGPL-3.0. Build the test-only submodule and its dependencies in a separate
+  reference environment; they are not part of the HydIR runtime.
 - HydIR source: record `git rev-parse HEAD` and require a clean worktree when
   running. Results from a modified tree must carry a diff hash and cannot be
   promoted to release evidence.

@@ -1,0 +1,14 @@
+[package]
+name = "hydir-irene3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hydir-api = { path = "../hydir-api" }
+hydir-backend = { path = "../hydir-backend" }
+hydir-core = { path = "../hydir-core" }
+object.workspace = true
+prost.workspace = true
+sha2.workspace = true

@@ -108,6 +108,13 @@ pub const RDX: u16 = 1 << 3;
 pub const RCX: u16 = 1 << 4;
 pub const R8: u16 = 1 << 7;
 pub const R9: u16 = 1 << 8;
+pub const RBX: u16 = 1 << 9;
+pub const R10: u16 = 1 << 10;
+pub const R11: u16 = 1 << 11;
+pub const R12: u16 = 1 << 12;
+pub const R13: u16 = 1 << 13;
+pub const R14: u16 = 1 << 14;
+pub const R15: u16 = 1 << 15;
 pub const RSP: u16 = 1 << 5;
 pub const RBP: u16 = 1 << 6;
 pub const ZF: u8 = 1 << 0;
@@ -155,6 +162,13 @@ fn register_bit(register: Register) -> u16 {
         Register::RCX => RCX,
         Register::R8 => R8,
         Register::R9 => R9,
+        Register::RBX => RBX,
+        Register::R10 => R10,
+        Register::R11 => R11,
+        Register::R12 => R12,
+        Register::R13 => R13,
+        Register::R14 => R14,
+        Register::R15 => R15,
         _ => unreachable!("classifier establishes canonical register parents"),
     }
 }
@@ -280,7 +294,14 @@ fn checked_register(register: Register, ip: u64) -> Result<Register, String> {
         | Register::RDX
         | Register::RCX
         | Register::R8
-        | Register::R9 => Ok(register),
+        | Register::R9
+        | Register::RBX
+        | Register::R10
+        | Register::R11
+        | Register::R12
+        | Register::R13
+        | Register::R14
+        | Register::R15 => Ok(register),
         _ => Err(format!(
             "register {register:?} unsupported at 0x{ip:x}; only full 64-bit scalar registers are modeled"
         )),
@@ -296,6 +317,13 @@ fn parent_of_32(register: Register, ip: u64) -> Result<Register, String> {
         Register::ECX => Ok(Register::RCX),
         Register::R8D => Ok(Register::R8),
         Register::R9D => Ok(Register::R9),
+        Register::EBX => Ok(Register::RBX),
+        Register::R10D => Ok(Register::R10),
+        Register::R11D => Ok(Register::R11),
+        Register::R12D => Ok(Register::R12),
+        Register::R13D => Ok(Register::R13),
+        Register::R14D => Ok(Register::R14),
+        Register::R15D => Ok(Register::R15),
         _ => Err(format!(
             "32-bit register {register:?} unsupported at 0x{ip:x}"
         )),
@@ -527,7 +555,7 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
         Mnemonic::Jo => Op::Jcc(Condition::O),
         Mnemonic::Jno => Op::Jcc(Condition::No),
         Mnemonic::Ret if instruction.op_count() == 0 => Op::Ret,
-        Mnemonic::Nop if instruction.op_count() == 0 => Op::Nop,
+        Mnemonic::Nop | Mnemonic::Endbr64 if instruction.op_count() == 0 => Op::Nop,
         _ => {
             return Err(format!(
                 "unsupported {:?} at 0x{ip:x}",
@@ -597,6 +625,31 @@ mod tests {
                 src: Value::Register(Register::RSI)
             })
         ));
+    }
+
+    #[test]
+    fn cet_landing_pad_is_a_zero_effect_operation() {
+        let mut decoder =
+            Decoder::with_ip(64, &[0xf3, 0x0f, 0x1e, 0xfa], 0x3000, DecoderOptions::NONE);
+        let operation = classify(&decoder.decode()).unwrap();
+        assert_eq!(operation, Op::Nop);
+        assert_eq!(operation.effects().read_registers, 0);
+        assert_eq!(operation.effects().write_registers, 0);
+    }
+
+    #[test]
+    fn callee_saved_and_extended_registers_are_first_class() {
+        let mut decoder = Decoder::with_ip(64, &[0x4c, 0x89, 0xe3], 0x4000, DecoderOptions::NONE);
+        let operation = classify(&decoder.decode()).unwrap();
+        assert_eq!(
+            operation,
+            Op::Mov {
+                dst: Register::RBX,
+                src: Value::Register(Register::R12),
+            }
+        );
+        assert_eq!(operation.effects().read_registers, R12);
+        assert_eq!(operation.effects().write_registers, RBX);
     }
 
     #[test]

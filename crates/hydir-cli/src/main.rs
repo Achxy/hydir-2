@@ -1,12 +1,13 @@
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
-    MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at, lift_symbol,
-    proven_stack_local_offsets, recover_at_cfg, recover_symbol_cfg, region_contract,
+    MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at, lift_cfg,
+    lift_symbol, proven_stack_local_offsets, recover_at_cfg, recover_symbol_cfg, region_contract,
 };
 use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
     CallingConvention, ScalarType, annotation_address_in_spec, parse_program_spec_json,
 };
+use hydir_irene3::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 mod local;
 mod passes;
 mod patch;
@@ -35,6 +36,9 @@ Usage:
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl analyze-spec <linked-elf>
+  hydirctl irene3-inspect <anvill-spec.pb> [--canonical-output <canonical.pb>]
+  hydirctl irene3-region <anvill-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
+  hydirctl irene3-compat-report <anvill-spec.pb> <linked-elf>
   hydirctl cfg <elf> <function-symbol>
   hydirctl region <linked-elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
@@ -217,6 +221,165 @@ fn run() -> Result<(), Box<dyn Error>> {
             let bytes = read_binary(&args[1])?;
             let spec = analyze_spec_elf(&bytes)?;
             println!("{}", serde_json::to_string_pretty(&spec)?);
+        }
+        Some("irene3-inspect") if args.len() == 2 || args.len() == 4 => {
+            let output = if args.len() == 4 {
+                if args[2] != "--canonical-output" {
+                    return Err(HELP.into());
+                }
+                Some(args[3].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &document.canonical_bytes())?;
+            }
+            let inventory = document.inventory();
+            let mut exact_executable_blocks = 0usize;
+            let mut block_byte_errors = Vec::new();
+            let mut block_inventory = Vec::new();
+            for function in &document.specification().functions {
+                for uid in function.blocks.keys() {
+                    let block = &function.blocks[uid];
+                    block_inventory.push(json!({
+                        "uid": uid,
+                        "address": format!("0x{:016x}", block.address),
+                        "size": block.size,
+                        "name": block.name,
+                    }));
+                    match document.block_bytes(*uid) {
+                        Ok(_) => exact_executable_blocks += 1,
+                        Err(error) if block_byte_errors.len() < 32 => block_byte_errors.push(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "Anvill Specification protobuf",
+                    "irene3_commit": hydir_irene3::IRENE3_COMMIT,
+                    "anvill_schema_commit": hydir_irene3::ANVILL_SCHEMA_COMMIT,
+                    "source_sha256": document.source_sha256(),
+                    "source_bytes": document.original_bytes().len(),
+                    "canonical_bytes": document.canonical_bytes().len(),
+                    "stable_target": document.require_stable_target().is_ok(),
+                    "arch": document.specification().arch,
+                    "operating_system": document.specification().operating_system,
+                    "image_name": document.specification().image_name,
+                    "image_base": format!("0x{:016x}", document.specification().image_base),
+                    "functions": inventory.functions,
+                    "blocks": inventory.blocks,
+                    "exact_executable_blocks": exact_executable_blocks,
+                    "block_byte_errors": block_byte_errors,
+                    "block_inventory": block_inventory,
+                    "memory_ranges": inventory.memory_ranges,
+                    "globals": inventory.globals,
+                    "symbols": inventory.symbols,
+                    "callsites": inventory.callsites,
+                }))?
+            );
+        }
+        Some("irene3-region") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let uid = parse_u64_auto(&args[3], "block UID")?;
+            let json = serde_json::to_vec_pretty(&document.region_spec_for_elf(&elf, uid)?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("irene3-compat-report") if args.len() == 3 => {
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let mut regions = Vec::new();
+            let mut bound = 0usize;
+            let mut lifted = 0usize;
+            let mut c_emitted = 0usize;
+            for function in &document.specification().functions {
+                for uid in function.blocks.keys() {
+                    let mut result = json!({
+                        "uid": uid,
+                        "bound": false,
+                        "lifted": false,
+                        "c_emitted": false,
+                    });
+                    match document.region_spec_for_elf(&elf, *uid) {
+                        Ok(region) => {
+                            bound += 1;
+                            result["bound"] = json!(true);
+                            result["entry"] = json!(format!("0x{:016x}", region.entry.0));
+                            result["bytes"] = json!(region.byte_length);
+                            match lift_cfg(document.block_bytes(*uid)?, region.entry.0) {
+                                Ok(llvm) => {
+                                    lifted += 1;
+                                    result["lifted"] = json!(true);
+                                    result["llvm_sha256"] =
+                                        json!(format!("{:x}", sha2::Sha256::digest(&llvm)));
+                                    match emit_structured_c(&llvm) {
+                                        Ok(c) => {
+                                            c_emitted += 1;
+                                            result["c_emitted"] = json!(true);
+                                            result["c_sha256"] =
+                                                json!(format!("{:x}", sha2::Sha256::digest(&c)));
+                                        }
+                                        Err(error) => result["diagnostic"] = json!(error),
+                                    }
+                                }
+                                Err(error) => result["diagnostic"] = json!(error.to_string()),
+                            }
+                        }
+                        Err(error) => result["diagnostic"] = json!(error),
+                    }
+                    regions.push(result);
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": 1,
+                    "source_sha256": document.source_sha256(),
+                    "binary_sha256": format!("{:x}", sha2::Sha256::digest(&elf)),
+                    "total_regions": document.inventory().blocks,
+                    "bound_regions": bound,
+                    "lifted_regions": lifted,
+                    "c_regions": c_emitted,
+                    "regions": regions,
+                }))?
+            );
         }
         Some("cfg") if args.len() == 3 => {
             let bytes = read_binary(&args[1])?;
@@ -405,6 +568,17 @@ fn parse_address_extent(address: &str, size: &str) -> Result<(u64, u64), Box<dyn
         return Err("size must be 1..=4096 bytes".into());
     }
     Ok((address, size))
+}
+
+fn parse_u64_auto(value: &str, label: &str) -> Result<u64, Box<dyn Error>> {
+    if let Some(digits) = value.strip_prefix("0x") {
+        if digits.is_empty() {
+            return Err(format!("{label} has no hexadecimal digits").into());
+        }
+        Ok(u64::from_str_radix(digits, 16)?)
+    } else {
+        Ok(value.parse::<u64>()?)
+    }
 }
 
 fn typed_model_lift(
