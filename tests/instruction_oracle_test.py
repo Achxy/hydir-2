@@ -31,14 +31,19 @@ def reg(context, name):
     return context.getConcreteRegisterValue(getattr(context.registers, name))
 
 
-def arithmetic_flags(left, right, result, subtract):
+def arithmetic_flags(left, right, result, subtract, bits=64):
+    mask = (1 << bits) - 1
+    sign = 1 << (bits - 1)
+    left &= mask
+    right &= mask
+    result &= mask
     if subtract:
         carry = left < right
-        overflow = bool(((left ^ right) & (left ^ result) & SIGN) != 0)
+        overflow = bool(((left ^ right) & (left ^ result) & sign) != 0)
     else:
         carry = result < left
-        overflow = bool((~(left ^ right) & (left ^ result) & SIGN) != 0)
-    return (int(carry), int(result == 0), int(bool(result & SIGN)), int(overflow))
+        overflow = bool((~(left ^ right) & (left ^ result) & sign) != 0)
+    return (int(carry), int(result == 0), int(bool(result & sign)), int(overflow))
 
 
 class InstructionOracleTests(unittest.TestCase):
@@ -87,6 +92,39 @@ class InstructionOracleTests(unittest.TestCase):
             self.assert_flags(context, arithmetic_flags(left, 1, compared, True))
             context = step("48f7c001000000", rax=left)
             self.assert_flags(context, (0, int((left & 1) == 0), 0, 0))
+
+    def test_dword_stack_and_arithmetic_effects(self):
+        stored = step("897dec", rbp=0x9000, rdi=0xfeedbeef87654321)
+        self.assertEqual(
+            int.from_bytes(stored.getConcreteMemoryAreaValue(0x8fec, 4), "little"),
+            0x87654321,
+        )
+        loaded = step("8b45ec", rbp=0x9000, rax=MASK, memory={0x8fec: MASK})
+        self.assertEqual(reg(loaded, "rax"), 0xffffffff)
+        values = (0, 1, 2, 0x7fffffff, 0x80000000, 0xffffffff)
+        for left in values:
+            for right in values:
+                result = (left + right) & 0xffffffff
+                context = step("01d0", rax=left, rdx=right)
+                self.assertEqual(reg(context, "rax"), result)
+                self.assert_flags(
+                    context, arithmetic_flags(left, right, result, False, bits=32)
+                )
+                compared = (left - right) & 0xffffffff
+                context = step(
+                    "3b45ec", rbp=0x9000, rax=left, memory={0x8fec: right}
+                )
+                self.assert_flags(
+                    context, arithmetic_flags(left, right, compared, True, bits=32)
+                )
+        incremented = step("8345f801", rbp=0x9000, memory={0x8ff8: 0xffffffff})
+        self.assertEqual(
+            int.from_bytes(incremented.getConcreteMemoryAreaValue(0x8ff8, 4), "little"),
+            0,
+        )
+        self.assert_flags(
+            incremented, arithmetic_flags(0xffffffff, 1, 0, False, bits=32)
+        )
 
     def test_all_supported_conditional_branches(self):
         conditions = {

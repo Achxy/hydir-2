@@ -58,10 +58,20 @@ pub enum Op {
         base: Register,
         displacement: i64,
     },
+    LoadStack32 {
+        dst: Register,
+        base: Register,
+        displacement: i64,
+    },
     StoreStack64 {
         base: Register,
         displacement: i64,
         src: Register,
+    },
+    StoreStack32 {
+        base: Register,
+        displacement: i64,
+        src: Value32,
     },
     Lea {
         dst: Register,
@@ -75,9 +85,34 @@ pub enum Op {
         dst: Register,
         src: Value,
     },
+    Alu32 {
+        kind: Alu,
+        dst: Register,
+        src: Value32,
+    },
+    AluStack32 {
+        kind: Alu,
+        base: Register,
+        displacement: i64,
+        src: Value32,
+    },
     Cmp {
         lhs: Register,
         rhs: Value,
+    },
+    Cmp32 {
+        lhs: Register,
+        rhs: Value32,
+    },
+    CmpRegStack32 {
+        lhs: Register,
+        base: Register,
+        displacement: i64,
+    },
+    CmpStack32 {
+        base: Register,
+        displacement: i64,
+        rhs: Value32,
     },
     Test {
         lhs: Register,
@@ -140,6 +175,7 @@ pub enum MemoryEffect {
     ReadSavedFramePointer,
     ReadStackLocal,
     WriteStackLocal,
+    ReadWriteStackLocal,
     WriteReturnAddress,
 }
 
@@ -206,9 +242,21 @@ impl Op {
                 effect.write_registers = register_bit(dst);
                 effect.memory = MemoryEffect::ReadStackLocal;
             }
+            Op::LoadStack32 { dst, base, .. } => {
+                effect.read_registers = if base == Register::RSP { RSP } else { RBP };
+                effect.write_registers = register_bit(dst);
+                effect.memory = MemoryEffect::ReadStackLocal;
+            }
             Op::StoreStack64 { base, src, .. } => {
                 effect.read_registers =
                     register_bit(src) | if base == Register::RSP { RSP } else { RBP };
+                effect.memory = MemoryEffect::WriteStackLocal;
+            }
+            Op::StoreStack32 { base, src, .. } => {
+                effect.read_registers = match src {
+                    Value32::Register(register) => register_bit(register),
+                    Value32::Immediate(_) => 0,
+                } | if base == Register::RSP { RSP } else { RBP };
                 effect.memory = MemoryEffect::WriteStackLocal;
             }
             Op::Lea {
@@ -223,9 +271,48 @@ impl Op {
                 effect.write_registers = register_bit(dst);
                 effect.write_flags = ALL_FLAGS;
             }
+            Op::Alu32 { dst, src, .. } => {
+                effect.read_registers = register_bit(dst)
+                    | match src {
+                        Value32::Register(register) => register_bit(register),
+                        Value32::Immediate(_) => 0,
+                    };
+                effect.write_registers = register_bit(dst);
+                effect.write_flags = ALL_FLAGS;
+            }
+            Op::AluStack32 { base, src, .. } => {
+                effect.read_registers = match src {
+                    Value32::Register(register) => register_bit(register),
+                    Value32::Immediate(_) => 0,
+                } | if base == Register::RSP { RSP } else { RBP };
+                effect.write_flags = ALL_FLAGS;
+                effect.memory = MemoryEffect::ReadWriteStackLocal;
+            }
             Op::Cmp { lhs, rhs } | Op::Test { lhs, rhs } => {
                 effect.read_registers = register_bit(lhs) | value_reads(rhs);
                 effect.write_flags = ALL_FLAGS;
+            }
+            Op::Cmp32 { lhs, rhs } => {
+                effect.read_registers = register_bit(lhs)
+                    | match rhs {
+                        Value32::Register(register) => register_bit(register),
+                        Value32::Immediate(_) => 0,
+                    };
+                effect.write_flags = ALL_FLAGS;
+            }
+            Op::CmpRegStack32 { lhs, base, .. } => {
+                effect.read_registers =
+                    register_bit(lhs) | if base == Register::RSP { RSP } else { RBP };
+                effect.write_flags = ALL_FLAGS;
+                effect.memory = MemoryEffect::ReadStackLocal;
+            }
+            Op::CmpStack32 { base, rhs, .. } => {
+                effect.read_registers = match rhs {
+                    Value32::Register(register) => register_bit(register),
+                    Value32::Immediate(_) => 0,
+                } | if base == Register::RSP { RSP } else { RBP };
+                effect.write_flags = ALL_FLAGS;
+                effect.memory = MemoryEffect::ReadStackLocal;
             }
             Op::SaveFramePointer => {
                 effect.read_registers = RSP | RBP;
@@ -338,6 +425,7 @@ fn operand32(instruction: &Instruction, index: u32) -> Result<Value32, String> {
             ip,
         )?)),
         OpKind::Immediate32 => Ok(Value32::Immediate(instruction.immediate32())),
+        OpKind::Immediate8to32 => Ok(Value32::Immediate(instruction.immediate8to32() as u32)),
         _ => Err(format!("32-bit operand kind unsupported at 0x{ip:x}")),
     }
 }
@@ -376,6 +464,17 @@ fn stack_memory(instruction: &Instruction) -> Result<(Register, i64), String> {
         ));
     }
     Ok((base, instruction.memory_displacement64() as i64))
+}
+
+fn alu_kind(mnemonic: Mnemonic) -> Alu {
+    match mnemonic {
+        Mnemonic::Add => Alu::Add,
+        Mnemonic::Sub => Alu::Sub,
+        Mnemonic::And => Alu::And,
+        Mnemonic::Or => Alu::Or,
+        Mnemonic::Xor => Alu::Xor,
+        _ => unreachable!("caller restricts arithmetic mnemonics"),
+    }
 }
 
 pub fn classify(instruction: &Instruction) -> Result<Op, String> {
@@ -450,6 +549,19 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
         }
         Mnemonic::Mov
             if instruction.op_count() == 2
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory
+                && instruction.op0_register().size() == 4 =>
+        {
+            let (base, displacement) = stack_memory(instruction)?;
+            Op::LoadStack32 {
+                dst: parent_of_32(instruction.op0_register(), ip)?,
+                base,
+                displacement,
+            }
+        }
+        Mnemonic::Mov
+            if instruction.op_count() == 2
                 && instruction.op0_kind() == OpKind::Memory
                 && instruction.op1_kind() == OpKind::Register
                 && instruction.op1_register().size() == 8 =>
@@ -459,6 +571,22 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 base,
                 displacement,
                 src: checked_register(instruction.op1_register(), ip)?,
+            }
+        }
+        Mnemonic::Mov
+            if instruction.op_count() == 2
+                && instruction.op0_kind() == OpKind::Memory
+                && instruction.memory_size().size() == 4
+                && matches!(
+                    instruction.op1_kind(),
+                    OpKind::Register | OpKind::Immediate32
+                ) =>
+        {
+            let (base, displacement) = stack_memory(instruction)?;
+            Op::StoreStack32 {
+                base,
+                displacement,
+                src: operand32(instruction, 1)?,
             }
         }
         Mnemonic::Mov
@@ -502,19 +630,74 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
             }
         }
         Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
+            if instruction.op_count() == 2
+                && instruction.op0_kind() == OpKind::Memory
+                && instruction.memory_size().size() == 4 =>
+        {
+            let (base, displacement) = stack_memory(instruction)?;
+            Op::AluStack32 {
+                kind: alu_kind(instruction.mnemonic()),
+                base,
+                displacement,
+                src: operand32(instruction, 1)?,
+            }
+        }
+        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
+            if instruction.op_count() == 2
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register().size() == 4 =>
+        {
+            Op::Alu32 {
+                kind: alu_kind(instruction.mnemonic()),
+                dst: parent_of_32(instruction.op0_register(), ip)?,
+                src: operand32(instruction, 1)?,
+            }
+        }
+        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
             if instruction.op_count() == 2 && instruction.op0_kind() == OpKind::Register =>
         {
             Op::Alu {
-                kind: match instruction.mnemonic() {
-                    Mnemonic::Add => Alu::Add,
-                    Mnemonic::Sub => Alu::Sub,
-                    Mnemonic::And => Alu::And,
-                    Mnemonic::Or => Alu::Or,
-                    Mnemonic::Xor => Alu::Xor,
-                    _ => unreachable!(),
-                },
+                kind: alu_kind(instruction.mnemonic()),
                 dst: register_dest()?,
                 src: operand(instruction, 1)?,
+            }
+        }
+        Mnemonic::Cmp | Mnemonic::Test
+            if instruction.op_count() == 2
+                && instruction.mnemonic() == Mnemonic::Cmp
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register().size() == 4
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            let (base, displacement) = stack_memory(instruction)?;
+            Op::CmpRegStack32 {
+                lhs: parent_of_32(instruction.op0_register(), ip)?,
+                base,
+                displacement,
+            }
+        }
+        Mnemonic::Cmp | Mnemonic::Test
+            if instruction.op_count() == 2
+                && instruction.mnemonic() == Mnemonic::Cmp
+                && instruction.op0_kind() == OpKind::Memory
+                && instruction.memory_size().size() == 4 =>
+        {
+            let (base, displacement) = stack_memory(instruction)?;
+            Op::CmpStack32 {
+                base,
+                displacement,
+                rhs: operand32(instruction, 1)?,
+            }
+        }
+        Mnemonic::Cmp | Mnemonic::Test
+            if instruction.op_count() == 2
+                && instruction.mnemonic() == Mnemonic::Cmp
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register().size() == 4 =>
+        {
+            Op::Cmp32 {
+                lhs: parent_of_32(instruction.op0_register(), ip)?,
+                rhs: operand32(instruction, 1)?,
             }
         }
         Mnemonic::Cmp | Mnemonic::Test
@@ -722,6 +905,77 @@ mod tests {
             }
         ));
         assert_eq!(load.effects().memory, MemoryEffect::ReadStackLocal);
+    }
+
+    #[test]
+    fn dword_stack_and_arithmetic_operations_are_typed() {
+        // mov [rbp-20],edi; mov eax,[rbp-20]; add eax,edx;
+        // add dword [rbp-8],1; cmp eax,[rbp-20]; cmp dword [rbp-20],0
+        let mut decoder = Decoder::with_ip(
+            64,
+            &[
+                0x89, 0x7d, 0xec, 0x8b, 0x45, 0xec, 0x01, 0xd0, 0x83, 0x45, 0xf8, 0x01, 0x3b, 0x45,
+                0xec, 0x83, 0x7d, 0xec, 0x00,
+            ],
+            0x1000,
+            DecoderOptions::NONE,
+        );
+        let store = classify(&decoder.decode()).unwrap();
+        assert!(matches!(
+            store,
+            Op::StoreStack32 {
+                base: Register::RBP,
+                displacement: -20,
+                src: Value32::Register(Register::RDI)
+            }
+        ));
+        let load = classify(&decoder.decode()).unwrap();
+        assert!(matches!(
+            load,
+            Op::LoadStack32 {
+                dst: Register::RAX,
+                base: Register::RBP,
+                displacement: -20
+            }
+        ));
+        assert!(matches!(
+            classify(&decoder.decode()),
+            Ok(Op::Alu32 {
+                kind: Alu::Add,
+                dst: Register::RAX,
+                src: Value32::Register(Register::RDX)
+            })
+        ));
+        let stack_add = classify(&decoder.decode()).unwrap();
+        assert!(matches!(
+            stack_add,
+            Op::AluStack32 {
+                kind: Alu::Add,
+                base: Register::RBP,
+                displacement: -8,
+                src: Value32::Immediate(1)
+            }
+        ));
+        assert_eq!(
+            stack_add.effects().memory,
+            MemoryEffect::ReadWriteStackLocal
+        );
+        assert!(matches!(
+            classify(&decoder.decode()),
+            Ok(Op::CmpRegStack32 {
+                lhs: Register::RAX,
+                base: Register::RBP,
+                displacement: -20
+            })
+        ));
+        assert!(matches!(
+            classify(&decoder.decode()),
+            Ok(Op::CmpStack32 {
+                base: Register::RBP,
+                displacement: -20,
+                rhs: Value32::Immediate(0)
+            })
+        ));
     }
 
     #[test]

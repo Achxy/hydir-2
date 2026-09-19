@@ -1,4 +1,4 @@
-/* Forty-two distinct, symbol-bounded u64(u64,u64) machine-code fixtures.
+/* Forty-four distinct, symbol-bounded u64(u64,u64) machine-code fixtures.
  * The validator sees only compiled ELF bytes; this source is oracle input. */
 .text
 
@@ -116,6 +116,34 @@ hydir_stack_branch:
   add $16, %rsp
   ret
 .size hydir_stack_branch, .-hydir_stack_branch
+
+.globl hydir_dword_redzone_add
+.type hydir_dword_redzone_add,@function
+hydir_dword_redzone_add:
+  push %rbp
+  mov %rsp, %rbp
+  mov %edi, -4(%rbp)
+  mov -4(%rbp), %eax
+  add %esi, %eax
+  pop %rbp
+  ret
+.size hydir_dword_redzone_add, .-hydir_dword_redzone_add
+
+.globl hydir_dword_redzone_max_s
+.type hydir_dword_redzone_max_s,@function
+hydir_dword_redzone_max_s:
+  push %rbp
+  mov %rsp, %rbp
+  mov %edi, -4(%rbp)
+  mov %esi, -8(%rbp)
+  mov -4(%rbp), %eax
+  cmp -8(%rbp), %eax
+  jge .Ldword_redzone_max_s_done
+  mov -8(%rbp), %eax
+.Ldword_redzone_max_s_done:
+  pop %rbp
+  ret
+.size hydir_dword_redzone_max_s, .-hydir_dword_redzone_max_s
 
 .globl hydir_nop_identity
 .type hydir_nop_identity,@function

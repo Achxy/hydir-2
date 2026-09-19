@@ -439,7 +439,12 @@ pub fn lift_symbol(bytes: &[u8], name: &str) -> Result<String> {
 /// successful scalar lift before treating a local value as defined.
 pub fn proven_stack_local_offsets(bytes: &[u8], name: &str) -> Result<Vec<i64>> {
     let (code, address, _) = symbol_code(bytes, name)?;
-    Ok(stack::analyze_stack(&code, address)?.slots)
+    Ok(stack::analyze_stack(&code, address)?
+        .slots
+        .into_iter()
+        .filter(|slot| slot.width_bytes == 8)
+        .map(|slot| slot.offset)
+        .collect())
 }
 
 /// Extract a validated, bounded named text symbol for an external semantics

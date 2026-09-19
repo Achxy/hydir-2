@@ -93,7 +93,11 @@ bash scripts/demo-local.sh
 bash scripts/demo-corpus.sh
 ```
 
-The bounded scalar contract now also covers proven balanced frames, initialized eight-byte stack locals, 32-bit `mov` zero-extension, and direct calls to uniquely bounded scalar leaf symbols. Other memory, unresolved calls, and unmodelled aliases remain explicit refusals.
+The bounded scalar contract now also covers proven balanced frames, initialized
+nonoverlapping 32/64-bit stack locals (including the SysV leaf red zone),
+32-bit arithmetic/comparisons with explicit flags, `mov` zero-extension, and
+direct calls to uniquely bounded scalar leaf symbols. Other memory, unresolved
+calls, and unmodelled aliases remain explicit refusals.
 
 The scripts record CFG, LLVM IR, C, and differential results as inspectable artifacts. These checks establish the documented subset only; they do not prove equivalence for arbitrary programs. The UI also keeps failures specific: an unsupported call can stop C generation without invalidating an already recovered CFG or LLVM lift.
 
