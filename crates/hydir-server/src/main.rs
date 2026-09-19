@@ -9,15 +9,19 @@ use hydir_api::v1::{
     UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
-use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
-use hydir_c::emit_structured_c;
-use hydir_core::{
-    Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
-    annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
-    parse_program_spec_json,
-    validate_analyst_annotation,
+use hydir_api::v2 as api_v2;
+use hydir_api::v2::hydir_v2_server::HydirV2Server;
+use hydir_backend::{
+    MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg, region_contract,
 };
-use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
+use hydir_c::{build_decompilation_unit, emit_structured_c};
+use hydir_core::{
+    Address, AnalystAnnotation, AnnotationKind, DECOMPILATION_UNIT_VERSION, FactProvenance,
+    FactSource, PATCH_BUNDLE_VERSION, PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION,
+    annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
+    parse_program_spec_json, validate_analyst_annotation,
+};
+use hydir_patch::{MAX_PATCH_BYTES, parse_patch_bundle_json, parse_patch_json, patch_binary};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -393,6 +397,44 @@ impl Store {
         ).map_err(internal)
     }
 
+    fn binary_at_revision(
+        &self,
+        principal: &str,
+        id: &str,
+        revision: u64,
+    ) -> Result<Vec<u8>, Status> {
+        self.connection()?
+            .query_row(
+                "SELECT b.content FROM project_revisions r \
+                 JOIN binaries b ON b.sha256=r.binary_sha256 \
+                 JOIN projects p ON p.id=r.project_id \
+                 WHERE r.project_id=?1 AND r.revision=?2 AND p.owner=?3",
+                params![id, revision as i64, principal],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| Status::not_found("project revision not found"))
+    }
+
+    fn store_artifact(
+        &self,
+        project_id: &str,
+        revision: u64,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<String, Status> {
+        let digest = sha256(content);
+        self.connection()?
+            .execute(
+                "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) \
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![project_id, revision as i64, digest, media_type, content],
+            )
+            .map_err(internal)?;
+        Ok(digest)
+    }
+
     fn job(&self, principal: &str, project_id: &str, job_id: &str) -> Result<JobReply, Status> {
         let row = self
             .connection()?
@@ -530,6 +572,43 @@ fn insert_event(
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn patch_worker_envelope(patch_json: &[u8], binary: &[u8]) -> Result<Vec<u8>, Status> {
+    if patch_json.is_empty() || patch_json.len() > MAX_PATCH_BYTES {
+        return Err(Status::invalid_argument(
+            "patch document must be 1..=4096 bytes",
+        ));
+    }
+    let patch_length = u32::try_from(patch_json.len())
+        .map_err(|_| Status::invalid_argument("patch document too long"))?;
+    let mut envelope = Vec::with_capacity(4 + patch_json.len() + binary.len());
+    envelope.extend_from_slice(&patch_length.to_le_bytes());
+    envelope.extend_from_slice(patch_json);
+    envelope.extend_from_slice(binary);
+    Ok(envelope)
+}
+
+fn validate_v2_patch_request(input: &api_v2::PatchRequest) -> Result<(), Status> {
+    if !input.trusted_fixture || !input.assume_u64x2 || !input.assume_entry_only {
+        return Err(Status::invalid_argument(
+            "patch requires trusted-fixture, u64x2, and entry-only assertions",
+        ));
+    }
+    if input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 128
+        || input.idempotency_key.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument(
+            "patch idempotency key must be 1..=128 non-control bytes",
+        ));
+    }
+    if input.patch_json.is_empty() || input.patch_json.len() > MAX_PATCH_BYTES {
+        return Err(Status::invalid_argument(
+            "patch document must be 1..=4096 bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn internal(error: rusqlite::Error) -> Status {
@@ -827,6 +906,9 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("cfg", Some(symbol)) => recover_symbol_cfg(bytes, symbol)
             .map_err(|error| error.to_string())
             .and_then(|cfg| serde_json::to_vec(&cfg).map_err(|error| error.to_string())),
+        ("region", Some(symbol)) => region_contract(bytes, symbol)
+            .map_err(|error| error.to_string())
+            .and_then(|region| serde_json::to_vec(&region).map_err(|error| error.to_string())),
         ("lift", Some(symbol)) => lift_symbol(bytes, symbol)
             .map(String::into_bytes)
             .map_err(|error| error.to_string()),
@@ -834,6 +916,13 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             .map_err(|error| error.to_string())
             .and_then(|ir| emit_structured_c(&ir))
             .map(String::into_bytes),
+        ("decompile-unit", Some(symbol)) => {
+            let region = region_contract(bytes, symbol).map_err(|error| error.to_string())?;
+            let ir = lift_symbol(bytes, symbol).map_err(|error| error.to_string())?;
+            let unit =
+                build_decompilation_unit(region, ir, concat!("hydir/", env!("CARGO_PKG_VERSION")))?;
+            serde_json::to_vec(&unit).map_err(|error| error.to_string())
+        }
         ("transform", Some(symbol)) => {
             let pass_length = *bytes.first().ok_or("transform worker lacks pass list")? as usize;
             let pass_bytes = bytes
@@ -889,6 +978,26 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             let binary = bytes.get(end..).ok_or("patch envelope lacks binary")?;
             let patch = parse_patch_json(patch_json)?;
             patch_binary(binary, &patch).map(|result| result.content)
+        }
+        ("patch-v2", None) => {
+            let length_bytes: [u8; 4] = bytes
+                .get(..4)
+                .ok_or("patch worker input lacks a length prefix")?
+                .try_into()
+                .map_err(|_| "invalid patch length prefix")?;
+            let patch_length = u32::from_le_bytes(length_bytes) as usize;
+            if patch_length == 0 || patch_length > MAX_PATCH_BYTES {
+                return Err("patch document exceeds worker limit".to_owned());
+            }
+            let end = 4usize
+                .checked_add(patch_length)
+                .ok_or("patch envelope length overflow")?;
+            let patch_json = bytes.get(4..end).ok_or("patch envelope is truncated")?;
+            let binary = bytes.get(end..).ok_or("patch envelope lacks binary")?;
+            let patch = parse_patch_json(patch_json)?;
+            let result = patch_binary(binary, &patch)?;
+            let bundle = serde_json::to_vec(&result.bundle).map_err(|error| error.to_string())?;
+            pack_worker_parts(&[&result.content, &bundle])
         }
         _ => Err("unsupported worker operation".to_owned()),
     }
@@ -2167,6 +2276,201 @@ impl Hydir for Store {
     }
 }
 
+#[tonic::async_trait]
+impl api_v2::hydir_v2_server::HydirV2 for Store {
+    async fn discover(
+        &self,
+        request: Request<api_v2::DiscoverRequest>,
+    ) -> Result<Response<api_v2::DiscoverReply>, Status> {
+        self.principal(&request)?;
+        Ok(Response::new(api_v2::DiscoverReply {
+            api_version: 2,
+            program_spec_version: PROGRAM_SPEC_VERSION,
+            region_spec_version: REGION_SPEC_VERSION,
+            decompilation_unit_version: DECOMPILATION_UNIT_VERSION,
+            patch_bundle_version: PATCH_BUNDLE_VERSION,
+            stable_contract:
+                "versioned region artifacts are available; full Irene3 parity remains gated"
+                    .to_owned(),
+            compile_patch: true,
+            structural_patch_verification: true,
+            behavior_patch_verification: false,
+        }))
+    }
+
+    async fn get_region(
+        &self,
+        request: Request<api_v2::RegionRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let content = run_worker("region", Some(&input.function_symbol), binary).await?;
+        let digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            "application/vnd.hydir.region-spec+json;version=3",
+            &content,
+        )?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: "application/vnd.hydir.region-spec+json;version=3".to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn decompile_region(
+        &self,
+        request: Request<api_v2::RegionRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let content = run_worker("decompile-unit", Some(&input.function_symbol), binary).await?;
+        let digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            "application/vnd.hydir.decompilation-unit+json;version=1",
+            &content,
+        )?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: "application/vnd.hydir.decompilation-unit+json;version=1".to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn compile_patch(
+        &self,
+        request: Request<api_v2::PatchRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        validate_v2_patch_request(&input)?;
+        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
+        let packed = run_worker("patch-v2", None, envelope).await?;
+        let [_patched, bundle] = unpack_worker_parts::<2>(&packed)?;
+        parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
+        let digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            "application/vnd.hydir.patch-bundle+json;version=2",
+            bundle,
+        )?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: "application/vnd.hydir.patch-bundle+json;version=2".to_owned(),
+            content: bundle.to_vec(),
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn apply_patch(
+        &self,
+        request: Request<api_v2::PatchRequest>,
+    ) -> Result<Response<api_v2::MutationReply>, Status> {
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("missing bearer credential"))?;
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        validate_v2_patch_request(&input)?;
+        let binary =
+            self.binary_at_revision(&principal, &input.project_id, input.expected_revision)?;
+        let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
+        let packed = run_worker("patch-v2", None, envelope).await?;
+        let [_patched, bundle] = unpack_worker_parts::<2>(&packed)?;
+        parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
+        let bundle_digest = self.store_artifact(
+            &input.project_id,
+            input.expected_revision,
+            "application/vnd.hydir.patch-bundle+json;version=2",
+            bundle,
+        )?;
+
+        let mut legacy_request = Request::new(PatchRequest {
+            project_id: input.project_id.clone(),
+            expected_revision: input.expected_revision,
+            patch_json: input.patch_json,
+            idempotency_key: input.idempotency_key,
+            trusted_fixture: input.trusted_fixture,
+            assume_u64x2: input.assume_u64x2,
+            assume_entry_only: input.assume_entry_only,
+        });
+        legacy_request
+            .metadata_mut()
+            .insert("authorization", authorization);
+        let reply = <Store as Hydir>::apply_patch(self, legacy_request)
+            .await?
+            .into_inner();
+        Ok(Response::new(api_v2::MutationReply {
+            project_id: reply.project_id,
+            revision: reply.revision,
+            binary_sha256: reply.binary_sha256,
+            patch_bundle_sha256: bundle_digest,
+        }))
+    }
+
+    async fn verify_patch(
+        &self,
+        request: Request<api_v2::VerifyPatchRequest>,
+    ) -> Result<Response<api_v2::VerificationReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        if input.patch_bundle_json.is_empty() || input.patch_bundle_json.len() > 2 * 1024 * 1024 {
+            return Err(Status::invalid_argument("PatchBundle must be 1..=2 MiB"));
+        }
+        let bundle =
+            parse_patch_bundle_json(&input.patch_bundle_json).map_err(Status::invalid_argument)?;
+        let belongs_to_project: bool = self
+            .connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_revisions r JOIN projects p ON p.id=r.project_id \
+                 WHERE r.project_id=?1 AND p.owner=?2 AND r.binary_sha256=?3)",
+                params![input.project_id, principal, bundle.original_sha256],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if !belongs_to_project {
+            return Err(Status::failed_precondition(
+                "PatchBundle original binary is not in project history",
+            ));
+        }
+        let report_json = serde_json::to_string(&json!({
+            "schema_version": 1,
+            "structurally_valid": true,
+            "behavior_verified": false,
+            "stable_verified": bundle.stable_verified,
+            "verification_evidence": bundle.verification_evidence,
+            "scope": "digest, schema, embedded bytes, placement, and project-history checks only; no sample execution",
+        }))
+        .map_err(|error| Status::internal(format!("verification report serialization: {error}")))?;
+        Ok(Response::new(api_v2::VerificationReply {
+            structurally_valid: true,
+            behavior_verified: false,
+            report_json,
+        }))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -2196,7 +2500,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let store = Store::open(Path::new(database))?;
             println!("hydird local RPC listening on {address}");
             Server::builder()
-                .add_service(HydirServer::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
+                .add_service(HydirServer::new(store.clone()).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
+                .add_service(HydirV2Server::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
                 .serve(address)
                 .await?;
         }
@@ -2259,6 +2564,125 @@ mod tests {
             .metadata_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
         request
+    }
+
+    #[tokio::test]
+    async fn v2_region_decompile_compile_verify_and_apply_are_digest_bound() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("v2-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "v2 workflow".to_owned(),
+                    idempotency_key: "create-v2".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let region_request = api_v2::RegionRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            function_symbol: "hydir_max2".to_owned(),
+            assume_u64x2: true,
+        };
+        let region = api_v2::hydir_v2_server::HydirV2::get_region(
+            &store,
+            authorized(region_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let parsed_region = hydir_core::parse_region_spec_json(&region.content).unwrap();
+        assert_eq!(parsed_region.schema_version, REGION_SPEC_VERSION);
+
+        let decompilation = api_v2::hydir_v2_server::HydirV2::decompile_region(
+            &store,
+            authorized(region_request, &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let unit: hydir_core::DecompilationUnit =
+            serde_json::from_slice(&decompilation.content).unwrap();
+        hydir_core::validate_decompilation_unit(&unit).unwrap();
+
+        let patch_json = serde_json::to_vec(&hydir_patch::PatchDocument {
+            schema_version: hydir_patch::PATCH_SCHEMA_VERSION,
+            binary_sha256: sha256(&binary),
+            function_symbol: "hydir_max2".to_owned(),
+            prototype: "u64(u64,u64)".to_owned(),
+            replacement: "return arg0;".to_owned(),
+        })
+        .unwrap();
+        let patch_request = api_v2::PatchRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: "v2-patch".to_owned(),
+            patch_json,
+            trusted_fixture: true,
+            assume_u64x2: true,
+            assume_entry_only: true,
+        };
+        let compiled = api_v2::hydir_v2_server::HydirV2::compile_patch(
+            &store,
+            authorized(patch_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let bundle = parse_patch_bundle_json(&compiled.content).unwrap();
+        assert!(!bundle.stable_verified);
+        let verified = api_v2::hydir_v2_server::HydirV2::verify_patch(
+            &store,
+            authorized(
+                api_v2::VerifyPatchRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: uploaded.revision,
+                    patch_bundle_json: compiled.content,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(verified.structurally_valid);
+        assert!(!verified.behavior_verified);
+
+        let applied = api_v2::hydir_v2_server::HydirV2::apply_patch(
+            &store,
+            authorized(patch_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(applied.revision, uploaded.revision + 1);
+        assert_eq!(applied.patch_bundle_sha256, compiled.sha256);
+        let replay = api_v2::hydir_v2_server::HydirV2::apply_patch(
+            &store,
+            authorized(patch_request, &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(replay.revision, applied.revision);
+        assert_eq!(replay.binary_sha256, applied.binary_sha256);
     }
 
     #[cfg(unix)]

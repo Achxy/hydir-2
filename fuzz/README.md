@@ -2,8 +2,10 @@
 
 The targets exercise ELF import and disassembly, scalar CFG lifting, and the
 restricted LLVM-to-C parser. They are crash and refusal checks, not semantic
-proof. `corpus/elf_import/max2.elf` was built from `tests/fixtures/max2.S` with
-Clang and LLD 22.1.8; `corpus/cfg_lift/max2` contains the function's 12 bytes.
+proof. [`corpus/elf_import/MANIFEST.json`](corpus/elf_import/MANIFEST.json)
+records every checked-in ELF's source, entry, exact length, SHA-256, and pinned
+Clang/LLD 22.1.8 revision. `corpus/elf_import/max2.elf` was built from
+`tests/fixtures/max2.S`; `corpus/cfg_lift/max2` contains the function's 12 bytes.
 `corpus/cfg_lift/mov32` exercises a 32-bit register write and return.
 `corpus/elf_import/frame.elf` comes from `tests/fixtures/scalar_corpus.S` and
 seeds a balanced frame contract case.
@@ -15,10 +17,10 @@ interior-entry evidence and patch refusal. They come from the matching
 
 ```sh
 clang --target=x86_64-unknown-linux-gnu -nostdlib -fuse-ld=lld -no-pie \
-  -Wl,-e,_start tests/fixtures/interior_entry.S \
+  -Wl,--build-id=none -Wl,-e,_start tests/fixtures/interior_entry.S \
   -o fuzz/corpus/elf_import/interior_entry.elf
 clang --target=x86_64-unknown-linux-gnu -nostdlib -fuse-ld=lld -no-pie \
-  -Wl,-e,_start tests/fixtures/interior_call.S \
+  -Wl,--build-id=none -Wl,-e,_start tests/fixtures/interior_call.S \
   -o fuzz/corpus/elf_import/interior_call.elf
 ```
 

@@ -168,12 +168,10 @@ fn analyze_stack_inner(code: &[u8], address: u64, allow_calls: bool) -> Result<S
                 state.rbp = None;
                 state.saved_rbp = false;
             }
-            Op::CallDirect { .. } if allow_calls => {
+            Op::CallDirect { .. } if allow_calls && state.rsp.rem_euclid(16) != 8 => {
                 // SysV AMD64 requires 16-byte alignment immediately before CALL.
                 // Function-entry RSP is eight bytes past that boundary.
-                if state.rsp.rem_euclid(16) != 8 {
-                    return Err(error(format!("unaligned stack at call 0x{ip:x}")));
-                }
+                return Err(error(format!("unaligned stack at call 0x{ip:x}")));
             }
             _ => {}
         }

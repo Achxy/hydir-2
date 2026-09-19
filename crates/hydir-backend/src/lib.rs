@@ -12,10 +12,10 @@ pub use cfg::lift_cfg;
 pub use disasm::disassemble_elf;
 
 use hydir_core::{
-    Address, AddressKind, AddressSpaceSpec, DisassemblyFlow, FactProvenance, FactSource,
-    FunctionCfg, FunctionSpec, ImportSpec, InteriorEntryEvidence, MappedSegmentSpec,
-    PROGRAM_SPEC_VERSION, ProgramSpec, RecoveryState, RegionContract, RelocationSpec,
-    RelocationTargetSpec, SectionSpec,
+    Address, AddressKind, AddressSpaceSpec, DisassemblyFlow, ExitStackRelation, FactProvenance,
+    FactSource, FunctionCfg, FunctionSpec, ImportSpec, InteriorEntryEvidence, MappedSegmentSpec,
+    PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION, RecoveryState, RegionContract,
+    RelocationSpec, RelocationTargetSpec, SectionSpec, UncertaintySpec,
 };
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
@@ -229,6 +229,19 @@ pub fn import_elf(bytes: &[u8]) -> Result<ProgramSpec> {
         reference_recovery: RecoveryState::NotAttempted,
         assumptions: Vec::new(),
         typed_model: Default::default(),
+        memory_facts: Vec::new(),
+        uncertainties: vec![UncertaintySpec {
+            id: "elf-import-control-flow".to_owned(),
+            category: "control_flow".to_owned(),
+            description: "ELF import inventories metadata but does not recover complete control flow"
+                .to_owned(),
+            affected_addresses: Vec::new(),
+            blocks_stable_operation: true,
+            provenance: elf_metadata("ELF import recovery boundary"),
+        }],
+        provenance: vec![elf_metadata(
+            "native object parser over immutable input bytes",
+        )],
         recovery_scope: "ELF metadata inventory only; calls, references, and stripped-code discovery not attempted".to_owned(),
         unresolved_control_flow: true,
     })
@@ -741,157 +754,6 @@ fn lift_lea(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lifts_machine_lea_not_source() {
-        // lea rax,[rdi+rsi]; ret
-        let ir = lift_linear(&[0x48, 0x8d, 0x04, 0x37, 0xc3], 0x401000).unwrap();
-        assert!(ir.contains("0x401000: 488d0437"));
-        assert!(ir.contains("add i64 %arg0, %arg1"));
-        assert!(ir.contains("ret i64 %v0"));
-        assert!(!ir.contains("nsw"));
-    }
-
-    #[test]
-    fn rejects_unknown_semantics() {
-        // xor rax,rax; ret
-        let err = lift_linear(&[0x48, 0x31, 0xc0, 0xc3], 0).unwrap_err();
-        assert!(err.0.contains("unsupported Xor"));
-    }
-
-    #[test]
-    fn rejects_partial_registers() {
-        // mov eax,edi; ret
-        let err = lift_linear(&[0x89, 0xf8, 0xc3], 0).unwrap_err();
-        assert!(err.0.contains("full 64-bit"));
-    }
-
-    #[test]
-    fn rejects_missing_result() {
-        let err = lift_linear(&[0xc3], 0).unwrap_err();
-        assert!(err.0.contains("uninitialized RAX"));
-    }
-
-    #[test]
-    fn lifts_wrapping_add_without_poison_flags() {
-        // mov rax,rdi; add rax,rsi; ret
-        let ir = lift_linear(&[0x48, 0x89, 0xf8, 0x48, 0x01, 0xf0, 0xc3], 0).unwrap();
-        assert!(ir.contains("add i64 %arg0, %arg1"));
-        assert!(!ir.contains("add nsw"));
-        assert!(!ir.contains("add nuw"));
-    }
-
-    #[test]
-    fn rejects_memory_read() {
-        // mov rax,[rdi]; ret
-        let err = lift_linear(&[0x48, 0x8b, 0x07, 0xc3], 0).unwrap_err();
-        assert!(err.0.contains("unsupported Mov"));
-    }
-
-    #[test]
-    fn metadata_inventory_limits_are_explicit() {
-        assert!(ensure_inventory_limit("sections", MAX_SPEC_SECTIONS, MAX_SPEC_SECTIONS).is_ok());
-        assert!(
-            ensure_inventory_limit("sections", MAX_SPEC_SECTIONS + 1, MAX_SPEC_SECTIONS)
-                .unwrap_err()
-                .0
-                .contains("sections exceed")
-        );
-        assert!(bounded_name(&"x".repeat(MAX_METADATA_NAME_BYTES)).is_ok());
-        assert!(bounded_name(&"x".repeat(MAX_METADATA_NAME_BYTES + 1)).is_err());
-    }
-
-    #[test]
-    fn generic_elf_osabi_is_not_claimed_as_linux() {
-        let flags = object::FileFlags::Elf {
-            os_abi: object::elf::ELFOSABI_SYSV,
-            abi_version: 0,
-            e_flags: 0,
-        };
-        assert_eq!(elf_target_triple(flags), "x86_64-unknown-elf");
-        let flags = object::FileFlags::Elf {
-            os_abi: object::elf::ELFOSABI_LINUX,
-            abi_version: 0,
-            e_flags: 0,
-        };
-        assert_eq!(elf_target_triple(flags), "x86_64-unknown-linux-gnu");
-    }
-
-    #[test]
-    fn external_symbol_extraction_rejects_non_elf() {
-        let error = extract_symbol_code(b"not an ELF", "main").unwrap_err();
-        assert!(error.0.contains("binary parse failed"));
-    }
-
-    #[test]
-    fn external_symbol_extraction_rejects_missing_symbol() {
-        let error = extract_symbol_code(&[], "missing").unwrap_err();
-        assert!(error.0.contains("binary parse failed"));
-    }
-
-    #[test]
-    fn region_contract_never_promotes_unknown_machine_state() {
-        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
-        let region = region_contract(binary, "hydir_max2").unwrap();
-        assert_eq!(region.bytes_hex, "4889f84839f773034889f0c3");
-        assert_eq!(region.exits.len(), 1);
-        assert_eq!(region.live_in, None);
-        assert_eq!(region.stack_delta, Some(8));
-        assert!(!region.replacement_ready);
-    }
-
-    #[test]
-    fn region_records_text_symbol_inside_selected_extent() {
-        let binary = include_bytes!("../../../fuzz/corpus/elf_import/interior_entry.elf");
-        let region = region_contract(binary, "hydir_outer").unwrap();
-        assert_eq!(region.observed_interior_entries.len(), 1);
-        assert_eq!(region.observed_interior_entries[0].entry.0, region.entry.0 + 3);
-        assert!(!region.replacement_ready);
-    }
-
-    #[test]
-    fn region_records_external_direct_call_to_interior() {
-        let binary = include_bytes!("../../../fuzz/corpus/elf_import/interior_call.elf");
-        let region = region_contract(binary, "hydir_outer").unwrap();
-        assert_eq!(region.observed_interior_entries.len(), 1);
-        let entry = &region.observed_interior_entries[0];
-        assert_eq!(entry.entry.0, region.entry.0 + 3);
-        assert!(entry.source.is_some());
-        assert!(!region.replacement_ready);
-    }
-
-    #[test]
-    fn region_reports_balanced_frame_without_claiming_replacement_safety() {
-        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
-        let region = region_contract(binary, "hydir_frame_balance").unwrap();
-        assert_eq!(region.stack_delta, Some(8));
-        assert_eq!(region.exits.len(), 1);
-        assert!(
-            !region
-                .unresolved_facts
-                .iter()
-                .any(|fact| fact.starts_with("scalar_cfg:"))
-        );
-        assert!(!region.replacement_ready);
-    }
-
-    #[test]
-    fn reports_proven_stack_local_offsets_for_typed_assertions() {
-        let binary = include_bytes!("../../../fuzz/corpus/elf_import/stack.elf");
-        assert_eq!(
-            proven_stack_local_offsets(binary, "hydir_stack_slot_add").unwrap(),
-            vec![-16]
-        );
-        assert_eq!(
-            proven_stack_local_offsets(binary, "hydir_stack_branch").unwrap(),
-            vec![-16]
-        );
-    }
-}
-
 /// Export immutable bytes and currently established region facts. This is a
 /// read-only evidence artifact; unknown live state and stack alignment keep it
 /// ineligible for replacement even when direct CFG recovery succeeds.
@@ -1013,8 +875,24 @@ pub fn region_contract(bytes: &[u8], name: &str) -> Result<RegionContract> {
         "stack alignment at entry and exits: not established".to_owned(),
         "relocation applicability after placement: not analyzed".to_owned(),
     ]);
+    let exit_stack_relations = stack_delta.map_or_else(Vec::new, |rsp_delta| {
+        exits
+            .iter()
+            .copied()
+            .map(|exit| ExitStackRelation {
+                exit,
+                rsp_delta,
+                alignment_mod_16: None,
+                provenance: FactProvenance {
+                    source: FactSource::NativeAnalysis,
+                    scope: "bounded native stack analysis over reachable region instructions"
+                        .to_owned(),
+                },
+            })
+            .collect()
+    });
     Ok(RegionContract {
-        schema_version: 2,
+        schema_version: REGION_SPEC_VERSION,
         binary_sha256: spec.binary_sha256,
         symbol_name: name.to_owned(),
         address_kind,
@@ -1027,7 +905,14 @@ pub fn region_contract(bytes: &[u8], name: &str) -> Result<RegionContract> {
         observed_interior_entries: observed_entries.into_values().collect(),
         live_in: None,
         live_out: None,
+        physical_live_in: Vec::new(),
+        physical_live_out: Vec::new(),
         stack_delta,
+        stack_entry_alignment: None,
+        exit_stack_relations,
+        global_references: Vec::new(),
+        variable_locations: Vec::new(),
+        assumptions: Vec::new(),
         unresolved_facts,
         replacement_ready: false,
         provenance: FactProvenance {
@@ -1035,4 +920,198 @@ pub fn region_contract(bytes: &[u8], name: &str) -> Result<RegionContract> {
             scope: "Linked ELF symbol bytes, conservative CFG and stack-state recovery".to_owned(),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifts_machine_lea_not_source() {
+        // lea rax,[rdi+rsi]; ret
+        let ir = lift_linear(&[0x48, 0x8d, 0x04, 0x37, 0xc3], 0x401000).unwrap();
+        assert!(ir.contains("0x401000: 488d0437"));
+        assert!(ir.contains("add i64 %arg0, %arg1"));
+        assert!(ir.contains("ret i64 %v0"));
+        assert!(!ir.contains("nsw"));
+    }
+
+    #[test]
+    fn rejects_unknown_semantics() {
+        // xor rax,rax; ret
+        let err = lift_linear(&[0x48, 0x31, 0xc0, 0xc3], 0).unwrap_err();
+        assert!(err.0.contains("unsupported Xor"));
+    }
+
+    #[test]
+    fn rejects_partial_registers() {
+        // mov eax,edi; ret
+        let err = lift_linear(&[0x89, 0xf8, 0xc3], 0).unwrap_err();
+        assert!(err.0.contains("full 64-bit"));
+    }
+
+    #[test]
+    fn rejects_missing_result() {
+        let err = lift_linear(&[0xc3], 0).unwrap_err();
+        assert!(err.0.contains("uninitialized RAX"));
+    }
+
+    #[test]
+    fn lifts_wrapping_add_without_poison_flags() {
+        // mov rax,rdi; add rax,rsi; ret
+        let ir = lift_linear(&[0x48, 0x89, 0xf8, 0x48, 0x01, 0xf0, 0xc3], 0).unwrap();
+        assert!(ir.contains("add i64 %arg0, %arg1"));
+        assert!(!ir.contains("add nsw"));
+        assert!(!ir.contains("add nuw"));
+    }
+
+    #[test]
+    fn rejects_memory_read() {
+        // mov rax,[rdi]; ret
+        let err = lift_linear(&[0x48, 0x8b, 0x07, 0xc3], 0).unwrap_err();
+        assert!(err.0.contains("unsupported Mov"));
+    }
+
+    #[test]
+    fn metadata_inventory_limits_are_explicit() {
+        assert!(ensure_inventory_limit("sections", MAX_SPEC_SECTIONS, MAX_SPEC_SECTIONS).is_ok());
+        assert!(
+            ensure_inventory_limit("sections", MAX_SPEC_SECTIONS + 1, MAX_SPEC_SECTIONS)
+                .unwrap_err()
+                .0
+                .contains("sections exceed")
+        );
+        assert!(bounded_name(&"x".repeat(MAX_METADATA_NAME_BYTES)).is_ok());
+        assert!(bounded_name(&"x".repeat(MAX_METADATA_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn generic_elf_osabi_is_not_claimed_as_linux() {
+        let flags = object::FileFlags::Elf {
+            os_abi: object::elf::ELFOSABI_SYSV,
+            abi_version: 0,
+            e_flags: 0,
+        };
+        assert_eq!(elf_target_triple(flags), "x86_64-unknown-elf");
+        let flags = object::FileFlags::Elf {
+            os_abi: object::elf::ELFOSABI_LINUX,
+            abi_version: 0,
+            e_flags: 0,
+        };
+        assert_eq!(elf_target_triple(flags), "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn external_symbol_extraction_rejects_non_elf() {
+        let error = extract_symbol_code(b"not an ELF", "main").unwrap_err();
+        assert!(error.0.contains("binary parse failed"));
+    }
+
+    #[test]
+    fn external_symbol_extraction_rejects_missing_symbol() {
+        let error = extract_symbol_code(&[], "missing").unwrap_err();
+        assert!(error.0.contains("binary parse failed"));
+    }
+
+    #[test]
+    fn region_contract_never_promotes_unknown_machine_state() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
+        let region = region_contract(binary, "hydir_max2").unwrap();
+        assert_eq!(region.bytes_hex, "4889f84839f773034889f0c3");
+        assert_eq!(region.exits.len(), 1);
+        assert_eq!(region.live_in, None);
+        assert_eq!(region.stack_delta, Some(8));
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn region_records_text_symbol_inside_selected_extent() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/interior_entry.elf");
+        let region = region_contract(binary, "hydir_outer").unwrap();
+        assert_eq!(region.observed_interior_entries.len(), 1);
+        assert_eq!(
+            region.observed_interior_entries[0].entry.0,
+            region.entry.0 + 3
+        );
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn region_records_external_direct_call_to_interior() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/interior_call.elf");
+        let region = region_contract(binary, "hydir_outer").unwrap();
+        assert_eq!(region.observed_interior_entries.len(), 1);
+        let entry = &region.observed_interior_entries[0];
+        assert_eq!(entry.entry.0, region.entry.0 + 3);
+        assert!(entry.source.is_some());
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn region_reports_balanced_frame_without_claiming_replacement_safety() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
+        let region = region_contract(binary, "hydir_frame_balance").unwrap();
+        assert_eq!(region.stack_delta, Some(8));
+        assert_eq!(region.exits.len(), 1);
+        assert!(
+            !region
+                .unresolved_facts
+                .iter()
+                .any(|fact| fact.starts_with("scalar_cfg:"))
+        );
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn reports_proven_stack_local_offsets_for_typed_assertions() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/stack.elf");
+        assert_eq!(
+            proven_stack_local_offsets(binary, "hydir_stack_slot_add").unwrap(),
+            vec![-16]
+        );
+        assert_eq!(
+            proven_stack_local_offsets(binary, "hydir_stack_branch").unwrap(),
+            vec![-16]
+        );
+    }
+
+    #[test]
+    fn checked_in_elf_fixtures_match_the_pinned_manifest() {
+        for (name, bytes, length, digest) in [
+            (
+                "max2.elf",
+                include_bytes!("../../../fuzz/corpus/elf_import/max2.elf").as_slice(),
+                1048,
+                "48b09f9d8580403f4aa51435dfc5955f10715609c1487a123d07c9c6bff38d7d",
+            ),
+            (
+                "frame.elf",
+                include_bytes!("../../../fuzz/corpus/elf_import/frame.elf").as_slice(),
+                3312,
+                "86e289c9ac20fd7031021877b617863b4c6087f05aa5f4a402f0b8c598ff0532",
+            ),
+            (
+                "stack.elf",
+                include_bytes!("../../../fuzz/corpus/elf_import/stack.elf").as_slice(),
+                3312,
+                "5e2f4266a51b4c010f266d8e005e6c11783d6d58a82a09a2baa884a828dd12b9",
+            ),
+            (
+                "interior_entry.elf",
+                include_bytes!("../../../fuzz/corpus/elf_import/interior_entry.elf").as_slice(),
+                1128,
+                "d808c757125322467338a877f8df32ad8415b8fdca74ad594fdde104c3c3455f",
+            ),
+            (
+                "interior_call.elf",
+                include_bytes!("../../../fuzz/corpus/elf_import/interior_call.elf").as_slice(),
+                1104,
+                "321806c9a4e730b1c2f62c2883947c5abd5cc2f844c27db3f75e8457c50b0057",
+            ),
+        ] {
+            assert_eq!(&bytes[..4], b"\x7fELF", "{name} ELF magic");
+            assert_eq!(bytes.len(), length, "{name} length");
+            assert_eq!(format!("{:x}", Sha256::digest(bytes)), digest, "{name}");
+        }
+    }
 }

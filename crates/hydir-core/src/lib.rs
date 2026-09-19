@@ -2,9 +2,13 @@
 //! represented as a negative fact.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 
 pub const SPEC_VERSION: u32 = 1;
-pub const PROGRAM_SPEC_VERSION: u32 = 3;
+pub const PROGRAM_SPEC_VERSION: u32 = 4;
+pub const REGION_SPEC_VERSION: u32 = 3;
+pub const DECOMPILATION_UNIT_VERSION: u32 = 1;
+pub const PATCH_BUNDLE_VERSION: u32 = 2;
 
 /// JSON addresses are strings so no consumer can round a 64-bit address via f64.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -57,6 +61,16 @@ pub struct ProgramSpec {
     /// Typed analyst facts are separate from ELF-derived facts and begin empty.
     #[serde(default)]
     pub typed_model: TypedModel,
+    /// Proven memory effects and mapped-object facts. An empty collection is
+    /// not a claim that the program has no memory effects.
+    #[serde(default)]
+    pub memory_facts: Vec<MemoryFact>,
+    /// Unresolved analysis state that downstream stable operations must honor.
+    #[serde(default)]
+    pub uncertainties: Vec<UncertaintySpec>,
+    /// Artifact-level origins in addition to provenance carried by each fact.
+    #[serde(default)]
+    pub provenance: Vec<FactProvenance>,
     pub recovery_scope: String,
     pub unresolved_control_flow: bool,
 }
@@ -371,14 +385,116 @@ pub struct StackFact {
     pub provenance: FactProvenance,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAccessKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// A bounded memory fact. Unknown locations and effects belong in
+/// `uncertainties`, never in fabricated `MemoryFact` entries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryFact {
+    pub id: String,
+    pub address_space: u32,
+    pub location: Address,
+    pub size_bytes: u64,
+    pub access: MemoryAccessKind,
+    pub scope: String,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UncertaintySpec {
+    pub id: String,
+    pub category: String,
+    pub description: String,
+    #[serde(default)]
+    pub affected_addresses: Vec<Address>,
+    pub blocks_stable_operation: bool,
+    pub provenance: FactProvenance,
+}
+
 pub fn migrate_program_spec(mut spec: ProgramSpec) -> Result<ProgramSpec, String> {
-    match spec.schema_version {
-        2 => spec.schema_version = PROGRAM_SPEC_VERSION,
+    let legacy_version = spec.schema_version;
+    match legacy_version {
+        2 | 3 => spec.schema_version = PROGRAM_SPEC_VERSION,
         PROGRAM_SPEC_VERSION => {}
         other => return Err(format!("unsupported ProgramSpec schema version {other}")),
     }
-    validate_typed_model(&spec)?;
+    if legacy_version < PROGRAM_SPEC_VERSION
+        && spec.unresolved_control_flow
+        && !spec
+            .uncertainties
+            .iter()
+            .any(|uncertainty| uncertainty.category == "control_flow")
+    {
+        spec.uncertainties.push(UncertaintySpec {
+            id: "legacy-unresolved-control-flow".to_owned(),
+            category: "control_flow".to_owned(),
+            description:
+                "Legacy ProgramSpec reported unresolved control flow without structured details"
+                    .to_owned(),
+            affected_addresses: Vec::new(),
+            blocks_stable_operation: true,
+            provenance: FactProvenance {
+                source: FactSource::NativeAnalysis,
+                scope: format!("derived while migrating ProgramSpec v{legacy_version}"),
+            },
+        });
+    }
+    validate_program_spec(&spec)?;
     Ok(spec)
+}
+
+pub fn validate_program_spec(spec: &ProgramSpec) -> Result<(), String> {
+    if spec.schema_version != PROGRAM_SPEC_VERSION {
+        return Err(format!(
+            "ProgramSpec schema version {} is not canonical version {PROGRAM_SPEC_VERSION}",
+            spec.schema_version
+        ));
+    }
+    validate_sha256("ProgramSpec binary", &spec.binary_sha256)?;
+    if spec.memory_facts.len() > 65_536 || spec.uncertainties.len() > 65_536 {
+        return Err("ProgramSpec exceeds bounded memory or uncertainty fact count".to_owned());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for fact in &spec.memory_facts {
+        if !ids.insert(fact.id.as_str())
+            || fact.id.is_empty()
+            || fact.id.len() > 128
+            || fact.size_bytes == 0
+            || fact.scope.is_empty()
+            || fact.scope.len() > 1024
+        {
+            return Err("invalid or duplicate ProgramSpec memory fact".to_owned());
+        }
+        if !spec
+            .address_spaces
+            .iter()
+            .any(|space| space.id == fact.address_space)
+        {
+            return Err("ProgramSpec memory fact uses an unknown address space".to_owned());
+        }
+    }
+    ids.clear();
+    for uncertainty in &spec.uncertainties {
+        if !ids.insert(uncertainty.id.as_str())
+            || uncertainty.id.is_empty()
+            || uncertainty.id.len() > 128
+            || uncertainty.category.is_empty()
+            || uncertainty.category.len() > 128
+            || uncertainty.description.is_empty()
+            || uncertainty.description.len() > 4096
+            || uncertainty.affected_addresses.len() > 4096
+        {
+            return Err("invalid or duplicate ProgramSpec uncertainty".to_owned());
+        }
+    }
+    validate_typed_model(spec)?;
+    Ok(())
 }
 
 pub fn parse_program_spec_json(bytes: &[u8]) -> Result<ProgramSpec, String> {
@@ -413,11 +529,7 @@ pub fn validate_typed_model(spec: &ProgramSpec) -> Result<(), String> {
         if !valid_id(&prototype.id) || prototype.parameters.len() > 6 {
             return Err("invalid prototype id or parameter count".to_owned());
         }
-        if prototype
-            .parameters
-            .iter()
-            .any(|parameter| *parameter == ScalarType::Void)
-        {
+        if prototype.parameters.contains(&ScalarType::Void) {
             return Err("void is not a parameter type".to_owned());
         }
         if prototype.provenance.source != FactSource::AnalystAssertion {
@@ -473,13 +585,238 @@ pub struct RegionContract {
     pub relocations: Vec<RelocationSpec>,
     #[serde(default)]
     pub observed_interior_entries: Vec<InteriorEntryEvidence>,
+    /// Legacy string locations retained for v2 readers. Canonical v3 writers
+    /// use the typed physical location collections below.
     pub live_in: Option<Vec<String>>,
     pub live_out: Option<Vec<String>>,
+    #[serde(default)]
+    pub physical_live_in: Vec<PhysicalLocationSpec>,
+    #[serde(default)]
+    pub physical_live_out: Vec<PhysicalLocationSpec>,
     /// RSP after each reachable near RET relative to RSP at region entry.
     pub stack_delta: Option<i64>,
+    /// Proven entry RSP residue modulo 16, if known.
+    #[serde(default)]
+    pub stack_entry_alignment: Option<u8>,
+    #[serde(default)]
+    pub exit_stack_relations: Vec<ExitStackRelation>,
+    #[serde(default)]
+    pub global_references: Vec<ReferenceSpec>,
+    #[serde(default)]
+    pub variable_locations: Vec<VariableLocationSpec>,
+    #[serde(default)]
+    pub assumptions: Vec<AssumptionSpec>,
     pub unresolved_facts: Vec<String>,
     pub replacement_ready: bool,
     pub provenance: FactProvenance,
+}
+
+/// Canonical name for the Irene3-compatible region artifact. The historical
+/// `RegionContract` name remains a source-compatible alias for existing users.
+pub type RegionSpec = RegionContract;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalLocationKind {
+    Register,
+    Flag,
+    Stack,
+    Memory,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhysicalLocationSpec {
+    pub name: String,
+    pub kind: PhysicalLocationKind,
+    pub width_bits: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExitStackRelation {
+    pub exit: Address,
+    pub rsp_delta: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment_mod_16: Option<u8>,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VariableLocationSpec {
+    pub variable: String,
+    pub location: PhysicalLocationSpec,
+    pub valid_from: Address,
+    pub valid_to: Address,
+    pub provenance: FactProvenance,
+}
+
+pub fn migrate_region_spec(mut spec: RegionSpec) -> Result<RegionSpec, String> {
+    match spec.schema_version {
+        2 => spec.schema_version = REGION_SPEC_VERSION,
+        REGION_SPEC_VERSION => {}
+        other => return Err(format!("unsupported RegionSpec schema version {other}")),
+    }
+    validate_region_spec(&spec)?;
+    Ok(spec)
+}
+
+pub fn parse_region_spec_json(bytes: &[u8]) -> Result<RegionSpec, String> {
+    let spec: RegionSpec = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid RegionSpec JSON: {error}"))?;
+    migrate_region_spec(spec)
+}
+
+pub fn validate_region_spec(spec: &RegionSpec) -> Result<(), String> {
+    if spec.schema_version != REGION_SPEC_VERSION {
+        return Err(format!(
+            "RegionSpec schema version {} is not canonical version {REGION_SPEC_VERSION}",
+            spec.schema_version
+        ));
+    }
+    validate_sha256("RegionSpec binary", &spec.binary_sha256)?;
+    validate_sha256("RegionSpec bytes", &spec.bytes_sha256)?;
+    let bytes = decode_hex(&spec.bytes_hex)?;
+    if bytes.len() as u64 != spec.byte_length {
+        return Err("RegionSpec byte length does not match bytes_hex".to_owned());
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != spec.bytes_sha256 {
+        return Err("RegionSpec byte digest does not match bytes_hex".to_owned());
+    }
+    if spec
+        .stack_entry_alignment
+        .is_some_and(|alignment| alignment >= 16)
+        || spec.exit_stack_relations.iter().any(|relation| {
+            relation
+                .alignment_mod_16
+                .is_some_and(|alignment| alignment >= 16)
+        })
+    {
+        return Err("RegionSpec stack alignment residue must be below 16".to_owned());
+    }
+    for location in spec
+        .physical_live_in
+        .iter()
+        .chain(&spec.physical_live_out)
+        .chain(
+            spec.variable_locations
+                .iter()
+                .map(|variable| &variable.location),
+        )
+    {
+        if location.name.is_empty()
+            || location.name.len() > 128
+            || !matches!(
+                location.width_bits,
+                1 | 8 | 16 | 32 | 64 | 80 | 128 | 256 | 512
+            )
+        {
+            return Err("RegionSpec contains an invalid physical location".to_owned());
+        }
+    }
+    if spec.replacement_ready && !spec.unresolved_facts.is_empty() {
+        return Err("RegionSpec cannot be replacement-ready with unresolved facts".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{label} SHA-256 must be 64 hexadecimal characters"));
+    }
+    Ok(())
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) || value.len() > 128 * 1024 * 1024 {
+        return Err("RegionSpec bytes_hex must be even-length and bounded".to_owned());
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text =
+                std::str::from_utf8(pair).map_err(|_| "RegionSpec bytes_hex is not UTF-8")?;
+            u8::from_str_radix(text, 16).map_err(|_| "RegionSpec bytes_hex is not hexadecimal")
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(str::to_owned)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecompilationDiagnostic {
+    pub code: String,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub blocks_stable_operation: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StatementAddressProvenance {
+    pub c_start_line: u32,
+    pub c_end_line: u32,
+    pub addresses: Vec<Address>,
+    pub provenance: FactProvenance,
+}
+
+/// Versioned output of one region decompilation. `cir` remains optional until
+/// the native structured representation exists; callers can distinguish the
+/// verified LLVM-compatible RegionIR from the deterministic C view.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecompilationUnit {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub region: RegionSpec,
+    pub region_ir_llvm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cir: Option<String>,
+    pub c_source: String,
+    #[serde(default)]
+    pub statement_provenance: Vec<StatementAddressProvenance>,
+    #[serde(default)]
+    pub diagnostics: Vec<DecompilationDiagnostic>,
+    pub engine_version: String,
+}
+
+pub fn validate_decompilation_unit(unit: &DecompilationUnit) -> Result<(), String> {
+    if unit.schema_version != DECOMPILATION_UNIT_VERSION {
+        return Err(format!(
+            "unsupported DecompilationUnit schema version {}",
+            unit.schema_version
+        ));
+    }
+    validate_region_spec(&unit.region)?;
+    if unit.binary_sha256 != unit.region.binary_sha256 {
+        return Err("DecompilationUnit and RegionSpec binary digests differ".to_owned());
+    }
+    if unit.region_ir_llvm.is_empty()
+        || unit.region_ir_llvm.len() > 8 * 1024 * 1024
+        || unit.region_ir_llvm.contains('\0')
+        || unit.c_source.is_empty()
+        || unit.c_source.len() > 8 * 1024 * 1024
+        || unit.c_source.contains('\0')
+        || unit.engine_version.is_empty()
+        || unit.engine_version.len() > 128
+    {
+        return Err("DecompilationUnit source or engine metadata is invalid".to_owned());
+    }
+    if unit.statement_provenance.iter().any(|mapping| {
+        mapping.c_start_line == 0
+            || mapping.c_end_line < mapping.c_start_line
+            || mapping.addresses.is_empty()
+    }) {
+        return Err("DecompilationUnit contains invalid statement provenance".to_owned());
+    }
+    Ok(())
 }
 
 /// A concrete lead that another entry may reach bytes inside a selected region.
@@ -656,15 +993,27 @@ mod tests {
             reference_recovery: RecoveryState::NotAttempted,
             assumptions: Vec::new(),
             typed_model: TypedModel::default(),
+            memory_facts: Vec::new(),
+            uncertainties: Vec::new(),
+            provenance: Vec::new(),
             recovery_scope: "test".to_owned(),
             unresolved_control_flow: true,
         };
         let mut legacy = serde_json::to_value(&spec).unwrap();
         legacy["schema_version"] = serde_json::json!(2);
         legacy.as_object_mut().unwrap().remove("typed_model");
+        legacy.as_object_mut().unwrap().remove("memory_facts");
+        legacy.as_object_mut().unwrap().remove("uncertainties");
+        legacy.as_object_mut().unwrap().remove("provenance");
         let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
         assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
         assert!(migrated.typed_model.prototypes.is_empty());
+        assert_eq!(migrated.uncertainties.len(), 1);
+
+        legacy["schema_version"] = serde_json::json!(3);
+        let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
+        assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
+        assert_eq!(migrated.uncertainties.len(), 1);
 
         spec.typed_model.prototypes.push(PrototypeAssertion {
             id: "prototype-main".to_owned(),
@@ -680,6 +1029,64 @@ mod tests {
             validate_typed_model(&spec)
                 .unwrap_err()
                 .contains("executable mapping")
+        );
+    }
+
+    #[test]
+    fn region_spec_v2_migrates_and_rejects_tampered_bytes() {
+        let code = [0xc3];
+        let spec = RegionContract {
+            schema_version: REGION_SPEC_VERSION,
+            binary_sha256: "b".repeat(64),
+            symbol_name: "return_only".to_owned(),
+            address_kind: AddressKind::Virtual,
+            entry: Address(0x401000),
+            byte_length: code.len() as u64,
+            bytes_sha256: format!("{:x}", Sha256::digest(code)),
+            bytes_hex: "c3".to_owned(),
+            exits: vec![Address(0x401000)],
+            relocations: Vec::new(),
+            observed_interior_entries: Vec::new(),
+            live_in: None,
+            live_out: None,
+            physical_live_in: Vec::new(),
+            physical_live_out: Vec::new(),
+            stack_delta: Some(8),
+            stack_entry_alignment: None,
+            exit_stack_relations: Vec::new(),
+            global_references: Vec::new(),
+            variable_locations: Vec::new(),
+            assumptions: Vec::new(),
+            unresolved_facts: vec!["live state not established".to_owned()],
+            replacement_ready: false,
+            provenance: FactProvenance {
+                source: FactSource::NativeAnalysis,
+                scope: "test".to_owned(),
+            },
+        };
+        let mut legacy = serde_json::to_value(&spec).unwrap();
+        legacy["schema_version"] = serde_json::json!(2);
+        for field in [
+            "physical_live_in",
+            "physical_live_out",
+            "stack_entry_alignment",
+            "exit_stack_relations",
+            "global_references",
+            "variable_locations",
+            "assumptions",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let migrated = parse_region_spec_json(legacy.to_string().as_bytes()).unwrap();
+        assert_eq!(migrated.schema_version, REGION_SPEC_VERSION);
+        assert!(migrated.physical_live_in.is_empty());
+
+        let mut tampered = serde_json::to_value(&spec).unwrap();
+        tampered["bytes_hex"] = serde_json::json!("90");
+        assert!(
+            parse_region_spec_json(tampered.to_string().as_bytes())
+                .unwrap_err()
+                .contains("digest")
         );
     }
 }

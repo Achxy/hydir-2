@@ -280,9 +280,7 @@ fn checked_register(register: Register, ip: u64) -> Result<Register, String> {
         | Register::RDX
         | Register::RCX
         | Register::R8
-        | Register::R9 => {
-            Ok(register)
-        }
+        | Register::R9 => Ok(register),
         _ => Err(format!(
             "register {register:?} unsupported at 0x{ip:x}; only full 64-bit scalar registers are modeled"
         )),
@@ -394,7 +392,7 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
         {
             Op::RestoreStackPointerFromFrame
         }
-        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
+        Mnemonic::Add | Mnemonic::Sub
             if instruction.op_count() == 2
                 && instruction.op0_kind() == OpKind::Register
                 && instruction.op0_register() == Register::RSP =>
@@ -403,9 +401,6 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 kind: match instruction.mnemonic() {
                     Mnemonic::Add => Alu::Add,
                     Mnemonic::Sub => Alu::Sub,
-                    Mnemonic::And => Alu::And,
-                    Mnemonic::Or => Alu::Or,
-                    Mnemonic::Xor => Alu::Xor,
                     _ => unreachable!(),
                 },
                 amount: stack_adjustment(instruction)?,
@@ -478,14 +473,17 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 displacement: instruction.memory_displacement64() as i64,
             }
         }
-        Mnemonic::Add | Mnemonic::Sub
+        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
             if instruction.op_count() == 2 && instruction.op0_kind() == OpKind::Register =>
         {
             Op::Alu {
-                kind: if instruction.mnemonic() == Mnemonic::Add {
-                    Alu::Add
-                } else {
-                    Alu::Sub
+                kind: match instruction.mnemonic() {
+                    Mnemonic::Add => Alu::Add,
+                    Mnemonic::Sub => Alu::Sub,
+                    Mnemonic::And => Alu::And,
+                    Mnemonic::Or => Alu::Or,
+                    Mnemonic::Xor => Alu::Xor,
+                    _ => unreachable!(),
                 },
                 dst: register_dest()?,
                 src: operand(instruction, 1)?,

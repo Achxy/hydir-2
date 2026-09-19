@@ -1,16 +1,38 @@
 # IRENE-3 comparison experiment
 
-Status: protocol prepared; no IRENE-3 build, Ghidra export, or patch run has
-been completed on this Windows host. Results must remain empty until measured
-on an isolated Linux x86-64 installation.
+Status: HydIR-side artifacts are now measured; no IRENE-3 build, Ghidra export,
+or upstream patch run has been completed on this Windows host. Upstream result
+cells remain pending until measured on an isolated Linux x86-64 installation.
+
+## HydIR implementation checkpoint — 2026-09-19
+
+- The rewritten upstream history was preserved and the working implementation
+  was recovered through rescue branch
+  `rescue/irene3-port-pre-integration-20260919` onto
+  `feature/irene3-native-port`.
+- All five checked-in ELF seeds were regenerated with pinned Clang/LLD 22.1.8.
+  Their sources, entry points, lengths, hashes, and common command arguments are
+  recorded in `fuzz/corpus/elf_import/MANIFEST.json` and enforced by a Rust test.
+- Canonical native artifacts now exist as `ProgramSpec` v4, `RegionSpec` v3,
+  `DecompilationUnit` v1, and `PatchBundle` v2. Program readers accept v2/v3;
+  region readers accept v2. Missing CIR, statement provenance, physical
+  liveness, stack alignment, and behavior evidence are explicit blockers.
+- Preserved `hydir.v1` and additive `hydir.v2` services run together. v2 covers
+  region/decompilation artifacts, patch compilation/application, and structural
+  verification. Python clients negotiate v2 with v1 fallback.
+- Rust workspace tests, fuzz-target compilation, warnings-as-errors Clippy,
+  protocol tests, and Python SDK boundary tests pass locally. The Triton oracle,
+  native Linux semantic/differential gates, Ghidra workflow, and upstream Irene3
+  suite remain unmeasured here.
 
 ## Pinned comparison input
 
 - IRENE-3 source: `trailofbits/irene3` commit
   `d97aee937ebb6d1cb8a362748c56414404eb75ff`; repository license:
   AGPL-3.0. Keep its build and dependencies outside the HydIR source tree.
-- HydIR source: record `git rev-parse HEAD` and the worktree diff hash when
-  running; this implementation is currently an uncommitted worktree.
+- HydIR source: record `git rev-parse HEAD` and require a clean worktree when
+  running. Results from a modified tree must carry a diff hash and cannot be
+  promoted to release evidence.
 - Use the same symbolized, linked Linux x86-64 ELF for both tools. Start with
   `tests/fixtures/max2.S`, `tests/fixtures/add2.S`, and
   `tests/fixtures/scalar_corpus.S` linked with `scalar_main.c` using
@@ -56,10 +78,10 @@ sha256sum target/irene3-comparison.elf
 
 | Fixture | HydIR region/hash | IRENE-3 spec/region | Entry/exit assumptions | Lift/lower outcome | Patch outcome | Behavior cases |
 | --- | --- | --- | --- | --- | --- | --- |
-| `hydir_max2` | pending | pending | pending | pending | pending | pending |
-| `hydir_add2` | pending | pending | pending | pending | pending | pending |
-| `hydir_frame_balance` | pending | pending | pending | pending | pending | pending |
-| `hydir_stack_branch` | pending | pending | pending | pending | pending | pending |
+| `hydir_max2` | v3; ELF `48b09f9d…`; region `5190c43d…`; 12 bytes at `0x201174` | pending | 1 return, RSP +8; live state/alignment unresolved | native LLVM and deterministic C succeed; DecompilationUnit has 3 blocking diagnostics | scalar v1→bundle v2 succeeds structurally; stable=false | local patch unit/re-import only; Linux behavior pending |
+| `hydir_add2` | v3; scratch ELF `42e88968…`; region `d9cf89c5…`; 5 bytes at `0x201174` | pending | 1 return, RSP +8; live state/alignment unresolved | native LLVM/C measured locally | pending | pending |
+| `hydir_frame_balance` | v3; ELF `86e289c9…`; region `604c9f73…`; 18 bytes at `0x2011d2` | pending | 1 return, RSP +8; live state/alignment unresolved | CFG/stack analysis succeeds locally | pending | pending |
+| `hydir_stack_branch` | v3; ELF `5e2f4266…`; region `2bfd6347…`; 28 bytes at `0x2011f9` | pending | 1 return, RSP +8; stack local proven elsewhere; live state/alignment unresolved | CFG/stack-local lift tests pass locally | pending | pending |
 
 Sources: [IRENE-3 repository and license](https://github.com/trailofbits/irene3),
 [pinned build recipes](https://github.com/trailofbits/irene3/blob/d97aee937ebb6d1cb8a362748c56414404eb75ff/justfile),

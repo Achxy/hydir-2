@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from hydir_sdk import HydirClient
 from hydir_sdk import hydir_pb2 as proto
+from hydir_sdk import hydir_v2_pb2 as proto_v2
 
 
 class ClientBoundaryTests(unittest.TestCase):
@@ -50,6 +51,33 @@ class ClientBoundaryTests(unittest.TestCase):
                     "project", 1, b"{}", trusted_fixture=True,
                     assume_u64x2=True, assume_entry_only=False,
                 )
+
+    def test_v2_region_artifact_is_hash_media_schema_and_revision_checked(self):
+        content = json.dumps({
+            "schema_version": 3,
+            "binary_sha256": "a" * 64,
+        }).encode("utf-8")
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            client._call = lambda *_: proto_v2.ArtifactReply(
+                sha256=__import__("hashlib").sha256(content).hexdigest(),
+                media_type="application/vnd.hydir.region-spec+json;version=3",
+                content=content,
+                project_revision=4,
+            )
+            region = client.get_region("project", 4, "symbol", assume_u64x2=True)
+            self.assertEqual(region["schema_version"], 3)
+            with self.assertRaises(ValueError):
+                client.get_region("project", 4, "symbol", assume_u64x2=False)
+
+    def test_v2_patch_compile_requires_all_assertions_before_network_use(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.compile_patch_bundle(
+                    "project", 1, b"{}", trusted_fixture=True,
+                    assume_u64x2=False, assume_entry_only=True,
+                )
+            with self.assertRaises(ValueError):
+                client.verify_patch_bundle("project", 1, b"")
 
     def test_transform_rejects_untrusted_or_unallowlisted_pipeline(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:

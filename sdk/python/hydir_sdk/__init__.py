@@ -14,13 +14,15 @@ from uuid import uuid4
 import grpc
 
 from . import hydir_pb2 as proto
+from . import hydir_v2_pb2 as proto_v2
 from .hydir_pb2_grpc import HydirStub
+from .hydir_v2_pb2_grpc import HydirV2Stub
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 
 
 class HydirClient:
-    """Authenticated loopback client; remote API version 1 only.
+    """Authenticated loopback client with additive v1/v2 negotiation.
 
     Mutations accept explicit project revisions. Pass the same idempotency key
     when retrying create-project or lift-job requests after an uncertain reply.
@@ -61,6 +63,7 @@ class HydirClient:
             ),
         )
         self._stub = HydirStub(self._channel)
+        self._stub_v2 = HydirV2Stub(self._channel)
 
     def close(self) -> None:
         self._channel.close()
@@ -79,6 +82,171 @@ class HydirClient:
         if reply.api_version != 1:
             raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
         return reply
+
+    def discover_v2(self):
+        reply = self._call(self._stub_v2.Discover, proto_v2.DiscoverRequest())
+        if reply.api_version != 2:
+            raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
+        return reply
+
+    def negotiate_api(self) -> tuple[int, object]:
+        """Prefer v2 while retaining a transparent v1 compatibility path."""
+        try:
+            return 2, self.discover_v2()
+        except grpc.RpcError as error:
+            if error.code() != grpc.StatusCode.UNIMPLEMENTED:
+                raise
+        return 1, self.discover()
+
+    @staticmethod
+    def _checked_json_artifact(
+        reply, *, revision: int, media_type: str, schema_version: int,
+    ) -> dict:
+        content = HydirClient._checked_artifact(reply, revision=revision)
+        if reply.media_type != media_type:
+            raise RuntimeError("Artifact media type verification failed")
+        value = json.loads(content)
+        if not isinstance(value, dict) or value.get("schema_version") != schema_version:
+            raise RuntimeError("Artifact schema version verification failed")
+        return value
+
+    def get_region(
+        self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
+    ) -> dict:
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub_v2.GetRegion,
+            proto_v2.RegionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.region-spec+json;version=3",
+            schema_version=3,
+        )
+
+    def decompile_region(
+        self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
+    ) -> dict:
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub_v2.DecompileRegion,
+            proto_v2.RegionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        unit = self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.decompilation-unit+json;version=1",
+            schema_version=1,
+        )
+        if unit.get("binary_sha256") != unit.get("region", {}).get("binary_sha256"):
+            raise RuntimeError("DecompilationUnit and RegionSpec binary identities differ")
+        return unit
+
+    def compile_patch_bundle(
+        self, project_id: str, revision: int, patch_json: bytes, *,
+        trusted_fixture: bool, assume_u64x2: bool, assume_entry_only: bool,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        request = self._v2_patch_request(
+            project_id,
+            revision,
+            patch_json,
+            trusted_fixture=trusted_fixture,
+            assume_u64x2=assume_u64x2,
+            assume_entry_only=assume_entry_only,
+            idempotency_key=idempotency_key,
+        )
+        reply = self._call(self._stub_v2.CompilePatch, request)
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.patch-bundle+json;version=2",
+            schema_version=2,
+        )
+
+    def apply_patch_v2(
+        self, project_id: str, revision: int, patch_json: bytes, *,
+        trusted_fixture: bool, assume_u64x2: bool, assume_entry_only: bool,
+        idempotency_key: str | None = None,
+    ) -> tuple[int, str, dict]:
+        request = self._v2_patch_request(
+            project_id,
+            revision,
+            patch_json,
+            trusted_fixture=trusted_fixture,
+            assume_u64x2=assume_u64x2,
+            assume_entry_only=assume_entry_only,
+            idempotency_key=idempotency_key,
+        )
+        reply = self._call(self._stub_v2.ApplyPatch, request)
+        if reply.project_id != project_id or reply.revision != revision + 1:
+            raise RuntimeError("Patch returned an unexpected project revision")
+        artifact = self._call(
+            self._stub.GetArtifact,
+            proto.ArtifactRequest(project_id=project_id, sha256=reply.patch_bundle_sha256),
+        )
+        bundle = self._checked_json_artifact(
+            artifact,
+            revision=revision,
+            media_type="application/vnd.hydir.patch-bundle+json;version=2",
+            schema_version=2,
+        )
+        if bundle.get("patched_sha256") != reply.binary_sha256:
+            raise RuntimeError("PatchBundle and patched revision binary identities differ")
+        return reply.revision, reply.binary_sha256, bundle
+
+    def verify_patch_bundle(
+        self, project_id: str, revision: int, patch_bundle_json: bytes,
+    ) -> dict:
+        if not patch_bundle_json or len(patch_bundle_json) > 2 * 1024 * 1024:
+            raise ValueError("PatchBundle must be 1..=2 MiB")
+        reply = self._call(
+            self._stub_v2.VerifyPatch,
+            proto_v2.VerifyPatchRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                patch_bundle_json=patch_bundle_json,
+            ),
+        )
+        report = json.loads(reply.report_json)
+        if not reply.structurally_valid or report.get("structurally_valid") is not True:
+            raise RuntimeError("PatchBundle structural verification failed")
+        if reply.behavior_verified != bool(report.get("behavior_verified")):
+            raise RuntimeError("PatchBundle behavior-verification status differs from report")
+        return report
+
+    @staticmethod
+    def _v2_patch_request(
+        project_id: str, revision: int, patch_json: bytes, *,
+        trusted_fixture: bool, assume_u64x2: bool, assume_entry_only: bool,
+        idempotency_key: str | None,
+    ):
+        if not (trusted_fixture and assume_u64x2 and assume_entry_only):
+            raise ValueError("Patch requires trusted-fixture, u64x2, and entry-only assertions")
+        if not patch_json or len(patch_json) > 4096:
+            raise ValueError("Patch document must be 1..=4096 bytes")
+        return proto_v2.PatchRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            idempotency_key=idempotency_key or str(uuid4()),
+            patch_json=patch_json,
+            trusted_fixture=True,
+            assume_u64x2=True,
+            assume_entry_only=True,
+        )
 
     def get_source(self) -> tuple[str, bytes]:
         """Retrieve and hash-check the exact source archive advertised by this build."""

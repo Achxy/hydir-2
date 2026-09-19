@@ -94,7 +94,14 @@ impl Field {
 
     fn ty(self) -> &'static str {
         match self {
-            Self::Rax | Self::Rdi | Self::Rsi | Self::Rdx | Self::Rcx | Self::R8 | Self::R9 | Self::Slot(_) => "i64",
+            Self::Rax
+            | Self::Rdi
+            | Self::Rsi
+            | Self::Rdx
+            | Self::Rcx
+            | Self::R8
+            | Self::R9
+            | Self::Slot(_) => "i64",
             _ => "i1",
         }
     }
@@ -266,12 +273,12 @@ fn recover(
             *owner = Some(ip);
         }
         let op = classify(&instruction).map_err(error)?;
-        if let Op::CallDirect { target } = op {
-            if allowed_calls.is_some_and(|allowed| !allowed.contains(&target)) {
-                return Err(error(format!(
-                    "direct call at 0x{ip:x} to 0x{target:x} requires a resolved callee and ABI state proof"
-                )));
-            }
+        if let Op::CallDirect { target } = op
+            && allowed_calls.is_some_and(|allowed| !allowed.contains(&target))
+        {
+            return Err(error(format!(
+                "direct call at 0x{ip:x} to 0x{target:x} requires a resolved callee and ABI state proof"
+            )));
         }
         let successors = match op {
             Op::Ret => vec![],
@@ -482,7 +489,7 @@ fn emit_flags(
                 output_name(Field::Cf, ip)
             ));
         }
-        Some(kind) => {
+        Some(kind @ (Alu::Add | Alu::Sub)) => {
             let lhs_neg = temporary(body, ip, sequence, &format!("icmp slt i64 {lhs}, 0"));
             let rhs_neg = temporary(body, ip, sequence, &format!("icmp slt i64 {rhs}, 0"));
             let first = temporary(
@@ -510,6 +517,16 @@ fn emit_flags(
                 format!("icmp ult i64 {lhs}, {rhs}")
             };
             body.push_str(&format!("  {} = {carry}\n", output_name(Field::Cf, ip)));
+        }
+        Some(Alu::And | Alu::Or | Alu::Xor) => {
+            body.push_str(&format!(
+                "  {} = and i1 false, false\n",
+                output_name(Field::Of, ip)
+            ));
+            body.push_str(&format!(
+                "  {} = and i1 false, false\n",
+                output_name(Field::Cf, ip)
+            ));
         }
     }
 }
@@ -640,10 +657,12 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
             let result = output_name(register_field(dst), ip);
             body.push_str(&format!(
                 "  {result} = {} i64 {lhs}, {rhs}\n",
-                if matches!(kind, Alu::Add) {
-                    "add"
-                } else {
-                    "sub"
+                match kind {
+                    Alu::Add => "add",
+                    Alu::Sub => "sub",
+                    Alu::And => "and",
+                    Alu::Or => "or",
+                    Alu::Xor => "xor",
                 }
             ));
             emit_flags(body, ip, &lhs, &rhs, &result, Some(kind), &mut sequence);
@@ -925,6 +944,15 @@ mod tests {
         assert!(ir.contains("trunc i64 %rdi_in_1000 to i32"));
         assert!(ir.contains("%rax_out_1000 = zext i32 %t_1000_0 to i64"));
         assert!(!ir.contains("nsw"));
+    }
+
+    #[test]
+    fn logical_alu_uses_logical_ir_and_clears_carry_and_overflow() {
+        // mov rax,rdi; and rax,rsi; ret
+        let ir = lift_cfg(&[0x48, 0x89, 0xf8, 0x48, 0x21, 0xf0, 0xc3], 0x1000).unwrap();
+        assert!(ir.contains("%rax_out_1003 = and i64 %rax_in_1003, %rsi_in_1003"));
+        assert!(ir.contains("%of_out_1003 = and i1 false, false"));
+        assert!(ir.contains("%cf_out_1003 = and i1 false, false"));
     }
 
     #[test]

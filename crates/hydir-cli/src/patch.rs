@@ -69,6 +69,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             "replacement_hex": result.replacement_bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             "assumptions": ["trusted fixture", "u64(u64,u64) SysV ABI", "no incoming control-flow edges to function interior"],
             "behavior_validation": "not run by patch command; validate intended change and unchanged effects separately",
+            "patch_bundle_version": hydir_core::PATCH_BUNDLE_VERSION,
+            "patch_bundle": result.bundle,
         }))?
     );
     Ok(())
