@@ -2,6 +2,7 @@
 
 mod interchange;
 
+use aws_sdk_s3::primitives::ByteStream;
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_api::v1::{
     AnnotationRequest, ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply,
@@ -377,15 +378,55 @@ PRAGMA user_version=9;
 COMMIT;
 ";
 
+const S3_STORAGE_MIGRATION: &str = "
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TABLE binaries_v10 (
+    sha256 TEXT PRIMARY KEY,
+    content BLOB NOT NULL,
+    storage_kind TEXT NOT NULL DEFAULT 'inline' CHECK(storage_kind IN ('inline','filesystem-cas','s3')),
+    storage_key TEXT NOT NULL DEFAULT '',
+    content_size INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO binaries_v10 SELECT sha256,content,storage_kind,storage_key,content_size FROM binaries;
+DROP TABLE binaries;
+ALTER TABLE binaries_v10 RENAME TO binaries;
+CREATE TABLE artifacts_v10 (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    revision INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    content BLOB NOT NULL,
+    storage_kind TEXT NOT NULL DEFAULT 'inline' CHECK(storage_kind IN ('inline','filesystem-cas','s3')),
+    storage_key TEXT NOT NULL DEFAULT '',
+    content_size INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(project_id, revision, sha256)
+);
+INSERT INTO artifacts_v10 SELECT project_id,revision,sha256,media_type,content,storage_kind,storage_key,content_size FROM artifacts;
+DROP TABLE artifacts;
+ALTER TABLE artifacts_v10 RENAME TO artifacts;
+PRAGMA user_version=10;
+COMMIT;
+PRAGMA foreign_keys=ON;
+";
+
 #[derive(Clone)]
 enum ContentStorage {
     Inline,
     FilesystemCas(Arc<FilesystemCas>),
+    S3(Arc<S3ContentStore>),
 }
 
 #[derive(Debug)]
 struct FilesystemCas {
     root: PathBuf,
+}
+
+#[derive(Debug)]
+struct S3ContentStore {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    prefix: String,
 }
 
 #[derive(Debug)]
@@ -398,7 +439,7 @@ struct StagedContent {
 }
 
 impl ContentStorage {
-    fn stage(&self, content: &[u8]) -> Result<StagedContent, Status> {
+    async fn stage(&self, content: &[u8]) -> Result<StagedContent, Status> {
         if content.len() > MAX_STORED_OBJECT_BYTES {
             return Err(Status::resource_exhausted(
                 "stored object exceeds size limit",
@@ -416,7 +457,13 @@ impl ContentStorage {
                 content_size,
             }),
             Self::FilesystemCas(storage) => {
-                storage.put(&digest, content).map_err(Status::internal)?;
+                let storage = storage.clone();
+                let stored_digest = digest.clone();
+                let stored_content = content.to_vec();
+                tokio::task::spawn_blocking(move || storage.put(&stored_digest, &stored_content))
+                    .await
+                    .map_err(|_| Status::internal("filesystem CAS task failed"))?
+                    .map_err(Status::internal)?;
                 Ok(StagedContent {
                     storage_key: digest.clone(),
                     digest,
@@ -425,10 +472,23 @@ impl ContentStorage {
                     content_size,
                 })
             }
+            Self::S3(storage) => {
+                storage
+                    .put(&digest, content.to_vec())
+                    .await
+                    .map_err(Status::internal)?;
+                Ok(StagedContent {
+                    storage_key: storage.object_key(&digest)?,
+                    digest,
+                    inline: Vec::new(),
+                    storage_kind: "s3",
+                    content_size,
+                })
+            }
         }
     }
 
-    fn load(
+    async fn load(
         &self,
         digest: &str,
         inline: Vec<u8>,
@@ -443,11 +503,27 @@ impl ContentStorage {
             "inline" => inline,
             "filesystem-cas" => match self {
                 Self::FilesystemCas(storage) => {
-                    storage.get(storage_key).map_err(Status::internal)?
+                    let storage = storage.clone();
+                    let storage_key = storage_key.to_owned();
+                    tokio::task::spawn_blocking(move || storage.get(&storage_key))
+                        .await
+                        .map_err(|_| Status::internal("filesystem CAS task failed"))?
+                        .map_err(Status::internal)?
                 }
-                Self::Inline => {
+                _ => {
                     return Err(Status::failed_precondition(
                         "database references filesystem CAS objects; start hydird with that store",
+                    ));
+                }
+            },
+            "s3" => match self {
+                Self::S3(storage) => storage
+                    .get(storage_key, digest)
+                    .await
+                    .map_err(Status::internal)?,
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "database references S3 objects; start hydird with that store",
                     ));
                 }
             },
@@ -457,6 +533,74 @@ impl ContentStorage {
             return Err(Status::data_loss(
                 "stored object failed size or digest validation",
             ));
+        }
+        Ok(content)
+    }
+}
+
+impl S3ContentStore {
+    fn object_key(&self, digest: &str) -> Result<String, Status> {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Status::data_loss("S3 object digest is invalid"));
+        }
+        let suffix = format!("sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        Ok(if self.prefix.is_empty() {
+            suffix
+        } else {
+            format!("{}/{suffix}", self.prefix)
+        })
+    }
+
+    async fn put(&self, digest: &str, content: Vec<u8>) -> Result<(), String> {
+        let key = self.object_key(digest).map_err(|error| error.to_string())?;
+        let result = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .metadata("hydir-sha256", digest)
+            .if_none_match("*")
+            .body(ByteStream::from(content))
+            .send()
+            .await;
+        if result.is_err() && self.get(&key, digest).await.is_err() {
+            return Err("S3 object write failed".to_owned());
+        }
+        Ok(())
+    }
+
+    async fn get(&self, key: &str, digest: &str) -> Result<Vec<u8>, String> {
+        if self.object_key(digest).map_err(|error| error.to_string())? != key {
+            return Err("S3 object key does not match its digest".to_owned());
+        }
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|_| "S3 object read failed".to_owned())?;
+        if output.content_length().unwrap_or_default() < 0
+            || output.content_length().unwrap_or_default() as usize > MAX_STORED_OBJECT_BYTES
+        {
+            return Err("S3 object exceeds size limit".to_owned());
+        }
+        let content_length = output.content_length().unwrap_or_default() as usize;
+        let mut body = output.body;
+        let mut content = Vec::with_capacity(content_length);
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .map_err(|_| "S3 object stream failed".to_owned())?
+        {
+            if content.len().saturating_add(chunk.len()) > MAX_STORED_OBJECT_BYTES {
+                return Err("S3 object exceeds size limit".to_owned());
+            }
+            content.extend_from_slice(&chunk);
+        }
+        if sha256(&content) != digest {
+            return Err("S3 object digest mismatch".to_owned());
         }
         Ok(content)
     }
@@ -798,7 +942,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 9 {
+        if version > 10 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -827,6 +971,9 @@ impl Store {
         }
         if version <= 8 {
             connection.execute_batch(CONTENT_STORAGE_MIGRATION)?;
+        }
+        if version <= 9 {
+            connection.execute_batch(S3_STORAGE_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -1121,7 +1268,12 @@ impl Store {
         })
     }
 
-    fn current_binary(&self, principal: &str, id: &str, revision: u64) -> Result<Vec<u8>, Status> {
+    async fn current_binary(
+        &self,
+        principal: &str,
+        id: &str,
+        revision: u64,
+    ) -> Result<Vec<u8>, Status> {
         let project = self.project(principal, id)?;
         if project.revision != revision {
             return Err(Status::aborted("stale project revision"));
@@ -1139,9 +1291,10 @@ impl Store {
         ).map_err(internal)?;
         self.content_storage
             .load(&stored.0, stored.1, &stored.2, &stored.3, stored.4)
+            .await
     }
 
-    fn binary_at_revision(
+    async fn binary_at_revision(
         &self,
         principal: &str,
         id: &str,
@@ -1161,16 +1314,17 @@ impl Store {
         let stored = stored.ok_or_else(|| Status::not_found("project revision not found"))?;
         self.content_storage
             .load(&stored.0, stored.1, &stored.2, &stored.3, stored.4)
+            .await
     }
 
-    fn store_artifact(
+    async fn store_artifact(
         &self,
         project_id: &str,
         revision: u64,
         media_type: &str,
         content: &[u8],
     ) -> Result<String, Status> {
-        let staged = self.content_storage.stage(content)?;
+        let staged = self.content_storage.stage(content).await?;
         let connection = self.connection()?;
         insert_artifact(
             &connection,
@@ -1182,7 +1336,7 @@ impl Store {
         Ok(staged.digest)
     }
 
-    fn commit_patch_mutation(
+    async fn commit_patch_mutation(
         &self,
         principal: &str,
         project_id: &str,
@@ -1197,7 +1351,7 @@ impl Store {
         let next = expected
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
-        let staged_binary = self.content_storage.stage(&patched)?;
+        let staged_binary = self.content_storage.stage(&patched).await?;
         let binary_sha256 = staged_binary.digest.clone();
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(internal)?;
@@ -1306,13 +1460,17 @@ impl Store {
         Ok(changed == 1)
     }
 
-    fn finish_lift_job(
+    async fn finish_lift_job(
         &self,
         job_id: &str,
         project_id: &str,
         revision: u64,
         result: Result<Vec<u8>, Status>,
     ) -> Result<(), Status> {
+        let prepared = match result {
+            Ok(content) => Ok(self.content_storage.stage(&content).await?),
+            Err(error) => Err(error.message().chars().take(4096).collect::<String>()),
+        };
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(internal)?;
         let state: Option<String> = tx
@@ -1325,9 +1483,8 @@ impl Store {
             tx.commit().map_err(internal)?;
             return Ok(());
         }
-        match result {
-            Ok(content) => {
-                let staged = self.content_storage.stage(&content)?;
+        match prepared {
+            Ok(staged) => {
                 let digest = staged.digest.clone();
                 insert_artifact(&tx, project_id, revision as i64, "text/x-llvm-ir", &staged)?;
                 tx.execute(
@@ -1337,8 +1494,7 @@ impl Store {
                 .map_err(internal)?;
                 insert_event(&tx, job_id, "succeeded", "LLVM IR artifact ready", &digest)?;
             }
-            Err(error) => {
-                let diagnostic: String = error.message().chars().take(4096).collect();
+            Err(diagnostic) => {
                 tx.execute(
                     "UPDATE jobs SET state='failed',diagnostic=?1 WHERE id=?2",
                     params![diagnostic, job_id],
@@ -1368,7 +1524,10 @@ impl Store {
             }
         }
         let result = run_worker("lift", Some(&symbol), bytes).await;
-        if let Err(error) = self.finish_lift_job(&job_id, &project_id, revision, result) {
+        if let Err(error) = self
+            .finish_lift_job(&job_id, &project_id, revision, result)
+            .await
+        {
             eprintln!("hydird job completion failed: {error}");
         }
         if let Ok(mut workers) = self.workers.lock() {
@@ -2174,7 +2333,7 @@ impl Hydir for Store {
             ));
         }
         run_worker("inspect", None, input.content.clone()).await?;
-        let staged_binary = self.content_storage.stage(&input.content)?;
+        let staged_binary = self.content_storage.stage(&input.content).await?;
         let expected = i64::try_from(input.expected_revision)
             .map_err(|_| Status::invalid_argument("revision too large"))?;
         {
@@ -2229,7 +2388,9 @@ impl Hydir for Store {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
         self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let raw = run_worker("inspect", None, bytes).await?;
         let mut spec: ProgramSpec = parse_program_spec_json(&raw)
             .map_err(|_| Status::internal("worker returned invalid program model"))?;
@@ -2252,7 +2413,9 @@ impl Hydir for Store {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
         self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let report = run_worker("analyze", None, bytes).await?;
         Ok(Response::new(JsonReply {
             json: String::from_utf8(report)
@@ -2267,7 +2430,9 @@ impl Hydir for Store {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
         self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let raw = run_worker("analyze-spec", None, bytes).await?;
         let mut spec: ProgramSpec = parse_program_spec_json(&raw)
             .map_err(|_| Status::internal("worker returned invalid analyzed model"))?;
@@ -2349,7 +2514,9 @@ impl Hydir for Store {
                 binary_sha256,
             }));
         }
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         if let Some(address) = address {
             let raw = run_worker("inspect", None, bytes).await?;
             let spec: ProgramSpec = parse_program_spec_json(&raw)
@@ -2448,7 +2615,9 @@ impl Hydir for Store {
         let input = request.into_inner();
         self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         valid_symbol(&input.function_symbol)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let cfg = run_worker("cfg", Some(&input.function_symbol), bytes).await?;
         Ok(Response::new(JsonReply {
             json: String::from_utf8(cfg)
@@ -2469,14 +2638,18 @@ impl Hydir for Store {
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content = run_worker("lift", Some(&input.function_symbol), bytes).await?;
-        let digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            "text/x-llvm-ir",
-            &content,
-        )?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "text/x-llvm-ir",
+                &content,
+            )
+            .await?;
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-llvm-ir".to_owned(),
@@ -2498,14 +2671,18 @@ impl Hydir for Store {
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content = run_worker("decompile", Some(&input.function_symbol), bytes).await?;
-        let digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            "text/x-csrc",
-            &content,
-        )?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "text/x-csrc",
+                &content,
+            )
+            .await?;
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-csrc".to_owned(),
@@ -2556,7 +2733,9 @@ impl Hydir for Store {
         }
         let pass_length = u8::try_from(input.passes.len())
             .map_err(|_| Status::invalid_argument("pass list is too long"))?;
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let binary_sha256 = sha256(&binary);
         let mut envelope = Vec::with_capacity(1 + input.passes.len() + binary.len());
         envelope.push(pass_length);
@@ -2566,10 +2745,10 @@ impl Hydir for Store {
         let parts = unpack_worker_parts::<4>(&packed)?;
         let report_json = String::from_utf8(parts[3].to_vec())
             .map_err(|_| Status::internal("transform report is not UTF-8"))?;
-        let staged_parts = parts
-            .iter()
-            .map(|part| self.content_storage.stage(part))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut staged_parts = Vec::with_capacity(parts.len());
+        for part in &parts {
+            staged_parts.push(self.content_storage.stage(part).await?);
+        }
         let digests = staged_parts
             .iter()
             .map(|part| part.digest.clone())
@@ -2669,15 +2848,17 @@ impl Hydir for Store {
         if let Some(prior) = prior {
             return Ok(Response::new(prior));
         }
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let packed = run_worker("rebuild", None, binary).await?;
         let parts = unpack_worker_parts::<3>(&packed)?;
         run_worker("inspect", None, parts[1].to_vec()).await?;
         let report_json = String::from_utf8(parts[2].to_vec())
             .map_err(|_| Status::internal("rebuild report is not UTF-8"))?;
-        let staged_ir = self.content_storage.stage(parts[0])?;
-        let staged_binary = self.content_storage.stage(parts[1])?;
-        let staged_report = self.content_storage.stage(parts[2])?;
+        let staged_ir = self.content_storage.stage(parts[0]).await?;
+        let staged_binary = self.content_storage.stage(parts[1]).await?;
+        let staged_report = self.content_storage.stage(parts[2]).await?;
         let ir_sha256 = staged_ir.digest.clone();
         let binary_sha256 = staged_binary.digest.clone();
         let report_sha256 = staged_report.digest.clone();
@@ -2789,7 +2970,9 @@ impl Hydir for Store {
                 binary_sha256,
             }));
         }
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         if binary.len() > MAX_WORKER_OUTPUT {
             return Err(Status::resource_exhausted(
                 "remote patch binary exceeds 16 MiB worker output limit",
@@ -2805,14 +2988,17 @@ impl Hydir for Store {
         if patched.len() != binary.len() {
             return Err(Status::internal("patch worker changed ELF file size"));
         }
-        Ok(Response::new(self.commit_patch_mutation(
-            &principal,
-            &input.project_id,
-            input.expected_revision,
-            &input.idempotency_key,
-            &patch_digest,
-            patched,
-        )?))
+        Ok(Response::new(
+            self.commit_patch_mutation(
+                &principal,
+                &input.project_id,
+                input.expected_revision,
+                &input.idempotency_key,
+                &patch_digest,
+                patched,
+            )
+            .await?,
+        ))
     }
 
     async fn get_artifact(
@@ -2840,13 +3026,16 @@ impl Hydir for Store {
             .map_err(internal)?;
         let (revision, media_type, inline, storage_kind, storage_key, content_size) =
             record.ok_or_else(|| Status::not_found("artifact not found"))?;
-        let content = self.content_storage.load(
-            &input.sha256,
-            inline,
-            &storage_kind,
-            &storage_key,
-            content_size,
-        )?;
+        let content = self
+            .content_storage
+            .load(
+                &input.sha256,
+                inline,
+                &storage_kind,
+                &storage_key,
+                content_size,
+            )
+            .await?;
         Ok(Response::new(ArtifactReply {
             sha256: input.sha256,
             media_type,
@@ -2900,7 +3089,9 @@ impl Hydir for Store {
                 &id,
             )?));
         }
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let id = Uuid::new_v4().to_string();
         {
             let mut conn = self.connection()?;
@@ -3180,14 +3371,18 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content = run_worker("region", Some(&input.function_symbol), binary).await?;
-        let digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            "application/vnd.hydir.region-spec+json;version=3",
-            &content,
-        )?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.region-spec+json;version=3",
+                &content,
+            )
+            .await?;
         Ok(Response::new(api_v2::ArtifactReply {
             sha256: digest,
             media_type: "application/vnd.hydir.region-spec+json;version=3".to_owned(),
@@ -3209,14 +3404,18 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content = run_worker("decompile-unit", Some(&input.function_symbol), binary).await?;
-        let digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            "application/vnd.hydir.decompilation-unit+json;version=1",
-            &content,
-        )?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.decompilation-unit+json;version=1",
+                &content,
+            )
+            .await?;
         Ok(Response::new(api_v2::ArtifactReply {
             sha256: digest,
             media_type: "application/vnd.hydir.decompilation-unit+json;version=1".to_owned(),
@@ -3238,16 +3437,20 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content =
             run_worker("physical-region-ir", Some(&input.function_symbol), binary).await?;
         let media_type = "application/vnd.hydir.physical-region-ir+json;version=1";
-        let digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            media_type,
-            &content,
-        )?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                media_type,
+                &content,
+            )
+            .await?;
         Ok(Response::new(api_v2::ArtifactReply {
             sha256: digest,
             media_type: media_type.to_owned(),
@@ -3264,17 +3467,21 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
         let input = request.into_inner();
         self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         validate_v2_patch_request(&input)?;
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
         let packed = run_worker("patch-v2", None, envelope).await?;
         let [_patched, bundle] = unpack_worker_parts::<2>(&packed)?;
         parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
-        let digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            "application/vnd.hydir.patch-bundle+json;version=2",
-            bundle,
-        )?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.patch-bundle+json;version=2",
+                bundle,
+            )
+            .await?;
         Ok(Response::new(api_v2::ArtifactReply {
             sha256: digest,
             media_type: "application/vnd.hydir.patch-bundle+json;version=2".to_owned(),
@@ -3291,8 +3498,9 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
         let input = request.into_inner();
         self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         validate_v2_patch_request(&input)?;
-        let binary =
-            self.binary_at_revision(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .binary_at_revision(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
         let packed = run_worker("patch-v2", None, envelope).await?;
         let [patched, bundle] = unpack_worker_parts::<2>(&packed)?;
@@ -3302,21 +3510,25 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
                 "v2 patch worker output differs from its PatchBundle digest",
             ));
         }
-        let bundle_digest = self.store_artifact(
-            &input.project_id,
-            input.expected_revision,
-            "application/vnd.hydir.patch-bundle+json;version=2",
-            bundle,
-        )?;
+        let bundle_digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.patch-bundle+json;version=2",
+                bundle,
+            )
+            .await?;
         let patch_digest = sha256(&input.patch_json);
-        let reply = self.commit_patch_mutation(
-            &principal,
-            &input.project_id,
-            input.expected_revision,
-            &input.idempotency_key,
-            &patch_digest,
-            patched.to_vec(),
-        )?;
+        let reply = self
+            .commit_patch_mutation(
+                &principal,
+                &input.project_id,
+                input.expected_revision,
+                &input.idempotency_key,
+                &patch_digest,
+                patched.to_vec(),
+            )
+            .await?;
         Ok(Response::new(api_v2::MutationReply {
             project_id: reply.project_id,
             revision: reply.revision,
@@ -3331,7 +3543,8 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     ) -> Result<Response<api_v2::VerificationReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
-        self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        self.current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         if input.patch_bundle_json.is_empty() || input.patch_bundle_json.len() > 2 * 1024 * 1024 {
             return Err(Status::invalid_argument("PatchBundle must be 1..=2 MiB"));
         }
@@ -3415,6 +3628,79 @@ fn filesystem_content_storage(root: &Path) -> Result<ContentStorage, Box<dyn Err
     Ok(ContentStorage::FilesystemCas(Arc::new(
         FilesystemCas::open(root)?,
     )))
+}
+
+async fn s3_content_storage(
+    endpoint: &str,
+    region: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Result<ContentStorage, Box<dyn Error>> {
+    if region.is_empty()
+        || region.len() > 64
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("S3 region must be 1..=64 ASCII letters, digits, or hyphens".into());
+    }
+    if bucket.len() < 3
+        || bucket.len() > 63
+        || bucket.starts_with(['.', '-'])
+        || bucket.ends_with(['.', '-'])
+        || bucket.contains("..")
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+    {
+        return Err("S3 bucket name is invalid".into());
+    }
+    let prefix = if prefix == "-" {
+        String::new()
+    } else {
+        let trimmed = prefix.trim_matches('/');
+        if trimmed.is_empty()
+            || trimmed.len() > 256
+            || trimmed
+                .split('/')
+                .any(|part| part.is_empty() || part == "..")
+            || !trimmed.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/')
+            })
+        {
+            return Err("S3 prefix must be `-` or a bounded safe object-key prefix".into());
+        }
+        trimmed.to_owned()
+    };
+    let custom_endpoint = if endpoint == "-" {
+        None
+    } else {
+        let parsed = url::Url::parse(endpoint)?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err("custom S3 endpoint must be an origin-only HTTPS URL".into());
+        }
+        Some(endpoint.to_owned())
+    };
+    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.to_owned()))
+        .load()
+        .await;
+    let mut builder = aws_sdk_s3::config::Builder::from(&shared);
+    if let Some(endpoint) = custom_endpoint {
+        builder = builder.endpoint_url(endpoint).force_path_style(true);
+    }
+    Ok(ContentStorage::S3(Arc::new(S3ContentStore {
+        client: aws_sdk_s3::Client::from_conf(builder.build()),
+        bucket: bucket.to_owned(),
+        prefix,
+    })))
 }
 
 async fn serve_rpc(
@@ -3562,7 +3848,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("hydird TLS/OIDC RPC with filesystem CAS listening on {address}");
             serve_rpc(store, address, Some(tls)).await?;
         }
-        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird identity list-oidc <database.sqlite> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> | hydird serve-oidc <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> | hydird serve-oidc-cas <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> <absolute-object-root>".into()),
+        [serve, database, bind, certificate, private_key, issuer, audience, jwks, endpoint, region, bucket, prefix]
+            if serve == "serve-oidc-s3" =>
+        {
+            if database == ":memory:" {
+                return Err("hydird serve-oidc-s3 requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let verifier = oidc_verifier(issuer, audience, Path::new(jwks))?;
+            let content_storage = s3_content_storage(endpoint, region, bucket, prefix).await?;
+            let store = Store::open_with_options(
+                Path::new(database),
+                AuthenticationMode::Oidc(Arc::new(verifier)),
+                content_storage,
+            )?;
+            println!("hydird TLS/OIDC RPC with S3 content storage listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird identity list-oidc <database.sqlite> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> | hydird serve-oidc <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> | hydird serve-oidc-cas <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> <absolute-object-root> | hydird serve-oidc-s3 <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> <-|https-endpoint> <region> <bucket> <-|prefix>".into()),
     }
     Ok(())
 }
@@ -3677,6 +3981,67 @@ mod tests {
         assert!(read_tls_material(Path::new("server.pem"), "certificate", false).is_err());
         std::fs::write(&certificate, b"pem\0text").unwrap();
         assert!(read_tls_material(&certificate, "certificate", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn s3_configuration_rejects_unsafe_names_and_endpoints_before_network_use() {
+        assert!(
+            s3_content_storage("-", "../region", "hydir-artifacts", "-")
+                .await
+                .is_err()
+        );
+        assert!(
+            s3_content_storage("-", "us-east-1", "Hydir_Artifacts", "-")
+                .await
+                .is_err()
+        );
+        assert!(
+            s3_content_storage("-", "us-east-1", "hydir-artifacts", "../../escape")
+                .await
+                .is_err()
+        );
+        assert!(
+            s3_content_storage(
+                "http://objects.example",
+                "us-east-1",
+                "hydir-artifacts",
+                "hydir"
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            s3_content_storage(
+                "https://user:secret@objects.example/?query=x",
+                "us-east-1",
+                "hydir-artifacts",
+                "hydir"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_ten_accepts_s3_metadata_and_preserves_foreign_keys() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let connection = store.connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        connection
+            .execute(
+                "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) VALUES(?1,x'','s3',?2,1)",
+                params!["0".repeat(64), "sha256/00/00/fixture"],
+            )
+            .unwrap();
+        let foreign_key_errors: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
     }
 
     #[test]
@@ -3800,7 +4165,7 @@ mod tests {
             .unwrap()
             .into_inner();
         let binary = b"digest-bound-binary";
-        let staged = store.content_storage.stage(binary).unwrap();
+        let staged = store.content_storage.stage(binary).await.unwrap();
         {
             let connection = store.connection().unwrap();
             insert_binary(&connection, &staged).unwrap();
@@ -3820,6 +4185,7 @@ mod tests {
         let artifact = b"content-addressed artifact";
         let artifact_digest = store
             .store_artifact(&project.project_id, 1, "application/test", artifact)
+            .await
             .unwrap();
         let inline_bytes: i64 = store
             .connection()
@@ -3834,6 +4200,7 @@ mod tests {
         assert_eq!(
             store
                 .current_binary("cas-analyst", &project.project_id, 1)
+                .await
                 .unwrap(),
             binary
         );
@@ -4426,7 +4793,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=10;")
+            .execute_batch("PRAGMA user_version=11;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -4460,7 +4827,23 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
+        let foreign_key_errors: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) VALUES(?1,x'','s3',?2,1)",
+                params!["0".repeat(64), "sha256/00/00/fixture"],
+            )
+            .unwrap();
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
         assert_eq!(
             store
