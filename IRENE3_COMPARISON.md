@@ -46,12 +46,11 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
   `interchange_import`; native proof gaps keep every imported region
   `replacement_ready=false`.
 - The native compatibility report currently binds 23/23 regions and recovers
-  exact declared-exit CFGs for 16/23. Direct-call edges remain typed separately
+  exact declared-exit CFGs for 19/23. Direct-call edges remain typed separately
   from continuation exits, and mismatched imported exits fail closed. Semantic
   lifting remains 0/23 for isolated regions. The remaining per-block blockers
   are entry/exit machine-state adapters, frame state entering mid-function
-  regions, general mapped/TLS memory, RIP-relative addressing, an RBX save, and
-  resolved-call contracts.
+  regions, general mapped/TLS memory, an RBX save, and resolved-call contracts.
   This result is deliberately separate from whole-function lifting: the pinned
   92-byte `fibIterative` function now lifts completely with typed dword red-zone
   locals, 32-bit arithmetic/comparisons and flags. LLVM `opt -passes=verify`

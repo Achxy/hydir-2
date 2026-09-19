@@ -57,6 +57,8 @@ class InstructionOracleTests(unittest.TestCase):
         self.assertEqual(reg(step("b8ffffffff", rax=SIGN), "rax"), 0xffffffff)
         context = step("488d44b707", rdi=MASK, rsi=SIGN)
         self.assertEqual(reg(context, "rax"), (MASK + SIGN * 4 + 7) & MASK)
+        context = step("488d0534120000", address=0x1000)
+        self.assertEqual(reg(context, "rax"), 0x223B)
 
     def test_add_sub_cmp_and_test_flags(self):
         values = (0, 1, 2, SIGN - 1, SIGN, MASK)

@@ -96,8 +96,9 @@ bash scripts/demo-corpus.sh
 The bounded scalar contract now also covers proven balanced frames, initialized
 nonoverlapping 32/64-bit stack locals (including the SysV leaf red zone),
 32-bit arithmetic/comparisons with explicit flags, `mov` zero-extension, and
-direct calls to uniquely bounded scalar leaf symbols. Other memory, unresolved
-calls, and unmodelled aliases remain explicit refusals.
+RIP-relative address formation, plus direct calls to uniquely bounded scalar
+leaf symbols. Other memory, unresolved calls, and unmodelled aliases remain
+explicit refusals.
 
 RegionSpec v3 CFG recovery is a separate structural stage. It requires decoded
 external edges to match the declared continuation exits exactly, records direct
