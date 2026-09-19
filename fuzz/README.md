@@ -1,8 +1,9 @@
 # HydIR fuzz targets
 
-The targets exercise ELF import and disassembly, scalar CFG lifting, and the
-restricted LLVM-to-C parser. They are crash and refusal checks, not semantic
-proof. [`corpus/elf_import/MANIFEST.json`](corpus/elf_import/MANIFEST.json)
+The targets exercise ELF import and disassembly, scalar CFG lifting, the
+restricted LLVM-to-C parser, and the bounded Anvill protobuf importer. They are
+crash and refusal checks, not semantic proof.
+[`corpus/elf_import/MANIFEST.json`](corpus/elf_import/MANIFEST.json)
 records every checked-in ELF's source, entry, exact length, SHA-256, and pinned
 Clang/LLD 22.1.8 revision. `corpus/elf_import/max2.elf` was built from
 `tests/fixtures/max2.S`; `corpus/cfg_lift/max2` contains the function's 12 bytes.
@@ -30,6 +31,7 @@ On a Linux development host with `cargo-fuzz` installed:
 cargo fuzz run elf_import
 cargo fuzz run cfg_lift
 cargo fuzz run c_output
+cargo fuzz run anvill_spec
 ```
 
 `.github/workflows/fuzz.yml` replays the checked-in seeds and runs each target

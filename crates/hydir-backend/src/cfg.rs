@@ -12,14 +12,21 @@ use hydir_semantics::{Alu, Condition, Op, Value, Value32, classify};
 use iced_x86::{Decoder, DecoderOptions, Register};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-const ALL_FIELDS: [Field; 19] = [
+const ALL_FIELDS: [Field; 26] = [
     Field::Rax,
+    Field::Rbx,
     Field::Rdi,
     Field::Rsi,
     Field::Rdx,
     Field::Rcx,
     Field::R8,
     Field::R9,
+    Field::R10,
+    Field::R11,
+    Field::R12,
+    Field::R13,
+    Field::R14,
+    Field::R15,
     Field::Zf,
     Field::Sf,
     Field::Of,
@@ -43,12 +50,19 @@ const INPUTS: u32 = Field::Rdi.bit()
 #[derive(Clone, Copy, Debug)]
 enum Field {
     Rax,
+    Rbx,
     Rdi,
     Rsi,
     Rdx,
     Rcx,
     R8,
     R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
     Zf,
     Sf,
     Of,
@@ -60,17 +74,24 @@ impl Field {
     const fn bit(self) -> u32 {
         let index = match self {
             Self::Rax => 0,
+            Self::Rbx => 11,
             Self::Rdi => 1,
             Self::Rsi => 2,
             Self::Rdx => 3,
             Self::Rcx => 4,
             Self::R8 => 9,
             Self::R9 => 10,
+            Self::R10 => 12,
+            Self::R11 => 13,
+            Self::R12 => 14,
+            Self::R13 => 15,
+            Self::R14 => 16,
+            Self::R15 => 17,
             Self::Zf => 5,
             Self::Sf => 6,
             Self::Of => 7,
             Self::Cf => 8,
-            Self::Slot(index) => 11 + index,
+            Self::Slot(index) => 18 + index,
         };
         1 << index
     }
@@ -78,12 +99,19 @@ impl Field {
     fn name(self) -> String {
         match self {
             Self::Rax => "rax".into(),
+            Self::Rbx => "rbx".into(),
             Self::Rdi => "rdi".into(),
             Self::Rsi => "rsi".into(),
             Self::Rdx => "rdx".into(),
             Self::Rcx => "rcx".into(),
             Self::R8 => "r8".into(),
             Self::R9 => "r9".into(),
+            Self::R10 => "r10".into(),
+            Self::R11 => "r11".into(),
+            Self::R12 => "r12".into(),
+            Self::R13 => "r13".into(),
+            Self::R14 => "r14".into(),
+            Self::R15 => "r15".into(),
             Self::Zf => "zf".into(),
             Self::Sf => "sf".into(),
             Self::Of => "of".into(),
@@ -95,12 +123,19 @@ impl Field {
     fn ty(self) -> &'static str {
         match self {
             Self::Rax
+            | Self::Rbx
             | Self::Rdi
             | Self::Rsi
             | Self::Rdx
             | Self::Rcx
             | Self::R8
             | Self::R9
+            | Self::R10
+            | Self::R11
+            | Self::R12
+            | Self::R13
+            | Self::R14
+            | Self::R15
             | Self::Slot(_) => "i64",
             _ => "i1",
         }
@@ -110,12 +145,19 @@ impl Field {
 fn register_field(register: Register) -> Field {
     match register {
         Register::RAX => Field::Rax,
+        Register::RBX => Field::Rbx,
         Register::RDI => Field::Rdi,
         Register::RSI => Field::Rsi,
         Register::RDX => Field::Rdx,
         Register::RCX => Field::Rcx,
         Register::R8 => Field::R8,
         Register::R9 => Field::R9,
+        Register::R10 => Field::R10,
+        Register::R11 => Field::R11,
+        Register::R12 => Field::R12,
+        Register::R13 => Field::R13,
+        Register::R14 => Field::R14,
+        Register::R15 => Field::R15,
         _ => unreachable!("all registers were checked during classification"),
     }
 }
@@ -131,7 +173,7 @@ impl OpEffects for Op {
             return 0;
         }
         let effects = self.effects();
-        u32::from(effects.write_registers & 0x1f) | (u32::from(effects.write_flags) << 5)
+        register_effect_fields(effects.write_registers) | (u32::from(effects.write_flags) << 5)
     }
 
     fn reads(self) -> u32 {
@@ -142,8 +184,31 @@ impl OpEffects for Op {
             return Field::Rax.bit();
         }
         let effects = self.effects();
-        u32::from(effects.read_registers & 0x1f) | (u32::from(effects.read_flags) << 5)
+        register_effect_fields(effects.read_registers) | (u32::from(effects.read_flags) << 5)
     }
+}
+
+fn register_effect_fields(registers: u16) -> u32 {
+    [
+        (hydir_semantics::RAX, Field::Rax),
+        (hydir_semantics::RBX, Field::Rbx),
+        (hydir_semantics::RDI, Field::Rdi),
+        (hydir_semantics::RSI, Field::Rsi),
+        (hydir_semantics::RDX, Field::Rdx),
+        (hydir_semantics::RCX, Field::Rcx),
+        (hydir_semantics::R8, Field::R8),
+        (hydir_semantics::R9, Field::R9),
+        (hydir_semantics::R10, Field::R10),
+        (hydir_semantics::R11, Field::R11),
+        (hydir_semantics::R12, Field::R12),
+        (hydir_semantics::R13, Field::R13),
+        (hydir_semantics::R14, Field::R14),
+        (hydir_semantics::R15, Field::R15),
+    ]
+    .into_iter()
+    .fold(0, |fields, (bit, field)| {
+        fields | if registers & bit != 0 { field.bit() } else { 0 }
+    })
 }
 
 fn is_frame_op(op: Op) -> bool {
@@ -227,6 +292,8 @@ impl Node {
                 | Field::Rcx.bit()
                 | Field::R8.bit()
                 | Field::R9.bit()
+                | Field::R10.bit()
+                | Field::R11.bit()
                 | Field::Zf.bit()
                 | Field::Sf.bit()
                 | Field::Of.bit()
@@ -726,7 +793,7 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
 
 /// Lift all instructions reachable from the first byte of a symbol-bounded
 /// function. Only direct branches within the symbol are allowed. The caller
-/// asserts the `u64(u64, u64)` SysV ABI contract; uninitialized register or
+/// asserts the six-register SysV integer ABI contract; uninitialized register or
 /// flag reads on any recovered path are rejected before IR is emitted.
 pub fn lift_cfg(code: &[u8], address: u64) -> Result<String> {
     lift_cfg_with_calls(code, address, &BTreeSet::new())
@@ -768,10 +835,14 @@ pub(super) fn lift_cfg_with_calls(
             }
             let mut values = Vec::new();
             if *ip == address && INPUTS & field.bit() != 0 {
-                let arg = if matches!(field, Field::Rdi) {
-                    "%arg0"
-                } else {
-                    "%arg1"
+                let arg = match field {
+                    Field::Rdi => "%arg0",
+                    Field::Rsi => "%arg1",
+                    Field::Rdx => "%arg2",
+                    Field::Rcx => "%arg3",
+                    Field::R8 => "%arg4",
+                    Field::R9 => "%arg5",
+                    _ => unreachable!("INPUTS contains only SysV integer argument registers"),
                 };
                 values.push(format!("[{arg}, %prologue]"));
             }
@@ -944,6 +1015,16 @@ mod tests {
         assert!(ir.contains("trunc i64 %rdi_in_1000 to i32"));
         assert!(ir.contains("%rax_out_1000 = zext i32 %t_1000_0 to i64"));
         assert!(!ir.contains("nsw"));
+    }
+
+    #[test]
+    fn preserves_extended_register_dataflow_and_sixth_argument_identity() {
+        // mov r10,r9; mov rax,r10; ret
+        let ir = lift_cfg(&[0x4d, 0x89, 0xca, 0x4c, 0x89, 0xd0, 0xc3], 0x1000).unwrap();
+        assert!(ir.contains("%r9_in_1000 = phi i64 [%arg5, %prologue]"));
+        assert!(ir.contains("%r10_out_1000 = add i64 0, %r9_in_1000"));
+        assert!(ir.contains("%rax_out_1003 = add i64 0, %r10_in_1003"));
+        assert!(ir.contains("ret i64 %rax_in_1006"));
     }
 
     #[test]

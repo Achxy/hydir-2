@@ -291,6 +291,7 @@ pub struct FactProvenance {
 pub enum FactSource {
     ElfMetadata,
     NativeAnalysis,
+    InterchangeImport,
     AnalystAssertion,
     ValidationEvidence,
 }
@@ -709,7 +710,7 @@ pub fn validate_region_spec(spec: &RegionSpec) -> Result<(), String> {
             || location.name.len() > 128
             || !matches!(
                 location.width_bits,
-                1 | 8 | 16 | 32 | 64 | 80 | 128 | 256 | 512
+                1 | 8 | 16 | 24 | 32 | 64 | 80 | 96 | 128 | 256 | 512
             )
         {
             return Err("RegionSpec contains an invalid physical location".to_owned());
