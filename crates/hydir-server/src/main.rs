@@ -54,7 +54,10 @@ use tokio::{
     process::Command,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Identity, Server, ServerTlsConfig},
+};
 use tonic_health::ServingStatus;
 use uuid::Uuid;
 
@@ -62,6 +65,7 @@ include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
 
 const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
+const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
 #[cfg(not(test))]
 const WORKER_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -2618,6 +2622,70 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     }
 }
 
+fn read_tls_material(path: &Path, label: &str, private: bool) -> Result<Vec<u8>, Box<dyn Error>> {
+    #[cfg(not(unix))]
+    let _ = private;
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute").into());
+    }
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_TLS_MATERIAL_BYTES {
+        return Err(format!("{label} must be a non-empty regular file of at most 1 MiB").into());
+    }
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!("{label} must not be group/world accessible (chmod 600)").into());
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.contains(&0) {
+        return Err(format!("{label} must be PEM text without NUL bytes").into());
+    }
+    Ok(bytes)
+}
+
+fn tls_config(certificate: &Path, private_key: &Path) -> Result<ServerTlsConfig, Box<dyn Error>> {
+    let certificate = read_tls_material(certificate, "TLS certificate", false)?;
+    let private_key = read_tls_material(private_key, "TLS private key", true)?;
+    Ok(ServerTlsConfig::new()
+        .identity(Identity::from_pem(certificate, private_key))
+        .timeout(Duration::from_secs(10)))
+}
+
+async fn serve_rpc(
+    store: Store,
+    address: SocketAddr,
+    tls: Option<ServerTlsConfig>,
+) -> Result<(), Box<dyn Error>> {
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_service_status("", ServingStatus::Serving)
+        .await;
+    let mut server = Server::builder();
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    server
+        .add_service(health_service)
+        .add_service(
+            HydirServer::new(store.clone())
+                .max_decoding_message_size(MAX_BINARY_BYTES + 1024)
+                .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
+        )
+        .add_service(
+            HydirV2Server::new(store)
+                .max_decoding_message_size(MAX_BINARY_BYTES + 1024)
+                .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
+        )
+        .add_service(interchange::interchange_service())
+        .add_service(interchange::patch_service())
+        .serve(address)
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -2645,21 +2713,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 return Err("hydird currently supports only authenticated loopback binding; TLS/non-loopback mode is not implemented".into());
             }
             let store = Store::open(Path::new(database))?;
-            let (health_reporter, health_service) = tonic_health::server::health_reporter();
-            health_reporter
-                .set_service_status("", ServingStatus::Serving)
-                .await;
             println!("hydird local RPC listening on {address}");
-            Server::builder()
-                .add_service(health_service)
-                .add_service(HydirServer::new(store.clone()).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
-                .add_service(HydirV2Server::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
-                .add_service(interchange::interchange_service())
-                .add_service(interchange::patch_service())
-                .serve(address)
-                .await?;
+            serve_rpc(store, address, None).await?;
         }
-        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird serve <database.sqlite> <loopback-host:port>".into()),
+        [serve, database, bind, certificate, private_key] if serve == "serve-tls" => {
+            if database == ":memory:" {
+                return Err("hydird serve-tls requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let store = Store::open(Path::new(database))?;
+            println!("hydird TLS RPC listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem>".into()),
     }
     Ok(())
 }
@@ -2667,6 +2734,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_material_requires_absolute_bounded_pem_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("server.pem");
+        std::fs::write(&certificate, b"-----BEGIN CERTIFICATE-----\nfixture\n").unwrap();
+        assert_eq!(
+            read_tls_material(&certificate, "certificate", false).unwrap(),
+            b"-----BEGIN CERTIFICATE-----\nfixture\n"
+        );
+        assert!(read_tls_material(Path::new("server.pem"), "certificate", false).is_err());
+        std::fs::write(&certificate, b"pem\0text").unwrap();
+        assert!(read_tls_material(&certificate, "certificate", false).is_err());
+    }
 
     #[test]
     fn worker_launch_mode_is_explicit_and_argument_separated() {

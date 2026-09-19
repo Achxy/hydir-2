@@ -39,8 +39,9 @@ const HELP: &str = "Remote commands:
   hydirctl remote job-cancel <project-id> <job-id>
   hydirctl remote job-events <project-id> <job-id> <after-sequence>
 
-Set HYDIR_ENDPOINT=http://127.0.0.1:50051 and HYDIR_TOKEN_FILE to a private
-credential file. No remote binary upload occurs except the explicit upload command.
+Set HYDIR_ENDPOINT to http://127.0.0.1:50051 for local mode or to an https://
+endpoint for TLS mode, and set HYDIR_TOKEN_FILE to a private credential file.
+No remote binary upload occurs except the explicit upload command.
 ";
 
 fn authorized<T>(value: T, credential: &MetadataValue<tonic::metadata::Ascii>) -> Request<T> {
@@ -84,6 +85,35 @@ fn check_artifact(content: &[u8], digest: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn validate_endpoint(endpoint: &str) -> Result<(), Box<dyn Error>> {
+    let uri: tonic::codegen::http::Uri = endpoint.parse()?;
+    let scheme = uri.scheme_str().ok_or("remote endpoint has no scheme")?;
+    let authority = uri
+        .authority()
+        .ok_or("remote endpoint has no host authority")?;
+    if authority.as_str().contains('@')
+        || uri
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+    {
+        return Err("remote endpoint must not contain credentials, a path, or a query".into());
+    }
+    match scheme {
+        "http" => {
+            let address: std::net::SocketAddr = authority.as_str().parse().map_err(
+                |_| "plaintext endpoint must use an explicit numeric loopback address and port",
+            )?;
+            if !address.ip().is_loopback() {
+                return Err("plaintext remote connections must use loopback".into());
+            }
+        }
+        "https" if !authority.host().is_empty() => {}
+        "https" => return Err("TLS endpoint has no host".into()),
+        _ => return Err("remote endpoint scheme must be http or https".into()),
+    }
+    Ok(())
+}
+
 fn write_executable_new(path: &str, content: &[u8]) -> Result<(), Box<dyn Error>> {
     let target = Path::new(path);
     if target.exists() {
@@ -108,14 +138,8 @@ fn write_executable_new(path: &str, content: &[u8]) -> Result<(), Box<dyn Error>
 
 pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let endpoint = env::var("HYDIR_ENDPOINT")
-        .map_err(|_| "HYDIR_ENDPOINT must explicitly name the local service")?;
-    let address: std::net::SocketAddr = endpoint
-        .strip_prefix("http://")
-        .ok_or("current remote client only supports explicit http://loopback-host:port")?
-        .parse()?;
-    if !address.ip().is_loopback() {
-        return Err("current remote client refuses non-loopback plaintext connections".into());
-    }
+        .map_err(|_| "HYDIR_ENDPOINT must explicitly name the HydIR service")?;
+    validate_endpoint(&endpoint)?;
     let token_file = env::var("HYDIR_TOKEN_FILE")
         .map_err(|_| "HYDIR_TOKEN_FILE must point to a private credential file")?;
     let token_path = Path::new(&token_file);
@@ -745,4 +769,19 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         _ => return Err(HELP.into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_endpoint;
+
+    #[test]
+    fn endpoint_policy_allows_tls_and_only_loopback_plaintext() {
+        assert!(validate_endpoint("http://127.0.0.1:50051").is_ok());
+        assert!(validate_endpoint("http://[::1]:50051").is_ok());
+        assert!(validate_endpoint("http://192.0.2.1:50051").is_err());
+        assert!(validate_endpoint("https://hydir.example:443").is_ok());
+        assert!(validate_endpoint("https://hydir.example/api").is_err());
+        assert!(validate_endpoint("https://user@hydir.example").is_err());
+    }
 }

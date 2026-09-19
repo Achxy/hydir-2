@@ -1,7 +1,7 @@
 # HydIR Python SDK (compatible v1 plus additive v2)
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
-`hydird`. It supports authenticated loopback discovery, project creation,
+`hydird`. It supports authenticated loopback or TLS discovery, project creation,
 explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
 durable lift jobs and event streams, a named allowlisted LLVM 14 pass
 experiment, restricted whole-executable rebuilding, and verified artifact
@@ -87,6 +87,8 @@ does not infer signatures. No sample is uploaded without a call to
 `upload_binary`. Artifact bytes are SHA-256 checked before being returned,
 and `export_artifact` refuses to overwrite an existing path. The client
 rejects plaintext non-loopback endpoints and non-private credential files.
+`https://host:port` endpoints use gRPC TLS with platform trust roots; callers
+using a private CA may pass its PEM bytes as `root_certificates`.
 
 Generated `hydir*_pb2.py` and `hydir*_pb2_grpc.py` correspond to the v1 and v2
 schemas in `crates/hydir-api/proto/`, produced with `grpcio-tools==1.84.0`.

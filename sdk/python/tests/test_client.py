@@ -21,8 +21,10 @@ class ClientBoundaryTests(unittest.TestCase):
     def test_plaintext_non_loopback_is_refused(self):
         with self.assertRaises(ValueError):
             HydirClient("http://192.0.2.1:50051", self.token)
+        with HydirClient("https://hydir.example:50051", self.token):
+            pass
         with self.assertRaises(ValueError):
-            HydirClient("https://127.0.0.1:50051", self.token)
+            HydirClient("https://hydir.example:50051/api", self.token)
 
     @unittest.skipUnless(os.name == "posix", "Unix file modes required")
     def test_non_private_credential_is_refused(self):

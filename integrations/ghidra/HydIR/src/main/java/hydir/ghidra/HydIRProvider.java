@@ -91,7 +91,7 @@ final class HydIRProvider extends ComponentProviderAdapter {
         connection.setBorder(BorderFactory.createTitledBorder("HydIR v2 connection"));
         connection.add(new JLabel("hydirctl"));
         connection.add(executable);
-        connection.add(new JLabel("Loopback endpoint"));
+        connection.add(new JLabel("Local/TLS endpoint"));
         connection.add(endpoint);
         connection.add(new JLabel("Private token file"));
         connection.add(tokenFile);

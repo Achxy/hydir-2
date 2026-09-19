@@ -10,14 +10,14 @@
   <a href="#native-analysis-workbench">Workbench</a> ·
   <a href="#verified-scalar-lift">Evidence</a> ·
   <a href="#symbolic-exploration-with-triton">Triton</a> ·
-  <a href="#authenticated-loopback-service">Remote API</a>
+  <a href="#authenticated-service">Remote API</a>
 </p>
 
 [![HydIR egui workbench with a selected ELF function, its lifted LLVM IR, inspector, diagnostics, and console](assets/screenshots/studio-lift.png)](assets/screenshots/studio-lift.png)
 
 *The native egui workbench analyzing `hydir_max2`: local ELF, machine-byte-derived LLVM IR, and the selected function's scope in one view.*
 
-HydIR opens little-endian x86-64 ELF files without uploading them. The current native slice recovers bounded control flow, emits LLVM IR and scalar C for a deliberately small instruction set, runs differential checks against trusted fixtures, and exposes the same core through a desktop app, CLI, Python SDK, and authenticated loopback service.
+HydIR opens little-endian x86-64 ELF files without uploading them. The current native slice recovers bounded control flow, emits LLVM IR and scalar C for a deliberately small instruction set, runs differential checks against trusted fixtures, and exposes the same core through a desktop app, CLI, Python SDK, and authenticated local-or-TLS service.
 
 This is an engineering workbench, not a general decompiler. Unsupported instructions, memory behavior, unresolved calls, unmodelled partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
 
@@ -71,7 +71,7 @@ The desktop workbench keeps the program tree, analysis views, inspector, and dia
 - show uncertain linear-sweep regions and undecodable gaps instead of silently promoting them to functions
 - inspect CFG, LLVM IR, scalar C, named pass results, and conservative global effects
 - save local names, comments, assumptions, and pane layout in a private SQLite project
-- create an authenticated loopback project only through an explicit transfer action
+- create an authenticated local-or-TLS project only through an explicit transfer action
 - apply bounded transforms, rebuilds, and scalar patches to new output paths
 
 The disassembly view ties each recovered instruction to its address and bytes. Branches and unsupported regions remain inspectable instead of being silently turned into source code.
@@ -82,7 +82,7 @@ Selecting a function fills the inspector with its entry, extent, source, asserte
 
 <p align="center"><img src="assets/screenshots/egui-inspector.webp" width="42%" alt="egui inspector cutout showing the selected function's ELF facts, ABI assertion, and CFG count"></p>
 
-Opening a local ELF does not upload it. Credentials are not persisted, remote projects do not reconnect automatically, and the service refuses non-loopback binding.
+Opening a local ELF does not upload it. Credentials are not persisted and remote projects do not reconnect automatically. Plaintext service connections remain loopback-only; remote connections require TLS.
 
 ## Verified scalar lift
 
@@ -166,9 +166,9 @@ cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name
 
 In egui, select a function and use **Run Triton**. The bottom console accepts a restricted, one-statement-at-a-time Python-shaped subset for inspecting bounded registers, expressions, and models; it is not a general Python shell.
 
-## Authenticated loopback service
+## Authenticated service
 
-`hydird` provides revisioned projects, explicit ELF upload, inspection, CFG and global-effect analysis, lift and scalar C artifacts, named pass experiments, annotations, bounded rebuild/patch operations, and durable lift jobs with events and cancellation. It preserves `hydir.v1` and adds `hydir.v2` region, DecompilationUnit, PatchBundle compile/apply, and structural verification operations. The CLI and [Python SDK](sdk/python/README.md) use the same authenticated API. The service does not execute uploaded binaries and will not bind to a non-loopback address.
+`hydird` provides revisioned projects, explicit ELF upload, inspection, CFG and global-effect analysis, lift and scalar C artifacts, named pass experiments, annotations, bounded rebuild/patch operations, and durable lift jobs with events and cancellation. It preserves `hydir.v1` and adds `hydir.v2` region, DecompilationUnit, PatchBundle compile/apply, and structural verification operations. The CLI and [Python SDK](sdk/python/README.md) use the same authenticated API. The service does not execute uploaded binaries. Plaintext service mode is restricted to loopback; non-loopback deployments must use TLS.
 
 ```bash
 # Create an identity once; save the one-time credential in a private 0600 file.
@@ -184,6 +184,15 @@ cargo run --locked --bin hydirctl -- remote discover
 cargo run --locked --bin hydirctl -- remote create demo unique-request-key
 cargo run --locked --bin hydirctl -- remote upload <project-id> <expected-revision> /path/to/program.elf
 ```
+
+The additive `serve-tls` mode accepts non-loopback connections only through TLS. Certificate and key paths must be absolute, the key must be private on Unix, and clients validate the certificate against configured trust roots:
+
+```bash
+cargo run --locked --bin hydird -- serve-tls /path/to/hydird.sqlite 0.0.0.0:50051 /run/secrets/tls.crt /run/secrets/tls.key
+export HYDIR_ENDPOINT=https://hydir.example:50051
+```
+
+This TLS/static-token/SQLite mode is a secure transport foundation, not the completed production deployment profile. OIDC, project roles, PostgreSQL, object storage, quotas, audit export, and Kubernetes packaging remain required before that profile is release-ready.
 
 Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent `remote inspect`, `cfg`, `lift`, `decompile`, `artifact`, or `job-*` operations. Credential files must not be group- or world-readable.
 
