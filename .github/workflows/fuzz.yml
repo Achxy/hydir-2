@@ -9,25 +9,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install nightly Rust and cargo-fuzz
         run: |
+          # rust-toolchain.toml pins stable, so every fuzz command selects nightly explicitly.
           rustup toolchain install nightly
-          rustup default nightly
-          cargo install cargo-fuzz --version 0.12.0 --locked
+          cargo +nightly install cargo-fuzz --version 0.12.0 --locked
       - name: ELF import and region corpus
         run: |
-          cargo fuzz build elf_import
-          cargo fuzz run elf_import -- -max_total_time=30
+          cargo +nightly fuzz build elf_import
+          cargo +nightly fuzz run elf_import -- -max_total_time=30
       - name: Scalar CFG and lift corpus
         run: |
-          cargo fuzz build cfg_lift
-          cargo fuzz run cfg_lift -- -max_total_time=30
+          cargo +nightly fuzz build cfg_lift
+          cargo +nightly fuzz run cfg_lift -- -max_total_time=30
       - name: LLVM-to-C parser corpus
         run: |
-          cargo fuzz build c_output
-          cargo fuzz run c_output -- -max_total_time=30
+          cargo +nightly fuzz build c_output
+          cargo +nightly fuzz run c_output -- -max_total_time=30
       - name: HydIR specification parser corpus
         run: |
-          cargo fuzz build hydir_spec
-          cargo fuzz run hydir_spec -- -max_total_time=30
+          cargo +nightly fuzz build hydir_spec
+          cargo +nightly fuzz run hydir_spec -- -max_total_time=30
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
