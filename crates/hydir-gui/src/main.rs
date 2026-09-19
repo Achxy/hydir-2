@@ -53,8 +53,15 @@ const GOOD: Color32 = Color32::from_rgb(124, 190, 152);
 const BAD: Color32 = Color32::from_rgb(232, 139, 124);
 const INFO: Color32 = Color32::from_rgb(104, 177, 216);
 const VIOLET: Color32 = Color32::from_rgb(180, 145, 222);
+const CONSOLE_MIN_HEIGHT: f32 = 100.0;
+const CONSOLE_MAX_HEIGHT: f32 = 900.0;
+const MAIN_VIEW_MIN_HEIGHT: f32 = 120.0;
 const PINNED_OPT: &str = "/usr/bin/opt-14";
 const PINNED_CLANG: &str = "/usr/bin/clang-14";
+
+fn resized_console_height(current: f32, drag_delta_y: f32, maximum: f32) -> f32 {
+    (current - drag_delta_y).clamp(CONSOLE_MIN_HEIGHT, maximum)
+}
 
 enum Task {
     LoadWorkbench,
@@ -4679,7 +4686,31 @@ impl AnalystApp {
         }
     }
 
-    fn console_view(&mut self, ui: &mut egui::Ui) {
+    fn console_view(&mut self, ui: &mut egui::Ui, maximum_height: f32) {
+        let (resize_rect, resize_response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::drag());
+        let resize_response = resize_response
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag to resize the console");
+        if resize_response.dragged() {
+            self.console_height = resized_console_height(
+                self.console_height,
+                resize_response.drag_delta().y,
+                maximum_height,
+            );
+            ui.ctx().request_repaint();
+        }
+        let resize_color = if resize_response.dragged() || resize_response.hovered() {
+            ACCENT
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        ui.painter().hline(
+            resize_rect.x_range(),
+            resize_rect.center().y,
+            egui::Stroke::new(1.0, resize_color),
+        );
+
         ui.horizontal(|ui| {
             ui.heading(RichText::new("Console").size(14.0));
             if ui
@@ -4797,8 +4828,6 @@ impl AnalystApp {
         } else {
             self.triton_console_body(ui);
         }
-        // Resizable egui panels must consume the selected space. Otherwise
-        // their contents can pull the edge back after the resize drag ends.
         ui.take_available_space();
     }
 
@@ -5679,13 +5708,15 @@ impl eframe::App for AnalystApp {
             });
         self.workbench.inspector_width = inspector.response.rect.width().clamp(220.0, 800.0);
         if self.console_visible {
-            let console = egui::Panel::bottom("console")
-                .resizable(true)
-                .default_size(self.console_height)
-                .min_size(100.0)
-                .max_size(900.0)
-                .show(ui, |ui| self.console_view(ui));
-            self.console_height = console.response.rect.height().clamp(100.0, 900.0);
+            let maximum_height = (ui.available_height() - MAIN_VIEW_MIN_HEIGHT)
+                .clamp(CONSOLE_MIN_HEIGHT, CONSOLE_MAX_HEIGHT);
+            self.console_height = self
+                .console_height
+                .clamp(CONSOLE_MIN_HEIGHT, maximum_height);
+            egui::Panel::bottom("console")
+                .resizable(false)
+                .exact_size(self.console_height)
+                .show(ui, |ui| self.console_view(ui, maximum_height));
         }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Frame::new()
@@ -6297,7 +6328,7 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         AnalystApp, Event, Tab, ir_slice, local_region_artifacts, preview_patch_local,
-        valid_bearer_token, validate_endpoint,
+        resized_console_height, valid_bearer_token, validate_endpoint,
     };
     use hydir_backend::lift_symbol;
     use hydir_core::{
@@ -6414,6 +6445,15 @@ mod tests {
         app.poll();
         assert!(app.console_visible);
         assert_eq!(app.console_height, 360.0);
+    }
+
+    #[test]
+    fn console_resize_tracks_drag_direction_and_keeps_the_released_height() {
+        assert_eq!(resized_console_height(220.0, -80.0, 900.0), 300.0);
+        assert_eq!(resized_console_height(300.0, 55.0, 900.0), 245.0);
+        assert_eq!(resized_console_height(245.0, 0.0, 900.0), 245.0);
+        assert_eq!(resized_console_height(120.0, 80.0, 900.0), 100.0);
+        assert_eq!(resized_console_height(860.0, -80.0, 900.0), 900.0);
     }
 
     #[test]
