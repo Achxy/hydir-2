@@ -104,6 +104,8 @@ def path_witness(context, choices: tuple[int, ...]) -> list[int] | None:
 def decode_and_process(context, code: bytes, address: int, offset: int):
     from triton import Instruction
 
+    # Triton accepts at most the x86 architectural maximum of 15 opcode bytes.
+    # Supplying the entire remaining function fails for symbols over that size.
     instruction = Instruction(code[offset : offset + 15])
     instruction.setAddress(address + offset)
     context.processing(instruction)

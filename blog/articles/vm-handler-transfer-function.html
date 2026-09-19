@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Read a VM stack-add handler from x86-64 ELF bytes through HydIR analysis, Triton state checks, and an LLVM IR transfer function.">
-  <link rel="canonical" href="https://hydir.wiki/articles/vm-handler-transfer-function.html">
+  <link rel="canonical" href="https://hydir.wiki/articles/vm-handler-transfer-function">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
-  <link rel="stylesheet" href="/article-styles.css">
+  <link rel="stylesheet" href="/styles.css">
   <script src="/vendor/katex/katex.min.js" defer></script>
   <script src="/vendor/katex/auto-render.min.js" defer></script>
   <script src="/assets/render-math.js" defer></script>
@@ -15,10 +15,10 @@
 </head>
 <body class="latex-dark-auto">
   <a class="skip" href="#article">Skip to article</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs.html" aria-current="page">Blogs</a></nav></header>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs" aria-current="page">Blogs</a></nav></header>
   <main class="site-main prose" id="article">
     <article>
-      <p class="eyebrow"><a href="/blogs.html">Blogs</a> / Binary semantics</p>
+      <p class="eyebrow"><a href="/blogs">Blogs</a> / Binary semantics</p>
       <h1>Lifting a VM Handler into a Transfer Function</h1>
       <p class="lead">A handler's native address locates its code; its transfer function describes the virtual instruction. We read a stack-add handler from a linked ELF with HydIR, execute its bytes with Triton, and express the resulting state transformation in LLVM IR.</p>
 
@@ -120,6 +120,6 @@ high_counterexample = ctx.isSat(unchanged_high != b)</code></pre>
       <p>The handler address identifies this native implementation. The projected state relation identifies the virtual instruction: a 64-bit stack addition with explicit changes to \(sp\) and \(vpc\), and a frame condition for every other virtual-state component.</p>
     </article>
   </main>
-  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/blogs.html">All blogs</a> · <a href="https://triton-library.github.io/documentation/doxygen/py_TritonContext_page.html">Triton API</a></p></footer>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/blogs">All blogs</a> · <a href="https://triton-library.github.io/documentation/doxygen/py_TritonContext_page.html">Triton API</a></p></footer>
 </body>
 </html>

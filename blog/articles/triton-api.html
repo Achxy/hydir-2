@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="A Triton model query followed by HydIR's symbolic report for a selected x86-64 ELF function.">
-  <link rel="canonical" href="https://hydir.wiki/articles/triton-api.html">
+  <link rel="canonical" href="https://hydir.wiki/articles/triton-api">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
-  <link rel="stylesheet" href="/article-styles.css">
+  <link rel="stylesheet" href="/styles.css">
   <script src="/vendor/prism/prism-core.min.js" defer></script>
   <script src="/vendor/prism/prism-bash.min.js" defer></script>
   <script src="/vendor/prism/prism-python.min.js" defer></script>
@@ -14,10 +14,10 @@
 </head>
 <body class="latex-dark-auto">
   <a class="skip" href="#article">Skip to article</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs.html">Blogs</a></nav></header>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs">Blogs</a></nav></header>
   <main class="site-main prose" id="article">
     <article>
-      <p class="eyebrow"><a href="/blogs.html">Blogs</a> / Symbolic exploration</p>
+      <p class="eyebrow"><a href="/blogs">Blogs</a> / Symbolic exploration</p>
       <h1>Finding an Input with Triton</h1>
       <p class="lead">Suppose a function copies its first argument into RAX. What value should we pass to make it return 7? <a href="https://github.com/JonathanSalwan/Triton">Triton's Python API</a> can find one. HydIR brings that symbolic analysis to selected x86-64 functions and shows the path conditions and return expressions it finds.</p>
 
@@ -43,9 +43,9 @@ cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name</
 
       <h2>Read the report</h2>
       <p>The report covers a selected function of up to 4,096 bytes, with up to 64 direct paths and 1,024 instructions per path. It records the decoded bytes, per-instruction symbolic expressions, path conditions, and final RAX expression.</p>
-      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/tests/triton_bridge_test.py">bridge tests</a> include a two-path fixture and model queries. For HydIR's separate LLVM lift and finite execution checks, follow the <a href="/articles/max2.html">max2 worked example</a>. The <a href="https://github.com/Achxy/hydir-2#quick-start">quick start</a> has the local build commands.</p>
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/tests/triton_bridge_test.py">bridge tests</a> include a two-path fixture and model queries. For HydIR's separate LLVM lift and finite execution checks, follow the <a href="/articles/max2">max2 worked example</a>. The <a href="/start">quick start</a> has the local build commands.</p>
     </article>
   </main>
-  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/blogs.html">All blogs</a> · <a href="https://github.com/JonathanSalwan/Triton">Triton upstream</a></p></footer>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/blogs">All blogs</a> · <a href="https://github.com/JonathanSalwan/Triton">Triton upstream</a></p></footer>
 </body>
 </html>
