@@ -1,37 +1,37 @@
-//! Exact Irene3 service names with bounded, fail-closed native preflight.
+//! HydIR interchange services with bounded, fail-closed native preflight.
 //!
 //! Wire compatibility is available now. Semantic responses are emitted only
 //! for an empty specification; non-empty regions remain blocked until their
 //! physical contracts can be represented without inventing state.
 
 use hydir_api::{
-    irene::server::{
-        Codegen, SpecChunk as IreneSpecChunk,
-        irene_server::{Irene, IreneServer},
+    interchange_service::server::{
+        Codegen, SpecChunk as InterchangeSpecChunk,
+        hydir_interchange_server::{HydirInterchange, HydirInterchangeServer},
     },
-    irene3::server::{
+    patch::server::{
         PatchGraph, PatchRequest, PatchResponse, SpecChunk as PatchSpecChunk,
-        patch_lang_server_server::{PatchLangServer, PatchLangServerServer},
+        hydir_patch_service_server::{HydirPatchService, HydirPatchServiceServer},
     },
 };
-use hydir_irene3::{MAX_SPECIFICATION_BYTES, SpecificationDocument, UPSTREAM_CHUNK_BYTES};
+use hydir_interchange::{HYDIR_CHUNK_BYTES, MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use tonic::{Request, Response, Status, Streaming};
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct IreneCompatibility;
+pub struct HydirInterchangeEndpoint;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PatchLangCompatibility;
+pub struct HydirPatchEndpoint;
 
-pub fn irene_service() -> IreneServer<IreneCompatibility> {
-    IreneServer::new(IreneCompatibility)
-        .max_decoding_message_size(UPSTREAM_CHUNK_BYTES + 1024)
+pub fn interchange_service() -> HydirInterchangeServer<HydirInterchangeEndpoint> {
+    HydirInterchangeServer::new(HydirInterchangeEndpoint)
+        .max_decoding_message_size(HYDIR_CHUNK_BYTES + 1024)
         .max_encoding_message_size(MAX_SPECIFICATION_BYTES + 1024)
 }
 
-pub fn patch_lang_service() -> PatchLangServerServer<PatchLangCompatibility> {
-    PatchLangServerServer::new(PatchLangCompatibility)
-        .max_decoding_message_size(UPSTREAM_CHUNK_BYTES + 1024)
+pub fn patch_service() -> HydirPatchServiceServer<HydirPatchEndpoint> {
+    HydirPatchServiceServer::new(HydirPatchEndpoint)
+        .max_decoding_message_size(HYDIR_CHUNK_BYTES + 1024)
         .max_encoding_message_size(MAX_SPECIFICATION_BYTES + 1024)
 }
 
@@ -51,25 +51,27 @@ fn compatibility_preflight(bytes: &[u8]) -> Result<SpecificationDocument, Status
 }
 
 fn append_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), Status> {
-    if chunk.len() > UPSTREAM_CHUNK_BYTES {
+    if chunk.len() > HYDIR_CHUNK_BYTES {
         return Err(Status::resource_exhausted(format!(
-            "Irene3 chunk exceeds the upstream {UPSTREAM_CHUNK_BYTES}-byte boundary"
+            "HydIR chunk exceeds the {HYDIR_CHUNK_BYTES}-byte boundary"
         )));
     }
     let new_length = bytes
         .len()
         .checked_add(chunk.len())
-        .ok_or_else(|| Status::resource_exhausted("Irene3 specification length overflows"))?;
+        .ok_or_else(|| Status::resource_exhausted("HydIR specification length overflows"))?;
     if new_length > MAX_SPECIFICATION_BYTES {
         return Err(Status::resource_exhausted(format!(
-            "Irene3 specification exceeds {MAX_SPECIFICATION_BYTES} bytes"
+            "HydIR specification exceeds {MAX_SPECIFICATION_BYTES} bytes"
         )));
     }
     bytes.extend_from_slice(chunk);
     Ok(())
 }
 
-async fn collect_irene(mut stream: Streaming<IreneSpecChunk>) -> Result<Vec<u8>, Status> {
+async fn collect_interchange(
+    mut stream: Streaming<InterchangeSpecChunk>,
+) -> Result<Vec<u8>, Status> {
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.message().await? {
         append_chunk(&mut bytes, &chunk.chunk)?;
@@ -86,16 +88,16 @@ async fn collect_patch(mut stream: Streaming<PatchSpecChunk>) -> Result<Vec<u8>,
 }
 
 #[tonic::async_trait]
-impl Irene for IreneCompatibility {
+impl HydirInterchange for HydirInterchangeEndpoint {
     async fn process_specification(
         &self,
-        request: Request<Streaming<IreneSpecChunk>>,
+        request: Request<Streaming<InterchangeSpecChunk>>,
     ) -> Result<Response<Codegen>, Status> {
-        let bytes = collect_irene(request.into_inner()).await?;
+        let bytes = collect_interchange(request.into_inner()).await?;
         let document = compatibility_preflight(&bytes)?;
         if document.inventory().blocks != 0 {
             return Err(Status::failed_precondition(
-                "Anvill wire import succeeded, but native Irene C emission is blocked until every region has proven physical live-state and stack adapters",
+                "HydIR interchange import succeeded, but native C emission is blocked until every region has proven physical live-state and stack adapters",
             ));
         }
         Ok(Response::new(Codegen {
@@ -105,7 +107,7 @@ impl Irene for IreneCompatibility {
 }
 
 #[tonic::async_trait]
-impl PatchLangServer for PatchLangCompatibility {
+impl HydirPatchService for HydirPatchEndpoint {
     async fn generate_patch_graph(
         &self,
         request: Request<Streaming<PatchSpecChunk>>,
@@ -114,7 +116,7 @@ impl PatchLangServer for PatchLangCompatibility {
         let document = compatibility_preflight(&bytes)?;
         if document.inventory().blocks != 0 {
             return Err(Status::failed_precondition(
-                "Anvill wire import succeeded, but PatchLang graph emission is blocked until typed PatchIR and physical region contracts are complete",
+                "HydIR interchange import succeeded, but patch graph emission is blocked until typed PatchIR and physical region contracts are complete",
             ));
         }
         Ok(Response::new(PatchGraph::default()))
@@ -125,7 +127,7 @@ impl PatchLangServer for PatchLangCompatibility {
         _request: Request<PatchRequest>,
     ) -> Result<Response<PatchResponse>, Status> {
         Err(Status::failed_precondition(
-            "no semantically complete PatchLang graph session is available",
+            "no semantically complete HydIR patch graph session is available",
         ))
     }
 }
@@ -133,10 +135,10 @@ impl PatchLangServer for PatchLangCompatibility {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hydir_api::specification::{Arch, Os, Specification};
+    use hydir_api::interchange::{Arch, Os, Specification};
     use hydir_api::{
-        irene::server::irene_client::IreneClient,
-        irene3::server::patch_lang_server_client::PatchLangServerClient,
+        interchange_service::server::hydir_interchange_client::HydirInterchangeClient,
+        patch::server::hydir_patch_service_client::HydirPatchServiceClient,
     };
     use prost::Message;
     use tokio::net::TcpListener;
@@ -156,7 +158,7 @@ mod tests {
 
         let mut collected = Vec::new();
         assert_eq!(
-            append_chunk(&mut collected, &vec![0; UPSTREAM_CHUNK_BYTES + 1])
+            append_chunk(&mut collected, &vec![0; HYDIR_CHUNK_BYTES + 1])
                 .unwrap_err()
                 .code(),
             tonic::Code::ResourceExhausted
@@ -178,14 +180,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_upstream_service_paths_stream_empty_specification() {
+    async fn exact_hydir_service_paths_stream_empty_specification() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             Server::builder()
-                .add_service(irene_service())
-                .add_service(patch_lang_service())
+                .add_service(interchange_service())
+                .add_service(patch_service())
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;
                 })
@@ -200,9 +202,11 @@ mod tests {
         }
         .encode_to_vec();
 
-        let mut irene = IreneClient::connect(endpoint.clone()).await.unwrap();
-        let codegen = irene
-            .process_specification(tokio_stream::iter([IreneSpecChunk {
+        let mut interchange = HydirInterchangeClient::connect(endpoint.clone())
+            .await
+            .unwrap();
+        let codegen = interchange
+            .process_specification(tokio_stream::iter([InterchangeSpecChunk {
                 chunk: bytes.clone(),
             }]))
             .await
@@ -210,7 +214,7 @@ mod tests {
             .into_inner();
         assert_eq!(codegen.json, "{\"patches\":[]}");
 
-        let mut patch = PatchLangServerClient::connect(endpoint).await.unwrap();
+        let mut patch = HydirPatchServiceClient::connect(endpoint).await.unwrap();
         let graph = patch
             .generate_patch_graph(tokio_stream::iter([PatchSpecChunk { chunk: bytes }]))
             .await

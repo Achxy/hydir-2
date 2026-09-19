@@ -1428,7 +1428,7 @@ mod tests {
             type_name: Some(format!("u{width_bits}")),
             provenance: FactProvenance {
                 source: FactSource::InterchangeImport,
-                scope: "test Anvill physical state".to_owned(),
+                scope: "test HydIR physical state".to_owned(),
             },
         }
     }
@@ -1468,7 +1468,7 @@ mod tests {
             replacement_ready: false,
             provenance: FactProvenance {
                 source: FactSource::InterchangeImport,
-                scope: "test Anvill region".to_owned(),
+                scope: "test HydIR region".to_owned(),
             },
         }
     }
@@ -1658,7 +1658,7 @@ mod tests {
 
     #[test]
     fn lifts_typed_32_bit_red_zone_fibonacci() {
-        // GCC's leaf fibIterative from the pinned Irene3 x86-64 fixture. It
+        // GCC's leaf fibIterative from the pinned HydIR x86-64 reference fixture. It
         // uses five disjoint dword locals in the SysV red zone.
         let code = [
             0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5, 0x89, 0x7d, 0xec, 0xc7, 0x45, 0xf0,

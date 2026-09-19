@@ -9,21 +9,21 @@ pub mod v2 {
     tonic::include_proto!("hydir.v2");
 }
 
-/// Exact Anvill protobuf schema pinned by the Irene3 compatibility baseline.
-pub mod specification {
-    tonic::include_proto!("specification");
+/// Canonical HydIR interchange specification.
+pub mod interchange {
+    tonic::include_proto!("hydir.interchange");
 }
 
-/// Exact `irene.server.Irene` compatibility service.
-pub mod irene {
+/// HydIR native interchange service.
+pub mod interchange_service {
     pub mod server {
-        tonic::include_proto!("irene.server");
+        tonic::include_proto!("hydir.interchange.server");
     }
 }
 
-/// Exact `irene3.server.PatchLangServer` compatibility service.
-pub mod irene3 {
+/// HydIR native patch service.
+pub mod patch {
     pub mod server {
-        tonic::include_proto!("irene3.server");
+        tonic::include_proto!("hydir.patch.server");
     }
 }

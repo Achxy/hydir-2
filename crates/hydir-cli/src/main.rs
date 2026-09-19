@@ -11,7 +11,7 @@ use hydir_c::{
 use hydir_core::{
     CallingConvention, ScalarType, annotation_address_in_spec, parse_program_spec_json,
 };
-use hydir_irene3::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
+use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 mod local;
 mod passes;
 mod patch;
@@ -40,10 +40,10 @@ Usage:
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl analyze-spec <linked-elf>
-  hydirctl irene3-inspect <anvill-spec.pb> [--canonical-output <canonical.pb>]
-  hydirctl irene3-region <anvill-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
-  hydirctl irene3-decompile-region <anvill-spec.pb> <linked-elf> <block-uid> [--output <unit.json>]
-  hydirctl irene3-compat-report <anvill-spec.pb> <linked-elf>
+  hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
+  hydirctl hydir-spec-region <hydir-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
+  hydirctl hydir-spec-decompile <hydir-spec.pb> <linked-elf> <block-uid> [--output <unit.json>]
+  hydirctl hydir-spec-report <hydir-spec.pb> <linked-elf>
   hydirctl cfg <elf> <function-symbol>
   hydirctl region <linked-elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
@@ -227,7 +227,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let spec = analyze_spec_elf(&bytes)?;
             println!("{}", serde_json::to_string_pretty(&spec)?);
         }
-        Some("irene3-inspect") if args.len() == 2 || args.len() == 4 => {
+        Some("hydir-spec-inspect") if args.len() == 2 || args.len() == 4 => {
             let output = if args.len() == 4 {
                 if args[2] != "--canonical-output" {
                     return Err(HELP.into());
@@ -239,7 +239,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let metadata = fs::metadata(&args[1])?;
             if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
                 return Err(format!(
-                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
                 )
                 .into());
             }
@@ -270,9 +270,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "schema": "Anvill Specification protobuf",
-                    "irene3_commit": hydir_irene3::IRENE3_COMMIT,
-                    "anvill_schema_commit": hydir_irene3::ANVILL_SCHEMA_COMMIT,
+                    "schema": "HydIR interchange specification protobuf",
+                    "reference_commit": hydir_interchange::EXTERNAL_REFERENCE_COMMIT,
+                    "interchange_schema_reference": hydir_interchange::INTERCHANGE_SCHEMA_REFERENCE,
                     "source_sha256": document.source_sha256(),
                     "source_bytes": document.original_bytes().len(),
                     "canonical_bytes": document.canonical_bytes().len(),
@@ -293,7 +293,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }))?
             );
         }
-        Some("irene3-region") if args.len() == 4 || args.len() == 6 => {
+        Some("hydir-spec-region") if args.len() == 4 || args.len() == 6 => {
             let output = if args.len() == 6 {
                 if args[4] != "--output" {
                     return Err(HELP.into());
@@ -305,7 +305,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let metadata = fs::metadata(&args[1])?;
             if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
                 return Err(format!(
-                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
                 )
                 .into());
             }
@@ -320,7 +320,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!();
             }
         }
-        Some("irene3-decompile-region") if args.len() == 4 || args.len() == 6 => {
+        Some("hydir-spec-decompile") if args.len() == 4 || args.len() == 6 => {
             let output = if args.len() == 6 {
                 if args[4] != "--output" {
                     return Err(HELP.into());
@@ -332,7 +332,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let metadata = fs::metadata(&args[1])?;
             if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
                 return Err(format!(
-                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
                 )
                 .into());
             }
@@ -354,11 +354,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!();
             }
         }
-        Some("irene3-compat-report") if args.len() == 3 => {
+        Some("hydir-spec-report") if args.len() == 3 => {
             let metadata = fs::metadata(&args[1])?;
             if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
                 return Err(format!(
-                    "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
                 )
                 .into());
             }

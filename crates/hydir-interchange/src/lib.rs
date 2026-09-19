@@ -1,10 +1,10 @@
-//! Lossless, bounded Irene3/Anvill interoperability boundary.
+//! Lossless, bounded HydIR specification interchange boundary.
 //!
 //! The original protobuf bytes remain authoritative so forwarding an artifact
 //! never discards unknown fields. The decoded pinned schema is a validated
 //! view used by native HydIR compatibility services.
 
-use hydir_api::specification::{
+use hydir_api::interchange::{
     Arch, BaseType, BlockContext, Callable, CodeBlock, FunctionLinkage, Os, Parameter,
     Specification, TypeSpec, Value, ValueMapping, Variable, program_address, type_spec, value,
     value_domain,
@@ -20,9 +20,9 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const IRENE3_COMMIT: &str = "d97aee937ebb6d1cb8a362748c56414404eb75ff";
-pub const ANVILL_SCHEMA_COMMIT: &str = "52f9638b023417c9bdbbb1791867cacc38c68888";
-pub const UPSTREAM_CHUNK_BYTES: usize = 2_000_000;
+pub const EXTERNAL_REFERENCE_COMMIT: &str = "d97aee937ebb6d1cb8a362748c56414404eb75ff";
+pub const INTERCHANGE_SCHEMA_REFERENCE: &str = "52f9638b023417c9bdbbb1791867cacc38c68888";
+pub const HYDIR_CHUNK_BYTES: usize = 2_000_000;
 pub const MAX_SPECIFICATION_BYTES: usize = 64 * 1024 * 1024;
 
 const MAX_FUNCTIONS: usize = 8_192;
@@ -60,11 +60,11 @@ impl SpecificationDocument {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.is_empty() || bytes.len() > MAX_SPECIFICATION_BYTES {
             return Err(format!(
-                "Anvill specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
             ));
         }
         let specification = Specification::decode(bytes)
-            .map_err(|error| format!("invalid Anvill specification protobuf: {error}"))?;
+            .map_err(|error| format!("invalid HydIR specification protobuf: {error}"))?;
         let inventory = validate_specification(&specification)?;
         Ok(Self {
             original: bytes.to_vec(),
@@ -98,10 +98,10 @@ impl SpecificationDocument {
 
     pub fn require_stable_target(&self) -> Result<(), String> {
         if self.specification.arch != Arch::Amd64 as i32 {
-            return Err("stable Irene3 compatibility requires ARCH_AMD64".to_owned());
+            return Err("stable HydIR interchange requires ARCH_AMD64".to_owned());
         }
         if self.specification.operating_system != Os::Linux as i32 {
-            return Err("stable Irene3 compatibility requires OS_LINUX".to_owned());
+            return Err("stable HydIR interchange requires OS_LINUX".to_owned());
         }
         Ok(())
     }
@@ -119,37 +119,37 @@ impl SpecificationDocument {
     pub fn block_bytes(&self, uid: u64) -> Result<&[u8], String> {
         let block = self
             .block(uid)
-            .ok_or_else(|| format!("Anvill block UID {uid} does not exist"))?;
+            .ok_or_else(|| format!("HydIR block UID {uid} does not exist"))?;
         let end = block
             .address
             .checked_add(u64::from(block.size))
-            .ok_or_else(|| format!("Anvill block UID {uid} address range overflows"))?;
+            .ok_or_else(|| format!("HydIR block UID {uid} address range overflows"))?;
         let mut result = None;
         for range in &self.specification.memory_ranges {
             let range_end = range
                 .address
                 .checked_add(range.values.len() as u64)
-                .ok_or_else(|| "Anvill memory range address overflows".to_owned())?;
+                .ok_or_else(|| "HydIR memory range address overflows".to_owned())?;
             if range.is_executable && range.address <= block.address && end <= range_end {
                 if result.is_some() {
                     return Err(format!(
-                        "Anvill block UID {uid} is covered by multiple executable memory ranges"
+                        "HydIR block UID {uid} is covered by multiple executable memory ranges"
                     ));
                 }
                 let start_offset = usize::try_from(block.address - range.address)
-                    .map_err(|_| "Anvill block offset does not fit usize".to_owned())?;
+                    .map_err(|_| "HydIR block offset does not fit usize".to_owned())?;
                 let end_offset = start_offset
                     .checked_add(block.size as usize)
-                    .ok_or_else(|| "Anvill block slice overflows".to_owned())?;
+                    .ok_or_else(|| "HydIR block slice overflows".to_owned())?;
                 result = Some(&range.values[start_offset..end_offset]);
             }
         }
         result.ok_or_else(|| {
-            format!("Anvill block UID {uid} lacks one exact executable memory mapping")
+            format!("HydIR block UID {uid} lacks one exact executable memory mapping")
         })
     }
 
-    /// Convert one Anvill basic block into a canonical RegionSpec after
+    /// Convert one HydIR interchange block into a canonical RegionSpec after
     /// proving its bytes against the supplied linked ELF. Imported liveness
     /// remains attributed to the interchange artifact and never becomes a
     /// native proof merely because the protobuf decoded successfully.
@@ -157,16 +157,16 @@ impl SpecificationDocument {
         self.require_stable_target()?;
         let program = import_elf(elf_bytes).map_err(|error| error.to_string())?;
         let file = object::File::parse(elf_bytes)
-            .map_err(|error| format!("ELF parse failed during Anvill binding: {error}"))?;
+            .map_err(|error| format!("ELF parse failed during HydIR binding: {error}"))?;
         if file.kind() == object::ObjectKind::Relocatable {
-            return Err("Anvill RegionSpec binding requires a linked ELF".to_owned());
+            return Err("HydIR RegionSpec binding requires a linked ELF".to_owned());
         }
         let (function, block) = self
             .specification
             .functions
             .iter()
             .find_map(|function| function.blocks.get(&uid).map(|block| (function, block)))
-            .ok_or_else(|| format!("Anvill block UID {uid} does not exist"))?;
+            .ok_or_else(|| format!("HydIR block UID {uid} does not exist"))?;
         let spec_bytes = self.block_bytes(uid)?;
         let (binary_address, elf_region) = bind_elf_block(
             &file,
@@ -177,11 +177,11 @@ impl SpecificationDocument {
         )?;
         debug_assert_eq!(spec_bytes, elf_region);
         let address_bias = block.address.checked_sub(binary_address).ok_or_else(|| {
-            "Anvill-to-ELF address translation uses an unsupported negative bias".to_owned()
+            "HydIR-to-ELF address translation uses an unsupported negative bias".to_owned()
         })?;
         let end = binary_address
             .checked_add(u64::from(block.size))
-            .ok_or_else(|| format!("Anvill block UID {uid} address range overflows"))?;
+            .ok_or_else(|| format!("HydIR block UID {uid} address range overflows"))?;
         let provenance = interchange_provenance(self.source_sha256());
         let context = function.block_context.get(&uid);
         let (physical_live_in, entry_variables) = context.map_or_else(
@@ -214,7 +214,7 @@ impl SpecificationDocument {
                     (Some(entry), Some(exit)) => exit
                         .checked_sub(entry)
                         .map(Some)
-                        .ok_or_else(|| "Anvill region stack delta overflows".to_owned()),
+                        .ok_or_else(|| "HydIR region stack delta overflows".to_owned()),
                     _ => Ok(None),
                 }
             })
@@ -230,7 +230,7 @@ impl SpecificationDocument {
                     .map(|successor| {
                         normalize_address(successor.address, address_bias).map(Address)
                     })
-                    .ok_or_else(|| format!("Anvill block UID {uid} has missing successor {target}"))
+                    .ok_or_else(|| format!("HydIR block UID {uid} has missing successor {target}"))
                     .and_then(|address| address)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -256,7 +256,7 @@ impl SpecificationDocument {
                         entry: Address(other_address),
                         source: None,
                         reason: format!(
-                            "Anvill block UID {} begins inside selected block UID {uid}",
+                            "HydIR block UID {} begins inside selected block UID {uid}",
                             other.uid
                         ),
                         provenance: provenance.clone(),
@@ -298,7 +298,7 @@ impl SpecificationDocument {
                 };
                 if calls.insert(source, contract).is_some() {
                     return Err(format!(
-                        "Anvill region block UID {uid} has duplicate call overrides at 0x{source:x}"
+                        "HydIR region block UID {uid} has duplicate call overrides at 0x{source:x}"
                     ));
                 }
             }
@@ -311,7 +311,7 @@ impl SpecificationDocument {
             };
             let source = callsite.call_address - call_bias;
             let callable = callsite.callable.as_ref().ok_or_else(|| {
-                format!("Anvill callsite at 0x{source:x} lacks a callable contract")
+                format!("HydIR callsite at 0x{source:x} lacks a callable contract")
             })?;
             calls
                 .entry(source)
@@ -334,16 +334,16 @@ impl SpecificationDocument {
         ];
         if context.is_none() {
             unresolved_facts
-                .push("Anvill block context and physical live state are absent".to_owned());
+                .push("HydIR block context and physical live state are absent".to_owned());
         }
         if stack_delta.is_none() {
-            unresolved_facts.push("Anvill block stack relation is unresolved".to_owned());
+            unresolved_facts.push("HydIR block stack relation is unresolved".to_owned());
         }
         if !observed_interior_entries.is_empty() {
-            unresolved_facts.push("another Anvill block starts inside this region".to_owned());
+            unresolved_facts.push("another HydIR block starts inside this region".to_owned());
         }
         let symbol_name = if block.name.is_empty() {
-            format!("irene3_uid_{uid}")
+            format!("hydir_uid_{uid}")
         } else {
             block.name.clone()
         };
@@ -402,7 +402,7 @@ impl SpecificationDocument {
     }
 }
 
-// Pinned Anvill block addresses are image-relative in this artifact, while
+// Pinned interchange block addresses are image-relative in this artifact, while
 // control-flow overrides use ELF virtual addresses. Other producers may use
 // the block convention for both. Select the convention from the call site's
 // exact region containment and then apply it consistently to that contract.
@@ -422,7 +422,7 @@ fn override_address_bias(
 
 fn bind_elf_block<'a>(
     file: &'a object::File<'a>,
-    function: &hydir_api::specification::Function,
+    function: &hydir_api::interchange::Function,
     block: &CodeBlock,
     image_base: u64,
     expected: &[u8],
@@ -447,11 +447,11 @@ fn bind_elf_block<'a>(
     match matches.as_slice() {
         [(address, bytes)] => Ok((*address, *bytes)),
         [] => Err(format!(
-            "Anvill block UID {} has no byte-identical mapping in the supplied ELF",
+            "HydIR block UID {} has no byte-identical mapping in the supplied ELF",
             block.uid
         )),
         _ => Err(format!(
-            "Anvill block UID {} matches multiple ELF address interpretations",
+            "HydIR block UID {} matches multiple ELF address interpretations",
             block.uid
         )),
     }
@@ -460,11 +460,11 @@ fn bind_elf_block<'a>(
 fn normalize_address(specification_address: u64, bias: u64) -> Result<u64, String> {
     specification_address
         .checked_sub(bias)
-        .ok_or_else(|| "Anvill-to-ELF address translation underflows".to_owned())
+        .ok_or_else(|| "HydIR-to-ELF address translation underflows".to_owned())
 }
 
 fn binary_block_address(
-    function: &hydir_api::specification::Function,
+    function: &hydir_api::interchange::Function,
     block: &CodeBlock,
     image_base: u64,
 ) -> Result<u64, String> {
@@ -480,13 +480,13 @@ fn binary_block_address(
                     .checked_sub(function.entry_address)
                     .ok_or_else(|| {
                         format!(
-                            "Anvill block UID {} precedes its function entry address",
+                            "HydIR block UID {} precedes its function entry address",
                             block.uid
                         )
                     })?;
                 return function_address
                     .checked_add(displacement)
-                    .ok_or_else(|| "normalized Anvill block address overflows".to_owned());
+                    .ok_or_else(|| "normalized HydIR block address overflows".to_owned());
             }
             program_address::Inner::ExtAddress(relative) => {
                 let function_address = if relative.displacement >= 0 {
@@ -498,19 +498,19 @@ fn binary_block_address(
                         .entry_vaddr
                         .checked_sub(relative.displacement.unsigned_abs())
                 }
-                .ok_or_else(|| "relative Anvill function address overflows".to_owned())?;
+                .ok_or_else(|| "relative HydIR function address overflows".to_owned())?;
                 let displacement = block
                     .address
                     .checked_sub(function.entry_address)
                     .ok_or_else(|| {
                         format!(
-                            "Anvill block UID {} precedes its function entry address",
+                            "HydIR block UID {} precedes its function entry address",
                             block.uid
                         )
                     })?;
                 return function_address
                     .checked_add(displacement)
-                    .ok_or_else(|| "normalized Anvill block address overflows".to_owned());
+                    .ok_or_else(|| "normalized HydIR block address overflows".to_owned());
             }
         }
     }
@@ -569,7 +569,7 @@ fn locations(
             .unwrap_or_else(|| format!("live_{index}"));
         let Some(variable) = &parameter.repr_var else {
             return Err(format!(
-                "Anvill live variable {variable_name} lacks a representation"
+                "HydIR live variable {variable_name} lacks a representation"
             ));
         };
         let type_name = variable.r#type.as_ref().map(type_name);
@@ -609,19 +609,19 @@ fn locations(
                 }
                 None => {
                     return Err(format!(
-                        "Anvill live variable {variable_name} has an empty physical location"
+                        "HydIR live variable {variable_name} has an empty physical location"
                     ));
                 }
             };
             let width_bits = width_bits.ok_or_else(|| {
-                format!("Anvill live variable {variable_name} has no bounded physical width")
+                format!("HydIR live variable {variable_name} has no bounded physical width")
             })?;
             if !matches!(
                 width_bits,
                 1 | 8 | 16 | 24 | 32 | 64 | 80 | 96 | 128 | 256 | 512
             ) {
                 return Err(format!(
-                    "Anvill live variable {variable_name} uses unsupported width {width_bits}"
+                    "HydIR live variable {variable_name} uses unsupported width {width_bits}"
                 ));
             }
             let kind_name = match kind {
@@ -676,7 +676,7 @@ fn stack_displacement(mappings: &[ValueMapping]) -> Result<Option<i64>, String> 
             });
         if let Some(displacement) = displacement {
             if result.is_some_and(|previous| previous != displacement) {
-                return Err("Anvill block has conflicting RSP affine equalities".to_owned());
+                return Err("HydIR block has conflicting RSP affine equalities".to_owned());
             }
             result = Some(displacement);
         }
@@ -741,7 +741,7 @@ fn interchange_provenance(source_sha256: &str) -> FactProvenance {
     FactProvenance {
         source: FactSource::InterchangeImport,
         scope: format!(
-            "Anvill protobuf from Irene3 {IRENE3_COMMIT}; source sha256:{source_sha256}"
+            "HydIR interchange protobuf; external reference {EXTERNAL_REFERENCE_COMMIT}; schema reference {INTERCHANGE_SCHEMA_REFERENCE}; source sha256:{source_sha256}"
         ),
     }
 }
@@ -778,12 +778,12 @@ fn validate_specification(specification: &Specification) -> Result<Inventory, St
         range
             .address
             .checked_add(range.values.len() as u64)
-            .ok_or_else(|| "Anvill memory range address overflows".to_owned())?;
+            .ok_or_else(|| "HydIR memory range address overflows".to_owned())?;
         total_memory = total_memory
             .checked_add(range.values.len())
-            .ok_or_else(|| "Anvill memory byte count overflows".to_owned())?;
+            .ok_or_else(|| "HydIR memory byte count overflows".to_owned())?;
         if total_memory > MAX_SPECIFICATION_BYTES {
-            return Err("Anvill memory ranges exceed the 64 MiB byte limit".to_owned());
+            return Err("HydIR memory ranges exceed the 64 MiB byte limit".to_owned());
         }
     }
 
@@ -794,36 +794,36 @@ fn validate_specification(specification: &Specification) -> Result<Inventory, St
     for function in &specification.functions {
         block_count = block_count
             .checked_add(function.blocks.len())
-            .ok_or_else(|| "Anvill block count overflows".to_owned())?;
+            .ok_or_else(|| "HydIR block count overflows".to_owned())?;
         bounded("blocks", block_count, MAX_BLOCKS)?;
         if function.blocks.is_empty()
             && function.func_linkage == FunctionLinkage::NormalUnspecified as i32
         {
             return Err(format!(
-                "Anvill function at 0x{:x} has no code blocks",
+                "HydIR function at 0x{:x} has no code blocks",
                 function.entry_address
             ));
         }
         if !function.blocks.is_empty() && !function.blocks.contains_key(&function.entry_uid) {
             return Err(format!(
-                "Anvill function at 0x{:x} has a missing entry UID {}",
+                "HydIR function at 0x{:x} has a missing entry UID {}",
                 function.entry_address, function.entry_uid
             ));
         }
         for (key, block) in &function.blocks {
             if *key != block.uid {
                 return Err(format!(
-                    "Anvill block map key {key} does not match embedded UID {}",
+                    "HydIR block map key {key} does not match embedded UID {}",
                     block.uid
                 ));
             }
             if block.size == 0 {
-                return Err(format!("Anvill block UID {key} has zero size"));
+                return Err(format!("HydIR block UID {key} has zero size"));
             }
             block
                 .address
                 .checked_add(u64::from(block.size))
-                .ok_or_else(|| format!("Anvill block UID {key} address range overflows"))?;
+                .ok_or_else(|| format!("HydIR block UID {key} address range overflows"))?;
             bounded_name("block name", &block.name)?;
             bounded(
                 "block incoming edges",
@@ -844,14 +844,14 @@ fn validate_specification(specification: &Specification) -> Result<Inventory, St
                 bounded_name("context assignment name", assignment)?;
             }
             if !block_uids.insert(*key) {
-                return Err(format!("duplicate Anvill block UID {key}"));
+                return Err(format!("duplicate HydIR block UID {key}"));
             }
         }
         for (key, block) in &function.blocks {
             for edge in block.incoming_blocks.iter().chain(&block.outgoing_blocks) {
                 if !function.blocks.contains_key(edge) {
                     return Err(format!(
-                        "Anvill block UID {key} references missing same-function edge UID {edge}"
+                        "HydIR block UID {key} references missing same-function edge UID {edge}"
                     ));
                 }
             }
@@ -859,7 +859,7 @@ fn validate_specification(specification: &Specification) -> Result<Inventory, St
         for context_uid in function.block_context.keys() {
             if !function.blocks.contains_key(context_uid) {
                 return Err(format!(
-                    "Anvill block context references missing UID {context_uid}"
+                    "HydIR block context references missing UID {context_uid}"
                 ));
             }
         }
@@ -986,7 +986,7 @@ fn validate_block_context(
             validate_variable(variable, type_nodes, value_nodes)?;
         }
         if let Some(domain) = &mapping.curr_val
-            && let Some(hydir_api::specification::value_domain::Inner::Symb(symbol)) = &domain.inner
+            && let Some(hydir_api::interchange::value_domain::Inner::Symb(symbol)) = &domain.inner
         {
             bounded_name("high-symbol name", &symbol.name)?;
         }
@@ -1073,9 +1073,9 @@ fn validate_variable(
 fn validate_value(location: &Value, value_nodes: &mut usize) -> Result<(), String> {
     *value_nodes = value_nodes
         .checked_add(1)
-        .ok_or_else(|| "Anvill value node count overflows".to_owned())?;
+        .ok_or_else(|| "HydIR value node count overflows".to_owned())?;
     if *value_nodes > MAX_VALUE_NODES {
-        return Err("Anvill value graph exceeds one million nodes".to_owned());
+        return Err("HydIR value graph exceeds one million nodes".to_owned());
     }
     match &location.inner_value {
         Some(value::InnerValue::Reg(register)) => {
@@ -1093,13 +1093,13 @@ fn validate_value(location: &Value, value_nodes: &mut usize) -> Result<(), Strin
 
 fn validate_type(r#type: &TypeSpec, depth: usize, nodes: &mut usize) -> Result<(), String> {
     if depth > MAX_TYPE_DEPTH {
-        return Err("Anvill type nesting exceeds 64 levels".to_owned());
+        return Err("HydIR type nesting exceeds 64 levels".to_owned());
     }
     *nodes = nodes
         .checked_add(1)
-        .ok_or_else(|| "Anvill type node count overflows".to_owned())?;
+        .ok_or_else(|| "HydIR type node count overflows".to_owned())?;
     if *nodes > MAX_TYPE_NODES {
-        return Err("Anvill type graph exceeds one million nodes".to_owned());
+        return Err("HydIR type graph exceeds one million nodes".to_owned());
     }
     match r#type.r#type.as_ref() {
         Some(type_spec::Type::Pointer(pointer)) => {
@@ -1109,7 +1109,7 @@ fn validate_type(r#type: &TypeSpec, depth: usize, nodes: &mut usize) -> Result<(
         }
         Some(type_spec::Type::Vector(vector)) => {
             if vector.size == 0 {
-                return Err("Anvill vector type has zero elements".to_owned());
+                return Err("HydIR vector type has zero elements".to_owned());
             }
             if let Some(base) = vector.base.as_deref() {
                 validate_type(base, depth + 1, nodes)?;
@@ -1143,7 +1143,7 @@ fn validate_type(r#type: &TypeSpec, depth: usize, nodes: &mut usize) -> Result<(
 
 fn bounded(label: &str, actual: usize, maximum: usize) -> Result<(), String> {
     if actual > maximum {
-        Err(format!("Anvill {label} exceed the limit of {maximum}"))
+        Err(format!("HydIR {label} exceed the limit of {maximum}"))
     } else {
         Ok(())
     }
@@ -1152,7 +1152,7 @@ fn bounded(label: &str, actual: usize, maximum: usize) -> Result<(), String> {
 fn bounded_name(label: &str, value: &str) -> Result<(), String> {
     if value.len() > MAX_NAME_BYTES || value.contains('\0') {
         Err(format!(
-            "Anvill {label} must be at most {MAX_NAME_BYTES} bytes and contain no NUL"
+            "HydIR {label} must be at most {MAX_NAME_BYTES} bytes and contain no NUL"
         ))
     } else {
         Ok(())
@@ -1162,7 +1162,7 @@ fn bounded_name(label: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hydir_api::specification::{
+    use hydir_api::interchange::{
         BlockContext, Call, ControlFlowOverrides, Function, MemoryRange, Register, ValueDomain,
         ValueMapping,
     };
@@ -1221,7 +1221,7 @@ mod tests {
         assert!(
             SpecificationDocument::decode(&spec.encode_to_vec())
                 .unwrap_err()
-                .contains("duplicate Anvill block UID")
+                .contains("duplicate HydIR block UID")
         );
 
         let mut spec = minimal();
@@ -1250,7 +1250,7 @@ mod tests {
         let document = SpecificationDocument::decode(&spec.encode_to_vec()).unwrap();
         assert_eq!(
             document.require_stable_target().unwrap_err(),
-            "stable Irene3 compatibility requires ARCH_AMD64"
+            "stable HydIR interchange requires ARCH_AMD64"
         );
     }
 

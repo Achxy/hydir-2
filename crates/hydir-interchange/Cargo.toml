@@ -1,5 +1,5 @@
 [package]
-name = "hydir-irene3"
+name = "hydir-interchange"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

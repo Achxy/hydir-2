@@ -622,7 +622,7 @@ pub struct RegionContract {
     pub provenance: FactProvenance,
 }
 
-/// Canonical name for the Irene3-compatible region artifact. The historical
+/// Canonical name for the HydIR region artifact. The historical
 /// `RegionContract` name remains a source-compatible alias for existing users.
 pub type RegionSpec = RegionContract;
 

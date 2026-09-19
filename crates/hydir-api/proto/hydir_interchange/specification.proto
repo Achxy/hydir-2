@@ -1,9 +1,8 @@
-// Vendored interoperability schema from Anvill commit
-// 52f9638b023417c9bdbbb1791867cacc38c68888 (AGPL-3.0-only).
-// Source: https://github.com/lifting-bits/anvill/blob/52f9638b023417c9bdbbb1791867cacc38c68888/data_specifications/specification.proto
+// HydIR interchange schema. Field numbers retain compatibility with the
+// pinned external AGPL-3.0-only reference recorded in proto/NOTICE.md.
 syntax = "proto3";
 
-package specification;
+package hydir.interchange;
 
 enum Arch {
   ARCH_UNSPECIFIED = 0;
