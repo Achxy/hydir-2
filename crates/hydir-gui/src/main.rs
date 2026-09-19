@@ -22,8 +22,8 @@ use hydir_core::{
     FunctionSpec, ProgramSpec, overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_patch::{
-    PatchBundle, PatchDocument, PlacementStrategy, parse_patch_bundle_json, parse_patch_json,
-    patch_binary,
+    PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
+    parse_patch_document,
 };
 use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings};
 use hydir_recompile::rebuild_bytes;
@@ -1081,7 +1081,7 @@ fn patch_document(binary_sha256: &str, symbol: &str, replacement: &str) -> Resul
     };
     let bytes = serde_json::to_vec(&document)
         .map_err(|error| format!("Could not encode scalar patch: {error}"))?;
-    parse_patch_json(&bytes)?;
+    parse_patch_document(&bytes)?;
     Ok(bytes)
 }
 
@@ -1115,8 +1115,8 @@ fn patch_local(
 ) -> Result<(Vec<u8>, ProgramSpec, String), String> {
     let digest = format!("{:x}", Sha256::digest(binary));
     let document = patch_document(&digest, symbol, replacement)?;
-    let validated = parse_patch_json(&document)?;
-    let patched = patch_binary(binary, &validated)?;
+    let (document, _) = parse_patch_document(&document)?;
+    let patched = compile_patch_binary(binary, &document)?;
     let spec = import_elf(&patched.content)
         .map_err(|error| format!("Patched ELF failed import: {error}"))?;
     if spec.binary_sha256 != patched.patched_sha256 {
@@ -1133,8 +1133,8 @@ fn preview_patch_local(
 ) -> Result<(PatchBundle, String), String> {
     let digest = format!("{:x}", Sha256::digest(binary));
     let document = patch_document(&digest, symbol, replacement)?;
-    let validated = parse_patch_json(&document)?;
-    let result = patch_binary(binary, &validated)?;
+    let (document, _) = parse_patch_document(&document)?;
+    let result = compile_patch_binary(binary, &document)?;
     Ok((
         result.bundle,
         "Structural verification passed locally. Behavior execution was not run.".to_owned(),
@@ -5417,14 +5417,18 @@ mod tests {
     #[test]
     fn local_patch_preview_exposes_verified_trampoline_plan_without_writing() {
         let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
-        let (bundle, report) =
-            preview_patch_local(binary, "hydir_nop_identity", "return 0x0123456789abcdef;")
-                .unwrap();
+        let (bundle, report) = preview_patch_local(
+            binary,
+            "hydir_nop_identity",
+            "u64 sum = arg0 + arg1;\nsum = sum - arg1;\nreturn sum;",
+        )
+        .unwrap();
         assert_eq!(
             bundle.placement_plan.strategy,
             hydir_patch::PlacementStrategy::EntryTrampoline
         );
         assert!(bundle.placement_plan.executable_segment.is_some());
+        assert!(bundle.typed_patch_ir.resolved_return.is_some());
         assert!(report.contains("Structural verification passed"));
     }
 
