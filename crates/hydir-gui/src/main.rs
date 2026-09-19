@@ -2166,6 +2166,7 @@ struct AnalystApp {
     triton_console_commands: Vec<String>,
     triton_console_input: String,
     console_mode: ConsoleMode,
+    console_visible: bool,
     console_detached: bool,
     console_height: f32,
     console_json: bool,
@@ -2265,6 +2266,7 @@ impl AnalystApp {
             triton_console_commands: Vec::new(),
             triton_console_input: String::new(),
             console_mode: ConsoleMode::Triton,
+            console_visible: false,
             console_detached: false,
             console_height: 220.0,
             console_json: false,
@@ -2563,6 +2565,7 @@ impl AnalystApp {
                             self.history.push(self.status.clone());
                             self.triton_result = Some(result);
                             self.console_mode = ConsoleMode::Activity;
+                            self.console_visible = true;
                             self.console_json = true;
                             self.failure = None;
                         }
@@ -2578,12 +2581,14 @@ impl AnalystApp {
                         self.triton_console_commands = commands;
                         self.triton_console_result = Some(result);
                         self.console_mode = ConsoleMode::Triton;
+                        self.console_visible = true;
                         self.status = "Triton console command completed".to_owned();
                         self.failure = None;
                     }
                     Err(error) => {
                         self.triton_console_input = commands.last().cloned().unwrap_or_default();
                         self.console_mode = ConsoleMode::Triton;
+                        self.console_visible = true;
                         self.status = "Triton console command failed".to_owned();
                         self.failure = Some(error.clone());
                         self.history.push(error);
@@ -3048,6 +3053,19 @@ impl AnalystApp {
                                 GOOD
                             }),
                         );
+                        if ui
+                            .add(egui::Button::selectable(
+                                self.console_visible,
+                                if self.console_visible {
+                                    "Hide console"
+                                } else {
+                                    "Open console"
+                                },
+                            ))
+                            .clicked()
+                        {
+                            self.console_visible = !self.console_visible;
+                        }
                         if let Some(spec) = &self.spec {
                             ui.label(
                                 RichText::new(format!("SHA-256 {}…", &spec.binary_sha256[..12]))
@@ -4678,20 +4696,30 @@ impl AnalystApp {
             {
                 self.console_mode = ConsoleMode::Triton;
             }
-            if ui
-                .button(if self.console_detached {
-                    "Dock"
-                } else {
-                    "Detach"
-                })
-                .clicked()
-            {
+            let dock = ui.button(if self.console_detached {
+                "Dock to bottom"
+            } else {
+                "Float console"
+            });
+            if dock.clicked() {
                 self.console_detached = !self.console_detached;
             }
+            dock.on_hover_text(if self.console_detached {
+                "Return the console to the resizable bottom panel."
+            } else {
+                "Turn the console into a draggable floating window."
+            });
+            if ui.button("Hide").clicked() {
+                self.console_visible = false;
+            }
             ui.label(
-                RichText::new("LOCAL ANALYSIS OUTPUT · no shell execution")
-                    .size(10.0)
-                    .color(MUTED),
+                RichText::new(if self.console_detached {
+                    "FLOATING · drag the title bar to move"
+                } else {
+                    "DOCKED BOTTOM · drag the top border to resize"
+                })
+                .size(10.0)
+                .color(MUTED),
             );
             if self.console_mode == ConsoleMode::Activity
                 && (self.disassembly_report.is_some() || self.triton_result.is_some())
@@ -5666,7 +5694,7 @@ impl eframe::App for AnalystApp {
                     });
             });
         self.workbench.inspector_width = inspector.response.rect.width().clamp(220.0, 800.0);
-        if !self.console_detached {
+        if self.console_visible && !self.console_detached {
             let console = egui::Panel::bottom("console")
                 .resizable(true)
                 .default_size(self.console_height)
@@ -5679,7 +5707,7 @@ impl eframe::App for AnalystApp {
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| self.main_view(ui));
         });
-        if self.console_detached {
+        if self.console_visible && self.console_detached {
             egui::Window::new("HydIR Console")
                 .id(egui::Id::new("detached_console"))
                 .resizable(true)
@@ -6390,6 +6418,22 @@ mod tests {
         assert!(decompilation.c_source.contains("uint64_t hydir_lifted("));
         let app = AnalystApp::new(&eframe::egui::Context::default());
         assert!(matches!(app.tab, Tab::RegionStudio));
+        assert!(!app.console_visible);
+    }
+
+    #[test]
+    fn triton_activity_opens_the_explicitly_hideable_console() {
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.events = receiver;
+        sender
+            .send(Event::TritonConsole {
+                commands: vec!["1 + 1".to_owned()],
+                result: Ok(serde_json::json!({"entries": []})),
+            })
+            .unwrap();
+        app.poll();
+        assert!(app.console_visible);
     }
 
     #[test]
