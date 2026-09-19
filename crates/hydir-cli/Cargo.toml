@@ -18,6 +18,7 @@ hydir-recompile = { path = "../hydir-recompile" }
 hydir-analysis = { path = "../hydir-analysis" }
 hydir-api = { path = "../hydir-api" }
 hydir-core = { path = "../hydir-core" }
+hydir-interchange = { path = "../hydir-interchange" }
 hydir-project = { path = "../hydir-project" }
 object.workspace = true
 iced-x86.workspace = true

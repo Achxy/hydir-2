@@ -1,0 +1,14 @@
+def ghidraInstallDir = System.getenv("GHIDRA_INSTALL_DIR")
+if (ghidraInstallDir == null) {
+    throw new GradleException("GHIDRA_INSTALL_DIR must point to Ghidra 12.1.3")
+}
+
+apply from: new File(ghidraInstallDir, "support/buildExtension.gradle").absolutePath
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation "junit:junit:4.13.2"
+}

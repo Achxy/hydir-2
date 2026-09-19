@@ -1,5 +1,8 @@
-//! Local-only, authenticated HydIR RPC slice. No sample execution endpoint.
+//! Authenticated local-or-TLS HydIR RPC slice. No sample execution endpoint.
 
+mod interchange;
+
+use aws_sdk_s3::primitives::ByteStream;
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_api::v1::{
     AnnotationRequest, ArtifactReply, ArtifactRequest, CreateProjectRequest, DiscoverReply,
@@ -9,28 +12,43 @@ use hydir_api::v1::{
     UploadBinaryRequest,
     hydir_server::{Hydir, HydirServer},
 };
-use hydir_backend::{MAX_BINARY_BYTES, import_elf, lift_symbol, recover_symbol_cfg};
-use hydir_c::emit_structured_c;
-use hydir_core::{
-    Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
-    annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
-    validate_analyst_annotation,
+use hydir_api::v2 as api_v2;
+use hydir_api::v2::hydir_v2_server::HydirV2Server;
+use hydir_backend::{
+    MAX_BINARY_BYTES, import_elf, lift_physical_region, lift_symbol, recover_symbol_cfg,
+    region_contract,
 };
-use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
+use hydir_c::{build_decompilation_unit, emit_structured_c};
+use hydir_core::{
+    Address, AnalystAnnotation, AnnotationKind, DECOMPILATION_UNIT_VERSION, FactProvenance,
+    FactSource, PATCH_BUNDLE_VERSION, PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION,
+    annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
+    parse_program_spec_json, validate_analyst_annotation,
+};
+use hydir_patch::{
+    MAX_PATCH_BYTES, compile_patch_binary, parse_patch_bundle_json, parse_patch_document,
+    parse_patch_json, patch_binary,
+};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
+};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 #[cfg(not(test))]
 use std::process::Stdio;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     error::Error,
+    ffi::OsString,
     io::{Read, Write},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -42,15 +60,100 @@ use tokio::{
     process::Command,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Identity, Server, ServerTlsConfig},
+};
+use tonic_health::ServingStatus;
 use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
 
 const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
+const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
+const MAX_STORED_OBJECT_BYTES: usize = MAX_BINARY_BYTES;
 #[cfg(not(test))]
 const WORKER_DEADLINE: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct WorkerLaunchSpec {
+    program: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+fn worker_launch_spec(
+    executable: &Path,
+    action: &str,
+    symbol: Option<&str>,
+    isolation: &str,
+    bubblewrap: Option<&Path>,
+) -> Result<WorkerLaunchSpec, String> {
+    let mut worker_arguments = vec![OsString::from("worker"), OsString::from(action)];
+    if let Some(symbol) = symbol {
+        worker_arguments.push(OsString::from(symbol));
+    }
+    match isolation {
+        "process" => Ok(WorkerLaunchSpec {
+            program: executable.to_owned(),
+            arguments: worker_arguments,
+        }),
+        "bubblewrap" => {
+            if !cfg!(target_os = "linux") {
+                return Err("bubblewrap worker isolation requires Linux".to_owned());
+            }
+            let bubblewrap = bubblewrap
+                .ok_or("HYDIR_BWRAP_PATH must be an absolute path in bubblewrap isolation mode")?;
+            if !bubblewrap.is_absolute() || !executable.is_absolute() {
+                return Err("worker and bubblewrap executable paths must be absolute".to_owned());
+            }
+            let mut arguments = [
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-all",
+                "--cap-drop",
+                "ALL",
+                "--clearenv",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--dir",
+                "/work",
+                "--chdir",
+                "/work",
+                "--setenv",
+                "PATH",
+                "/usr/bin",
+                "--ro-bind",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+            arguments.push(executable.as_os_str().to_owned());
+            arguments.push(OsString::from("/hydird"));
+            arguments.push(OsString::from("--"));
+            arguments.push(OsString::from("/hydird"));
+            arguments.extend(worker_arguments);
+            Ok(WorkerLaunchSpec {
+                program: bubblewrap.to_owned(),
+                arguments,
+            })
+        }
+        _ => Err("HYDIR_WORKER_ISOLATION must be `process` or `bubblewrap`".to_owned()),
+    }
+}
 
 #[cfg(all(not(test), target_os = "linux"))]
 struct WorkerProcessGroup {
@@ -219,14 +322,601 @@ PRAGMA user_version=6;
 COMMIT;
 ";
 
+const PROJECT_ACCESS_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE project_acls (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    principal TEXT NOT NULL REFERENCES identities(principal),
+    role TEXT NOT NULL CHECK(role IN ('viewer','analyst','operator','admin')),
+    granted_by TEXT NOT NULL REFERENCES identities(principal),
+    created_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+    PRIMARY KEY(project_id, principal)
+);
+CREATE INDEX project_acls_principal ON project_acls(principal, project_id);
+INSERT INTO project_acls(project_id,principal,role,granted_by)
+    SELECT id,owner,'admin',owner FROM projects;
+ALTER TABLE jobs ADD COLUMN requested_by TEXT REFERENCES identities(principal);
+UPDATE jobs SET requested_by=(SELECT owner FROM projects WHERE projects.id=jobs.project_id)
+    WHERE requested_by IS NULL;
+CREATE TABLE audit_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+    principal TEXT NOT NULL,
+    action TEXT NOT NULL,
+    project_id TEXT,
+    details_json TEXT NOT NULL
+);
+PRAGMA user_version=7;
+COMMIT;
+";
+
+const OIDC_IDENTITY_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE oidc_identities (
+    principal TEXT PRIMARY KEY REFERENCES identities(principal),
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    UNIQUE(issuer, subject)
+);
+PRAGMA user_version=8;
+COMMIT;
+";
+
+const CONTENT_STORAGE_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+ALTER TABLE binaries ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'inline'
+    CHECK(storage_kind IN ('inline','filesystem-cas'));
+ALTER TABLE binaries ADD COLUMN storage_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE binaries ADD COLUMN content_size INTEGER NOT NULL DEFAULT 0;
+UPDATE binaries SET content_size=length(content);
+ALTER TABLE artifacts ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'inline'
+    CHECK(storage_kind IN ('inline','filesystem-cas'));
+ALTER TABLE artifacts ADD COLUMN storage_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE artifacts ADD COLUMN content_size INTEGER NOT NULL DEFAULT 0;
+UPDATE artifacts SET content_size=length(content);
+PRAGMA user_version=9;
+COMMIT;
+";
+
+const S3_STORAGE_MIGRATION: &str = "
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TABLE binaries_v10 (
+    sha256 TEXT PRIMARY KEY,
+    content BLOB NOT NULL,
+    storage_kind TEXT NOT NULL DEFAULT 'inline' CHECK(storage_kind IN ('inline','filesystem-cas','s3')),
+    storage_key TEXT NOT NULL DEFAULT '',
+    content_size INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO binaries_v10 SELECT sha256,content,storage_kind,storage_key,content_size FROM binaries;
+DROP TABLE binaries;
+ALTER TABLE binaries_v10 RENAME TO binaries;
+CREATE TABLE artifacts_v10 (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    revision INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    content BLOB NOT NULL,
+    storage_kind TEXT NOT NULL DEFAULT 'inline' CHECK(storage_kind IN ('inline','filesystem-cas','s3')),
+    storage_key TEXT NOT NULL DEFAULT '',
+    content_size INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(project_id, revision, sha256)
+);
+INSERT INTO artifacts_v10 SELECT project_id,revision,sha256,media_type,content,storage_kind,storage_key,content_size FROM artifacts;
+DROP TABLE artifacts;
+ALTER TABLE artifacts_v10 RENAME TO artifacts;
+PRAGMA user_version=10;
+COMMIT;
+PRAGMA foreign_keys=ON;
+";
+
+#[derive(Clone)]
+enum ContentStorage {
+    Inline,
+    FilesystemCas(Arc<FilesystemCas>),
+    S3(Arc<S3ContentStore>),
+}
+
+#[derive(Debug)]
+struct FilesystemCas {
+    root: PathBuf,
+}
+
+#[derive(Debug)]
+struct S3ContentStore {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    prefix: String,
+}
+
+#[derive(Debug)]
+struct StagedContent {
+    digest: String,
+    inline: Vec<u8>,
+    storage_kind: &'static str,
+    storage_key: String,
+    content_size: i64,
+}
+
+impl ContentStorage {
+    async fn stage(&self, content: &[u8]) -> Result<StagedContent, Status> {
+        if content.len() > MAX_STORED_OBJECT_BYTES {
+            return Err(Status::resource_exhausted(
+                "stored object exceeds size limit",
+            ));
+        }
+        let digest = sha256(content);
+        let content_size = i64::try_from(content.len())
+            .map_err(|_| Status::resource_exhausted("stored object exceeds size limit"))?;
+        match self {
+            Self::Inline => Ok(StagedContent {
+                digest,
+                inline: content.to_vec(),
+                storage_kind: "inline",
+                storage_key: String::new(),
+                content_size,
+            }),
+            Self::FilesystemCas(storage) => {
+                let storage = storage.clone();
+                let stored_digest = digest.clone();
+                let stored_content = content.to_vec();
+                tokio::task::spawn_blocking(move || storage.put(&stored_digest, &stored_content))
+                    .await
+                    .map_err(|_| Status::internal("filesystem CAS task failed"))?
+                    .map_err(Status::internal)?;
+                Ok(StagedContent {
+                    storage_key: digest.clone(),
+                    digest,
+                    inline: Vec::new(),
+                    storage_kind: "filesystem-cas",
+                    content_size,
+                })
+            }
+            Self::S3(storage) => {
+                storage
+                    .put(&digest, content.to_vec())
+                    .await
+                    .map_err(Status::internal)?;
+                Ok(StagedContent {
+                    storage_key: storage.object_key(&digest)?,
+                    digest,
+                    inline: Vec::new(),
+                    storage_kind: "s3",
+                    content_size,
+                })
+            }
+        }
+    }
+
+    async fn load(
+        &self,
+        digest: &str,
+        inline: Vec<u8>,
+        storage_kind: &str,
+        storage_key: &str,
+        content_size: i64,
+    ) -> Result<Vec<u8>, Status> {
+        if content_size < 0 || content_size as usize > MAX_STORED_OBJECT_BYTES {
+            return Err(Status::data_loss("stored object size is invalid"));
+        }
+        let content = match storage_kind {
+            "inline" => inline,
+            "filesystem-cas" => match self {
+                Self::FilesystemCas(storage) => {
+                    let storage = storage.clone();
+                    let storage_key = storage_key.to_owned();
+                    tokio::task::spawn_blocking(move || storage.get(&storage_key))
+                        .await
+                        .map_err(|_| Status::internal("filesystem CAS task failed"))?
+                        .map_err(Status::internal)?
+                }
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "database references filesystem CAS objects; start hydird with that store",
+                    ));
+                }
+            },
+            "s3" => match self {
+                Self::S3(storage) => storage
+                    .get(storage_key, digest)
+                    .await
+                    .map_err(Status::internal)?,
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "database references S3 objects; start hydird with that store",
+                    ));
+                }
+            },
+            _ => return Err(Status::data_loss("unknown stored object backend")),
+        };
+        if content.len() != content_size as usize || sha256(&content) != digest {
+            return Err(Status::data_loss(
+                "stored object failed size or digest validation",
+            ));
+        }
+        Ok(content)
+    }
+}
+
+impl S3ContentStore {
+    fn object_key(&self, digest: &str) -> Result<String, Status> {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Status::data_loss("S3 object digest is invalid"));
+        }
+        let suffix = format!("sha256/{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        Ok(if self.prefix.is_empty() {
+            suffix
+        } else {
+            format!("{}/{suffix}", self.prefix)
+        })
+    }
+
+    async fn put(&self, digest: &str, content: Vec<u8>) -> Result<(), String> {
+        let key = self.object_key(digest).map_err(|error| error.to_string())?;
+        let result = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .metadata("hydir-sha256", digest)
+            .if_none_match("*")
+            .body(ByteStream::from(content))
+            .send()
+            .await;
+        if result.is_err() && self.get(&key, digest).await.is_err() {
+            return Err("S3 object write failed".to_owned());
+        }
+        Ok(())
+    }
+
+    async fn get(&self, key: &str, digest: &str) -> Result<Vec<u8>, String> {
+        if self.object_key(digest).map_err(|error| error.to_string())? != key {
+            return Err("S3 object key does not match its digest".to_owned());
+        }
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|_| "S3 object read failed".to_owned())?;
+        if output.content_length().unwrap_or_default() < 0
+            || output.content_length().unwrap_or_default() as usize > MAX_STORED_OBJECT_BYTES
+        {
+            return Err("S3 object exceeds size limit".to_owned());
+        }
+        let content_length = output.content_length().unwrap_or_default() as usize;
+        let mut body = output.body;
+        let mut content = Vec::with_capacity(content_length);
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .map_err(|_| "S3 object stream failed".to_owned())?
+        {
+            if content.len().saturating_add(chunk.len()) > MAX_STORED_OBJECT_BYTES {
+                return Err("S3 object exceeds size limit".to_owned());
+            }
+            content.extend_from_slice(&chunk);
+        }
+        if sha256(&content) != digest {
+            return Err("S3 object digest mismatch".to_owned());
+        }
+        Ok(content)
+    }
+}
+
+impl FilesystemCas {
+    fn open(root: &Path) -> Result<Self, Box<dyn Error>> {
+        if !root.is_absolute() {
+            return Err("filesystem CAS root must be absolute".into());
+        }
+        std::fs::create_dir_all(root)?;
+        let metadata = std::fs::symlink_metadata(root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("filesystem CAS root must be a real directory".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err("filesystem CAS root must not be group/world writable".into());
+            }
+        }
+        Ok(Self {
+            root: root.to_owned(),
+        })
+    }
+
+    fn object_path(&self, digest: &str) -> Result<PathBuf, String> {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("filesystem CAS key must be SHA-256 hex".to_owned());
+        }
+        Ok(self
+            .root
+            .join(&digest[..2])
+            .join(&digest[2..4])
+            .join(digest))
+    }
+
+    fn put(&self, digest: &str, content: &[u8]) -> Result<(), String> {
+        if sha256(content) != digest {
+            return Err("filesystem CAS write digest mismatch".to_owned());
+        }
+        let destination = self.object_path(digest)?;
+        if destination.exists() {
+            return self.verify_existing(&destination, digest, content.len());
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "filesystem CAS object has no parent".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let temporary = parent.join(format!(".{}.{}.tmp", digest, Uuid::new_v4().simple()));
+        let write_result = (|| -> Result<(), String> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            file.write_all(content).map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            match std::fs::rename(&temporary, &destination) {
+                Ok(()) => Ok(()),
+                Err(_) if destination.exists() => {
+                    std::fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        write_result?;
+        self.verify_existing(&destination, digest, content.len())
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        let path = self.object_path(key)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_STORED_OBJECT_BYTES as u64
+        {
+            return Err("filesystem CAS object is not a bounded regular file".to_owned());
+        }
+        let content = std::fs::read(path).map_err(|error| error.to_string())?;
+        if sha256(&content) != key {
+            return Err("filesystem CAS object digest mismatch".to_owned());
+        }
+        Ok(content)
+    }
+
+    fn verify_existing(&self, path: &Path, digest: &str, size: usize) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != size as u64
+        {
+            return Err("filesystem CAS object metadata mismatch".to_owned());
+        }
+        let content = std::fs::read(path).map_err(|error| error.to_string())?;
+        if sha256(&content) != digest {
+            return Err("filesystem CAS object digest mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProjectRole {
+    Viewer,
+    Analyst,
+    Operator,
+    Admin,
+}
+
+impl ProjectRole {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "viewer" => Ok(Self::Viewer),
+            "analyst" => Ok(Self::Analyst),
+            "operator" => Ok(Self::Operator),
+            "admin" => Ok(Self::Admin),
+            _ => Err("project role must be viewer, analyst, operator, or admin".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Analyst => "analyst",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+#[derive(Clone)]
+enum AuthenticationMode {
+    StaticTokens,
+    Oidc(Arc<OidcVerifier>),
+}
+
+struct OidcVerifier {
+    issuer: String,
+    audience: String,
+    keys: JwkSet,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcClaims {
+    sub: String,
+}
+
+struct OidcIdentity {
+    principal: String,
+    subject: String,
+}
+
+struct OidcIdentityRecord {
+    principal: String,
+    issuer: String,
+    subject: String,
+}
+
+impl OidcVerifier {
+    fn new(issuer: String, audience: String, keys: JwkSet) -> Result<Self, String> {
+        let uri: tonic::codegen::http::Uri = issuer
+            .parse()
+            .map_err(|_| "OIDC issuer must be a valid HTTPS URI")?;
+        if uri.scheme_str() != Some("https") || uri.authority().is_none() || uri.query().is_some() {
+            return Err("OIDC issuer must be an absolute HTTPS URI".to_owned());
+        }
+        if audience.is_empty() || audience.len() > 256 || audience.chars().any(char::is_control) {
+            return Err("OIDC audience must be 1..=256 non-control characters".to_owned());
+        }
+        if keys.keys.is_empty() || keys.keys.len() > 128 {
+            return Err("OIDC JWKS must contain 1..=128 keys".to_owned());
+        }
+        let mut key_ids = HashSet::new();
+        for key in &keys.keys {
+            let key_id = key
+                .common
+                .key_id
+                .as_deref()
+                .filter(|key_id| !key_id.is_empty() && key_id.len() <= 128)
+                .ok_or("every OIDC JWK requires a 1..=128 byte kid")?;
+            if !key_ids.insert(key_id) {
+                return Err("OIDC JWKS contains duplicate kid values".to_owned());
+            }
+            if !matches!(key.algorithm, AlgorithmParameters::RSA(_))
+                || key.common.key_algorithm != Some(KeyAlgorithm::RS256)
+                || key
+                    .common
+                    .public_key_use
+                    .as_ref()
+                    .is_some_and(|usage| usage != &PublicKeyUse::Signature)
+                || key
+                    .common
+                    .key_operations
+                    .as_ref()
+                    .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
+                || (key.common.public_key_use.is_some() && key.common.key_operations.is_some())
+            {
+                return Err(
+                    "OIDC JWKS keys must be RSA verification keys with alg RS256".to_owned(),
+                );
+            }
+            DecodingKey::from_jwk(key)
+                .map_err(|error| format!("OIDC JWK `{key_id}` is invalid: {error}"))?;
+        }
+        Ok(Self {
+            issuer,
+            audience,
+            keys,
+        })
+    }
+
+    fn verify(&self, token: &str) -> Result<OidcIdentity, String> {
+        if token.len() > 16 * 1024
+            || token.bytes().any(|byte| !byte.is_ascii_graphic())
+            || token.split('.').count() != 3
+        {
+            return Err("OIDC bearer token is not a bounded compact JWT".to_owned());
+        }
+        let header = decode_header(token).map_err(|_| "OIDC JWT header is invalid")?;
+        if header.alg != Algorithm::RS256 {
+            return Err("OIDC JWT algorithm must be RS256".to_owned());
+        }
+        let key_id = header.kid.as_deref().ok_or("OIDC JWT header has no kid")?;
+        let key = self
+            .keys
+            .find(key_id)
+            .ok_or("OIDC JWT kid is not present in the pinned JWKS")?;
+        let decoding_key = DecodingKey::from_jwk(key).map_err(|_| "OIDC JWT key is invalid")?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[self.audience.as_str()]);
+        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.validate_nbf = true;
+        validation.leeway = 30;
+        let claims = decode::<OidcClaims>(token, &decoding_key, &validation)
+            .map_err(|_| "OIDC JWT signature or claims are invalid")?
+            .claims;
+        if claims.sub.is_empty()
+            || claims.sub.len() > 512
+            || claims.sub.chars().any(char::is_control)
+        {
+            return Err("OIDC subject must be 1..=512 non-control characters".to_owned());
+        }
+        let principal = format!(
+            "oidc-{:x}",
+            Sha256::digest(format!("{}\0{}", self.issuer, claims.sub))
+        );
+        Ok(OidcIdentity {
+            principal,
+            subject: claims.sub,
+        })
+    }
+}
+
+fn require_project_role_in(
+    connection: &Connection,
+    principal: &str,
+    id: &str,
+    required: ProjectRole,
+) -> Result<ProjectRole, Status> {
+    let role: Option<String> = connection
+        .query_row(
+            "SELECT role FROM project_acls WHERE project_id=?1 AND principal=?2",
+            params![id, principal],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    let role = role
+        .as_deref()
+        .map(ProjectRole::parse)
+        .transpose()
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("project not found"))?;
+    if role < required {
+        return Err(Status::permission_denied(format!(
+            "project operation requires {} role",
+            required.as_str()
+        )));
+    }
+    Ok(role)
+}
+
 #[derive(Clone)]
 struct Store {
     db: Arc<Mutex<Connection>>,
     workers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    authentication: AuthenticationMode,
+    content_storage: ContentStorage,
 }
 
 impl Store {
     fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+        Self::open_with_options(
+            path,
+            AuthenticationMode::StaticTokens,
+            ContentStorage::Inline,
+        )
+    }
+
+    fn open_with_auth(
+        path: &Path,
+        authentication: AuthenticationMode,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::open_with_options(path, authentication, ContentStorage::Inline)
+    }
+
+    fn open_with_options(
+        path: &Path,
+        authentication: AuthenticationMode,
+        content_storage: ContentStorage,
+    ) -> Result<Self, Box<dyn Error>> {
         #[cfg(unix)]
         if path != Path::new(":memory:") {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -252,7 +942,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 6 {
+        if version > 10 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -273,6 +963,18 @@ impl Store {
         if version <= 5 {
             connection.execute_batch(ANNOTATION_MIGRATION)?;
         }
+        if version <= 6 {
+            connection.execute_batch(PROJECT_ACCESS_MIGRATION)?;
+        }
+        if version <= 7 {
+            connection.execute_batch(OIDC_IDENTITY_MIGRATION)?;
+        }
+        if version <= 8 {
+            connection.execute_batch(CONTENT_STORAGE_MIGRATION)?;
+        }
+        if version <= 9 {
+            connection.execute_batch(S3_STORAGE_MIGRATION)?;
+        }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
           FROM jobs WHERE state IN ('queued','running');
@@ -282,6 +984,8 @@ impl Store {
         Ok(Self {
             db: Arc::new(Mutex::new(connection)),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            authentication,
+            content_storage,
         })
     }
 
@@ -294,12 +998,13 @@ impl Store {
     fn create_identity(&self, principal: &str) -> Result<String, Box<dyn Error>> {
         if principal.is_empty()
             || principal.len() > 128
+            || principal.starts_with("oidc-")
             || !principal
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
             return Err(
-                "principal must be 1..=128 ASCII letters, digits, underscore, or hyphen".into(),
+                "principal must be 1..=128 ASCII letters, digits, underscore, or hyphen and must not use the reserved oidc- prefix".into(),
             );
         }
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -315,6 +1020,9 @@ impl Store {
     }
 
     fn rotate_identity(&self, principal: &str) -> Result<String, Box<dyn Error>> {
+        if principal.starts_with("oidc-") {
+            return Err("OIDC identities cannot receive static credentials".into());
+        }
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let digest = sha256(token.as_bytes());
         let changed = self
@@ -331,35 +1039,221 @@ impl Store {
         Ok(token)
     }
 
+    fn oidc_identities(&self) -> Result<Vec<OidcIdentityRecord>, Box<dyn Error>> {
+        let connection = self.db.lock().map_err(|_| "database lock poisoned")?;
+        let mut statement = connection.prepare(
+            "SELECT principal,issuer,subject FROM oidc_identities ORDER BY issuer,subject",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(OidcIdentityRecord {
+                    principal: row.get(0)?,
+                    issuer: row.get(1)?,
+                    subject: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     fn principal<T>(&self, request: &Request<T>) -> Result<String, Status> {
         let bearer = request
             .metadata()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| Status::unauthenticated("missing or invalid bearer credential"))?;
-        let digest = sha256(bearer.as_bytes());
-        self.connection()?
+        self.authenticate_bearer(bearer)
+    }
+
+    fn authenticate_bearer(&self, bearer: &str) -> Result<String, Status> {
+        match &self.authentication {
+            AuthenticationMode::StaticTokens => {
+                if bearer.len() != 64 || !bearer.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(Status::unauthenticated("invalid static bearer credential"));
+                }
+                let digest = sha256(bearer.as_bytes());
+                self.connection()?
+                    .query_row(
+                        "SELECT principal FROM identities WHERE token_sha256=?1",
+                        [digest],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                    .ok_or_else(|| Status::unauthenticated("invalid bearer credential"))
+            }
+            AuthenticationMode::Oidc(verifier) => {
+                let identity = verifier.verify(bearer).map_err(Status::unauthenticated)?;
+                let disabled_static_digest =
+                    sha256(format!("oidc-static-disabled\0{}", identity.principal).as_bytes());
+                let mut connection = self.connection()?;
+                let transaction = connection.transaction().map_err(internal)?;
+                let registered: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT issuer,subject FROM oidc_identities WHERE principal=?1",
+                        [&identity.principal],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if let Some(registered) = registered {
+                    if registered != (verifier.issuer.clone(), identity.subject) {
+                        return Err(Status::unauthenticated("OIDC identity mapping collision"));
+                    }
+                } else {
+                    let principal_exists: bool = transaction
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1)",
+                            [&identity.principal],
+                            |row| row.get(0),
+                        )
+                        .map_err(internal)?;
+                    if principal_exists {
+                        return Err(Status::unauthenticated(
+                            "OIDC principal collides with an existing local identity",
+                        ));
+                    }
+                    transaction
+                        .execute(
+                            "INSERT INTO identities(principal,token_sha256) VALUES(?1,?2)",
+                            params![identity.principal, disabled_static_digest],
+                        )
+                        .map_err(internal)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO oidc_identities(principal,issuer,subject) VALUES(?1,?2,?3)",
+                            params![identity.principal, verifier.issuer, identity.subject],
+                        )
+                        .map_err(internal)?;
+                }
+                transaction.commit().map_err(internal)?;
+                Ok(identity.principal)
+            }
+        }
+    }
+
+    fn require_project_role(
+        &self,
+        principal: &str,
+        id: &str,
+        required: ProjectRole,
+    ) -> Result<ProjectRole, Status> {
+        let connection = self.connection()?;
+        require_project_role_in(&connection, principal, id, required)
+    }
+
+    fn set_project_role(
+        &self,
+        actor: &str,
+        project_id: &str,
+        principal: &str,
+        role: Option<ProjectRole>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.db.lock().map_err(|_| "database lock poisoned")?;
+        let transaction = connection.transaction()?;
+        let actor_role: Option<String> = transaction
             .query_row(
-                "SELECT principal FROM identities WHERE token_sha256=?1",
-                [digest],
+                "SELECT role FROM project_acls WHERE project_id=?1 AND principal=?2",
+                params![project_id, actor],
                 |row| row.get(0),
             )
-            .optional()
-            .map_err(internal)?
-            .ok_or_else(|| Status::unauthenticated("invalid bearer credential"))
+            .optional()?;
+        if actor_role.as_deref() != Some("admin") {
+            return Err("actor is not a project admin".into());
+        }
+        let owner: String = transaction
+            .query_row(
+                "SELECT owner FROM projects WHERE id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "project does not exist")?;
+        if principal == owner && role != Some(ProjectRole::Admin) {
+            return Err("the project owner must retain the admin role".into());
+        }
+        let identity_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1)",
+            [principal],
+            |row| row.get(0),
+        )?;
+        if !identity_exists {
+            return Err("target principal does not exist".into());
+        }
+        let (action, details) = if let Some(role) = role {
+            transaction.execute(
+                "INSERT INTO project_acls(project_id,principal,role,granted_by) VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(project_id,principal) DO UPDATE SET role=excluded.role,granted_by=excluded.granted_by,created_at_ms=(unixepoch('subsec') * 1000)",
+                params![project_id, principal, role.as_str(), actor],
+            )?;
+            (
+                "project.role.set",
+                serde_json::to_string(&json!({"principal": principal, "role": role.as_str()}))?,
+            )
+        } else {
+            if transaction.execute(
+                "DELETE FROM project_acls WHERE project_id=?1 AND principal=?2",
+                params![project_id, principal],
+            )? == 0
+            {
+                return Err("target principal has no project role".into());
+            }
+            (
+                "project.role.revoke",
+                serde_json::to_string(&json!({"principal": principal}))?,
+            )
+        };
+        transaction.execute(
+            "INSERT INTO audit_events(principal,action,project_id,details_json) VALUES(?1,?2,?3,?4)",
+            params![actor, action, project_id, details],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn project_access(
+        &self,
+        actor: &str,
+        project_id: &str,
+    ) -> Result<Vec<(String, ProjectRole)>, Box<dyn Error>> {
+        let connection = self.db.lock().map_err(|_| "database lock poisoned")?;
+        let actor_role: Option<String> = connection
+            .query_row(
+                "SELECT role FROM project_acls WHERE project_id=?1 AND principal=?2",
+                params![project_id, actor],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actor_role.as_deref() != Some("admin") {
+            return Err("actor is not a project admin".into());
+        }
+        let mut statement = connection.prepare(
+            "SELECT principal,role FROM project_acls WHERE project_id=?1 ORDER BY principal",
+        )?;
+        let records = statement
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        records
+            .into_iter()
+            .map(|(principal, role)| {
+                ProjectRole::parse(&role)
+                    .map(|role| (principal, role))
+                    .map_err(Into::into)
+            })
+            .collect()
     }
 
     fn project(&self, principal: &str, id: &str) -> Result<ProjectReply, Status> {
+        self.require_project_role(principal, id, ProjectRole::Viewer)?;
         let conn = self.connection()?;
         let row: Option<(String, String, i64, Option<String>)> = conn
             .query_row(
                 "SELECT p.id,p.name,p.current_revision,r.binary_sha256 \
              FROM projects p LEFT JOIN project_revisions r \
              ON r.project_id=p.id AND r.revision=p.current_revision \
-             WHERE p.id=?1 AND p.owner=?2",
-                params![id, principal],
+             WHERE p.id=?1",
+                params![id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
@@ -374,7 +1268,12 @@ impl Store {
         })
     }
 
-    fn current_binary(&self, principal: &str, id: &str, revision: u64) -> Result<Vec<u8>, Status> {
+    async fn current_binary(
+        &self,
+        principal: &str,
+        id: &str,
+        revision: u64,
+    ) -> Result<Vec<u8>, Status> {
         let project = self.project(principal, id)?;
         if project.revision != revision {
             return Err(Status::aborted("stale project revision"));
@@ -384,22 +1283,144 @@ impl Store {
                 "project has no uploaded binary",
             ));
         }
-        self.connection()?.query_row(
-            "SELECT b.content FROM project_revisions r JOIN binaries b ON b.sha256=r.binary_sha256 \
+        let stored: (String, Vec<u8>, String, String, i64) = self.connection()?.query_row(
+            "SELECT b.sha256,b.content,b.storage_kind,b.storage_key,b.content_size FROM project_revisions r JOIN binaries b ON b.sha256=r.binary_sha256 \
              WHERE r.project_id=?1 AND r.revision=?2",
             params![id, revision as i64],
-            |row| row.get(0),
-        ).map_err(internal)
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).map_err(internal)?;
+        self.content_storage
+            .load(&stored.0, stored.1, &stored.2, &stored.3, stored.4)
+            .await
+    }
+
+    async fn binary_at_revision(
+        &self,
+        principal: &str,
+        id: &str,
+        revision: u64,
+    ) -> Result<Vec<u8>, Status> {
+        self.require_project_role(principal, id, ProjectRole::Viewer)?;
+        let stored: Option<(String, Vec<u8>, String, String, i64)> = self.connection()?
+            .query_row(
+                "SELECT b.sha256,b.content,b.storage_kind,b.storage_key,b.content_size FROM project_revisions r \
+                 JOIN binaries b ON b.sha256=r.binary_sha256 \
+                 WHERE r.project_id=?1 AND r.revision=?2",
+                params![id, revision as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let stored = stored.ok_or_else(|| Status::not_found("project revision not found"))?;
+        self.content_storage
+            .load(&stored.0, stored.1, &stored.2, &stored.3, stored.4)
+            .await
+    }
+
+    async fn store_artifact(
+        &self,
+        project_id: &str,
+        revision: u64,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<String, Status> {
+        let staged = self.content_storage.stage(content).await?;
+        let connection = self.connection()?;
+        insert_artifact(
+            &connection,
+            project_id,
+            revision as i64,
+            media_type,
+            &staged,
+        )?;
+        Ok(staged.digest)
+    }
+
+    async fn commit_patch_mutation(
+        &self,
+        principal: &str,
+        project_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+        patch_digest: &str,
+        patched: Vec<u8>,
+    ) -> Result<PatchReply, Status> {
+        self.require_project_role(principal, project_id, ProjectRole::Operator)?;
+        let expected = i64::try_from(expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        let staged_binary = self.content_storage.stage(&patched).await?;
+        let binary_sha256 = staged_binary.digest.clone();
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(internal)?;
+        require_project_role_in(&tx, principal, project_id, ProjectRole::Operator)?;
+        let prior: Option<(i64, String, i64, String)> = tx
+            .query_row(
+                "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
+                params![project_id, idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some((prior_expected, prior_digest, revision, prior_binary_sha)) = prior {
+            if prior_expected != expected || prior_digest != patch_digest {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to a different patch request",
+                ));
+            }
+            return Ok(PatchReply {
+                project_id: project_id.to_owned(),
+                revision: revision as u64,
+                artifact_sha256: prior_binary_sha.clone(),
+                binary_sha256: prior_binary_sha,
+            });
+        }
+        let current: i64 = tx
+            .query_row(
+                "SELECT current_revision FROM projects WHERE id=?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if current != expected {
+            return Err(Status::aborted("stale project revision"));
+        }
+        insert_binary(&tx, &staged_binary)?;
+        tx.execute(
+            "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+            params![project_id, next, binary_sha256],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "UPDATE projects SET current_revision=?1 WHERE id=?2",
+            params![next, project_id],
+        )
+        .map_err(internal)?;
+        insert_artifact(&tx, project_id, next, "application/x-elf", &staged_binary)?;
+        tx.execute(
+            "INSERT INTO patch_requests(project_id,idempotency_key,expected_revision,patch_sha256,new_revision,binary_sha256) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![project_id, idempotency_key, expected, patch_digest, next, binary_sha256],
+        )
+        .map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(PatchReply {
+            project_id: project_id.to_owned(),
+            revision: next as u64,
+            artifact_sha256: binary_sha256.clone(),
+            binary_sha256,
+        })
     }
 
     fn job(&self, principal: &str, project_id: &str, job_id: &str) -> Result<JobReply, Status> {
+        self.require_project_role(principal, project_id, ProjectRole::Viewer)?;
         let row = self
             .connection()?
             .query_row(
                 "SELECT j.project_id,j.id,j.revision,j.kind,j.state,j.artifact_sha256,j.diagnostic \
-             FROM jobs j JOIN projects p ON p.id=j.project_id \
-             WHERE j.id=?1 AND j.project_id=?2 AND p.owner=?3",
-                params![job_id, project_id, principal],
+             FROM jobs j WHERE j.id=?1 AND j.project_id=?2",
+                params![job_id, project_id],
                 |row| {
                     Ok(JobReply {
                         project_id: row.get(0)?,
@@ -439,13 +1460,17 @@ impl Store {
         Ok(changed == 1)
     }
 
-    fn finish_lift_job(
+    async fn finish_lift_job(
         &self,
         job_id: &str,
         project_id: &str,
         revision: u64,
         result: Result<Vec<u8>, Status>,
     ) -> Result<(), Status> {
+        let prepared = match result {
+            Ok(content) => Ok(self.content_storage.stage(&content).await?),
+            Err(error) => Err(error.message().chars().take(4096).collect::<String>()),
+        };
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(internal)?;
         let state: Option<String> = tx
@@ -458,13 +1483,10 @@ impl Store {
             tx.commit().map_err(internal)?;
             return Ok(());
         }
-        match result {
-            Ok(content) => {
-                let digest = sha256(&content);
-                tx.execute(
-                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,'text/x-llvm-ir',?4)",
-                    params![project_id, revision as i64, digest, content],
-                ).map_err(internal)?;
+        match prepared {
+            Ok(staged) => {
+                let digest = staged.digest.clone();
+                insert_artifact(&tx, project_id, revision as i64, "text/x-llvm-ir", &staged)?;
                 tx.execute(
                     "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
                     params![digest, job_id],
@@ -472,8 +1494,7 @@ impl Store {
                 .map_err(internal)?;
                 insert_event(&tx, job_id, "succeeded", "LLVM IR artifact ready", &digest)?;
             }
-            Err(error) => {
-                let diagnostic: String = error.message().chars().take(4096).collect();
+            Err(diagnostic) => {
                 tx.execute(
                     "UPDATE jobs SET state='failed',diagnostic=?1 WHERE id=?2",
                     params![diagnostic, job_id],
@@ -503,7 +1524,10 @@ impl Store {
             }
         }
         let result = run_worker("lift", Some(&symbol), bytes).await;
-        if let Err(error) = self.finish_lift_job(&job_id, &project_id, revision, result) {
+        if let Err(error) = self
+            .finish_lift_job(&job_id, &project_id, revision, result)
+            .await
+        {
             eprintln!("hydird job completion failed: {error}");
         }
         if let Ok(mut workers) = self.workers.lock() {
@@ -527,8 +1551,88 @@ fn insert_event(
     Ok(())
 }
 
+fn insert_binary(connection: &Connection, content: &StagedContent) -> Result<(), Status> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO binaries(sha256,content,storage_kind,storage_key,content_size) \
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                content.digest,
+                content.inline,
+                content.storage_kind,
+                content.storage_key,
+                content.content_size
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn insert_artifact(
+    connection: &Connection,
+    project_id: &str,
+    revision: i64,
+    media_type: &str,
+    content: &StagedContent,
+) -> Result<(), Status> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content,storage_kind,storage_key,content_size) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                project_id,
+                revision,
+                content.digest,
+                media_type,
+                content.inline,
+                content.storage_kind,
+                content.storage_key,
+                content.content_size
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn patch_worker_envelope(patch_json: &[u8], binary: &[u8]) -> Result<Vec<u8>, Status> {
+    if patch_json.is_empty() || patch_json.len() > MAX_PATCH_BYTES {
+        return Err(Status::invalid_argument(
+            "patch document must be 1..=4096 bytes",
+        ));
+    }
+    let patch_length = u32::try_from(patch_json.len())
+        .map_err(|_| Status::invalid_argument("patch document too long"))?;
+    let mut envelope = Vec::with_capacity(4 + patch_json.len() + binary.len());
+    envelope.extend_from_slice(&patch_length.to_le_bytes());
+    envelope.extend_from_slice(patch_json);
+    envelope.extend_from_slice(binary);
+    Ok(envelope)
+}
+
+fn validate_v2_patch_request(input: &api_v2::PatchRequest) -> Result<(), Status> {
+    if !input.trusted_fixture || !input.assume_u64x2 || !input.assume_entry_only {
+        return Err(Status::invalid_argument(
+            "patch requires trusted-fixture, u64x2, and entry-only assertions",
+        ));
+    }
+    if input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 128
+        || input.idempotency_key.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument(
+            "patch idempotency key must be 1..=128 non-control bytes",
+        ));
+    }
+    if input.patch_json.is_empty() || input.patch_json.len() > MAX_PATCH_BYTES {
+        return Err(Status::invalid_argument(
+            "patch document must be 1..=4096 bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn internal(error: rusqlite::Error) -> Status {
@@ -826,6 +1930,14 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("cfg", Some(symbol)) => recover_symbol_cfg(bytes, symbol)
             .map_err(|error| error.to_string())
             .and_then(|cfg| serde_json::to_vec(&cfg).map_err(|error| error.to_string())),
+        ("region", Some(symbol)) => region_contract(bytes, symbol)
+            .map_err(|error| error.to_string())
+            .and_then(|region| serde_json::to_vec(&region).map_err(|error| error.to_string())),
+        ("physical-region-ir", Some(symbol)) => {
+            let region = region_contract(bytes, symbol).map_err(|error| error.to_string())?;
+            let ir = lift_physical_region(&region).map_err(|error| error.to_string())?;
+            serde_json::to_vec(&ir).map_err(|error| error.to_string())
+        }
         ("lift", Some(symbol)) => lift_symbol(bytes, symbol)
             .map(String::into_bytes)
             .map_err(|error| error.to_string()),
@@ -833,6 +1945,13 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             .map_err(|error| error.to_string())
             .and_then(|ir| emit_structured_c(&ir))
             .map(String::into_bytes),
+        ("decompile-unit", Some(symbol)) => {
+            let region = region_contract(bytes, symbol).map_err(|error| error.to_string())?;
+            let ir = lift_symbol(bytes, symbol).map_err(|error| error.to_string())?;
+            let unit =
+                build_decompilation_unit(region, ir, concat!("hydir/", env!("CARGO_PKG_VERSION")))?;
+            serde_json::to_vec(&unit).map_err(|error| error.to_string())
+        }
         ("transform", Some(symbol)) => {
             let pass_length = *bytes.first().ok_or("transform worker lacks pass list")? as usize;
             let pass_bytes = bytes
@@ -889,6 +2008,26 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             let patch = parse_patch_json(patch_json)?;
             patch_binary(binary, &patch).map(|result| result.content)
         }
+        ("patch-v2", None) => {
+            let length_bytes: [u8; 4] = bytes
+                .get(..4)
+                .ok_or("patch worker input lacks a length prefix")?
+                .try_into()
+                .map_err(|_| "invalid patch length prefix")?;
+            let patch_length = u32::from_le_bytes(length_bytes) as usize;
+            if patch_length == 0 || patch_length > MAX_PATCH_BYTES {
+                return Err("patch document exceeds worker limit".to_owned());
+            }
+            let end = 4usize
+                .checked_add(patch_length)
+                .ok_or("patch envelope length overflow")?;
+            let patch_json = bytes.get(4..end).ok_or("patch envelope is truncated")?;
+            let binary = bytes.get(end..).ok_or("patch envelope lacks binary")?;
+            let (document, _) = parse_patch_document(patch_json)?;
+            let result = compile_patch_binary(binary, &document)?;
+            let bundle = serde_json::to_vec(&result.bundle).map_err(|error| error.to_string())?;
+            pack_worker_parts(&[&result.content, &bundle])
+        }
         _ => Err("unsupported worker operation".to_owned()),
     }
 }
@@ -911,13 +2050,17 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
 async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Result<Vec<u8>, Status> {
     let executable =
         env::current_exe().map_err(|_| Status::internal("worker executable unavailable"))?;
-    let mut command = Command::new(executable);
-    command.arg("worker").arg(action);
-    command.env_clear();
     if let Some(symbol) = symbol {
         valid_symbol(symbol)?;
-        command.arg(symbol);
     }
+    let isolation = env::var("HYDIR_WORKER_ISOLATION").unwrap_or_else(|_| "process".to_owned());
+    let bubblewrap = env::var_os("HYDIR_BWRAP_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/bwrap"));
+    let launch = worker_launch_spec(&executable, action, symbol, &isolation, Some(&bubblewrap))
+        .map_err(Status::failed_precondition)?;
+    let mut command = Command::new(launch.program);
+    command.args(launch.arguments).env_clear();
     #[cfg(target_os = "linux")]
     // SAFETY: the closure runs after fork and before exec, uses only libc's
     // async-signal-safe setrlimit calls, and captures no process state.
@@ -931,6 +2074,8 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
                 (libc::RLIMIT_CPU, 25),
                 (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
                 (libc::RLIMIT_NOFILE, 64),
+                (libc::RLIMIT_NPROC, 32),
+                (libc::RLIMIT_STACK, 16 * 1024 * 1024),
                 (libc::RLIMIT_CORE, 0),
             ] {
                 let limit = libc::rlimit {
@@ -941,6 +2086,12 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::umask(0o077);
             Ok(())
         });
     }
@@ -1125,17 +2276,30 @@ impl Hydir for Store {
                 )
                 .optional()
                 .map_err(internal)?;
-            let id =
-                if let Some(id) = prior {
-                    id
-                } else {
-                    let id = Uuid::new_v4().to_string();
-                    transaction.execute(
-                    "INSERT INTO projects(id,owner,name,idempotency_key) VALUES(?1,?2,?3,?4)",
-                    params![id, principal, input.name, input.idempotency_key],
-                ).map_err(internal)?;
-                    id
-                };
+            let id = if let Some(id) = prior {
+                id
+            } else {
+                let id = Uuid::new_v4().to_string();
+                transaction
+                    .execute(
+                        "INSERT INTO projects(id,owner,name,idempotency_key) VALUES(?1,?2,?3,?4)",
+                        params![id, principal, input.name, input.idempotency_key],
+                    )
+                    .map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO project_acls(project_id,principal,role,granted_by) VALUES(?1,?2,'admin',?2)",
+                        params![id, principal],
+                    )
+                    .map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO audit_events(principal,action,project_id,details_json) VALUES(?1,'project.create',?2,?3)",
+                        params![principal, id, serde_json::to_string(&json!({"name": input.name})).map_err(|error| Status::internal(format!("audit serialization failed: {error}")))?],
+                    )
+                    .map_err(internal)?;
+                id
+            };
             transaction.commit().map_err(internal)?;
             id
         };
@@ -1158,6 +2322,7 @@ impl Hydir for Store {
     ) -> Result<Response<ProjectReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if input.content.is_empty() || input.content.len() > MAX_BINARY_BYTES {
             return Err(Status::invalid_argument("binary must be 1..=64 MiB"));
         }
@@ -1168,15 +2333,17 @@ impl Hydir for Store {
             ));
         }
         run_worker("inspect", None, input.content.clone()).await?;
+        let staged_binary = self.content_storage.stage(&input.content).await?;
         let expected = i64::try_from(input.expected_revision)
             .map_err(|_| Status::invalid_argument("revision too large"))?;
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
             let current: Option<i64> = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -1198,11 +2365,7 @@ impl Hydir for Store {
             let next = current
                 .checked_add(1)
                 .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
-            tx.execute(
-                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![digest, input.content],
-            )
-            .map_err(internal)?;
+            insert_binary(&tx, &staged_binary)?;
             tx.execute(
                 "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
                 params![input.project_id, next, digest],
@@ -1224,9 +2387,12 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let raw = run_worker("inspect", None, bytes).await?;
-        let mut spec: ProgramSpec = serde_json::from_slice(&raw)
+        let mut spec: ProgramSpec = parse_program_spec_json(&raw)
             .map_err(|_| Status::internal("worker returned invalid program model"))?;
         let annotations = annotations_for(
             &*self.connection()?,
@@ -1246,7 +2412,10 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let report = run_worker("analyze", None, bytes).await?;
         Ok(Response::new(JsonReply {
             json: String::from_utf8(report)
@@ -1260,9 +2429,12 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let raw = run_worker("analyze-spec", None, bytes).await?;
-        let mut spec: ProgramSpec = serde_json::from_slice(&raw)
+        let mut spec: ProgramSpec = parse_program_spec_json(&raw)
             .map_err(|_| Status::internal("worker returned invalid analyzed model"))?;
         let annotations = annotations_for(
             &*self.connection()?,
@@ -1314,6 +2486,7 @@ impl Hydir for Store {
     ) -> Result<Response<ProjectReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         let (kind, address) = validate_annotation(&input)?;
         let expected = i64::try_from(input.expected_revision)
             .map_err(|_| Status::invalid_argument("revision too large"))?;
@@ -1341,10 +2514,12 @@ impl Hydir for Store {
                 binary_sha256,
             }));
         }
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         if let Some(address) = address {
             let raw = run_worker("inspect", None, bytes).await?;
-            let spec: ProgramSpec = serde_json::from_slice(&raw)
+            let spec: ProgramSpec = parse_program_spec_json(&raw)
                 .map_err(|_| Status::internal("worker returned invalid program model"))?;
             if !annotation_address_in_spec(&spec, address) {
                 return Err(Status::invalid_argument(
@@ -1365,6 +2540,7 @@ impl Hydir for Store {
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Analyst)?;
             if let Some((revision, binary_sha256)) = annotation_replay(
                 &tx,
                 &input.project_id,
@@ -1381,8 +2557,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -1437,8 +2613,11 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         valid_symbol(&input.function_symbol)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let cfg = run_worker("cfg", Some(&input.function_symbol), bytes).await?;
         Ok(Response::new(JsonReply {
             json: String::from_utf8(cfg)
@@ -1452,19 +2631,25 @@ impl Hydir for Store {
     ) -> Result<Response<ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content = run_worker("lift", Some(&input.function_symbol), bytes).await?;
-        let digest = sha256(&content);
-        self.connection()?.execute(
-            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-            params![input.project_id, input.expected_revision as i64, digest, "text/x-llvm-ir", content],
-        ).map_err(internal)?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "text/x-llvm-ir",
+                &content,
+            )
+            .await?;
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-llvm-ir".to_owned(),
@@ -1479,19 +2664,25 @@ impl Hydir for Store {
     ) -> Result<Response<ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
             ));
         }
         valid_symbol(&input.function_symbol)?;
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let content = run_worker("decompile", Some(&input.function_symbol), bytes).await?;
-        let digest = sha256(&content);
-        self.connection()?.execute(
-            "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-            params![input.project_id, input.expected_revision as i64, digest, "text/x-csrc", content],
-        ).map_err(internal)?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "text/x-csrc",
+                &content,
+            )
+            .await?;
         Ok(Response::new(ArtifactReply {
             sha256: digest,
             media_type: "text/x-csrc".to_owned(),
@@ -1506,6 +2697,7 @@ impl Hydir for Store {
     ) -> Result<Response<TransformReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if !input.assume_u64x2 || !input.trusted_fixture {
             return Err(Status::invalid_argument(
                 "transform requires u64x2 and trusted-fixture assertions",
@@ -1541,7 +2733,9 @@ impl Hydir for Store {
         }
         let pass_length = u8::try_from(input.passes.len())
             .map_err(|_| Status::invalid_argument("pass list is too long"))?;
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let binary_sha256 = sha256(&binary);
         let mut envelope = Vec::with_capacity(1 + input.passes.len() + binary.len());
         envelope.push(pass_length);
@@ -1551,13 +2745,21 @@ impl Hydir for Store {
         let parts = unpack_worker_parts::<4>(&packed)?;
         let report_json = String::from_utf8(parts[3].to_vec())
             .map_err(|_| Status::internal("transform report is not UTF-8"))?;
-        let digests = parts.map(sha256);
+        let mut staged_parts = Vec::with_capacity(parts.len());
+        for part in &parts {
+            staged_parts.push(self.content_storage.stage(part).await?);
+        }
+        let digests = staged_parts
+            .iter()
+            .map(|part| part.digest.clone())
+            .collect::<Vec<_>>();
         let next = expected
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
             if let Some(prior) = transform_replay(
                 &tx,
                 &input.project_id,
@@ -1569,8 +2771,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -1587,19 +2789,16 @@ impl Hydir for Store {
                 params![next, input.project_id],
             )
             .map_err(internal)?;
-            for (index, (media_type, part)) in [
-                ("text/x-llvm-ir", parts[0]),
-                ("text/x-llvm-ir", parts[1]),
-                ("text/x-llvm-ir", parts[2]),
-                ("application/json", parts[3]),
+            for (media_type, staged) in [
+                "text/x-llvm-ir",
+                "text/x-llvm-ir",
+                "text/x-llvm-ir",
+                "application/json",
             ]
             .into_iter()
-            .enumerate()
+            .zip(&staged_parts)
             {
-                tx.execute(
-                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-                    params![input.project_id, next, digests[index], media_type, part],
-                ).map_err(internal)?;
+                insert_artifact(&tx, &input.project_id, next, media_type, staged)?;
             }
             tx.execute(
                 "INSERT INTO transform_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision,raw_sha256,before_sha256,after_sha256,report_sha256,ir_text_changed,report_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -1625,6 +2824,7 @@ impl Hydir for Store {
     ) -> Result<Response<RebuildReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if !input.trusted_fixture {
             return Err(Status::invalid_argument(
                 "rebuild requires an explicit trusted-fixture assertion",
@@ -1648,21 +2848,27 @@ impl Hydir for Store {
         if let Some(prior) = prior {
             return Ok(Response::new(prior));
         }
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let packed = run_worker("rebuild", None, binary).await?;
         let parts = unpack_worker_parts::<3>(&packed)?;
         run_worker("inspect", None, parts[1].to_vec()).await?;
         let report_json = String::from_utf8(parts[2].to_vec())
             .map_err(|_| Status::internal("rebuild report is not UTF-8"))?;
-        let ir_sha256 = sha256(parts[0]);
-        let binary_sha256 = sha256(parts[1]);
-        let report_sha256 = sha256(parts[2]);
+        let staged_ir = self.content_storage.stage(parts[0]).await?;
+        let staged_binary = self.content_storage.stage(parts[1]).await?;
+        let staged_report = self.content_storage.stage(parts[2]).await?;
+        let ir_sha256 = staged_ir.digest.clone();
+        let binary_sha256 = staged_binary.digest.clone();
+        let report_sha256 = staged_report.digest.clone();
         let next = expected
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
             if let Some(prior) =
                 rebuild_replay(&tx, &input.project_id, &input.idempotency_key, expected)?
             {
@@ -1670,19 +2876,15 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
             if current != expected {
                 return Err(Status::aborted("stale project revision"));
             }
-            tx.execute(
-                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![binary_sha256, parts[1]],
-            )
-            .map_err(internal)?;
+            insert_binary(&tx, &staged_binary)?;
             tx.execute(
                 "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
                 params![input.project_id, next, binary_sha256],
@@ -1693,16 +2895,12 @@ impl Hydir for Store {
                 params![next, input.project_id],
             )
             .map_err(internal)?;
-            for (digest, media_type, content) in [
-                (&ir_sha256, "text/x-llvm-ir", parts[0]),
-                (&binary_sha256, "application/x-elf", parts[1]),
-                (&report_sha256, "application/json", parts[2]),
+            for (media_type, staged) in [
+                ("text/x-llvm-ir", &staged_ir),
+                ("application/x-elf", &staged_binary),
+                ("application/json", &staged_report),
             ] {
-                tx.execute(
-                    "INSERT OR IGNORE INTO artifacts(project_id,revision,sha256,media_type,content) VALUES(?1,?2,?3,?4,?5)",
-                    params![input.project_id, next, digest, media_type, content],
-                )
-                .map_err(internal)?;
+                insert_artifact(&tx, &input.project_id, next, media_type, staged)?;
             }
             tx.execute(
                 "INSERT INTO rebuild_requests(project_id,idempotency_key,expected_revision,new_revision,binary_sha256,ir_sha256,report_sha256,report_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -1727,6 +2925,7 @@ impl Hydir for Store {
     ) -> Result<Response<PatchReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if !input.trusted_fixture || !input.assume_u64x2 || !input.assume_entry_only {
             return Err(Status::invalid_argument(
                 "patch requires trusted-fixture, u64x2, and entry-only assertions",
@@ -1771,7 +2970,9 @@ impl Hydir for Store {
                 binary_sha256,
             }));
         }
-        let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         if binary.len() > MAX_WORKER_OUTPUT {
             return Err(Status::resource_exhausted(
                 "remote patch binary exceeds 16 MiB worker output limit",
@@ -1787,77 +2988,17 @@ impl Hydir for Store {
         if patched.len() != binary.len() {
             return Err(Status::internal("patch worker changed ELF file size"));
         }
-        let binary_sha256 = sha256(&patched);
-        let next = expected
-            .checked_add(1)
-            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
-        {
-            let mut conn = self.connection()?;
-            let tx = conn.transaction().map_err(internal)?;
-            let raced: Option<(i64, String, i64, String)> = tx
-                .query_row(
-                    "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
-                    params![input.project_id, input.idempotency_key],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(internal)?;
-            if let Some((prior_expected, prior_digest, revision, prior_binary_sha)) = raced {
-                if prior_expected != expected || prior_digest != patch_digest {
-                    return Err(Status::already_exists(
-                        "idempotency key belongs to a different patch request",
-                    ));
-                }
-                return Ok(Response::new(PatchReply {
-                    project_id: input.project_id,
-                    revision: revision as u64,
-                    artifact_sha256: prior_binary_sha.clone(),
-                    binary_sha256: prior_binary_sha,
-                }));
-            }
-            let current: i64 = tx
-                .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
-                    |row| row.get(0),
-                )
-                .map_err(internal)?;
-            if current != expected {
-                return Err(Status::aborted("stale project revision"));
-            }
-            tx.execute(
-                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![binary_sha256, patched],
+        Ok(Response::new(
+            self.commit_patch_mutation(
+                &principal,
+                &input.project_id,
+                input.expected_revision,
+                &input.idempotency_key,
+                &patch_digest,
+                patched,
             )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
-                params![input.project_id, next, binary_sha256],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "UPDATE projects SET current_revision=?1 WHERE id=?2",
-                params![next, input.project_id],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO artifacts(project_id,revision,sha256,media_type,content) SELECT ?1,?2,sha256,'application/x-elf',content FROM binaries WHERE sha256=?3",
-                params![input.project_id, next, binary_sha256],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO patch_requests(project_id,idempotency_key,expected_revision,patch_sha256,new_revision,binary_sha256) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![input.project_id, input.idempotency_key, expected, patch_digest, next, binary_sha256],
-            )
-            .map_err(internal)?;
-            tx.commit().map_err(internal)?;
-        }
-        Ok(Response::new(PatchReply {
-            project_id: input.project_id,
-            revision: next as u64,
-            artifact_sha256: binary_sha256.clone(),
-            binary_sha256,
-        }))
+            .await?,
+        ))
     }
 
     async fn get_artifact(
@@ -1866,25 +3007,35 @@ impl Hydir for Store {
     ) -> Result<Response<ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Viewer)?;
         if input.sha256.len() != 64 || !input.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Status::invalid_argument(
                 "artifact digest must be SHA-256 hex",
             ));
         }
-        let record: Option<(i64, String, Vec<u8>)> = self
+        let record: Option<(i64, String, Vec<u8>, String, String, i64)> = self
             .connection()?
             .query_row(
-                "SELECT a.revision,a.media_type,a.content FROM artifacts a \
-             JOIN projects p ON p.id=a.project_id \
-             WHERE a.project_id=?1 AND a.sha256=?2 AND p.owner=?3 \
+                "SELECT a.revision,a.media_type,a.content,a.storage_kind,a.storage_key,a.content_size FROM artifacts a \
+             WHERE a.project_id=?1 AND a.sha256=?2 \
              ORDER BY a.revision DESC LIMIT 1",
-                params![input.project_id, input.sha256, principal],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                params![input.project_id, input.sha256],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .optional()
             .map_err(internal)?;
-        let (revision, media_type, content) =
+        let (revision, media_type, inline, storage_kind, storage_key, content_size) =
             record.ok_or_else(|| Status::not_found("artifact not found"))?;
+        let content = self
+            .content_storage
+            .load(
+                &input.sha256,
+                inline,
+                &storage_kind,
+                &storage_key,
+                content_size,
+            )
+            .await?;
         Ok(Response::new(ArtifactReply {
             sha256: input.sha256,
             media_type,
@@ -1899,6 +3050,7 @@ impl Hydir for Store {
     ) -> Result<Response<JobReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         valid_symbol(&input.function_symbol)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
@@ -1937,11 +3089,14 @@ impl Hydir for Store {
                 &id,
             )?));
         }
-        let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
         let id = Uuid::new_v4().to_string();
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Analyst)?;
             let retry: Option<(String, i64, String)> = tx.query_row(
                 "SELECT id,revision,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
                 params![input.project_id, input.idempotency_key],
@@ -1963,8 +3118,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -1973,8 +3128,8 @@ impl Hydir for Store {
             }
             let active: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM jobs j JOIN projects p ON p.id=j.project_id \
-                 WHERE p.owner=?1 AND j.state IN ('queued','running')",
+                    "SELECT COUNT(*) FROM jobs \
+                 WHERE requested_by=?1 AND state IN ('queued','running')",
                     [principal.as_str()],
                     |row| row.get(0),
                 )
@@ -1983,14 +3138,15 @@ impl Hydir for Store {
                 return Err(Status::resource_exhausted("identity has two active jobs"));
             }
             tx.execute(
-                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state) \
-                 VALUES(?1,?2,?3,'lift',?4,?5,'queued')",
+                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state,requested_by) \
+                 VALUES(?1,?2,?3,'lift',?4,?5,'queued',?6)",
                 params![
                     id,
                     input.project_id,
                     expected,
                     input.function_symbol,
-                    input.idempotency_key
+                    input.idempotency_key,
+                    principal
                 ],
             )
             .map_err(internal)?;
@@ -2040,7 +3196,22 @@ impl Hydir for Store {
     async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<JobReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        let role =
+            self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         self.job(&principal, &input.project_id, &input.job_id)?;
+        let requested_by: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT requested_by FROM jobs WHERE id=?1 AND project_id=?2",
+                params![input.job_id, input.project_id],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if role < ProjectRole::Operator && requested_by.as_deref() != Some(principal.as_str()) {
+            return Err(Status::permission_denied(
+                "analysts may cancel only jobs they requested",
+            ));
+        }
         let changed = {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
@@ -2085,12 +3256,13 @@ impl Hydir for Store {
         request: Request<JobEventRequest>,
     ) -> Result<Response<Self::StreamJobEventsStream>, Status> {
         let principal = self.principal(&request)?;
-        let token = request
+        let bearer = request
             .metadata()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| Status::unauthenticated("credential missing"))?;
-        let token_digest = sha256(token.strip_prefix("Bearer ").unwrap_or_default().as_bytes());
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or_else(|| Status::unauthenticated("credential missing"))?
+            .to_owned();
         let input = request.into_inner();
         self.job(&principal, &input.project_id, &input.job_id)?;
         let mut cursor = i64::try_from(input.after_sequence)
@@ -2100,23 +3272,20 @@ impl Hydir for Store {
         tokio::spawn(async move {
             loop {
                 let snapshot: Result<(Vec<JobEvent>, bool), Status> = (|| {
-                    let conn = store.connection()?;
-                    let credential_valid: bool = conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1 AND token_sha256=?2)",
-                        params![principal, token_digest],
-                        |row| row.get(0),
-                    ).map_err(internal)?;
-                    if !credential_valid {
+                    if store.authenticate_bearer(&bearer)? != principal {
                         return Err(Status::unauthenticated("credential was revoked"));
                     }
+                    let conn = store.connection()?;
                     let state: String = conn
                         .query_row(
-                            "SELECT j.state FROM jobs j JOIN projects p ON p.id=j.project_id \
-                         WHERE j.id=?1 AND j.project_id=?2 AND p.owner=?3",
+                            "SELECT j.state FROM jobs j JOIN project_acls a ON a.project_id=j.project_id \
+                         WHERE j.id=?1 AND j.project_id=?2 AND a.principal=?3",
                             params![input.job_id, input.project_id, principal],
                             |row| row.get(0),
                         )
-                        .map_err(internal)?;
+                        .optional()
+                        .map_err(internal)?
+                        .ok_or_else(|| Status::permission_denied("project access was revoked"))?;
                     let mut statement = conn
                         .prepare(
                             "SELECT sequence,state,message,artifact_sha256 FROM job_events \
@@ -2166,6 +3335,406 @@ impl Hydir for Store {
     }
 }
 
+#[tonic::async_trait]
+impl api_v2::hydir_v2_server::HydirV2 for Store {
+    async fn discover(
+        &self,
+        request: Request<api_v2::DiscoverRequest>,
+    ) -> Result<Response<api_v2::DiscoverReply>, Status> {
+        self.principal(&request)?;
+        Ok(Response::new(api_v2::DiscoverReply {
+            api_version: 2,
+            program_spec_version: PROGRAM_SPEC_VERSION,
+            region_spec_version: REGION_SPEC_VERSION,
+            decompilation_unit_version: DECOMPILATION_UNIT_VERSION,
+            patch_bundle_version: PATCH_BUNDLE_VERSION,
+            stable_contract:
+                "versioned region artifacts are available; full HydIR region parity remains gated"
+                    .to_owned(),
+            compile_patch: true,
+            structural_patch_verification: true,
+            behavior_patch_verification: false,
+            physical_region_ir: true,
+        }))
+    }
+
+    async fn get_region(
+        &self,
+        request: Request<api_v2::RegionRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let content = run_worker("region", Some(&input.function_symbol), binary).await?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.region-spec+json;version=3",
+                &content,
+            )
+            .await?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: "application/vnd.hydir.region-spec+json;version=3".to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn decompile_region(
+        &self,
+        request: Request<api_v2::RegionRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let content = run_worker("decompile-unit", Some(&input.function_symbol), binary).await?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.decompilation-unit+json;version=1",
+                &content,
+            )
+            .await?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: "application/vnd.hydir.decompilation-unit+json;version=1".to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn lift_region(
+        &self,
+        request: Request<api_v2::RegionRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        if !input.assume_u64x2 {
+            return Err(Status::invalid_argument(
+                "explicit u64(u64,u64) prototype assertion required",
+            ));
+        }
+        valid_symbol(&input.function_symbol)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let content =
+            run_worker("physical-region-ir", Some(&input.function_symbol), binary).await?;
+        let media_type = "application/vnd.hydir.physical-region-ir+json;version=1";
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                media_type,
+                &content,
+            )
+            .await?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: media_type.to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn compile_patch(
+        &self,
+        request: Request<api_v2::PatchRequest>,
+    ) -> Result<Response<api_v2::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        validate_v2_patch_request(&input)?;
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
+        let packed = run_worker("patch-v2", None, envelope).await?;
+        let [_patched, bundle] = unpack_worker_parts::<2>(&packed)?;
+        parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.patch-bundle+json;version=2",
+                bundle,
+            )
+            .await?;
+        Ok(Response::new(api_v2::ArtifactReply {
+            sha256: digest,
+            media_type: "application/vnd.hydir.patch-bundle+json;version=2".to_owned(),
+            content: bundle.to_vec(),
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn apply_patch(
+        &self,
+        request: Request<api_v2::PatchRequest>,
+    ) -> Result<Response<api_v2::MutationReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
+        validate_v2_patch_request(&input)?;
+        let binary = self
+            .binary_at_revision(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
+        let packed = run_worker("patch-v2", None, envelope).await?;
+        let [patched, bundle] = unpack_worker_parts::<2>(&packed)?;
+        let parsed_bundle = parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
+        if sha256(patched) != parsed_bundle.patched_sha256 {
+            return Err(Status::internal(
+                "v2 patch worker output differs from its PatchBundle digest",
+            ));
+        }
+        let bundle_digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                "application/vnd.hydir.patch-bundle+json;version=2",
+                bundle,
+            )
+            .await?;
+        let patch_digest = sha256(&input.patch_json);
+        let reply = self
+            .commit_patch_mutation(
+                &principal,
+                &input.project_id,
+                input.expected_revision,
+                &input.idempotency_key,
+                &patch_digest,
+                patched.to_vec(),
+            )
+            .await?;
+        Ok(Response::new(api_v2::MutationReply {
+            project_id: reply.project_id,
+            revision: reply.revision,
+            binary_sha256: reply.binary_sha256,
+            patch_bundle_sha256: bundle_digest,
+        }))
+    }
+
+    async fn verify_patch(
+        &self,
+        request: Request<api_v2::VerifyPatchRequest>,
+    ) -> Result<Response<api_v2::VerificationReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        if input.patch_bundle_json.is_empty() || input.patch_bundle_json.len() > 2 * 1024 * 1024 {
+            return Err(Status::invalid_argument("PatchBundle must be 1..=2 MiB"));
+        }
+        let bundle =
+            parse_patch_bundle_json(&input.patch_bundle_json).map_err(Status::invalid_argument)?;
+        let belongs_to_project: bool = self
+            .connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_revisions r \
+                 WHERE r.project_id=?1 AND r.binary_sha256=?2)",
+                params![input.project_id, bundle.original_sha256],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if !belongs_to_project {
+            return Err(Status::failed_precondition(
+                "PatchBundle original binary is not in project history",
+            ));
+        }
+        let report_json = serde_json::to_string(&json!({
+            "schema_version": 1,
+            "structurally_valid": true,
+            "behavior_verified": false,
+            "stable_verified": bundle.stable_verified,
+            "verification_evidence": bundle.verification_evidence,
+            "scope": "digest, schema, embedded bytes, placement, and project-history checks only; no sample execution",
+        }))
+        .map_err(|error| Status::internal(format!("verification report serialization: {error}")))?;
+        Ok(Response::new(api_v2::VerificationReply {
+            structurally_valid: true,
+            behavior_verified: false,
+            report_json,
+        }))
+    }
+}
+
+fn read_tls_material(path: &Path, label: &str, private: bool) -> Result<Vec<u8>, Box<dyn Error>> {
+    #[cfg(not(unix))]
+    let _ = private;
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute").into());
+    }
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_TLS_MATERIAL_BYTES {
+        return Err(format!("{label} must be a non-empty regular file of at most 1 MiB").into());
+    }
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!("{label} must not be group/world accessible (chmod 600)").into());
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.contains(&0) {
+        return Err(format!("{label} must be PEM text without NUL bytes").into());
+    }
+    Ok(bytes)
+}
+
+fn tls_config(certificate: &Path, private_key: &Path) -> Result<ServerTlsConfig, Box<dyn Error>> {
+    let certificate = read_tls_material(certificate, "TLS certificate", false)?;
+    let private_key = read_tls_material(private_key, "TLS private key", true)?;
+    Ok(ServerTlsConfig::new()
+        .identity(Identity::from_pem(certificate, private_key))
+        .timeout(Duration::from_secs(10)))
+}
+
+fn oidc_verifier(
+    issuer: &str,
+    audience: &str,
+    jwks_path: &Path,
+) -> Result<OidcVerifier, Box<dyn Error>> {
+    let bytes = read_tls_material(jwks_path, "OIDC JWKS", false)?;
+    let keys: JwkSet =
+        serde_json::from_slice(&bytes).map_err(|error| format!("OIDC JWKS JSON: {error}"))?;
+    OidcVerifier::new(issuer.to_owned(), audience.to_owned(), keys).map_err(Into::into)
+}
+
+fn filesystem_content_storage(root: &Path) -> Result<ContentStorage, Box<dyn Error>> {
+    Ok(ContentStorage::FilesystemCas(Arc::new(
+        FilesystemCas::open(root)?,
+    )))
+}
+
+async fn s3_content_storage(
+    endpoint: &str,
+    region: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Result<ContentStorage, Box<dyn Error>> {
+    if region.is_empty()
+        || region.len() > 64
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("S3 region must be 1..=64 ASCII letters, digits, or hyphens".into());
+    }
+    if bucket.len() < 3
+        || bucket.len() > 63
+        || bucket.starts_with(['.', '-'])
+        || bucket.ends_with(['.', '-'])
+        || bucket.contains("..")
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+    {
+        return Err("S3 bucket name is invalid".into());
+    }
+    let prefix = if prefix == "-" {
+        String::new()
+    } else {
+        let trimmed = prefix.trim_matches('/');
+        if trimmed.is_empty()
+            || trimmed.len() > 256
+            || trimmed
+                .split('/')
+                .any(|part| part.is_empty() || part == "..")
+            || !trimmed.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/')
+            })
+        {
+            return Err("S3 prefix must be `-` or a bounded safe object-key prefix".into());
+        }
+        trimmed.to_owned()
+    };
+    let custom_endpoint = if endpoint == "-" {
+        None
+    } else {
+        let parsed = url::Url::parse(endpoint)?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err("custom S3 endpoint must be an origin-only HTTPS URL".into());
+        }
+        Some(endpoint.to_owned())
+    };
+    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.to_owned()))
+        .load()
+        .await;
+    let mut builder = aws_sdk_s3::config::Builder::from(&shared);
+    if let Some(endpoint) = custom_endpoint {
+        builder = builder.endpoint_url(endpoint).force_path_style(true);
+    }
+    Ok(ContentStorage::S3(Arc::new(S3ContentStore {
+        client: aws_sdk_s3::Client::from_conf(builder.build()),
+        bucket: bucket.to_owned(),
+        prefix,
+    })))
+}
+
+async fn serve_rpc(
+    store: Store,
+    address: SocketAddr,
+    tls: Option<ServerTlsConfig>,
+) -> Result<(), Box<dyn Error>> {
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_service_status("", ServingStatus::Serving)
+        .await;
+    let mut server = Server::builder();
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    server
+        .add_service(health_service)
+        .add_service(
+            HydirServer::new(store.clone())
+                .max_decoding_message_size(MAX_BINARY_BYTES + 1024)
+                .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
+        )
+        .add_service(
+            HydirV2Server::new(store)
+                .max_decoding_message_size(MAX_BINARY_BYTES + 1024)
+                .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
+        )
+        .add_service(interchange::interchange_service())
+        .add_service(interchange::patch_service())
+        .serve(address)
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -2184,6 +3753,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let token = store.rotate_identity(principal)?;
             println!("principal: {principal}\nnew credential (save securely; shown once): {token}");
         }
+        [identity, list, database] if identity == "identity" && list == "list-oidc" => {
+            let store = Store::open(Path::new(database))?;
+            let identities = store
+                .oidc_identities()?
+                .into_iter()
+                .map(|identity| {
+                    json!({
+                        "principal": identity.principal,
+                        "issuer": identity.issuer,
+                        "subject": identity.subject,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&identities)?);
+        }
+        [access, grant, database, project, actor, principal, role]
+            if access == "access" && grant == "grant" =>
+        {
+            let store = Store::open(Path::new(database))?;
+            let role = ProjectRole::parse(role)?;
+            store.set_project_role(actor, project, principal, Some(role))?;
+            println!("granted {} role on {project} to {principal}", role.as_str());
+        }
+        [access, revoke, database, project, actor, principal]
+            if access == "access" && revoke == "revoke" =>
+        {
+            let store = Store::open(Path::new(database))?;
+            store.set_project_role(actor, project, principal, None)?;
+            println!("revoked access to {project} from {principal}");
+        }
+        [access, list, database, project, actor] if access == "access" && list == "list" => {
+            let store = Store::open(Path::new(database))?;
+            let records = store
+                .project_access(actor, project)?
+                .into_iter()
+                .map(|(principal, role)| json!({"principal": principal, "role": role.as_str()}))
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
         [serve, database, bind] if serve == "serve" => {
             if database == ":memory:" {
                 return Err("hydird serve requires a persistent SQLite database file".into());
@@ -2194,12 +3802,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             let store = Store::open(Path::new(database))?;
             println!("hydird local RPC listening on {address}");
-            Server::builder()
-                .add_service(HydirServer::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
-                .serve(address)
-                .await?;
+            serve_rpc(store, address, None).await?;
         }
-        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird serve <database.sqlite> <loopback-host:port>".into()),
+        [serve, database, bind, certificate, private_key] if serve == "serve-tls" => {
+            if database == ":memory:" {
+                return Err("hydird serve-tls requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let store = Store::open(Path::new(database))?;
+            println!("hydird TLS RPC listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        [serve, database, bind, certificate, private_key, issuer, audience, jwks]
+            if serve == "serve-oidc" =>
+        {
+            if database == ":memory:" {
+                return Err("hydird serve-oidc requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let verifier = oidc_verifier(issuer, audience, Path::new(jwks))?;
+            let store = Store::open_with_auth(
+                Path::new(database),
+                AuthenticationMode::Oidc(Arc::new(verifier)),
+            )?;
+            println!("hydird TLS/OIDC RPC listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        [serve, database, bind, certificate, private_key, issuer, audience, jwks, object_root]
+            if serve == "serve-oidc-cas" =>
+        {
+            if database == ":memory:" {
+                return Err("hydird serve-oidc-cas requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let verifier = oidc_verifier(issuer, audience, Path::new(jwks))?;
+            let content_storage = filesystem_content_storage(Path::new(object_root))?;
+            let store = Store::open_with_options(
+                Path::new(database),
+                AuthenticationMode::Oidc(Arc::new(verifier)),
+                content_storage,
+            )?;
+            println!("hydird TLS/OIDC RPC with filesystem CAS listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        [serve, database, bind, certificate, private_key, issuer, audience, jwks, endpoint, region, bucket, prefix]
+            if serve == "serve-oidc-s3" =>
+        {
+            if database == ":memory:" {
+                return Err("hydird serve-oidc-s3 requires a persistent SQLite database file".into());
+            }
+            let address: SocketAddr = bind.parse()?;
+            let tls = tls_config(Path::new(certificate), Path::new(private_key))?;
+            let verifier = oidc_verifier(issuer, audience, Path::new(jwks))?;
+            let content_storage = s3_content_storage(endpoint, region, bucket, prefix).await?;
+            let store = Store::open_with_options(
+                Path::new(database),
+                AuthenticationMode::Oidc(Arc::new(verifier)),
+                content_storage,
+            )?;
+            println!("hydird TLS/OIDC RPC with S3 content storage listening on {address}");
+            serve_rpc(store, address, Some(tls)).await?;
+        }
+        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird identity list-oidc <database.sqlite> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> | hydird serve-oidc <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> | hydird serve-oidc-cas <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> <absolute-object-root> | hydird serve-oidc-s3 <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem> <https-issuer> <audience> <absolute-jwks.json> <-|https-endpoint> <region> <bucket> <-|prefix>".into()),
     }
     Ok(())
 }
@@ -2207,6 +3874,222 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_oidc_jwks_verifies_claims_and_provisions_stable_principal() {
+        use jsonwebtoken::{EncodingKey, Header, encode, jwk::Jwk};
+        use rand::rngs::OsRng;
+        use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey};
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct Claims<'a> {
+            sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
+            exp: u64,
+            nbf: u64,
+        }
+
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let private_der = private_key.to_pkcs1_der().unwrap();
+        let encoding_key = EncodingKey::from_rsa_der(private_der.as_bytes());
+        let mut jwk = Jwk::from_encoding_key(&encoding_key, Algorithm::RS256).unwrap();
+        jwk.common.key_id = Some("test-key".to_owned());
+        jwk.common.public_key_use = Some(PublicKeyUse::Signature);
+        let verifier = Arc::new(
+            OidcVerifier::new(
+                "https://identity.example/tenant".to_owned(),
+                "hydir-api".to_owned(),
+                JwkSet { keys: vec![jwk] },
+            )
+            .unwrap(),
+        );
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = Claims {
+            sub: "analyst@example",
+            iss: "https://identity.example/tenant",
+            aud: "hydir-api",
+            exp: now + 300,
+            nbf: now.saturating_sub(1),
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key".to_owned());
+        let token = encode(&header, &claims, &encoding_key).unwrap();
+        let store = Store::open_with_auth(
+            Path::new(":memory:"),
+            AuthenticationMode::Oidc(verifier.clone()),
+        )
+        .unwrap();
+        let principal = store.authenticate_bearer(&token).unwrap();
+        assert!(principal.starts_with("oidc-"));
+        assert!(store.rotate_identity(&principal).is_err());
+        assert_eq!(store.authenticate_bearer(&token).unwrap(), principal);
+        let registered: (String, String) = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT issuer,subject FROM oidc_identities WHERE principal=?1",
+                [&principal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            registered,
+            (
+                "https://identity.example/tenant".to_owned(),
+                "analyst@example".to_owned()
+            )
+        );
+
+        let wrong_audience = encode(
+            &header,
+            &Claims {
+                aud: "another-api",
+                ..claims
+            },
+            &encoding_key,
+        )
+        .unwrap();
+        assert!(store.authenticate_bearer(&wrong_audience).is_err());
+        let expired = encode(
+            &header,
+            &Claims {
+                exp: now.saturating_sub(31),
+                ..claims
+            },
+            &encoding_key,
+        )
+        .unwrap();
+        assert!(store.authenticate_bearer(&expired).is_err());
+        let mut unknown_header = Header::new(Algorithm::RS256);
+        unknown_header.kid = Some("unknown-key".to_owned());
+        let unknown_key = encode(&unknown_header, &claims, &encoding_key).unwrap();
+        assert!(store.authenticate_bearer(&unknown_key).is_err());
+        assert!(verifier.verify("not.a.jwt").is_err());
+    }
+
+    #[test]
+    fn tls_material_requires_absolute_bounded_pem_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("server.pem");
+        std::fs::write(&certificate, b"-----BEGIN CERTIFICATE-----\nfixture\n").unwrap();
+        assert_eq!(
+            read_tls_material(&certificate, "certificate", false).unwrap(),
+            b"-----BEGIN CERTIFICATE-----\nfixture\n"
+        );
+        assert!(read_tls_material(Path::new("server.pem"), "certificate", false).is_err());
+        std::fs::write(&certificate, b"pem\0text").unwrap();
+        assert!(read_tls_material(&certificate, "certificate", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn s3_configuration_rejects_unsafe_names_and_endpoints_before_network_use() {
+        assert!(
+            s3_content_storage("-", "../region", "hydir-artifacts", "-")
+                .await
+                .is_err()
+        );
+        assert!(
+            s3_content_storage("-", "us-east-1", "Hydir_Artifacts", "-")
+                .await
+                .is_err()
+        );
+        assert!(
+            s3_content_storage("-", "us-east-1", "hydir-artifacts", "../../escape")
+                .await
+                .is_err()
+        );
+        assert!(
+            s3_content_storage(
+                "http://objects.example",
+                "us-east-1",
+                "hydir-artifacts",
+                "hydir"
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            s3_content_storage(
+                "https://user:secret@objects.example/?query=x",
+                "us-east-1",
+                "hydir-artifacts",
+                "hydir"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_ten_accepts_s3_metadata_and_preserves_foreign_keys() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let connection = store.connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        connection
+            .execute(
+                "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) VALUES(?1,x'','s3',?2,1)",
+                params!["0".repeat(64), "sha256/00/00/fixture"],
+            )
+            .unwrap();
+        let foreign_key_errors: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[test]
+    fn worker_launch_mode_is_explicit_and_argument_separated() {
+        let executable = Path::new(if cfg!(windows) {
+            "C:\\hydir\\hydird.exe"
+        } else {
+            "/opt/hydir/hydird"
+        });
+        let direct =
+            worker_launch_spec(executable, "lift", Some("hydir_symbol"), "process", None).unwrap();
+        assert_eq!(direct.program, executable);
+        assert_eq!(
+            direct.arguments,
+            ["worker", "lift", "hydir_symbol"].map(OsString::from)
+        );
+        assert!(
+            worker_launch_spec(executable, "lift", None, "unknown", None)
+                .unwrap_err()
+                .contains("process` or `bubblewrap")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_worker_has_no_network_and_minimal_read_only_mounts() {
+        let launch = worker_launch_spec(
+            Path::new("/opt/hydir/hydird"),
+            "inspect",
+            None,
+            "bubblewrap",
+            Some(Path::new("/usr/bin/bwrap")),
+        )
+        .unwrap();
+        let arguments = launch
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(arguments.iter().any(|value| value == "--unshare-all"));
+        assert!(arguments.iter().any(|value| value == "--clearenv"));
+        assert!(
+            arguments
+                .windows(3)
+                .any(|window| window == ["--cap-drop", "ALL", "--clearenv"])
+        );
+        assert_eq!(arguments.last().map(AsRef::as_ref), Some("inspect"));
+    }
 
     #[test]
     fn annotation_inputs_are_bounded_and_names_cannot_spoof_display_lines() {
@@ -2258,6 +4141,241 @@ mod tests {
             .metadata_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
         request
+    }
+
+    #[tokio::test]
+    async fn filesystem_cas_is_digest_verified_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("cas.sqlite");
+        let object_root = directory.path().join("objects");
+        let storage = filesystem_content_storage(&object_root).unwrap();
+        let store =
+            Store::open_with_options(&database, AuthenticationMode::StaticTokens, storage.clone())
+                .unwrap();
+        let token = store.create_identity("cas-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "CAS project".to_owned(),
+                    idempotency_key: "cas-project".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = b"digest-bound-binary";
+        let staged = store.content_storage.stage(binary).await.unwrap();
+        {
+            let connection = store.connection().unwrap();
+            insert_binary(&connection, &staged).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,1,?2)",
+                    params![project.project_id, staged.digest],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE projects SET current_revision=1 WHERE id=?1",
+                    [&project.project_id],
+                )
+                .unwrap();
+        }
+        let artifact = b"content-addressed artifact";
+        let artifact_digest = store
+            .store_artifact(&project.project_id, 1, "application/test", artifact)
+            .await
+            .unwrap();
+        let inline_bytes: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT length(content) FROM artifacts WHERE sha256=?1",
+                [&artifact_digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inline_bytes, 0);
+        assert_eq!(
+            store
+                .current_binary("cas-analyst", &project.project_id, 1)
+                .await
+                .unwrap(),
+            binary
+        );
+        drop(store);
+
+        let reopened =
+            Store::open_with_options(&database, AuthenticationMode::StaticTokens, storage).unwrap();
+        let found = reopened
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: artifact_digest.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(found.content, artifact);
+
+        let object_path = object_root
+            .join(&artifact_digest[..2])
+            .join(&artifact_digest[2..4])
+            .join(&artifact_digest);
+        std::fs::write(&object_path, b"corrupt").unwrap();
+        assert_eq!(
+            reopened
+                .get_artifact(authorized(
+                    ArtifactRequest {
+                        project_id: project.project_id,
+                        sha256: artifact_digest,
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_region_decompile_compile_verify_and_apply_are_digest_bound() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("v2-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "v2 workflow".to_owned(),
+                    idempotency_key: "create-v2".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let region_request = api_v2::RegionRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            function_symbol: "hydir_max2".to_owned(),
+            assume_u64x2: true,
+        };
+        let region = api_v2::hydir_v2_server::HydirV2::get_region(
+            &store,
+            authorized(region_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let parsed_region = hydir_core::parse_region_spec_json(&region.content).unwrap();
+        assert_eq!(parsed_region.schema_version, REGION_SPEC_VERSION);
+
+        let physical_ir = api_v2::hydir_v2_server::HydirV2::lift_region(
+            &store,
+            authorized(region_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            physical_ir.media_type,
+            "application/vnd.hydir.physical-region-ir+json;version=1"
+        );
+        let physical_ir: hydir_core::PhysicalRegionIr =
+            serde_json::from_slice(&physical_ir.content).unwrap();
+        hydir_core::validate_physical_region_ir(&physical_ir, &parsed_region).unwrap();
+
+        let decompilation = api_v2::hydir_v2_server::HydirV2::decompile_region(
+            &store,
+            authorized(region_request, &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let unit: hydir_core::DecompilationUnit =
+            serde_json::from_slice(&decompilation.content).unwrap();
+        hydir_core::validate_decompilation_unit(&unit).unwrap();
+
+        let patch_json = serde_json::to_vec(&hydir_patch::PatchDocument {
+            schema_version: hydir_patch::PATCH_SCHEMA_VERSION,
+            binary_sha256: sha256(&binary),
+            function_symbol: "hydir_max2".to_owned(),
+            prototype: "u64(u64,u64)".to_owned(),
+            replacement: "u64 sum = arg0 + arg1;\nsum = sum - arg1;\nreturn sum;".to_owned(),
+        })
+        .unwrap();
+        let patch_request = api_v2::PatchRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: "v2-patch".to_owned(),
+            patch_json,
+            trusted_fixture: true,
+            assume_u64x2: true,
+            assume_entry_only: true,
+        };
+        let compiled = api_v2::hydir_v2_server::HydirV2::compile_patch(
+            &store,
+            authorized(patch_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let bundle = parse_patch_bundle_json(&compiled.content).unwrap();
+        assert!(!bundle.stable_verified);
+        assert!(bundle.typed_patch_ir.expression.is_none());
+        assert!(bundle.typed_patch_ir.resolved_return.is_some());
+        let verified = api_v2::hydir_v2_server::HydirV2::verify_patch(
+            &store,
+            authorized(
+                api_v2::VerifyPatchRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: uploaded.revision,
+                    patch_bundle_json: compiled.content,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(verified.structurally_valid);
+        assert!(!verified.behavior_verified);
+
+        let applied = api_v2::hydir_v2_server::HydirV2::apply_patch(
+            &store,
+            authorized(patch_request.clone(), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(applied.revision, uploaded.revision + 1);
+        assert_eq!(applied.patch_bundle_sha256, compiled.sha256);
+        let replay = api_v2::hydir_v2_server::HydirV2::apply_patch(
+            &store,
+            authorized(patch_request, &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(replay.revision, applied.revision);
+        assert_eq!(replay.binary_sha256, applied.binary_sha256);
     }
 
     #[cfg(unix)]
@@ -2365,8 +4483,8 @@ mod tests {
         {
             let conn = store.connection().unwrap();
             conn.execute(
-                "INSERT INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![binary_sha256, fake_binary],
+                "INSERT INTO binaries(sha256,content,content_size) VALUES(?1,?2,?3)",
+                params![binary_sha256, fake_binary, fake_binary.len() as i64],
             )
             .unwrap();
             conn.execute(
@@ -2675,7 +4793,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=7;")
+            .execute_batch("PRAGMA user_version=11;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -2709,8 +4827,172 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 10);
+        let foreign_key_errors: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) VALUES(?1,x'','s3',?2,1)",
+                params!["0".repeat(64), "sha256/00/00/fixture"],
+            )
+            .unwrap();
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
+        assert_eq!(
+            store
+                .require_project_role("alice", "p", ProjectRole::Admin)
+                .unwrap(),
+            ProjectRole::Admin
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roles_are_ordered_persistent_and_audited() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("roles.sqlite");
+        let store = Store::open(&database).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        store.create_identity("carol").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "shared".to_owned(),
+                    idempotency_key: "shared-1".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        store
+            .set_project_role(
+                "alice",
+                &project.project_id,
+                "bob",
+                Some(ProjectRole::Viewer),
+            )
+            .unwrap();
+        assert!(store.project("bob", &project.project_id).is_ok());
+        assert!(
+            store
+                .get_project(authorized(
+                    ProjectRequest {
+                        project_id: project.project_id.clone(),
+                        expected_revision: 0,
+                    },
+                    &bob,
+                ))
+                .await
+                .is_ok()
+        );
+        let denied_upload = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content: b"not an ELF".to_vec(),
+                    content_sha256: sha256(b"not an ELF"),
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied_upload.code(), tonic::Code::PermissionDenied);
+        let denied_analysis = store
+            .inspect(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied_analysis.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            store
+                .require_project_role("bob", &project.project_id, ProjectRole::Analyst)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        store
+            .set_project_role(
+                "alice",
+                &project.project_id,
+                "bob",
+                Some(ProjectRole::Analyst),
+            )
+            .unwrap();
+        assert!(
+            store
+                .require_project_role("bob", &project.project_id, ProjectRole::Analyst)
+                .is_ok()
+        );
+        let analysis_without_binary = store
+            .inspect(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            analysis_without_binary.code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(
+            store
+                .set_project_role(
+                    "bob",
+                    &project.project_id,
+                    "carol",
+                    Some(ProjectRole::Viewer)
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .set_project_role("alice", &project.project_id, "alice", None)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .project_access("alice", &project.project_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        let audit_count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE project_id=?1",
+                [&project.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 3);
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .require_project_role("bob", &project.project_id, ProjectRole::Analyst)
+                .unwrap(),
+            ProjectRole::Analyst
+        );
     }
 
     #[tokio::test]
@@ -2734,8 +5016,8 @@ mod tests {
         {
             let conn = store.connection().unwrap();
             conn.execute(
-                "INSERT INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![sha256(bytes), bytes],
+                "INSERT INTO binaries(sha256,content,content_size) VALUES(?1,?2,?3)",
+                params![sha256(bytes), bytes, bytes.len() as i64],
             )
             .unwrap();
             conn.execute(
