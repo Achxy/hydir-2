@@ -246,10 +246,27 @@ atomic rename. A failed database transaction can leave an unreferenced object,
 which is harmless in the immutable CAS and may be reclaimed by future storage
 maintenance tooling. Back up the SQLite database and object root together.
 
+`serve-oidc-s3` stores the same digest-derived immutable keys in AWS S3 or an
+S3-compatible HTTPS service. It uses the standard AWS credential provider
+chain, streams reads through a 64 MiB hard bound, and verifies SHA-256 after
+every read. Pass `-` for the AWS-managed endpoint and/or an empty object prefix;
+custom endpoints must be origin-only HTTPS URLs:
+
+```bash
+cargo run --locked --bin hydird -- serve-oidc-s3 \
+  /path/to/hydird.sqlite 0.0.0.0:50051 \
+  /run/secrets/tls.crt /run/secrets/tls.key \
+  https://identity.example/tenant hydir-api /run/config/oidc-jwks.json \
+  - us-east-1 hydir-artifacts production
+```
+
+HydIR records only the S3 key, backend kind, digest, and size in metadata. It
+never stores cloud credentials in the project database or command line.
+
 The TLS/OIDC/SQLite/filesystem-CAS mode is a secure deployment foundation, not
 the completed production profile. Automatic discovery/key refresh, PostgreSQL,
-S3-compatible storage, quotas, audit export, and Kubernetes packaging remain
-required before that profile is release-ready.
+quotas, audit export, and Kubernetes packaging remain required before that
+profile is release-ready.
 
 Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent `remote inspect`, `cfg`, `lift`, `decompile`, `artifact`, or `job-*` operations. Credential files must not be group- or world-readable.
 
