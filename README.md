@@ -53,8 +53,8 @@ cargo run --locked --bin hydirctl -- decompile \
 ```
 
 The [semantic evidence gate](SEMANTIC_GATE.md) records supported cases,
-explicit refusals, and semantic mismatches. The [IRENE-3 comparison](IRENE3_COMPARISON.md)
-defines the pinned compatibility experiment, while [MIRRORBALL_STUDY.md](MIRRORBALL_STUDY.md)
+explicit refusals, and semantic mismatches. The [HydIR compatibility report](HYDIR_COMPATIBILITY.md)
+defines the pinned reference experiment, while [MIRRORBALL_STUDY.md](MIRRORBALL_STUDY.md)
 tracks recovery-boundary evidence.
 
 Clang with x86-64 ELF and LLVM IR support is required for the full demo path. Native execution comparisons require Linux x86-64. On macOS with Docker Desktop:
@@ -113,21 +113,21 @@ The scripts record CFG, LLVM IR, C, and differential results as inspectable arti
 
 [![egui C output cutout refusing an unsupported call while retaining other analysis results](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
 
-## Irene3 interoperability checkpoint
+## HydIR interchange checkpoint
 
-HydIR compiles the exact pinned Anvill, `irene.server.Irene`, and
-`irene3.server.PatchLangServer` protobuf contracts. Anvill specifications are
-decoded under explicit inventory, nesting, value, chunk, and total-size limits;
-the original bytes are retained for lossless forwarding. A specification can
-be bound to its matching ELF and converted block-by-block into RegionSpec v3:
+HydIR owns its protobuf contracts under the `hydir.interchange` and
+`hydir.patch` namespaces. Specifications are decoded under explicit inventory,
+nesting, value, chunk, and total-size limits; the original bytes are retained
+for lossless forwarding. A specification can be bound to its matching ELF and
+converted block-by-block into RegionSpec v3:
 
 ```bash
-cargo run --locked --bin hydirctl -- irene3-inspect program.proto
-cargo run --locked --bin hydirctl -- irene3-region \
+cargo run --locked --bin hydirctl -- hydir-spec-inspect program.proto
+cargo run --locked --bin hydirctl -- hydir-spec-region \
   program.proto program.elf 26 --output region.json
-cargo run --locked --bin hydirctl -- irene3-decompile-region \
+cargo run --locked --bin hydirctl -- hydir-spec-decompile \
   program.proto program.elf 35 --output decompilation-unit.json
-cargo run --locked --bin hydirctl -- irene3-compat-report \
+cargo run --locked --bin hydirctl -- hydir-spec-report \
   program.proto program.elf
 ```
 
@@ -137,18 +137,18 @@ addresses, and every live output through an explicit pass-through mapping. Its
 LLVM-compatible text and deterministic C use aggregate results rather than an
 invented scalar function ABI; other region shapes continue to fail closed.
 
-The local server mounts both upstream service names and accepts Irene3's
-streaming chunk convention. For non-empty programs it currently returns a
-fail-closed precondition error instead of fabricating C or PatchLang while
-physical adapters and typed PatchIR remain incomplete. The pinned upstream
-repository is a test-only submodule and is not linked into HydIR:
+The local server mounts both HydIR services and accepts the bounded streaming
+chunk convention. For non-empty programs it currently returns a fail-closed
+precondition error instead of fabricating C or PatchIR while physical adapters
+remain incomplete. The pinned external reference repository is a test-only
+submodule and is not linked into HydIR:
 
 ```bash
-git submodule update --init third_party/irene3-reference
+git submodule update --init third_party/hydir-reference
 ```
 
 Measured compatibility and remaining semantic blockers are recorded in
-[IRENE3_COMPARISON.md](IRENE3_COMPARISON.md).
+[HYDIR_COMPATIBILITY.md](HYDIR_COMPATIBILITY.md).
 
 ## Symbolic exploration with Triton
 

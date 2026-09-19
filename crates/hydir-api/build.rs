@@ -6,14 +6,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schemas = [
         "proto/hydir.proto",
         "proto/hydir_v2.proto",
-        "proto/anvill/data_specifications/specification.proto",
-        "proto/irene/service.proto",
-        "proto/irene3/patch_service.proto",
+        "proto/hydir_interchange/specification.proto",
+        "proto/hydir_interchange/service.proto",
+        "proto/hydir_patch/service.proto",
     ];
     tonic_prost_build::configure()
-        // Deterministic Anvill re-encoding requires ordered protobuf maps.
+        // Deterministic HydIR interchange re-encoding requires ordered protobuf maps.
         // Keep the existing HydIR v1/v2 generated Rust field types unchanged.
-        .btree_map(".specification")
+        .btree_map(".hydir.interchange")
         .compile_protos(&schemas, &["proto"])?;
     for schema in schemas {
         println!("cargo:rerun-if-changed={schema}");

@@ -425,12 +425,12 @@ version = "0.0.0"
 dependencies = [
  "hydir-backend",
  "hydir-c",
- "hydir-irene3",
+ "hydir-interchange",
  "libfuzzer-sys",
 ]
 
 [[package]]
-name = "hydir-irene3"
+name = "hydir-interchange"
 version = "0.1.0"
 dependencies = [
  "hydir-api",

@@ -6,6 +6,6 @@ fuzz_target!(|bytes: &[u8]| {
     // Keep smoke iterations cheap while the production parser independently
     // enforces its 64 MiB interchange ceiling.
     if !bytes.is_empty() && bytes.len() <= 1024 * 1024 {
-        let _ = hydir_irene3::SpecificationDocument::decode(bytes);
+        let _ = hydir_interchange::SpecificationDocument::decode(bytes);
     }
 });

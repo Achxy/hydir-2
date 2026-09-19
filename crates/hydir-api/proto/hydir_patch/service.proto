@@ -1,8 +1,7 @@
-// Wire-compatible with Irene3 commit
-// d97aee937ebb6d1cb8a362748c56414404eb75ff (AGPL-3.0-only).
+// HydIR native region-patch service.
 syntax = "proto3";
 
-package irene3.server;
+package hydir.patch.server;
 
 message SpecChunk {
   bytes chunk = 1;
@@ -31,7 +30,7 @@ message PatchResponse {
   string patched_module = 3;
 }
 
-service PatchLangServer {
+service HydirPatchService {
   rpc GeneratePatchGraph(stream SpecChunk) returns (PatchGraph) {}
   rpc ApplyPatch(PatchRequest) returns (PatchResponse) {}
 }

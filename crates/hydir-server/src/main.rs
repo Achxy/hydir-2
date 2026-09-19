@@ -1,6 +1,6 @@
 //! Local-only, authenticated HydIR RPC slice. No sample execution endpoint.
 
-mod compat;
+mod interchange;
 
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_api::v1::{
@@ -2292,7 +2292,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
             decompilation_unit_version: DECOMPILATION_UNIT_VERSION,
             patch_bundle_version: PATCH_BUNDLE_VERSION,
             stable_contract:
-                "versioned region artifacts are available; full Irene3 parity remains gated"
+                "versioned region artifacts are available; full HydIR region parity remains gated"
                     .to_owned(),
             compile_patch: true,
             structural_patch_verification: true,
@@ -2504,8 +2504,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Server::builder()
                 .add_service(HydirServer::new(store.clone()).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
                 .add_service(HydirV2Server::new(store).max_decoding_message_size(MAX_BINARY_BYTES + 1024).max_encoding_message_size(MAX_BINARY_BYTES + 1024))
-                .add_service(compat::irene_service())
-                .add_service(compat::patch_lang_service())
+                .add_service(interchange::interchange_service())
+                .add_service(interchange::patch_service())
                 .serve(address)
                 .await?;
         }

@@ -1335,7 +1335,7 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
- "hydir-irene3",
+ "hydir-interchange",
  "hydir-patch",
  "hydir-project",
  "hydir-recompile",
@@ -1383,7 +1383,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hydir-irene3"
+name = "hydir-interchange"
 version = "0.1.0"
 dependencies = [
  "hydir-api",
@@ -1446,7 +1446,7 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
- "hydir-irene3",
+ "hydir-interchange",
  "hydir-patch",
  "hydir-recompile",
  "hydir-transform",

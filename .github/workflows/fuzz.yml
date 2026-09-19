@@ -24,10 +24,10 @@ jobs:
         run: |
           cargo fuzz build c_output
           cargo fuzz run c_output -- -max_total_time=30
-      - name: Anvill specification parser corpus
+      - name: HydIR specification parser corpus
         run: |
-          cargo fuzz build anvill_spec
-          cargo fuzz run anvill_spec -- -max_total_time=30
+          cargo fuzz build hydir_spec
+          cargo fuzz run hydir_spec -- -max_total_time=30
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
