@@ -1,4 +1,4 @@
-//! Local-only, authenticated HydIR RPC slice. No sample execution endpoint.
+//! Authenticated local-or-TLS HydIR RPC slice. No sample execution endpoint.
 
 mod interchange;
 
@@ -315,6 +315,92 @@ PRAGMA user_version=6;
 COMMIT;
 ";
 
+const PROJECT_ACCESS_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE project_acls (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    principal TEXT NOT NULL REFERENCES identities(principal),
+    role TEXT NOT NULL CHECK(role IN ('viewer','analyst','operator','admin')),
+    granted_by TEXT NOT NULL REFERENCES identities(principal),
+    created_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+    PRIMARY KEY(project_id, principal)
+);
+CREATE INDEX project_acls_principal ON project_acls(principal, project_id);
+INSERT INTO project_acls(project_id,principal,role,granted_by)
+    SELECT id,owner,'admin',owner FROM projects;
+ALTER TABLE jobs ADD COLUMN requested_by TEXT REFERENCES identities(principal);
+UPDATE jobs SET requested_by=(SELECT owner FROM projects WHERE projects.id=jobs.project_id)
+    WHERE requested_by IS NULL;
+CREATE TABLE audit_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+    principal TEXT NOT NULL,
+    action TEXT NOT NULL,
+    project_id TEXT,
+    details_json TEXT NOT NULL
+);
+PRAGMA user_version=7;
+COMMIT;
+";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProjectRole {
+    Viewer,
+    Analyst,
+    Operator,
+    Admin,
+}
+
+impl ProjectRole {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "viewer" => Ok(Self::Viewer),
+            "analyst" => Ok(Self::Analyst),
+            "operator" => Ok(Self::Operator),
+            "admin" => Ok(Self::Admin),
+            _ => Err("project role must be viewer, analyst, operator, or admin".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Analyst => "analyst",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+fn require_project_role_in(
+    connection: &Connection,
+    principal: &str,
+    id: &str,
+    required: ProjectRole,
+) -> Result<ProjectRole, Status> {
+    let role: Option<String> = connection
+        .query_row(
+            "SELECT role FROM project_acls WHERE project_id=?1 AND principal=?2",
+            params![id, principal],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    let role = role
+        .as_deref()
+        .map(ProjectRole::parse)
+        .transpose()
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("project not found"))?;
+    if role < required {
+        return Err(Status::permission_denied(format!(
+            "project operation requires {} role",
+            required.as_str()
+        )));
+    }
+    Ok(role)
+}
+
 #[derive(Clone)]
 struct Store {
     db: Arc<Mutex<Connection>>,
@@ -348,7 +434,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 6 {
+        if version > 7 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -368,6 +454,9 @@ impl Store {
         }
         if version <= 5 {
             connection.execute_batch(ANNOTATION_MIGRATION)?;
+        }
+        if version <= 6 {
+            connection.execute_batch(PROJECT_ACCESS_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -447,15 +536,128 @@ impl Store {
             .ok_or_else(|| Status::unauthenticated("invalid bearer credential"))
     }
 
+    fn require_project_role(
+        &self,
+        principal: &str,
+        id: &str,
+        required: ProjectRole,
+    ) -> Result<ProjectRole, Status> {
+        let connection = self.connection()?;
+        require_project_role_in(&connection, principal, id, required)
+    }
+
+    fn set_project_role(
+        &self,
+        actor: &str,
+        project_id: &str,
+        principal: &str,
+        role: Option<ProjectRole>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.db.lock().map_err(|_| "database lock poisoned")?;
+        let transaction = connection.transaction()?;
+        let actor_role: Option<String> = transaction
+            .query_row(
+                "SELECT role FROM project_acls WHERE project_id=?1 AND principal=?2",
+                params![project_id, actor],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actor_role.as_deref() != Some("admin") {
+            return Err("actor is not a project admin".into());
+        }
+        let owner: String = transaction
+            .query_row(
+                "SELECT owner FROM projects WHERE id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "project does not exist")?;
+        if principal == owner && role != Some(ProjectRole::Admin) {
+            return Err("the project owner must retain the admin role".into());
+        }
+        let identity_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identities WHERE principal=?1)",
+            [principal],
+            |row| row.get(0),
+        )?;
+        if !identity_exists {
+            return Err("target principal does not exist".into());
+        }
+        let (action, details) = if let Some(role) = role {
+            transaction.execute(
+                "INSERT INTO project_acls(project_id,principal,role,granted_by) VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(project_id,principal) DO UPDATE SET role=excluded.role,granted_by=excluded.granted_by,created_at_ms=(unixepoch('subsec') * 1000)",
+                params![project_id, principal, role.as_str(), actor],
+            )?;
+            (
+                "project.role.set",
+                serde_json::to_string(&json!({"principal": principal, "role": role.as_str()}))?,
+            )
+        } else {
+            if transaction.execute(
+                "DELETE FROM project_acls WHERE project_id=?1 AND principal=?2",
+                params![project_id, principal],
+            )? == 0
+            {
+                return Err("target principal has no project role".into());
+            }
+            (
+                "project.role.revoke",
+                serde_json::to_string(&json!({"principal": principal}))?,
+            )
+        };
+        transaction.execute(
+            "INSERT INTO audit_events(principal,action,project_id,details_json) VALUES(?1,?2,?3,?4)",
+            params![actor, action, project_id, details],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn project_access(
+        &self,
+        actor: &str,
+        project_id: &str,
+    ) -> Result<Vec<(String, ProjectRole)>, Box<dyn Error>> {
+        let connection = self.db.lock().map_err(|_| "database lock poisoned")?;
+        let actor_role: Option<String> = connection
+            .query_row(
+                "SELECT role FROM project_acls WHERE project_id=?1 AND principal=?2",
+                params![project_id, actor],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actor_role.as_deref() != Some("admin") {
+            return Err("actor is not a project admin".into());
+        }
+        let mut statement = connection.prepare(
+            "SELECT principal,role FROM project_acls WHERE project_id=?1 ORDER BY principal",
+        )?;
+        let records = statement
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        records
+            .into_iter()
+            .map(|(principal, role)| {
+                ProjectRole::parse(&role)
+                    .map(|role| (principal, role))
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
     fn project(&self, principal: &str, id: &str) -> Result<ProjectReply, Status> {
+        self.require_project_role(principal, id, ProjectRole::Viewer)?;
         let conn = self.connection()?;
         let row: Option<(String, String, i64, Option<String>)> = conn
             .query_row(
                 "SELECT p.id,p.name,p.current_revision,r.binary_sha256 \
              FROM projects p LEFT JOIN project_revisions r \
              ON r.project_id=p.id AND r.revision=p.current_revision \
-             WHERE p.id=?1 AND p.owner=?2",
-                params![id, principal],
+             WHERE p.id=?1",
+                params![id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
@@ -494,13 +696,13 @@ impl Store {
         id: &str,
         revision: u64,
     ) -> Result<Vec<u8>, Status> {
+        self.require_project_role(principal, id, ProjectRole::Viewer)?;
         self.connection()?
             .query_row(
                 "SELECT b.content FROM project_revisions r \
                  JOIN binaries b ON b.sha256=r.binary_sha256 \
-                 JOIN projects p ON p.id=r.project_id \
-                 WHERE r.project_id=?1 AND r.revision=?2 AND p.owner=?3",
-                params![id, revision as i64, principal],
+                 WHERE r.project_id=?1 AND r.revision=?2",
+                params![id, revision as i64],
                 |row| row.get(0),
             )
             .optional()
@@ -535,6 +737,7 @@ impl Store {
         patch_digest: &str,
         patched: Vec<u8>,
     ) -> Result<PatchReply, Status> {
+        self.require_project_role(principal, project_id, ProjectRole::Operator)?;
         let expected = i64::try_from(expected_revision)
             .map_err(|_| Status::invalid_argument("revision too large"))?;
         let next = expected
@@ -543,6 +746,7 @@ impl Store {
         let binary_sha256 = sha256(&patched);
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(internal)?;
+        require_project_role_in(&tx, principal, project_id, ProjectRole::Operator)?;
         let prior: Option<(i64, String, i64, String)> = tx
             .query_row(
                 "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
@@ -566,8 +770,8 @@ impl Store {
         }
         let current: i64 = tx
             .query_row(
-                "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                params![project_id, principal],
+                "SELECT current_revision FROM projects WHERE id=?1",
+                params![project_id],
                 |row| row.get(0),
             )
             .map_err(internal)?;
@@ -609,13 +813,13 @@ impl Store {
     }
 
     fn job(&self, principal: &str, project_id: &str, job_id: &str) -> Result<JobReply, Status> {
+        self.require_project_role(principal, project_id, ProjectRole::Viewer)?;
         let row = self
             .connection()?
             .query_row(
                 "SELECT j.project_id,j.id,j.revision,j.kind,j.state,j.artifact_sha256,j.diagnostic \
-             FROM jobs j JOIN projects p ON p.id=j.project_id \
-             WHERE j.id=?1 AND j.project_id=?2 AND p.owner=?3",
-                params![job_id, project_id, principal],
+             FROM jobs j WHERE j.id=?1 AND j.project_id=?2",
+                params![job_id, project_id],
                 |row| {
                     Ok(JobReply {
                         project_id: row.get(0)?,
@@ -1425,17 +1629,30 @@ impl Hydir for Store {
                 )
                 .optional()
                 .map_err(internal)?;
-            let id =
-                if let Some(id) = prior {
-                    id
-                } else {
-                    let id = Uuid::new_v4().to_string();
-                    transaction.execute(
-                    "INSERT INTO projects(id,owner,name,idempotency_key) VALUES(?1,?2,?3,?4)",
-                    params![id, principal, input.name, input.idempotency_key],
-                ).map_err(internal)?;
-                    id
-                };
+            let id = if let Some(id) = prior {
+                id
+            } else {
+                let id = Uuid::new_v4().to_string();
+                transaction
+                    .execute(
+                        "INSERT INTO projects(id,owner,name,idempotency_key) VALUES(?1,?2,?3,?4)",
+                        params![id, principal, input.name, input.idempotency_key],
+                    )
+                    .map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO project_acls(project_id,principal,role,granted_by) VALUES(?1,?2,'admin',?2)",
+                        params![id, principal],
+                    )
+                    .map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO audit_events(principal,action,project_id,details_json) VALUES(?1,'project.create',?2,?3)",
+                        params![principal, id, serde_json::to_string(&json!({"name": input.name})).map_err(|error| Status::internal(format!("audit serialization failed: {error}")))?],
+                    )
+                    .map_err(internal)?;
+                id
+            };
             transaction.commit().map_err(internal)?;
             id
         };
@@ -1458,6 +1675,7 @@ impl Hydir for Store {
     ) -> Result<Response<ProjectReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if input.content.is_empty() || input.content.len() > MAX_BINARY_BYTES {
             return Err(Status::invalid_argument("binary must be 1..=64 MiB"));
         }
@@ -1473,10 +1691,11 @@ impl Hydir for Store {
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
             let current: Option<i64> = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -1524,6 +1743,7 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let raw = run_worker("inspect", None, bytes).await?;
         let mut spec: ProgramSpec = parse_program_spec_json(&raw)
@@ -1546,6 +1766,7 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let report = run_worker("analyze", None, bytes).await?;
         Ok(Response::new(JsonReply {
@@ -1560,6 +1781,7 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let raw = run_worker("analyze-spec", None, bytes).await?;
         let mut spec: ProgramSpec = parse_program_spec_json(&raw)
@@ -1614,6 +1836,7 @@ impl Hydir for Store {
     ) -> Result<Response<ProjectReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         let (kind, address) = validate_annotation(&input)?;
         let expected = i64::try_from(input.expected_revision)
             .map_err(|_| Status::invalid_argument("revision too large"))?;
@@ -1665,6 +1888,7 @@ impl Hydir for Store {
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Analyst)?;
             if let Some((revision, binary_sha256)) = annotation_replay(
                 &tx,
                 &input.project_id,
@@ -1681,8 +1905,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -1737,6 +1961,7 @@ impl Hydir for Store {
     ) -> Result<Response<JsonReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         valid_symbol(&input.function_symbol)?;
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let cfg = run_worker("cfg", Some(&input.function_symbol), bytes).await?;
@@ -1752,6 +1977,7 @@ impl Hydir for Store {
     ) -> Result<Response<ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
@@ -1779,6 +2005,7 @@ impl Hydir for Store {
     ) -> Result<Response<ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
@@ -1806,6 +2033,7 @@ impl Hydir for Store {
     ) -> Result<Response<TransformReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if !input.assume_u64x2 || !input.trusted_fixture {
             return Err(Status::invalid_argument(
                 "transform requires u64x2 and trusted-fixture assertions",
@@ -1858,6 +2086,7 @@ impl Hydir for Store {
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
             if let Some(prior) = transform_replay(
                 &tx,
                 &input.project_id,
@@ -1869,8 +2098,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -1925,6 +2154,7 @@ impl Hydir for Store {
     ) -> Result<Response<RebuildReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if !input.trusted_fixture {
             return Err(Status::invalid_argument(
                 "rebuild requires an explicit trusted-fixture assertion",
@@ -1963,6 +2193,7 @@ impl Hydir for Store {
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
             if let Some(prior) =
                 rebuild_replay(&tx, &input.project_id, &input.idempotency_key, expected)?
             {
@@ -1970,8 +2201,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -2027,6 +2258,7 @@ impl Hydir for Store {
     ) -> Result<Response<PatchReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         if !input.trusted_fixture || !input.assume_u64x2 || !input.assume_entry_only {
             return Err(Status::invalid_argument(
                 "patch requires trusted-fixture, u64x2, and entry-only assertions",
@@ -2103,6 +2335,7 @@ impl Hydir for Store {
     ) -> Result<Response<ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Viewer)?;
         if input.sha256.len() != 64 || !input.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Status::invalid_argument(
                 "artifact digest must be SHA-256 hex",
@@ -2112,10 +2345,9 @@ impl Hydir for Store {
             .connection()?
             .query_row(
                 "SELECT a.revision,a.media_type,a.content FROM artifacts a \
-             JOIN projects p ON p.id=a.project_id \
-             WHERE a.project_id=?1 AND a.sha256=?2 AND p.owner=?3 \
+             WHERE a.project_id=?1 AND a.sha256=?2 \
              ORDER BY a.revision DESC LIMIT 1",
-                params![input.project_id, input.sha256, principal],
+                params![input.project_id, input.sha256],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -2136,6 +2368,7 @@ impl Hydir for Store {
     ) -> Result<Response<JobReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         valid_symbol(&input.function_symbol)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
@@ -2179,6 +2412,7 @@ impl Hydir for Store {
         {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Analyst)?;
             let retry: Option<(String, i64, String)> = tx.query_row(
                 "SELECT id,revision,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
                 params![input.project_id, input.idempotency_key],
@@ -2200,8 +2434,8 @@ impl Hydir for Store {
             }
             let current: i64 = tx
                 .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
@@ -2210,8 +2444,8 @@ impl Hydir for Store {
             }
             let active: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM jobs j JOIN projects p ON p.id=j.project_id \
-                 WHERE p.owner=?1 AND j.state IN ('queued','running')",
+                    "SELECT COUNT(*) FROM jobs \
+                 WHERE requested_by=?1 AND state IN ('queued','running')",
                     [principal.as_str()],
                     |row| row.get(0),
                 )
@@ -2220,14 +2454,15 @@ impl Hydir for Store {
                 return Err(Status::resource_exhausted("identity has two active jobs"));
             }
             tx.execute(
-                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state) \
-                 VALUES(?1,?2,?3,'lift',?4,?5,'queued')",
+                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state,requested_by) \
+                 VALUES(?1,?2,?3,'lift',?4,?5,'queued',?6)",
                 params![
                     id,
                     input.project_id,
                     expected,
                     input.function_symbol,
-                    input.idempotency_key
+                    input.idempotency_key,
+                    principal
                 ],
             )
             .map_err(internal)?;
@@ -2277,7 +2512,22 @@ impl Hydir for Store {
     async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<JobReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        let role =
+            self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         self.job(&principal, &input.project_id, &input.job_id)?;
+        let requested_by: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT requested_by FROM jobs WHERE id=?1 AND project_id=?2",
+                params![input.job_id, input.project_id],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if role < ProjectRole::Operator && requested_by.as_deref() != Some(principal.as_str()) {
+            return Err(Status::permission_denied(
+                "analysts may cancel only jobs they requested",
+            ));
+        }
         let changed = {
             let mut conn = self.connection()?;
             let tx = conn.transaction().map_err(internal)?;
@@ -2348,12 +2598,14 @@ impl Hydir for Store {
                     }
                     let state: String = conn
                         .query_row(
-                            "SELECT j.state FROM jobs j JOIN projects p ON p.id=j.project_id \
-                         WHERE j.id=?1 AND j.project_id=?2 AND p.owner=?3",
+                            "SELECT j.state FROM jobs j JOIN project_acls a ON a.project_id=j.project_id \
+                         WHERE j.id=?1 AND j.project_id=?2 AND a.principal=?3",
                             params![input.job_id, input.project_id, principal],
                             |row| row.get(0),
                         )
-                        .map_err(internal)?;
+                        .optional()
+                        .map_err(internal)?
+                        .ok_or_else(|| Status::permission_denied("project access was revoked"))?;
                     let mut statement = conn
                         .prepare(
                             "SELECT sequence,state,message,artifact_sha256 FROM job_events \
@@ -2432,6 +2684,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     ) -> Result<Response<api_v2::ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
@@ -2460,6 +2713,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     ) -> Result<Response<api_v2::ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
@@ -2488,6 +2742,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     ) -> Result<Response<api_v2::ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         if !input.assume_u64x2 {
             return Err(Status::invalid_argument(
                 "explicit u64(u64,u64) prototype assertion required",
@@ -2518,6 +2773,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     ) -> Result<Response<api_v2::ArtifactReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
         validate_v2_patch_request(&input)?;
         let binary = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
@@ -2544,6 +2800,7 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
     ) -> Result<Response<api_v2::MutationReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
         validate_v2_patch_request(&input)?;
         let binary =
             self.binary_at_revision(&principal, &input.project_id, input.expected_revision)?;
@@ -2594,9 +2851,9 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
         let belongs_to_project: bool = self
             .connection()?
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM project_revisions r JOIN projects p ON p.id=r.project_id \
-                 WHERE r.project_id=?1 AND p.owner=?2 AND r.binary_sha256=?3)",
-                params![input.project_id, principal, bundle.original_sha256],
+                "SELECT EXISTS(SELECT 1 FROM project_revisions r \
+                 WHERE r.project_id=?1 AND r.binary_sha256=?2)",
+                params![input.project_id, bundle.original_sha256],
                 |row| row.get(0),
             )
             .map_err(internal)?;
@@ -2704,6 +2961,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let token = store.rotate_identity(principal)?;
             println!("principal: {principal}\nnew credential (save securely; shown once): {token}");
         }
+        [access, grant, database, project, actor, principal, role]
+            if access == "access" && grant == "grant" =>
+        {
+            let store = Store::open(Path::new(database))?;
+            let role = ProjectRole::parse(role)?;
+            store.set_project_role(actor, project, principal, Some(role))?;
+            println!("granted {} role on {project} to {principal}", role.as_str());
+        }
+        [access, revoke, database, project, actor, principal]
+            if access == "access" && revoke == "revoke" =>
+        {
+            let store = Store::open(Path::new(database))?;
+            store.set_project_role(actor, project, principal, None)?;
+            println!("revoked access to {project} from {principal}");
+        }
+        [access, list, database, project, actor] if access == "access" && list == "list" => {
+            let store = Store::open(Path::new(database))?;
+            let records = store
+                .project_access(actor, project)?
+                .into_iter()
+                .map(|(principal, role)| json!({"principal": principal, "role": role.as_str()}))
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
         [serve, database, bind] if serve == "serve" => {
             if database == ":memory:" {
                 return Err("hydird serve requires a persistent SQLite database file".into());
@@ -2726,7 +3007,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("hydird TLS RPC listening on {address}");
             serve_rpc(store, address, Some(tls)).await?;
         }
-        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem>".into()),
+        _ => return Err("Usage: hydird identity create|rotate <database.sqlite> <principal> | hydird access grant <database.sqlite> <project-id> <admin-principal> <principal> <viewer|analyst|operator|admin> | hydird access revoke <database.sqlite> <project-id> <admin-principal> <principal> | hydird access list <database.sqlite> <project-id> <admin-principal> | hydird serve <database.sqlite> <loopback-host:port> | hydird serve-tls <database.sqlite> <host:port> <absolute-cert.pem> <absolute-key.pem>".into()),
     }
     Ok(())
 }
@@ -3399,7 +3680,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=7;")
+            .execute_batch("PRAGMA user_version=8;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -3433,8 +3714,156 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert_eq!(store.project("alice", "p").unwrap().name, "existing");
+        assert_eq!(
+            store
+                .require_project_role("alice", "p", ProjectRole::Admin)
+                .unwrap(),
+            ProjectRole::Admin
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roles_are_ordered_persistent_and_audited() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("roles.sqlite");
+        let store = Store::open(&database).unwrap();
+        let alice = store.create_identity("alice").unwrap();
+        let bob = store.create_identity("bob").unwrap();
+        store.create_identity("carol").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "shared".to_owned(),
+                    idempotency_key: "shared-1".to_owned(),
+                },
+                &alice,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        store
+            .set_project_role(
+                "alice",
+                &project.project_id,
+                "bob",
+                Some(ProjectRole::Viewer),
+            )
+            .unwrap();
+        assert!(store.project("bob", &project.project_id).is_ok());
+        assert!(
+            store
+                .get_project(authorized(
+                    ProjectRequest {
+                        project_id: project.project_id.clone(),
+                        expected_revision: 0,
+                    },
+                    &bob,
+                ))
+                .await
+                .is_ok()
+        );
+        let denied_upload = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content: b"not an ELF".to_vec(),
+                    content_sha256: sha256(b"not an ELF"),
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied_upload.code(), tonic::Code::PermissionDenied);
+        let denied_analysis = store
+            .inspect(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied_analysis.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            store
+                .require_project_role("bob", &project.project_id, ProjectRole::Analyst)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        store
+            .set_project_role(
+                "alice",
+                &project.project_id,
+                "bob",
+                Some(ProjectRole::Analyst),
+            )
+            .unwrap();
+        assert!(
+            store
+                .require_project_role("bob", &project.project_id, ProjectRole::Analyst)
+                .is_ok()
+        );
+        let analysis_without_binary = store
+            .inspect(authorized(
+                ProjectRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                },
+                &bob,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            analysis_without_binary.code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(
+            store
+                .set_project_role(
+                    "bob",
+                    &project.project_id,
+                    "carol",
+                    Some(ProjectRole::Viewer)
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .set_project_role("alice", &project.project_id, "alice", None)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .project_access("alice", &project.project_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        let audit_count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE project_id=?1",
+                [&project.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 3);
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .require_project_role("bob", &project.project_id, ProjectRole::Analyst)
+                .unwrap(),
+            ProjectRole::Analyst
+        );
     }
 
     #[tokio::test]
