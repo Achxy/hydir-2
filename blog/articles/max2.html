@@ -4,17 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Follow a 16-byte unsigned-max function from assembly through HydIR's CFG, LLVM IR, C output, and finite fixture checks.">
-  <link rel="canonical" href="https://hydir.wiki/articles/max2.html">
+  <link rel="canonical" href="https://hydir.wiki/articles/max2">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
-  <link rel="stylesheet" href="/article-styles.css">
+  <link rel="stylesheet" href="/styles.css">
   <title>How HydIR Lifts a 16-Byte Function — HydIR</title>
 </head>
 <body class="latex-dark-auto">
   <a class="skip" href="#article">Skip to article</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs.html">Blogs</a></nav></header>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs">Blogs</a></nav></header>
   <main class="site-main prose" id="article">
     <article>
-      <p class="eyebrow"><a href="/blogs.html">Blogs</a> / Worked example</p>
+      <p class="eyebrow"><a href="/blogs">Blogs</a> / Worked example</p>
       <h1>How HydIR Lifts a 16-Byte Function</h1>
 
       <p>Let's take one small function apart. <code>hydir_max2</code> returns the larger of two unsigned arguments, and its assembly fits in 16 bytes. We will read those bytes, follow the branch HydIR recovers, inspect the LLVM IR and C output, and finish with a finite comparison against the original fixture. Along the way, each stage tells us something different about the function.</p>
@@ -125,6 +125,6 @@
       <p>The script compares stdout, stderr, and exit status on selected inputs. Its report records those controlled fixture executions alongside the rebuilt artifacts.</p>
     </article>
   </main>
-  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs.html">All blogs</a></p></footer>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs">All blogs</a></p></footer>
 </body>
 </html>

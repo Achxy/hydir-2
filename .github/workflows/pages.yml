@@ -24,10 +24,11 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check:blog
+      - run: npm run build:blog
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: blog
+          path: target/blog-pages
 
   deploy:
     name: Deploy to GitHub Pages

@@ -4,37 +4,37 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="HydIR engineering blogs about bounded binary lifting, Triton symbolic exploration, and worked x86-64 examples.">
-  <link rel="canonical" href="https://hydir.wiki/blogs.html">
+  <link rel="canonical" href="https://hydir.wiki/blogs">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
-  <link rel="stylesheet" href="/article-styles.css">
+  <link rel="stylesheet" href="/styles.css">
   <title>Blogs — HydIR</title>
 </head>
 <body class="latex-dark-auto">
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs.html" aria-current="page">Blogs</a></nav></header>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs" aria-current="page">Blogs</a></nav></header>
   <main class="site-main prose" id="content">
     <p class="eyebrow">Engineering notes</p>
     <h1>Blogs</h1>
     <hr class="section-rule">
     <article>
-      <h2><a href="/articles/vm-handler-transfer-function.html">Lifting a VM Handler into a Transfer Function</a></h2>
+      <h2><a href="/articles/vm-handler-transfer-function">Lifting a VM Handler into a Transfer Function</a></h2>
       <p>Read the checked-in stack-add handler from ELF bytes to a virtual-state equation. HydIR supplies the function boundary and native analysis; Triton checks the instructions; the accompanying LLVM model expresses the state change.</p>
-      <p><a href="/articles/vm-handler-transfer-function.html">Read the VM-handler analysis →</a></p>
+      <p><a href="/articles/vm-handler-transfer-function">Read the VM-handler analysis →</a></p>
     </article>
     <hr class="section-rule">
     <article>
-      <h2><a href="/articles/triton-api.html">Finding an Input with Triton</a></h2>
+      <h2><a href="/articles/triton-api">Finding an Input with Triton</a></h2>
       <p>Start with one instruction and ask Triton which input makes it return 7. Then see how HydIR applies the same idea to a selected function from an ELF.</p>
-      <p><a href="/articles/triton-api.html">Read the Triton article →</a></p>
+      <p><a href="/articles/triton-api">Read the Triton article →</a></p>
     </article>
     <hr class="section-rule">
     <article>
-      <h2><a href="/articles/max2.html">How HydIR Lifts a 16-Byte Function</a></h2>
+      <h2><a href="/articles/max2">How HydIR Lifts a 16-Byte Function</a></h2>
       <p>Start with a 16-byte function, read its branch, then follow HydIR's CFG, LLVM IR, C output, and fixture comparison.</p>
-      <figure><a href="/articles/max2.html"><img src="/assets/egui-cfg.webp" width="1440" height="427" alt="HydIR CFG view showing the taken and fallthrough edges for the max2 function" loading="lazy"></a><figcaption>A direct branch and its two successors in the max2 fixture.</figcaption></figure>
-      <p><a href="/articles/max2.html">Read the worked example →</a></p>
+      <figure><a href="/articles/max2"><img src="/assets/egui-cfg.webp" width="1440" height="427" alt="HydIR CFG view showing the taken and fallthrough edges for the max2 function" loading="lazy"></a><figcaption>A direct branch and its two successors in the max2 fixture.</figcaption></figure>
+      <p><a href="/articles/max2">Read the worked example →</a></p>
     </article>
   </main>
-  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="https://github.com/Achxy/hydir-2#quick-start">Start locally</a></p></footer>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/start">Start locally</a></p></footer>
 </body>
 </html>

@@ -1,11 +1,12 @@
 <h1 align="center">HydIR</h1>
 
 <p align="center">
-  <strong>A native workbench for inspecting, lifting, testing, and rebuilding a bounded x86-64 ELF subset.</strong><br>
-  Local by default, explicit about uncertainty, and designed around inspectable artifacts.
+  <strong>Open an x86-64 ELF, follow a function, and inspect what HydIR can recover.</strong><br>
+  A local workbench with CLI tools for the parts that need saved artifacts.
 </p>
 
 <p align="center">
+  <a href="https://hydir.wiki/">Documentation</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#native-analysis-workbench">Workbench</a> ·
   <a href="#verified-scalar-lift">Evidence</a> ·
@@ -17,13 +18,13 @@
 
 *The native egui workbench analyzing `hydir_max2`: local ELF, machine-byte-derived LLVM IR, and the selected function's scope in one view.*
 
-HydIR opens little-endian x86-64 ELF files without uploading them. The current native slice recovers bounded control flow, emits LLVM IR and scalar C for a deliberately small instruction set, runs differential checks against trusted fixtures, and exposes the same core through a desktop app, CLI, Python SDK, and authenticated local-or-TLS service.
+Start with a function you can name. HydIR opens little-endian x86-64 ELF files without uploading them, shows the function's bytes and reachable branches, and turns supported semantics into inspectable LLVM IR and C. The same native core is available through the desktop app, CLI, Python SDK, and authenticated local-or-TLS service.
 
-This is an engineering workbench, not a general decompiler. Unsupported instructions, memory behavior, unresolved calls, unmodelled partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
+The checked-in [`hydir_max2` walkthrough](https://hydir.wiki/articles/max2) shows the whole path on a 16-byte function. HydIR is an engineering workbench for a bounded subset, not a general decompiler: unsupported instructions or memory behavior, unresolved calls, unmodelled partial registers, and ambiguous recovery paths stop the lift instead of being guessed.
 
 ## Quick start
 
-Rust 1.96 is pinned in [`rust-toolchain.toml`](rust-toolchain.toml), and [`Cargo.lock`](Cargo.lock) fixes the Rust dependency graph.
+Clone the repository with its submodules. Rust 1.96 is pinned in [`rust-toolchain.toml`](rust-toolchain.toml), and [`Cargo.lock`](Cargo.lock) fixes the Rust dependency graph. Run the tests, then open the workbench:
 
 ```bash
 cargo test --locked --workspace
@@ -48,7 +49,7 @@ cargo run --locked --bin hydir -- \
   --open-local /path/to/program.elf function_name
 ```
 
-Or inspect it from the CLI:
+If you want files you can keep or diff, take one function through the CLI:
 
 ```bash
 cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
@@ -68,7 +69,7 @@ explicit refusals, and semantic mismatches. The [HydIR compatibility report](HYD
 defines the pinned reference experiment, while [MIRRORBALL_STUDY.md](MIRRORBALL_STUDY.md)
 tracks recovery-boundary evidence.
 
-Clang with x86-64 ELF and LLVM IR support is required for the full demo path. Native execution comparisons require Linux x86-64. On macOS with Docker Desktop:
+The lift command asks you to assert a two-argument unsigned 64-bit ABI; HydIR does not guess the prototype. The full demo path needs Clang with x86-64 ELF and LLVM IR support. Native execution comparisons require Linux x86-64. On macOS with Docker Desktop:
 
 ```bash
 bash scripts/demo-linux-docker.sh
@@ -97,7 +98,7 @@ Opening a local ELF does not upload it. Credentials are not persisted and remote
 
 ## Verified scalar lift
 
-The checked demo path covers 20 distinct scalar functions. Each function is lifted to LLVM IR and C, verified where the required LLVM tools are available, then compared with native execution on 1,008 inputs per output path.
+After reading one lift, it is fair to ask whether it behaves like the original. The demo scripts answer that question for 20 distinct scalar fixture functions. They emit LLVM IR and C, run the LLVM verifier where the required tools are available, and compare each output path with native execution on 1,008 input pairs.
 
 ```bash
 bash scripts/demo-local.sh
@@ -120,7 +121,7 @@ physical-state and memory contract is available.
 Imported call-site `stop`/`noreturn` facts are kept distinct, source-attributed,
 and may suppress a region fallthrough only at their exact instruction address.
 
-The scripts record CFG, LLVM IR, C, and differential results as inspectable artifacts. These checks establish the documented subset only; they do not prove equivalence for arbitrary programs. The UI also keeps failures specific: an unsupported call can stop C generation without invalidating an already recovered CFG or LLVM lift.
+The scripts save the CFG, LLVM IR, C, and comparison reports, so you can read what was checked. A finite pass says something useful about those fixtures; it does not prove equivalence for arbitrary programs. The UI also keeps failures specific: an unsupported call can stop C generation without discarding an already recovered CFG or LLVM lift.
 
 [![egui C output cutout refusing an unsupported call while retaining other analysis results](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
 
@@ -167,7 +168,7 @@ Measured compatibility and remaining semantic blockers are recorded in
 
 ## Symbolic exploration with Triton
 
-The optional Triton bridge explores bounded direct-control-flow paths inside one selected x86-64 function and returns symbolic expressions. It is separate from the LLVM lift and does not establish whole-program equivalence. Use a Python interpreter with the Triton bindings available; `doctor` reports whether HydIR can import them.
+Triton lets you ask a different kind of question: what input could produce a chosen output? HydIR's Triton bridge explores direct paths in a selected x86-64 function and reports symbolic expressions and path conditions. Use a Python interpreter with Triton installed; `doctor` checks whether HydIR can import it.
 
 ```bash
 export HYDIR_TRITON_PYTHON=/path/to/python-with-triton
@@ -175,7 +176,7 @@ cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name
 ```
 
-In egui, select a function and use **Run Triton**. The bottom console accepts a restricted, one-statement-at-a-time Python-shaped subset for inspecting bounded registers, expressions, and models; it is not a general Python shell.
+In the workbench, select a function and use **Run Triton**. The bottom console also accepts a small, restricted set of Triton statements, entered one at a time. The [Triton walkthrough](https://hydir.wiki/articles/triton-api) begins with one instruction and shows how to ask for a model. The bridge is separate from the LLVM lift; its explored paths do not establish whole-program equivalence.
 
 ## Authenticated service
 
@@ -280,6 +281,13 @@ quotas, audit export, and Kubernetes packaging remain required before that
 profile is release-ready.
 
 Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent `remote inspect`, `cfg`, `lift`, `decompile`, `artifact`, or `job-*` operations. Credential files must not be group- or world-readable.
+
+## Documentation site
+
+The [HydIR wiki](https://hydir.wiki/) is a static site in `blog/`. To preview it
+locally with the same clean URLs used on Vercel, run
+`python scripts/serve-wiki-site.py` and open `http://127.0.0.1:8765/`.
+Run `python scripts/check-wiki-site.py` to check its routes and assets.
 
 ## License
 
