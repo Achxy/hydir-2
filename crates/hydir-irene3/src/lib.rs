@@ -9,16 +9,16 @@ use hydir_api::specification::{
     Specification, TypeSpec, Value, ValueMapping, Variable, program_address, type_spec, value,
     value_domain,
 };
-use hydir_backend::import_elf;
+use hydir_backend::{import_elf, recover_region_cfg};
 use hydir_core::{
-    Address, AddressKind, ExitStackRelation, FactProvenance, FactSource, InteriorEntryEvidence,
-    PhysicalLocationKind, PhysicalLocationSpec, REGION_SPEC_VERSION, RegionSpec,
-    VariableLocationSpec, validate_region_spec,
+    Address, AddressKind, CallSpec, EdgeKind, ExitStackRelation, FactProvenance, FactSource,
+    InteriorEntryEvidence, PhysicalLocationKind, PhysicalLocationSpec, REGION_SPEC_VERSION,
+    RegionSpec, VariableLocationSpec, validate_region_spec,
 };
 use object::{Object, ObjectSegment};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const IRENE3_COMMIT: &str = "d97aee937ebb6d1cb8a362748c56414404eb75ff";
 pub const ANVILL_SCHEMA_COMMIT: &str = "52f9638b023417c9bdbbb1791867cacc38c68888";
@@ -272,6 +272,60 @@ impl SpecificationDocument {
                     && (binary_address..end).contains(&relocation.location.0)
             })
             .collect();
+        let mut calls = BTreeMap::new();
+        if let Some(overrides) = &self.specification.overrides {
+            for call in &overrides.calls {
+                let Some(call_bias) =
+                    override_address_bias(call.address, address_bias, binary_address..end)
+                else {
+                    continue;
+                };
+                let source = call.address - call_bias;
+                let contract = CallSpec {
+                    source: Address(source),
+                    target: call
+                        .target_address
+                        .map(|address| address.checked_sub(call_bias).unwrap_or(address))
+                        .map(Address),
+                    return_address: call
+                        .return_address
+                        .map(|address| address.checked_sub(call_bias).unwrap_or(address))
+                        .map(Address),
+                    is_tailcall: call.is_tailcall,
+                    stops_flow: call.stop,
+                    noreturn: call.noreturn,
+                    provenance: provenance.clone(),
+                };
+                if calls.insert(source, contract).is_some() {
+                    return Err(format!(
+                        "Anvill region block UID {uid} has duplicate call overrides at 0x{source:x}"
+                    ));
+                }
+            }
+        }
+        for callsite in &self.specification.callsites {
+            let Some(call_bias) =
+                override_address_bias(callsite.call_address, address_bias, binary_address..end)
+            else {
+                continue;
+            };
+            let source = callsite.call_address - call_bias;
+            let callable = callsite.callable.as_ref().ok_or_else(|| {
+                format!("Anvill callsite at 0x{source:x} lacks a callable contract")
+            })?;
+            calls
+                .entry(source)
+                .and_modify(|call| call.noreturn |= callable.is_noreturn)
+                .or_insert_with(|| CallSpec {
+                    source: Address(source),
+                    target: None,
+                    return_address: None,
+                    is_tailcall: false,
+                    stops_flow: false,
+                    noreturn: callable.is_noreturn,
+                    provenance: provenance.clone(),
+                });
+        }
         let mut unresolved_facts = vec![
             "stack alignment at region entry and exits is not established".to_owned(),
             "absence of undiscovered indirect interior entries is not proven".to_owned(),
@@ -293,7 +347,7 @@ impl SpecificationDocument {
         } else {
             block.name.clone()
         };
-        let region = RegionSpec {
+        let mut region = RegionSpec {
             schema_version: REGION_SPEC_VERSION,
             binary_sha256: program.binary_sha256,
             symbol_name,
@@ -306,6 +360,7 @@ impl SpecificationDocument {
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
             exits,
+            calls: calls.into_values().collect(),
             relocations,
             observed_interior_entries,
             live_in: None,
@@ -322,9 +377,47 @@ impl SpecificationDocument {
             replacement_ready: false,
             provenance,
         };
+        if let Ok(cfg) = recover_region_cfg(&region) {
+            for call in &region.calls {
+                let native_target = cfg
+                    .edges
+                    .iter()
+                    .find(|edge| edge.source == call.source && edge.kind == EdgeKind::Call)
+                    .map(|edge| edge.target);
+                if call.target.is_some() && call.target != native_target {
+                    let imported = call
+                        .target
+                        .map_or_else(|| "none".to_owned(), |address| format!("0x{:x}", address.0));
+                    let native = native_target
+                        .map_or_else(|| "none".to_owned(), |address| format!("0x{:x}", address.0));
+                    region.unresolved_facts.push(format!(
+                        "interchange call target at 0x{:x} is {imported}, but native decoding observes {native}",
+                        call.source.0
+                    ));
+                }
+            }
+        }
         validate_region_spec(&region)?;
         Ok(region)
     }
+}
+
+// Pinned Anvill block addresses are image-relative in this artifact, while
+// control-flow overrides use ELF virtual addresses. Other producers may use
+// the block convention for both. Select the convention from the call site's
+// exact region containment and then apply it consistently to that contract.
+fn override_address_bias(
+    address: u64,
+    address_bias: u64,
+    region: std::ops::Range<u64>,
+) -> Option<u64> {
+    if region.contains(&address) {
+        return Some(0);
+    }
+    address
+        .checked_sub(address_bias)
+        .filter(|normalized| region.contains(normalized))
+        .map(|_| address_bias)
 }
 
 fn bind_elf_block<'a>(
@@ -667,6 +760,12 @@ fn validate_specification(specification: &Specification) -> Result<Inventory, St
     )?;
     bounded("symbols", specification.symbols.len(), MAX_SYMBOLS)?;
     bounded("callsites", specification.callsites.len(), MAX_CALLSITES)?;
+    if let Some(overrides) = &specification.overrides {
+        bounded("call overrides", overrides.calls.len(), MAX_CALLSITES)?;
+        bounded("jump overrides", overrides.jumps.len(), MAX_CALLSITES)?;
+        bounded("return overrides", overrides.returns.len(), MAX_CALLSITES)?;
+        bounded("other overrides", overrides.others.len(), MAX_CALLSITES)?;
+    }
     bounded(
         "type aliases",
         specification.type_aliases.len(),
@@ -1064,7 +1163,8 @@ fn bounded_name(label: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use hydir_api::specification::{
-        BlockContext, Function, MemoryRange, Register, ValueDomain, ValueMapping,
+        BlockContext, Call, ControlFlowOverrides, Function, MemoryRange, Register, ValueDomain,
+        ValueMapping,
     };
     use hydir_backend::extract_symbol_code;
     use std::collections::BTreeMap;
@@ -1178,6 +1278,20 @@ mod tests {
     }
 
     #[test]
+    fn call_override_bias_is_selected_from_region_containment() {
+        let region = 0x133e..0x1343;
+        assert_eq!(
+            override_address_bias(0x133e, 0x400000, region.clone()),
+            Some(0)
+        );
+        assert_eq!(
+            override_address_bias(0x40133e, 0x400000, region.clone()),
+            Some(0x400000)
+        );
+        assert_eq!(override_address_bias(0x500000, 0x400000, region), None);
+    }
+
+    #[test]
     fn binds_region_bytes_and_imported_live_state_to_exact_elf() {
         let elf = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
         let (code, address) = extract_symbol_code(elf, "hydir_max2").unwrap();
@@ -1219,6 +1333,15 @@ mod tests {
                 is_executable: true,
                 values: code.clone(),
             }],
+            overrides: Some(ControlFlowOverrides {
+                calls: vec![Call {
+                    address,
+                    stop: true,
+                    target_address: Some(3),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
             image_name: "max2.elf".to_owned(),
             ..Default::default()
         };
@@ -1229,6 +1352,15 @@ mod tests {
         assert_eq!(region.stack_delta, Some(8));
         assert_eq!(region.physical_live_in[0].name, "RDI");
         assert_eq!(region.physical_live_out[0].name, "RAX");
+        assert_eq!(region.calls.len(), 1);
+        assert!(region.calls[0].stops_flow);
+        assert_eq!(region.calls[0].target, Some(Address(3)));
+        assert!(
+            region
+                .unresolved_facts
+                .iter()
+                .any(|fact| fact.contains("interchange call target"))
+        );
         assert!(!region.replacement_ready);
         assert_eq!(region.provenance.source, FactSource::InterchangeImport);
 
