@@ -353,6 +353,29 @@ fn recover_bounded(
             *owner = Some(ip);
         }
         let op = classify(&instruction).map_err(error)?;
+        let frame_address_lea = matches!(
+            op,
+            Op::Lea { base, index, .. }
+                if base.is_some_and(|register| matches!(register, Register::RSP | Register::RBP))
+                    || index.is_some_and(|register| matches!(register, Register::RSP | Register::RBP))
+        );
+        if prove_stack
+            && (frame_address_lea
+                || matches!(
+                    op,
+                    Op::LoadMemory64 { .. }
+                        | Op::LoadMemory32 { .. }
+                        | Op::StoreMemory64 { .. }
+                        | Op::StoreMemory32 { .. }
+                        | Op::AluRegMemory64 { .. }
+                        | Op::SaveRegister { .. }
+                        | Op::RestoreRegister { .. }
+                ))
+        {
+            return Err(error(format!(
+                "mapped memory or non-frame save semantics at 0x{ip:x} require a region physical-state contract"
+            )));
+        }
         if let Op::CallDirect { target } = op
             && allowed_calls.is_some_and(|allowed| !allowed.contains(&target))
         {
@@ -1103,6 +1126,15 @@ fn emit_node(body: &mut String, ip: u64, node: &Node) {
         }
         Op::Ret => body.push_str(&format!("  ret i64 {}\n", input_name(Field::Rax, ip))),
         Op::Nop => body.push_str(&format!("  br label %b{:x}\n", node.successors[0])),
+        Op::LoadMemory64 { .. }
+        | Op::LoadMemory32 { .. }
+        | Op::StoreMemory64 { .. }
+        | Op::StoreMemory32 { .. }
+        | Op::AluRegMemory64 { .. }
+        | Op::SaveRegister { .. }
+        | Op::RestoreRegister { .. } => {
+            unreachable!("semantic recovery rejects unadapted mapped memory and register saves")
+        }
         Op::SaveFramePointer
         | Op::RestoreFramePointer
         | Op::SetFramePointer

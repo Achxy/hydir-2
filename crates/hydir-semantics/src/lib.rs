@@ -16,6 +16,16 @@ pub enum Value32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryAddress {
+    pub segment: Option<Register>,
+    pub base: Option<Register>,
+    pub index: Option<Register>,
+    pub scale: u32,
+    pub displacement: i64,
+    pub absolute: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alu {
     Add,
     Sub,
@@ -73,6 +83,22 @@ pub enum Op {
         displacement: i64,
         src: Value32,
     },
+    LoadMemory64 {
+        dst: Register,
+        address: MemoryAddress,
+    },
+    LoadMemory32 {
+        dst: Register,
+        address: MemoryAddress,
+    },
+    StoreMemory64 {
+        address: MemoryAddress,
+        src: Register,
+    },
+    StoreMemory32 {
+        address: MemoryAddress,
+        src: Value32,
+    },
     Lea {
         dst: Register,
         base: Option<Register>,
@@ -96,6 +122,11 @@ pub enum Op {
         displacement: i64,
         src: Value32,
     },
+    AluRegMemory64 {
+        kind: Alu,
+        dst: Register,
+        address: MemoryAddress,
+    },
     Cmp {
         lhs: Register,
         rhs: Value,
@@ -117,6 +148,12 @@ pub enum Op {
     Test {
         lhs: Register,
         rhs: Value,
+    },
+    SaveRegister {
+        register: Register,
+    },
+    RestoreRegister {
+        register: Register,
     },
     SaveFramePointer,
     RestoreFramePointer,
@@ -173,9 +210,13 @@ pub enum MemoryEffect {
     ReadReturnAddress,
     WriteSavedFramePointer,
     ReadSavedFramePointer,
+    WriteSavedRegister,
+    ReadSavedRegister,
     ReadStackLocal,
     WriteStackLocal,
     ReadWriteStackLocal,
+    ReadMappedMemory,
+    WriteMappedMemory,
     WriteReturnAddress,
 }
 
@@ -207,6 +248,18 @@ fn register_bit(register: Register) -> u16 {
         Register::R15 => R15,
         _ => unreachable!("classifier establishes canonical register parents"),
     }
+}
+
+fn address_register_bit(register: Register) -> u16 {
+    match register {
+        Register::RSP => RSP,
+        Register::RBP => RBP,
+        _ => register_bit(register),
+    }
+}
+
+fn address_reads(address: MemoryAddress) -> u16 {
+    address.base.map_or(0, address_register_bit) | address.index.map_or(0, address_register_bit)
 }
 
 impl Op {
@@ -259,6 +312,23 @@ impl Op {
                 } | if base == Register::RSP { RSP } else { RBP };
                 effect.memory = MemoryEffect::WriteStackLocal;
             }
+            Op::LoadMemory64 { dst, address } | Op::LoadMemory32 { dst, address } => {
+                effect.read_registers = address_reads(address);
+                effect.write_registers = register_bit(dst);
+                effect.memory = MemoryEffect::ReadMappedMemory;
+            }
+            Op::StoreMemory64 { address, src } => {
+                effect.read_registers = address_reads(address) | register_bit(src);
+                effect.memory = MemoryEffect::WriteMappedMemory;
+            }
+            Op::StoreMemory32 { address, src } => {
+                effect.read_registers = address_reads(address)
+                    | match src {
+                        Value32::Register(register) => register_bit(register),
+                        Value32::Immediate(_) => 0,
+                    };
+                effect.memory = MemoryEffect::WriteMappedMemory;
+            }
             Op::Lea {
                 dst, base, index, ..
             } => {
@@ -288,6 +358,12 @@ impl Op {
                 effect.write_flags = ALL_FLAGS;
                 effect.memory = MemoryEffect::ReadWriteStackLocal;
             }
+            Op::AluRegMemory64 { dst, address, .. } => {
+                effect.read_registers = register_bit(dst) | address_reads(address);
+                effect.write_registers = register_bit(dst);
+                effect.write_flags = ALL_FLAGS;
+                effect.memory = MemoryEffect::ReadMappedMemory;
+            }
             Op::Cmp { lhs, rhs } | Op::Test { lhs, rhs } => {
                 effect.read_registers = register_bit(lhs) | value_reads(rhs);
                 effect.write_flags = ALL_FLAGS;
@@ -313,6 +389,16 @@ impl Op {
                 } | if base == Register::RSP { RSP } else { RBP };
                 effect.write_flags = ALL_FLAGS;
                 effect.memory = MemoryEffect::ReadStackLocal;
+            }
+            Op::SaveRegister { register } => {
+                effect.read_registers = RSP | register_bit(register);
+                effect.write_registers = RSP;
+                effect.memory = MemoryEffect::WriteSavedRegister;
+            }
+            Op::RestoreRegister { register } => {
+                effect.read_registers = RSP;
+                effect.write_registers = RSP | register_bit(register);
+                effect.memory = MemoryEffect::ReadSavedRegister;
             }
             Op::SaveFramePointer => {
                 effect.read_registers = RSP | RBP;
@@ -466,6 +552,45 @@ fn stack_memory(instruction: &Instruction) -> Result<(Register, i64), String> {
     Ok((base, instruction.memory_displacement64() as i64))
 }
 
+fn address_register(register: Register, ip: u64) -> Result<Option<Register>, String> {
+    match register {
+        Register::None => Ok(None),
+        Register::RSP | Register::RBP => Ok(Some(register)),
+        _ => checked_register(register, ip).map(Some),
+    }
+}
+
+fn memory_address(instruction: &Instruction) -> Result<MemoryAddress, String> {
+    let ip = instruction.ip();
+    let segment = match instruction.segment_prefix() {
+        Register::None => None,
+        segment @ (Register::FS | Register::GS) => Some(segment),
+        segment => {
+            return Err(format!(
+                "memory segment {segment:?} unsupported at 0x{ip:x}"
+            ));
+        }
+    };
+    if instruction.is_ip_rel_memory_operand() {
+        return Ok(MemoryAddress {
+            segment,
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            absolute: Some(instruction.ip_rel_memory_address()),
+        });
+    }
+    Ok(MemoryAddress {
+        segment,
+        base: address_register(instruction.memory_base(), ip)?,
+        index: address_register(instruction.memory_index(), ip)?,
+        scale: instruction.memory_index_scale(),
+        displacement: instruction.memory_displacement64() as i64,
+        absolute: None,
+    })
+}
+
 fn alu_kind(mnemonic: Mnemonic) -> Alu {
     match mnemonic {
         Mnemonic::Add => Alu::Add,
@@ -500,6 +625,20 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 && instruction.op0_register() == Register::RBP =>
         {
             Op::RestoreFramePointer
+        }
+        Mnemonic::Push
+            if instruction.op_count() == 1 && instruction.op0_kind() == OpKind::Register =>
+        {
+            Op::SaveRegister {
+                register: checked_register(instruction.op0_register(), ip)?,
+            }
+        }
+        Mnemonic::Pop
+            if instruction.op_count() == 1 && instruction.op0_kind() == OpKind::Register =>
+        {
+            Op::RestoreRegister {
+                register: checked_register(instruction.op0_register(), ip)?,
+            }
         }
         Mnemonic::Mov
             if instruction.op_count() == 2
@@ -540,11 +679,17 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 && instruction.op1_kind() == OpKind::Memory
                 && instruction.op0_register().size() == 8 =>
         {
-            let (base, displacement) = stack_memory(instruction)?;
-            Op::LoadStack64 {
-                dst: register_dest()?,
-                base,
-                displacement,
+            if let Ok((base, displacement)) = stack_memory(instruction) {
+                Op::LoadStack64 {
+                    dst: register_dest()?,
+                    base,
+                    displacement,
+                }
+            } else {
+                Op::LoadMemory64 {
+                    dst: register_dest()?,
+                    address: memory_address(instruction)?,
+                }
             }
         }
         Mnemonic::Mov
@@ -553,11 +698,17 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 && instruction.op1_kind() == OpKind::Memory
                 && instruction.op0_register().size() == 4 =>
         {
-            let (base, displacement) = stack_memory(instruction)?;
-            Op::LoadStack32 {
-                dst: parent_of_32(instruction.op0_register(), ip)?,
-                base,
-                displacement,
+            if let Ok((base, displacement)) = stack_memory(instruction) {
+                Op::LoadStack32 {
+                    dst: parent_of_32(instruction.op0_register(), ip)?,
+                    base,
+                    displacement,
+                }
+            } else {
+                Op::LoadMemory32 {
+                    dst: parent_of_32(instruction.op0_register(), ip)?,
+                    address: memory_address(instruction)?,
+                }
             }
         }
         Mnemonic::Mov
@@ -566,11 +717,18 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                 && instruction.op1_kind() == OpKind::Register
                 && instruction.op1_register().size() == 8 =>
         {
-            let (base, displacement) = stack_memory(instruction)?;
-            Op::StoreStack64 {
-                base,
-                displacement,
-                src: checked_register(instruction.op1_register(), ip)?,
+            let src = checked_register(instruction.op1_register(), ip)?;
+            if let Ok((base, displacement)) = stack_memory(instruction) {
+                Op::StoreStack64 {
+                    base,
+                    displacement,
+                    src,
+                }
+            } else {
+                Op::StoreMemory64 {
+                    address: memory_address(instruction)?,
+                    src,
+                }
             }
         }
         Mnemonic::Mov
@@ -582,11 +740,18 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                     OpKind::Register | OpKind::Immediate32
                 ) =>
         {
-            let (base, displacement) = stack_memory(instruction)?;
-            Op::StoreStack32 {
-                base,
-                displacement,
-                src: operand32(instruction, 1)?,
+            let src = operand32(instruction, 1)?;
+            if let Ok((base, displacement)) = stack_memory(instruction) {
+                Op::StoreStack32 {
+                    base,
+                    displacement,
+                    src,
+                }
+            } else {
+                Op::StoreMemory32 {
+                    address: memory_address(instruction)?,
+                    src,
+                }
             }
         }
         Mnemonic::Mov
@@ -618,20 +783,25 @@ pub fn classify(instruction: &Instruction) -> Result<Op, String> {
                     src: Value::Immediate(instruction.ip_rel_memory_address() as i64),
                 }
             } else {
-                let optional_register = |register| {
-                    if register == Register::None {
-                        Ok(None)
-                    } else {
-                        checked_register(register, ip).map(Some)
-                    }
-                };
                 Op::Lea {
                     dst: register_dest()?,
-                    base: optional_register(instruction.memory_base())?,
-                    index: optional_register(instruction.memory_index())?,
+                    base: address_register(instruction.memory_base(), ip)?,
+                    index: address_register(instruction.memory_index(), ip)?,
                     scale: instruction.memory_index_scale(),
                     displacement: instruction.memory_displacement64() as i64,
                 }
+            }
+        }
+        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
+            if instruction.op_count() == 2
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register().size() == 8
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            Op::AluRegMemory64 {
+                kind: alu_kind(instruction.mnemonic()),
+                dst: register_dest()?,
+                address: memory_address(instruction)?,
             }
         }
         Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
@@ -858,6 +1028,60 @@ mod tests {
             }
         );
         assert_eq!(op.effects().memory, MemoryEffect::None);
+    }
+
+    #[test]
+    fn mapped_tls_memory_and_callee_save_operations_are_typed() {
+        let mut decoder = Decoder::with_ip(
+            64,
+            &[
+                0x53, 0x5b, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, 0x64, 0x48, 0x2b,
+                0x14, 0x25, 0x28, 0x00, 0x00, 0x00,
+            ],
+            0x1000,
+            DecoderOptions::NONE,
+        );
+        let save = classify(&decoder.decode()).unwrap();
+        assert_eq!(
+            save,
+            Op::SaveRegister {
+                register: Register::RBX
+            }
+        );
+        assert_eq!(save.effects().memory, MemoryEffect::WriteSavedRegister);
+        let restore = classify(&decoder.decode()).unwrap();
+        assert_eq!(
+            restore,
+            Op::RestoreRegister {
+                register: Register::RBX
+            }
+        );
+        assert_eq!(restore.effects().memory, MemoryEffect::ReadSavedRegister);
+        let address = MemoryAddress {
+            segment: Some(Register::FS),
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0x28,
+            absolute: None,
+        };
+        let load = classify(&decoder.decode()).unwrap();
+        assert_eq!(
+            load,
+            Op::LoadMemory64 {
+                dst: Register::RAX,
+                address
+            }
+        );
+        assert_eq!(load.effects().memory, MemoryEffect::ReadMappedMemory);
+        assert_eq!(
+            classify(&decoder.decode()).unwrap(),
+            Op::AluRegMemory64 {
+                kind: Alu::Sub,
+                dst: Register::RDX,
+                address
+            }
+        );
     }
 
     #[test]
