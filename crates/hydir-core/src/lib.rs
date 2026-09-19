@@ -810,10 +810,23 @@ pub fn validate_decompilation_unit(unit: &DecompilationUnit) -> Result<(), Strin
     {
         return Err("DecompilationUnit source or engine metadata is invalid".to_owned());
     }
+    let c_line_count = unit.c_source.lines().count() as u64;
+    let region_end = unit
+        .region
+        .entry
+        .0
+        .checked_add(unit.region.byte_length)
+        .ok_or_else(|| "DecompilationUnit region range overflows".to_owned())?;
     if unit.statement_provenance.iter().any(|mapping| {
         mapping.c_start_line == 0
             || mapping.c_end_line < mapping.c_start_line
+            || u64::from(mapping.c_end_line) > c_line_count
             || mapping.addresses.is_empty()
+            || mapping
+                .addresses
+                .iter()
+                .any(|address| !(unit.region.entry.0..region_end).contains(&address.0))
+            || mapping.provenance.scope.is_empty()
     }) {
         return Err("DecompilationUnit contains invalid statement provenance".to_owned());
     }
