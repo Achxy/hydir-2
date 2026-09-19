@@ -185,6 +185,22 @@ cargo run --locked --bin hydirctl -- remote create demo unique-request-key
 cargo run --locked --bin hydirctl -- remote upload <project-id> <expected-revision> /path/to/program.elf
 ```
 
+Projects use ordered `viewer`, `analyst`, `operator`, and `admin` roles. Existing
+owners migrate to `admin`; new projects create their owner ACL atomically.
+Administrative access changes are offline database-owner operations and append
+an audit event:
+
+```bash
+cargo run --locked --bin hydird -- identity create /path/to/hydird.sqlite reviewer
+cargo run --locked --bin hydird -- access grant /path/to/hydird.sqlite <project-id> analyst reviewer viewer
+cargo run --locked --bin hydird -- access list /path/to/hydird.sqlite <project-id> analyst
+cargo run --locked --bin hydird -- access revoke /path/to/hydird.sqlite <project-id> analyst reviewer
+```
+
+Viewers can read project artifacts, analysts can create analysis/annotation
+work, operators can mutate binaries, and admins can manage project access. The
+project owner cannot be downgraded or removed.
+
 The additive `serve-tls` mode accepts non-loopback connections only through TLS. Certificate and key paths must be absolute, the key must be private on Unix, and clients validate the certificate against configured trust roots:
 
 ```bash
