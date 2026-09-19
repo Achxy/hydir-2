@@ -14,7 +14,7 @@ use hydir_backend::{MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_symbol, 
 use hydir_c::emit_structured_c;
 use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, DisassemblyReport, FactSource, FunctionCfg,
-    FunctionSpec, ProgramSpec, overlay_analyst_assumptions,
+    FunctionSpec, ProgramSpec, overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_patch::{PatchDocument, parse_patch_json, patch_binary};
 use hydir_project::{LocalProject, LocalProjectStore, WorkbenchSettings};
@@ -393,7 +393,7 @@ async fn open_remote(
         .await
         .map_err(|e| format!("Remote inspection failed: {e}"))?
         .into_inner();
-    let spec: ProgramSpec = serde_json::from_str(&reply.json)
+    let spec: ProgramSpec = parse_program_spec_json(reply.json.as_bytes())
         .map_err(|e| format!("Invalid remote program model: {e}"))?;
     if spec.binary_sha256 != project.binary_sha256 {
         return Err("Remote project binary hash changed during inspection.".to_owned());
@@ -661,7 +661,7 @@ async fn add_remote_annotation(
         .await
         .map_err(|error| format!("Cannot reopen annotated revision: {error}"))?
         .into_inner();
-    let spec: ProgramSpec = serde_json::from_str(&inspected.json)
+    let spec: ProgramSpec = parse_program_spec_json(inspected.json.as_bytes())
         .map_err(|error| format!("Invalid annotated program model: {error}"))?;
     if spec.binary_sha256 != binary_sha256 {
         return Err("Annotated program digest changed unexpectedly.".to_owned());
@@ -911,7 +911,7 @@ async fn rebuild_remote(
         .await
         .map_err(|error| format!("Could not inspect rebuilt binary: {error}"))?
         .into_inner();
-    let spec: ProgramSpec = serde_json::from_str(&inspection.json)
+    let spec: ProgramSpec = parse_program_spec_json(inspection.json.as_bytes())
         .map_err(|error| format!("Invalid rebuilt program model: {error}"))?;
     if spec.binary_sha256 != reply.binary_sha256 {
         return Err("Rebuilt program model digest differs from project.".to_owned());
@@ -5006,7 +5006,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(3);
         app.events = receiver;
         app.spec = Some(ProgramSpec {
-            schema_version: 2,
+            schema_version: hydir_core::PROGRAM_SPEC_VERSION,
             binary_sha256: "a".repeat(64),
             target_triple: "x86_64-unknown-elf".to_owned(),
             abi: "System V AMD64".to_owned(),
@@ -5025,6 +5025,7 @@ mod tests {
             call_recovery: RecoveryState::NotAttempted,
             reference_recovery: RecoveryState::NotAttempted,
             assumptions: Vec::new(),
+            typed_model: Default::default(),
             recovery_scope: "test".to_owned(),
             unresolved_control_flow: true,
         });

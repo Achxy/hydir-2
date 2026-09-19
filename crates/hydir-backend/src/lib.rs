@@ -1,19 +1,21 @@
 //! Narrow, native ELF/x86-64 frontend and machine-code-to-LLVM lift.
 //!
 //! The supported slice accepts symbol-bounded, two-u64-argument SysV
-//! functions. It rejects memory operations, calls, partial registers and
+//! functions. It rejects unresolved calls, unmodeled partial registers and
 //! unknown instructions rather than guessing their behavior.
 
 mod cfg;
 mod disasm;
+mod stack;
 
 pub use cfg::lift_cfg;
 pub use disasm::disassemble_elf;
 
 use hydir_core::{
-    Address, AddressKind, AddressSpaceSpec, FactProvenance, FactSource, FunctionCfg, FunctionSpec,
-    ImportSpec, MappedSegmentSpec, PROGRAM_SPEC_VERSION, ProgramSpec, RecoveryState,
-    RelocationSpec, RelocationTargetSpec, SectionSpec,
+    Address, AddressKind, AddressSpaceSpec, DisassemblyFlow, FactProvenance, FactSource,
+    FunctionCfg, FunctionSpec, ImportSpec, InteriorEntryEvidence, MappedSegmentSpec,
+    PROGRAM_SPEC_VERSION, ProgramSpec, RecoveryState, RegionContract, RelocationSpec,
+    RelocationTargetSpec, SectionSpec,
 };
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use object::{
@@ -21,7 +23,11 @@ use object::{
     ObjectSymbolTable, RelocationTarget, SectionKind, SymbolKind,
 };
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    fmt,
+};
 
 #[derive(Debug)]
 pub struct HydirError(pub String);
@@ -222,6 +228,7 @@ pub fn import_elf(bytes: &[u8]) -> Result<ProgramSpec> {
         call_recovery: RecoveryState::NotAttempted,
         reference_recovery: RecoveryState::NotAttempted,
         assumptions: Vec::new(),
+        typed_model: Default::default(),
         recovery_scope: "ELF metadata inventory only; calls, references, and stripped-code discovery not attempted".to_owned(),
         unresolved_control_flow: true,
     })
@@ -333,9 +340,93 @@ fn relocation_target(
 
 /// Lift a named ELF symbol. The symbol's bytes, not source or pseudocode, are
 /// decoded. The caller asserts the function prototype `u64(u64, u64)`.
+/// Direct calls are limited to unique bounded scalar leaf symbols in a linked
+/// ELF; stack alignment and caller-saved state are checked before emission.
 pub fn lift_symbol(bytes: &[u8], name: &str) -> Result<String> {
     let (code, address, _) = symbol_code(bytes, name)?;
-    lift_cfg(&code, address)
+    let plain = lift_cfg(&code, address);
+    if plain.is_ok() {
+        return plain;
+    }
+    let targets = cfg::discover_direct_calls(&code, address)?;
+    if targets.is_empty() {
+        return plain;
+    }
+    if targets.len() > 8 {
+        return Err(error(
+            "more than eight direct-call targets exceed the scalar C subset",
+        ));
+    }
+    let file = parse_elf(bytes)?;
+    if file.kind() == object::ObjectKind::Relocatable {
+        return Err(error("direct-call lift requires a linked ELF"));
+    }
+    let spec = import_elf(bytes)?;
+    let caller_end = address
+        .checked_add(code.len() as u64)
+        .ok_or_else(|| error("caller address range overflow"))?;
+    if spec.relocations.iter().any(|relocation| {
+        relocation.address_kind == AddressKind::Virtual
+            && (address..caller_end).contains(&relocation.location.0)
+    }) {
+        return Err(error("direct-call caller contains a relocation"));
+    }
+    let mut helpers = String::new();
+    for target in &targets {
+        let mut symbols = file.symbols().filter(|symbol| {
+            symbol.kind() == SymbolKind::Text
+                && symbol.is_definition()
+                && symbol.size() > 0
+                && symbol.address() == *target
+        });
+        let symbol = symbols.next().ok_or_else(|| {
+            error(format!(
+                "direct-call target 0x{target:x} has no bounded symbol"
+            ))
+        })?;
+        if symbols.next().is_some() {
+            return Err(error(format!(
+                "direct-call target 0x{target:x} is ambiguous"
+            )));
+        }
+        let callee_name = symbol
+            .name()
+            .map_err(|_| error("direct-call callee symbol has no valid name"))?;
+        let (callee_code, callee_address, _) = symbol_code(bytes, callee_name)?;
+        let callee_end = callee_address
+            .checked_add(callee_code.len() as u64)
+            .ok_or_else(|| error("callee address range overflow"))?;
+        if callee_address != *target || (address < callee_end && callee_address < caller_end) {
+            return Err(error(
+                "direct-call callee overlaps caller or has unstable address",
+            ));
+        }
+        let callee_ir = lift_cfg(&callee_code, callee_address).map_err(|reason| {
+            error(format!(
+                "direct-call callee {callee_name:?} is not a scalar leaf: {reason}"
+            ))
+        })?;
+        let definition = callee_ir
+            .split_once("define i64 @hydir_lifted")
+            .ok_or_else(|| error("internal callee LLVM definition missing"))?
+            .1;
+        helpers.push_str(&format!(
+            "define i64 @hydir_callee_{target:x}{definition}\n"
+        ));
+    }
+    let caller_ir = cfg::lift_cfg_with_calls(&code, address, &targets)?;
+    let (header, main) = caller_ir
+        .split_once("define i64 @hydir_lifted")
+        .ok_or_else(|| error("internal caller LLVM definition missing"))?;
+    Ok(format!("{header}{helpers}define i64 @hydir_lifted{main}"))
+}
+
+/// Proven eight-byte local offsets, relative to function-entry RSP. This is
+/// only a stack-address analysis result; callers must also require a
+/// successful scalar lift before treating a local value as defined.
+pub fn proven_stack_local_offsets(bytes: &[u8], name: &str) -> Result<Vec<i64>> {
+    let (code, address, _) = symbol_code(bytes, name)?;
+    Ok(stack::analyze_stack(&code, address)?.slots)
 }
 
 /// Extract a validated, bounded named text symbol for an external semantics
@@ -740,4 +831,208 @@ mod tests {
         let error = extract_symbol_code(&[], "missing").unwrap_err();
         assert!(error.0.contains("binary parse failed"));
     }
+
+    #[test]
+    fn region_contract_never_promotes_unknown_machine_state() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
+        let region = region_contract(binary, "hydir_max2").unwrap();
+        assert_eq!(region.bytes_hex, "4889f84839f773034889f0c3");
+        assert_eq!(region.exits.len(), 1);
+        assert_eq!(region.live_in, None);
+        assert_eq!(region.stack_delta, Some(8));
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn region_records_text_symbol_inside_selected_extent() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/interior_entry.elf");
+        let region = region_contract(binary, "hydir_outer").unwrap();
+        assert_eq!(region.observed_interior_entries.len(), 1);
+        assert_eq!(region.observed_interior_entries[0].entry.0, region.entry.0 + 3);
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn region_records_external_direct_call_to_interior() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/interior_call.elf");
+        let region = region_contract(binary, "hydir_outer").unwrap();
+        assert_eq!(region.observed_interior_entries.len(), 1);
+        let entry = &region.observed_interior_entries[0];
+        assert_eq!(entry.entry.0, region.entry.0 + 3);
+        assert!(entry.source.is_some());
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn region_reports_balanced_frame_without_claiming_replacement_safety() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
+        let region = region_contract(binary, "hydir_frame_balance").unwrap();
+        assert_eq!(region.stack_delta, Some(8));
+        assert_eq!(region.exits.len(), 1);
+        assert!(
+            !region
+                .unresolved_facts
+                .iter()
+                .any(|fact| fact.starts_with("scalar_cfg:"))
+        );
+        assert!(!region.replacement_ready);
+    }
+
+    #[test]
+    fn reports_proven_stack_local_offsets_for_typed_assertions() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/stack.elf");
+        assert_eq!(
+            proven_stack_local_offsets(binary, "hydir_stack_slot_add").unwrap(),
+            vec![-16]
+        );
+        assert_eq!(
+            proven_stack_local_offsets(binary, "hydir_stack_branch").unwrap(),
+            vec![-16]
+        );
+    }
+}
+
+/// Export immutable bytes and currently established region facts. This is a
+/// read-only evidence artifact; unknown live state and stack alignment keep it
+/// ineligible for replacement even when direct CFG recovery succeeds.
+pub fn region_contract(bytes: &[u8], name: &str) -> Result<RegionContract> {
+    let file = parse_elf(bytes)?;
+    if file.kind() == object::ObjectKind::Relocatable {
+        return Err(error("region contract requires a linked ELF"));
+    }
+    let (code, address, address_kind) = symbol_code(bytes, name)?;
+    let end = address
+        .checked_add(code.len() as u64)
+        .ok_or_else(|| error("region address range overflow"))?;
+    let spec = import_elf(bytes)?;
+    let mut observed_entries = BTreeMap::<u64, InteriorEntryEvidence>::new();
+    if let Some(entry) = spec.entry_point
+        && (address + 1..end).contains(&entry.0)
+    {
+        observed_entries.insert(
+            entry.0,
+            InteriorEntryEvidence {
+                entry,
+                source: None,
+                reason: "ELF entry point lies inside selected symbol".to_owned(),
+                provenance: FactProvenance {
+                    source: FactSource::ElfMetadata,
+                    scope: "ELF entry address".to_owned(),
+                },
+            },
+        );
+    }
+    for function in &spec.functions {
+        if function.address_kind == AddressKind::Virtual
+            && (address + 1..end).contains(&function.address.0)
+        {
+            observed_entries
+                .entry(function.address.0)
+                .or_insert_with(|| InteriorEntryEvidence {
+                    entry: function.address,
+                    source: None,
+                    reason: format!(
+                        "ELF text symbol {} begins inside selected symbol",
+                        function.name
+                    ),
+                    provenance: FactProvenance {
+                        source: FactSource::ElfMetadata,
+                        scope: "symbol entry only; executable reachability not proven".to_owned(),
+                    },
+                });
+        }
+    }
+    let mut unresolved_facts = Vec::new();
+    match disassemble_elf(bytes) {
+        Ok(report) => {
+            for instruction in report.instructions {
+                if instruction.function.is_none()
+                    || (address..end).contains(&instruction.address.0)
+                    || !matches!(
+                        instruction.flow,
+                        DisassemblyFlow::Call
+                            | DisassemblyFlow::ConditionalBranch
+                            | DisassemblyFlow::UnconditionalBranch
+                    )
+                {
+                    continue;
+                }
+                if let Some(target) = instruction.branch_target
+                    && (address + 1..end).contains(&target.0)
+                {
+                    observed_entries.entry(target.0).or_insert_with(|| InteriorEntryEvidence {
+                        entry: target,
+                        source: Some(instruction.address),
+                        reason: format!("recovered direct {:?} enters selected symbol interior", instruction.flow),
+                        provenance: FactProvenance {
+                            source: FactSource::NativeAnalysis,
+                            scope: "direct edge from recursively decoded symbol code; other code remains uncertain".to_owned(),
+                        },
+                    });
+                }
+            }
+        }
+        Err(reason) => unresolved_facts.push(format!("outside_edge_scan: {reason}")),
+    }
+    let relocations = spec
+        .relocations
+        .into_iter()
+        .filter(|relocation| {
+            relocation.address_kind == AddressKind::Virtual
+                && (address..end).contains(&relocation.location.0)
+        })
+        .collect();
+    if !observed_entries.is_empty() {
+        unresolved_facts
+            .push("one or more observed entries reach the selected symbol interior".to_owned());
+    }
+    if let Err(reason) = cfg::recover_function_cfg(
+        &code,
+        address,
+        address_kind,
+        name,
+        spec.binary_sha256.clone(),
+        "ELF symbol extent and native iced-x86 decoding",
+    ) {
+        unresolved_facts.push(format!("scalar_cfg: {reason}"));
+    }
+    if let Err(reason) = cfg::lift_cfg(&code, address) {
+        unresolved_facts.push(format!("scalar_lift: {reason}"));
+    }
+    let (exits, stack_delta) = match stack::analyze_stack(&code, address) {
+        Ok(evidence) => (evidence.return_sites, Some(evidence.exit_rsp_delta)),
+        Err(reason) => {
+            unresolved_facts.push(format!("stack_and_exits: {reason}"));
+            (Vec::new(), None)
+        }
+    };
+    unresolved_facts.extend([
+        "alternate entries and unreachable bytes: not analyzed".to_owned(),
+        "live_in machine locations: not analyzed".to_owned(),
+        "live_out machine locations: not analyzed".to_owned(),
+        "stack alignment at entry and exits: not established".to_owned(),
+        "relocation applicability after placement: not analyzed".to_owned(),
+    ]);
+    Ok(RegionContract {
+        schema_version: 2,
+        binary_sha256: spec.binary_sha256,
+        symbol_name: name.to_owned(),
+        address_kind,
+        entry: Address(address),
+        byte_length: code.len() as u64,
+        bytes_sha256: format!("{:x}", Sha256::digest(&code)),
+        bytes_hex: code.iter().map(|byte| format!("{byte:02x}")).collect(),
+        exits,
+        relocations,
+        observed_interior_entries: observed_entries.into_values().collect(),
+        live_in: None,
+        live_out: None,
+        stack_delta,
+        unresolved_facts,
+        replacement_ready: false,
+        provenance: FactProvenance {
+            source: FactSource::NativeAnalysis,
+            scope: "Linked ELF symbol bytes, conservative CFG and stack-state recovery".to_owned(),
+        },
+    })
 }

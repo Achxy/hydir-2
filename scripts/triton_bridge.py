@@ -69,15 +69,42 @@ def new_context():
     from triton import ARCH, TritonContext
 
     context = TritonContext(ARCH.X86_64)
+    context.setSolverTimeout(2000)
     context.symbolizeRegister(context.registers.rdi, "arg0")
     context.symbolizeRegister(context.registers.rsi, "arg1")
     return context
 
 
+def path_witness(context, choices: tuple[int, ...]) -> list[int] | None:
+    """Solve the selected branch at each replayed conditional instruction."""
+    branches = [constraint.getBranchConstraints()
+                for constraint in context.getPathConstraints()
+                if constraint.isMultipleBranches()]
+    if len(branches) != len(choices):
+        fail("Triton path constraints differ from replayed branch choices")
+    selected = []
+    for options, choice in zip(branches, choices):
+        if choice >= len(options):
+            fail("Triton branch choice is outside replayed constraints")
+        selected.append(options[choice]["constraint"])
+    if not selected:
+        return [0, 0]
+    predicate = selected[0] if len(selected) == 1 else context.getAstContext().land(selected)
+    if not context.isSat(predicate):
+        return None
+    model = context.getModel(predicate)
+    values = []
+    for alias in ("arg0", "arg1"):
+        variable = context.getSymbolicVariable(alias)
+        solution = model.get(variable.getId())
+        values.append(int(solution.getValue()) if solution is not None else 0)
+    return values
+
+
 def decode_and_process(context, code: bytes, address: int, offset: int):
     from triton import Instruction
 
-    instruction = Instruction(code[offset:])
+    instruction = Instruction(code[offset : offset + 15])
     instruction.setAddress(address + offset)
     context.processing(instruction)
     size = instruction.getSize()
@@ -124,7 +151,7 @@ def register_ast(context, register) -> str:
     expression = context.getSymbolicRegister(register)
     if expression is None:
         return "(_ bv0 64)"
-    return str(expression.getAst())
+    return str(context.getAstContext().unroll(expression.getAst()))
 
 
 class ConsoleEvaluator:
@@ -286,11 +313,11 @@ def main() -> None:
         symbol, digest, address, code = validate_request(request)
 
         instructions: dict[int, dict] = {}
-        paths = [(tuple(), 0, tuple(), frozenset())]
+        paths = [(tuple(), 0, tuple(), frozenset(), tuple())]
         path_results: list[dict] = []
 
         while paths:
-            trace, offset, conditions, visited = paths.pop()
+            trace, offset, conditions, visited, choices = paths.pop()
             if len(path_results) >= MAX_PATHS:
                 fail("control-flow path count exceeds 64-path limit")
             if offset in visited:
@@ -319,12 +346,16 @@ def main() -> None:
             next_visited = visited | {offset}
 
             if mnemonic.startswith("ret"):
+                witness = path_witness(context, choices)
+                if witness is None:
+                    continue
                 path_results.append(
                     {
                         "path_condition": "(and " + " ".join(conditions) + ")"
                         if conditions
                         else "true",
                         "rax": register_ast(context, context.registers.rax),
+                        "input_witness": witness,
                     }
                 )
                 continue
@@ -335,25 +366,26 @@ def main() -> None:
                 next_offset = offset + size
                 if next_offset >= len(code):
                     fail(f"non-returning instruction at 0x{address + offset:x} reaches symbol end")
-                paths.append((next_trace, next_offset, conditions, next_visited))
+                paths.append((next_trace, next_offset, conditions, next_visited, choices))
+                continue
+
+            if mnemonic.startswith("jmp"):
+                target = direct_target(instruction)
+                if target is None:
+                    fail(f"unresolved control flow at 0x{address + offset:x}")
+                next_offset = target_offset(target, address, code)
+                if next_offset in next_visited:
+                    fail(f"control-flow loop at 0x{target:x} is unsupported")
+                paths.append((next_trace, next_offset, conditions, next_visited, choices))
                 continue
 
             constraints = context.getPathConstraints()
             if not constraints:
-                if mnemonic.startswith("jmp"):
-                    target = direct_target(instruction)
-                    if target is None:
-                        fail(f"unresolved control flow at 0x{address + offset:x}")
-                    next_offset = target_offset(target, address, code)
-                    if next_offset in next_visited:
-                        fail(f"control-flow loop at 0x{target:x} is unsupported")
-                    paths.append((next_trace, next_offset, conditions, next_visited))
-                    continue
                 fail(f"unresolved control flow at 0x{address + offset:x}")
             branches = constraints[-1].getBranchConstraints()
             if not branches:
                 fail(f"unresolved control flow at 0x{address + offset:x}")
-            for branch in branches:
+            for choice, branch in enumerate(branches):
                 target = int(branch["dstAddr"])
                 next_offset = target_offset(target, address, code)
                 if next_offset in next_visited:
@@ -362,10 +394,13 @@ def main() -> None:
                     (
                         next_trace,
                         next_offset,
-                        conditions + (str(branch["constraint"]),),
+                        conditions + (str(context.getAstContext().unroll(branch["constraint"])),),
                         next_visited,
+                        choices + (choice,),
                     )
                 )
+                if len(paths) + len(path_results) > MAX_PATHS:
+                    fail("control-flow path count exceeds 64-path limit")
 
         if not path_results:
             fail("no return path recovered")

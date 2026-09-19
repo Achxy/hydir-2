@@ -1,0 +1,31 @@
+name: fuzz corpus and smoke
+on:
+  push:
+  pull_request:
+jobs:
+  native-linux-fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly
+          rustup default nightly
+          cargo install cargo-fuzz --version 0.12.0 --locked
+      - name: ELF import and region corpus
+        run: |
+          cargo fuzz build elf_import
+          cargo fuzz run elf_import -- -max_total_time=30
+      - name: Scalar CFG and lift corpus
+        run: |
+          cargo fuzz build cfg_lift
+          cargo fuzz run cfg_lift -- -max_total_time=30
+      - name: LLVM-to-C parser corpus
+        run: |
+          cargo fuzz build c_output
+          cargo fuzz run c_output -- -max_total_time=30
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

@@ -541,7 +541,7 @@ mod tests {
 
     fn spec(bytes: &[u8]) -> ProgramSpec {
         ProgramSpec {
-            schema_version: 2,
+            schema_version: hydir_core::PROGRAM_SPEC_VERSION,
             binary_sha256: format!("{:x}", Sha256::digest(bytes)),
             target_triple: "x86_64-unknown-elf".to_owned(),
             abi: "System V AMD64".to_owned(),
@@ -575,6 +575,7 @@ mod tests {
             call_recovery: RecoveryState::NotAttempted,
             reference_recovery: RecoveryState::NotAttempted,
             assumptions: Vec::new(),
+            typed_model: Default::default(),
             recovery_scope: "test".to_owned(),
             unresolved_control_flow: true,
         }

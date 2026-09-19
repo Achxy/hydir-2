@@ -4,7 +4,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const SPEC_VERSION: u32 = 1;
-pub const PROGRAM_SPEC_VERSION: u32 = 2;
+pub const PROGRAM_SPEC_VERSION: u32 = 3;
 
 /// JSON addresses are strings so no consumer can round a 64-bit address via f64.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -54,6 +54,9 @@ pub struct ProgramSpec {
     pub call_recovery: RecoveryState,
     pub reference_recovery: RecoveryState,
     pub assumptions: Vec<AssumptionSpec>,
+    /// Typed analyst facts are separate from ELF-derived facts and begin empty.
+    #[serde(default)]
+    pub typed_model: TypedModel,
     pub recovery_scope: String,
     pub unresolved_control_flow: bool,
 }
@@ -317,7 +320,179 @@ pub struct FunctionCfg {
     pub recovery_scope: String,
 }
 
-pub const DISASSEMBLY_SCHEMA_VERSION: u32 = 1;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TypedModel {
+    pub schema_version: u32,
+    pub prototypes: Vec<PrototypeAssertion>,
+    pub stack_facts: Vec<StackFact>,
+}
+
+impl Default for TypedModel {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            prototypes: Vec::new(),
+            stack_facts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalarType {
+    U64,
+    Void,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallingConvention {
+    SysvAmd64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrototypeAssertion {
+    pub id: String,
+    pub entry: Address,
+    pub return_type: ScalarType,
+    pub parameters: Vec<ScalarType>,
+    pub calling_convention: CallingConvention,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StackFact {
+    pub id: String,
+    pub function_entry: Address,
+    /// Signed displacement from function-entry RSP. This is an assertion,
+    /// not an alias proof or an instruction-level stack analysis result.
+    pub entry_rsp_offset: i64,
+    pub width_bits: u16,
+    pub provenance: FactProvenance,
+}
+
+pub fn migrate_program_spec(mut spec: ProgramSpec) -> Result<ProgramSpec, String> {
+    match spec.schema_version {
+        2 => spec.schema_version = PROGRAM_SPEC_VERSION,
+        PROGRAM_SPEC_VERSION => {}
+        other => return Err(format!("unsupported ProgramSpec schema version {other}")),
+    }
+    validate_typed_model(&spec)?;
+    Ok(spec)
+}
+
+pub fn parse_program_spec_json(bytes: &[u8]) -> Result<ProgramSpec, String> {
+    let spec: ProgramSpec = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid ProgramSpec JSON: {error}"))?;
+    migrate_program_spec(spec)
+}
+
+pub fn validate_typed_model(spec: &ProgramSpec) -> Result<(), String> {
+    if spec.typed_model.schema_version != 1 {
+        return Err(format!(
+            "unsupported typed model schema version {}",
+            spec.typed_model.schema_version
+        ));
+    }
+    if spec.typed_model.prototypes.len() > 8192 || spec.typed_model.stack_facts.len() > 32768 {
+        return Err("typed model exceeds bounded fact count".to_owned());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut entries = std::collections::BTreeSet::new();
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    };
+    for prototype in &spec.typed_model.prototypes {
+        if !ids.insert(prototype.id.as_str()) || !entries.insert(prototype.entry) {
+            return Err("duplicate typed prototype id or entry".to_owned());
+        }
+        if !valid_id(&prototype.id) || prototype.parameters.len() > 6 {
+            return Err("invalid prototype id or parameter count".to_owned());
+        }
+        if prototype
+            .parameters
+            .iter()
+            .any(|parameter| *parameter == ScalarType::Void)
+        {
+            return Err("void is not a parameter type".to_owned());
+        }
+        if prototype.provenance.source != FactSource::AnalystAssertion {
+            return Err("typed prototype must identify analyst assertion provenance".to_owned());
+        }
+        if !spec.mapped_segments.iter().any(|segment| {
+            segment.executable
+                && segment.virtual_address.0 <= prototype.entry.0
+                && segment
+                    .virtual_address
+                    .0
+                    .checked_add(segment.memory_size)
+                    .is_some_and(|end| prototype.entry.0 < end)
+        }) {
+            return Err(format!(
+                "prototype entry 0x{:x} is not in executable mapping",
+                prototype.entry.0
+            ));
+        }
+    }
+    for fact in &spec.typed_model.stack_facts {
+        if !ids.insert(fact.id.as_str()) || !valid_id(&fact.id) {
+            return Err("duplicate or invalid stack fact id".to_owned());
+        }
+        if !matches!(fact.width_bits, 8 | 16 | 32 | 64)
+            || !(-65536..=65536).contains(&fact.entry_rsp_offset)
+        {
+            return Err("stack fact width or displacement is out of bounds".to_owned());
+        }
+        if fact.provenance.source != FactSource::AnalystAssertion {
+            return Err("stack fact must identify analyst assertion provenance".to_owned());
+        }
+        if !entries.contains(&fact.function_entry) {
+            return Err("stack fact has no matching typed prototype".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Evidence for a symbol-bounded region. Missing machine-state facts remain
+/// explicit and prevent this artifact from authorizing a replacement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegionContract {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub symbol_name: String,
+    pub address_kind: AddressKind,
+    pub entry: Address,
+    pub byte_length: u64,
+    pub bytes_sha256: String,
+    pub bytes_hex: String,
+    pub exits: Vec<Address>,
+    pub relocations: Vec<RelocationSpec>,
+    #[serde(default)]
+    pub observed_interior_entries: Vec<InteriorEntryEvidence>,
+    pub live_in: Option<Vec<String>>,
+    pub live_out: Option<Vec<String>>,
+    /// RSP after each reachable near RET relative to RSP at region entry.
+    pub stack_delta: Option<i64>,
+    pub unresolved_facts: Vec<String>,
+    pub replacement_ready: bool,
+    pub provenance: FactProvenance,
+}
+
+/// A concrete lead that another entry may reach bytes inside a selected region.
+/// Its absence is not proof that no indirect or undiscovered entry exists.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InteriorEntryEvidence {
+    pub entry: Address,
+    pub source: Option<Address>,
+    pub reason: String,
+    pub provenance: FactProvenance,
+}
+
+pub const DISASSEMBLY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisassemblyReport {
@@ -326,10 +501,24 @@ pub struct DisassemblyReport {
     pub target_triple: String,
     pub sections: Vec<DisassemblySection>,
     pub functions: Vec<DisassemblyFunction>,
+    /// Direct-call targets are leads, never asserted function boundaries.
+    #[serde(default)]
+    pub candidates: Vec<FunctionCandidate>,
     pub instructions: Vec<DisassemblyInstruction>,
     pub gaps: Vec<DisassemblyGap>,
     pub warnings: Vec<String>,
     pub provenance: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FunctionCandidate {
+    pub entry: Address,
+    pub evidence_site: Address,
+    pub evidence_bytes_hex: String,
+    pub reason: String,
+    pub extent: Option<u64>,
+    pub recovery_state: RecoveryState,
+    pub provenance: FactProvenance,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -423,5 +612,74 @@ mod tests {
         assert_eq!(json, "\"0xfffffffffffffffe\"");
         let recovered: Address = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn program_spec_v2_migrates_and_typed_assertions_validate() {
+        let provenance = FactProvenance {
+            source: FactSource::AnalystAssertion,
+            scope: "test".to_owned(),
+        };
+        let mut spec = ProgramSpec {
+            schema_version: PROGRAM_SPEC_VERSION,
+            binary_sha256: "a".repeat(64),
+            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            abi: "System V AMD64".to_owned(),
+            file_kind: "Executable".to_owned(),
+            image_base: None,
+            entry_point: Some(Address(0x401000)),
+            data_layout: None,
+            address_spaces: Vec::new(),
+            mapped_segments: vec![MappedSegmentSpec {
+                id: "load".to_owned(),
+                address_space: 0,
+                virtual_address: Address(0x401000),
+                memory_size: 0x1000,
+                file_offset: Address(0),
+                file_size: 0x1000,
+                alignment: 0x1000,
+                readable: true,
+                writable: false,
+                executable: true,
+                provenance: FactProvenance {
+                    source: FactSource::ElfMetadata,
+                    scope: "test".to_owned(),
+                },
+            }],
+            sections: Vec::new(),
+            functions: Vec::new(),
+            imports: Vec::new(),
+            relocations: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            call_recovery: RecoveryState::NotAttempted,
+            reference_recovery: RecoveryState::NotAttempted,
+            assumptions: Vec::new(),
+            typed_model: TypedModel::default(),
+            recovery_scope: "test".to_owned(),
+            unresolved_control_flow: true,
+        };
+        let mut legacy = serde_json::to_value(&spec).unwrap();
+        legacy["schema_version"] = serde_json::json!(2);
+        legacy.as_object_mut().unwrap().remove("typed_model");
+        let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
+        assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
+        assert!(migrated.typed_model.prototypes.is_empty());
+
+        spec.typed_model.prototypes.push(PrototypeAssertion {
+            id: "prototype-main".to_owned(),
+            entry: Address(0x401000),
+            return_type: ScalarType::U64,
+            parameters: vec![ScalarType::U64, ScalarType::U64],
+            calling_convention: CallingConvention::SysvAmd64,
+            provenance,
+        });
+        assert!(validate_typed_model(&spec).is_ok());
+        spec.typed_model.prototypes[0].entry = Address(0x900000);
+        assert!(
+            validate_typed_model(&spec)
+                .unwrap_err()
+                .contains("executable mapping")
+        );
     }
 }

@@ -1310,6 +1310,7 @@ name = "hydir-backend"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "hydir-semantics",
  "iced-x86",
  "object",
  "sha2",
@@ -1318,6 +1319,9 @@ dependencies = [
 [[package]]
 name = "hydir-c"
 version = "0.1.0"
+dependencies = [
+ "hydir-backend",
+]
 
 [[package]]
 name = "hydir-cli"
@@ -1400,11 +1404,19 @@ dependencies = [
 name = "hydir-recompile"
 version = "0.1.0"
 dependencies = [
+ "hydir-semantics",
  "iced-x86",
  "object",
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "hydir-semantics"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ use hydir_c::emit_structured_c;
 use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
     annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
+    parse_program_spec_json,
     validate_analyst_annotation,
 };
 use hydir_patch::{MAX_PATCH_BYTES, parse_patch_json, patch_binary};
@@ -1226,7 +1227,7 @@ impl Hydir for Store {
         let input = request.into_inner();
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let raw = run_worker("inspect", None, bytes).await?;
-        let mut spec: ProgramSpec = serde_json::from_slice(&raw)
+        let mut spec: ProgramSpec = parse_program_spec_json(&raw)
             .map_err(|_| Status::internal("worker returned invalid program model"))?;
         let annotations = annotations_for(
             &*self.connection()?,
@@ -1262,7 +1263,7 @@ impl Hydir for Store {
         let input = request.into_inner();
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         let raw = run_worker("analyze-spec", None, bytes).await?;
-        let mut spec: ProgramSpec = serde_json::from_slice(&raw)
+        let mut spec: ProgramSpec = parse_program_spec_json(&raw)
             .map_err(|_| Status::internal("worker returned invalid analyzed model"))?;
         let annotations = annotations_for(
             &*self.connection()?,
@@ -1344,7 +1345,7 @@ impl Hydir for Store {
         let bytes = self.current_binary(&principal, &input.project_id, input.expected_revision)?;
         if let Some(address) = address {
             let raw = run_worker("inspect", None, bytes).await?;
-            let spec: ProgramSpec = serde_json::from_slice(&raw)
+            let spec: ProgramSpec = parse_program_spec_json(&raw)
                 .map_err(|_| Status::internal("worker returned invalid program model"))?;
             if !annotation_address_in_spec(&spec, address) {
                 return Err(Status::invalid_argument(

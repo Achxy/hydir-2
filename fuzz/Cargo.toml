@@ -1,0 +1,36 @@
+[package]
+name = "hydir-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hydir-backend = { path = "../crates/hydir-backend" }
+hydir-c = { path = "../crates/hydir-c" }
+
+[[bin]]
+name = "elf_import"
+path = "fuzz_targets/elf_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cfg_lift"
+path = "fuzz_targets/cfg_lift.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "c_output"
+path = "fuzz_targets/c_output.rs"
+test = false
+doc = false
+bench = false
