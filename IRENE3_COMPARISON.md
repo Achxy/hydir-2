@@ -51,10 +51,14 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
   its address-specific imported Anvill `stop` contract; `noreturn` and `stop`
   remain distinct facts. Its imported target `0x3` conflicts with the natively
   decoded `0x1090` and is retained as an unresolved cross-check, not silently
-  trusted. Semantic lifting remains 0/23 for isolated regions.
-  Mapped/TLS memory and RBX saves are now typed MachineIR but remain semantic
-  blockers alongside entry/exit adapters, mid-function frame state, memory
-  contracts, and resolved-call contracts.
+  trusted. Typed RegionDecisionIR now lifts and emits deterministic C for 1/23
+  isolated regions: UID 35's two-exit `JG` consumes its imported ZF/SF/OF
+  inputs, returns the exact continuation address, and carries all seven live
+  outputs through explicit input/output bindings. LLVM 22 verification, Clang
+  C compilation, and all eight boolean flag combinations pass. The remaining
+  22 regions still fail closed. Mapped/TLS memory and RBX saves are typed
+  MachineIR but remain semantic blockers alongside general entry/exit adapters,
+  mid-function frame state, memory contracts, and resolved-call contracts.
   This result is deliberately separate from whole-function lifting: the pinned
   92-byte `fibIterative` function now lifts completely with typed dword red-zone
   locals, 32-bit arithmetic/comparisons and flags. LLVM `opt -passes=verify`

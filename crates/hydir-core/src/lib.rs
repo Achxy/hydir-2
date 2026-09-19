@@ -870,6 +870,195 @@ pub struct InteriorEntryEvidence {
     pub provenance: FactProvenance,
 }
 
+pub const REGION_DECISION_IR_VERSION: u32 = 1;
+
+/// A condition consumed by a side-effect-free region decision. Flag names are
+/// resolved through the explicit physical input list rather than an implicit
+/// function ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionPredicate {
+    Equal,
+    NotEqual,
+    Signed,
+    NotSigned,
+    Overflow,
+    NotOverflow,
+    Below,
+    AboveOrEqual,
+    BelowOrEqual,
+    Above,
+    Less,
+    GreaterOrEqual,
+    LessOrEqual,
+    Greater,
+}
+
+impl RegionPredicate {
+    pub fn required_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Equal | Self::NotEqual => &["ZF"],
+            Self::Signed | Self::NotSigned => &["SF"],
+            Self::Overflow | Self::NotOverflow => &["OF"],
+            Self::Below | Self::AboveOrEqual => &["CF"],
+            Self::BelowOrEqual | Self::Above => &["CF", "ZF"],
+            Self::Less | Self::GreaterOrEqual => &["SF", "OF"],
+            Self::LessOrEqual | Self::Greater => &["ZF", "SF", "OF"],
+        }
+    }
+}
+
+/// An output value proven to be the unchanged value of a physical input.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegionPassThroughBinding {
+    pub output_index: u32,
+    pub input_index: u32,
+}
+
+/// Typed RegionIR for a side-effect-free conditional region. This is a narrow
+/// first native RegionIR form: it makes both continuations and every live
+/// output explicit while refusing instructions that mutate machine state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegionDecisionIr {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub region_bytes_sha256: String,
+    pub entry: Address,
+    pub instruction_addresses: Vec<Address>,
+    pub predicate: RegionPredicate,
+    pub true_exit: Address,
+    pub false_exit: Address,
+    pub physical_inputs: Vec<PhysicalLocationSpec>,
+    pub physical_outputs: Vec<PhysicalLocationSpec>,
+    pub pass_through: Vec<RegionPassThroughBinding>,
+}
+
+pub fn validate_region_decision_ir(
+    ir: &RegionDecisionIr,
+    region: &RegionSpec,
+) -> Result<(), String> {
+    validate_region_spec(region)?;
+    if ir.schema_version != REGION_DECISION_IR_VERSION {
+        return Err(format!(
+            "unsupported RegionDecisionIR schema version {}",
+            ir.schema_version
+        ));
+    }
+    if ir.binary_sha256 != region.binary_sha256
+        || ir.region_bytes_sha256 != region.bytes_sha256
+        || ir.entry != region.entry
+    {
+        return Err("RegionDecisionIR is not digest-bound to its RegionSpec".to_owned());
+    }
+    let end = region
+        .entry
+        .0
+        .checked_add(region.byte_length)
+        .ok_or_else(|| "RegionDecisionIR address range overflows".to_owned())?;
+    let instruction_addresses = ir
+        .instruction_addresses
+        .iter()
+        .map(|address| address.0)
+        .collect::<std::collections::BTreeSet<_>>();
+    if instruction_addresses.len() != ir.instruction_addresses.len()
+        || instruction_addresses.is_empty()
+        || instruction_addresses
+            .iter()
+            .any(|address| !(region.entry.0..end).contains(address))
+    {
+        return Err("RegionDecisionIR contains invalid instruction provenance".to_owned());
+    }
+    let ir_exits = [ir.true_exit, ir.false_exit]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let region_exits = region
+        .exits
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if ir.true_exit == ir.false_exit
+        || region.exits.len() != 2
+        || region_exits.len() != 2
+        || ir_exits != region_exits
+    {
+        return Err("RegionDecisionIR exits do not match the RegionSpec".to_owned());
+    }
+    if ir.physical_inputs.len() > 256
+        || ir.physical_outputs.len() > 256
+        || ir.physical_inputs.len() != region.physical_live_in.len()
+        || ir.physical_outputs.len() != region.physical_live_out.len()
+        || ir.pass_through.len() != ir.physical_outputs.len()
+    {
+        return Err("RegionDecisionIR physical state inventory is invalid".to_owned());
+    }
+    let same_location = |left: &PhysicalLocationSpec, right: &PhysicalLocationSpec| {
+        left.name == right.name
+            && left.kind == right.kind
+            && left.width_bits == right.width_bits
+            && left.type_name == right.type_name
+    };
+    if !ir
+        .physical_inputs
+        .iter()
+        .zip(&region.physical_live_in)
+        .all(|(left, right)| same_location(left, right))
+        || !ir
+            .physical_outputs
+            .iter()
+            .zip(&region.physical_live_out)
+            .all(|(left, right)| same_location(left, right))
+    {
+        return Err("RegionDecisionIR physical state differs from its RegionSpec".to_owned());
+    }
+    let input_names = ir
+        .physical_inputs
+        .iter()
+        .map(|location| location.name.to_ascii_uppercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let output_names = ir
+        .physical_outputs
+        .iter()
+        .map(|location| location.name.to_ascii_uppercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    if input_names.len() != ir.physical_inputs.len()
+        || output_names.len() != ir.physical_outputs.len()
+    {
+        return Err("RegionDecisionIR physical state contains duplicate names".to_owned());
+    }
+    let mut bound_outputs = std::collections::BTreeSet::new();
+    for binding in &ir.pass_through {
+        let output_index = usize::try_from(binding.output_index)
+            .map_err(|_| "RegionDecisionIR output index overflows")?;
+        let input_index = usize::try_from(binding.input_index)
+            .map_err(|_| "RegionDecisionIR input index overflows")?;
+        let output = ir
+            .physical_outputs
+            .get(output_index)
+            .ok_or_else(|| "RegionDecisionIR output binding is out of range".to_owned())?;
+        let input = ir
+            .physical_inputs
+            .get(input_index)
+            .ok_or_else(|| "RegionDecisionIR input binding is out of range".to_owned())?;
+        if !bound_outputs.insert(output_index) || !same_location(output, input) {
+            return Err("RegionDecisionIR pass-through binding is invalid".to_owned());
+        }
+    }
+    for flag in ir.predicate.required_flags() {
+        let input = ir
+            .physical_inputs
+            .iter()
+            .find(|input| input.name.eq_ignore_ascii_case(flag))
+            .ok_or_else(|| format!("RegionDecisionIR lacks required {flag} input"))?;
+        if !matches!(input.width_bits, 1 | 8) {
+            return Err(format!(
+                "RegionDecisionIR {flag} input has unsupported width {}",
+                input.width_bits
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub const DISASSEMBLY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -125,9 +125,17 @@ be bound to its matching ELF and converted block-by-block into RegionSpec v3:
 cargo run --locked --bin hydirctl -- irene3-inspect program.proto
 cargo run --locked --bin hydirctl -- irene3-region \
   program.proto program.elf 26 --output region.json
+cargo run --locked --bin hydirctl -- irene3-decompile-region \
+  program.proto program.elf 35 --output decompilation-unit.json
 cargo run --locked --bin hydirctl -- irene3-compat-report \
   program.proto program.elf
 ```
+
+The first typed native RegionIR form covers side-effect-free conditional
+regions. It binds imported physical flag inputs, both exact continuation
+addresses, and every live output through an explicit pass-through mapping. Its
+LLVM-compatible text and deterministic C use aggregate results rather than an
+invented scalar function ABI; other region shapes continue to fail closed.
 
 The local server mounts both upstream service names and accepts Irene3's
 streaming chunk convention. For non-empty programs it currently returns a
