@@ -18,7 +18,8 @@ cells remain pending until measured on an isolated Linux x86-64 installation.
   recorded in `fuzz/corpus/elf_import/MANIFEST.json` and enforced by a Rust test.
 - Canonical native artifacts now exist as `ProgramSpec` v4, `RegionSpec` v3,
   `DecompilationUnit` v1, and `PatchBundle` v2. Program readers accept v2/v3;
-  region readers accept v2. Missing CIR, statement provenance, physical
+  region readers accept v2. Decompilation units retain validated many-to-one
+  machine-address/C-statement provenance. Missing CIR, complete physical
   liveness, stack alignment, and behavior evidence are explicit blockers.
 - Preserved `hydir.v1` and additive `hydir.v2` services run together. v2 covers
   region/decompilation artifacts, patch compilation/application, and structural
@@ -114,7 +115,7 @@ sha256sum target/irene3-comparison.elf
 
 | Fixture | HydIR region/hash | IRENE-3 spec/region | Entry/exit assumptions | Lift/lower outcome | Patch outcome | Behavior cases |
 | --- | --- | --- | --- | --- | --- | --- |
-| `hydir_max2` | v3; ELF `48b09f9d…`; region `5190c43d…`; 12 bytes at `0x201174` | pending | 1 return, RSP +8; live state/alignment unresolved | native LLVM and deterministic C succeed; DecompilationUnit has 3 blocking diagnostics | scalar v1→bundle v2 succeeds structurally; stable=false | local patch unit/re-import only; Linux behavior pending |
+| `hydir_max2` | v3; ELF `48b09f9d…`; region `5190c43d…`; 12 bytes at `0x201174` | pending | 1 return, RSP +8; live state/alignment unresolved | native LLVM and deterministic C succeed; DecompilationUnit maps 1 structured C statement to 5 machine addresses and retains 2 blocking diagnostics | scalar v1→bundle v2 succeeds structurally; stable=false | local patch unit/re-import only; Linux behavior pending |
 | `hydir_add2` | v3; scratch ELF `42e88968…`; region `d9cf89c5…`; 5 bytes at `0x201174` | pending | 1 return, RSP +8; live state/alignment unresolved | native LLVM/C measured locally | pending | pending |
 | `hydir_frame_balance` | v3; ELF `86e289c9…`; region `604c9f73…`; 18 bytes at `0x2011d2` | pending | 1 return, RSP +8; live state/alignment unresolved | CFG/stack analysis succeeds locally | pending | pending |
 | `hydir_stack_branch` | v3; ELF `5e2f4266…`; region `2bfd6347…`; 28 bytes at `0x2011f9` | pending | 1 return, RSP +8; stack local proven elsewhere; live state/alignment unresolved | CFG/stack-local lift tests pass locally | pending | pending |
