@@ -46,13 +46,17 @@ x86-64 installation.
   successor `0x11b4`, and RSP delta -8. Imported evidence is explicitly marked
   `interchange_import`; native proof gaps keep every imported region
   `replacement_ready=false`.
-- The native compatibility report currently binds 23/23 regions and recovers
-  exact declared-exit CFGs for 23/23. Direct-call edges remain typed separately
+- The native compatibility report currently binds 23/23 regions, recovers
+  exact declared-exit CFGs for 23/23, and emits digest-bound
+  `PhysicalRegionIR` v1 for 23/23. The general IR preserves typed operands,
+  exact successors, register/flag/memory effects, imported boundary state,
+  stack deltas, and unresolved facts; all 23 remain `lowering_ready=false`.
+  Direct-call edges remain typed separately
   from continuation exits. Block 47's missing fallthrough is justified only by
   its address-specific imported HydIR `stop` contract; `noreturn` and `stop`
   remain distinct facts. Its imported target `0x3` conflicts with the natively
   decoded `0x1090` and is retained as an unresolved cross-check, not silently
-  trusted. Typed RegionDecisionIR now lifts and emits deterministic C for 1/23
+  trusted. Typed RegionDecisionIR lifts and emits deterministic C for 1/23
   isolated regions: UID 35's two-exit `JG` consumes its imported ZF/SF/OF
   inputs, returns the exact continuation address, and carries all seven live
   outputs through explicit input/output bindings. LLVM 22 verification, Clang
