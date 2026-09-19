@@ -2267,7 +2267,7 @@ impl AnalystApp {
             triton_console_input: String::new(),
             console_mode: ConsoleMode::Triton,
             console_visible: false,
-            console_detached: false,
+            console_detached: true,
             console_height: 220.0,
             console_json: false,
             annotations: Vec::new(),
@@ -2565,6 +2565,9 @@ impl AnalystApp {
                             self.history.push(self.status.clone());
                             self.triton_result = Some(result);
                             self.console_mode = ConsoleMode::Activity;
+                            if !self.console_visible {
+                                self.console_detached = true;
+                            }
                             self.console_visible = true;
                             self.console_json = true;
                             self.failure = None;
@@ -2581,6 +2584,9 @@ impl AnalystApp {
                         self.triton_console_commands = commands;
                         self.triton_console_result = Some(result);
                         self.console_mode = ConsoleMode::Triton;
+                        if !self.console_visible {
+                            self.console_detached = true;
+                        }
                         self.console_visible = true;
                         self.status = "Triton console command completed".to_owned();
                         self.failure = None;
@@ -2588,6 +2594,9 @@ impl AnalystApp {
                     Err(error) => {
                         self.triton_console_input = commands.last().cloned().unwrap_or_default();
                         self.console_mode = ConsoleMode::Triton;
+                        if !self.console_visible {
+                            self.console_detached = true;
+                        }
                         self.console_visible = true;
                         self.status = "Triton console command failed".to_owned();
                         self.failure = Some(error.clone());
@@ -3064,7 +3073,12 @@ impl AnalystApp {
                             ))
                             .clicked()
                         {
-                            self.console_visible = !self.console_visible;
+                            if self.console_visible {
+                                self.console_visible = false;
+                            } else {
+                                self.console_detached = true;
+                                self.console_visible = true;
+                            }
                         }
                         if let Some(spec) = &self.spec {
                             ui.label(
@@ -5710,7 +5724,9 @@ impl eframe::App for AnalystApp {
         if self.console_visible && self.console_detached {
             egui::Window::new("HydIR Console")
                 .id(egui::Id::new("detached_console"))
+                .movable(true)
                 .resizable(true)
+                .default_pos(egui::pos2(96.0, 110.0))
                 .default_size(egui::vec2(860.0, 420.0))
                 .min_size(egui::vec2(420.0, 180.0))
                 .show(ui.ctx(), |ui| self.console_view(ui));
@@ -6419,6 +6435,7 @@ mod tests {
         let app = AnalystApp::new(&eframe::egui::Context::default());
         assert!(matches!(app.tab, Tab::RegionStudio));
         assert!(!app.console_visible);
+        assert!(app.console_detached);
     }
 
     #[test]
@@ -6434,6 +6451,7 @@ mod tests {
             .unwrap();
         app.poll();
         assert!(app.console_visible);
+        assert!(app.console_detached);
     }
 
     #[test]
