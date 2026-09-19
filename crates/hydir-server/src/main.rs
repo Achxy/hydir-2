@@ -24,7 +24,10 @@ use hydir_core::{
     annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
     parse_program_spec_json, validate_analyst_annotation,
 };
-use hydir_patch::{MAX_PATCH_BYTES, parse_patch_bundle_json, parse_patch_json, patch_binary};
+use hydir_patch::{
+    MAX_PATCH_BYTES, compile_patch_binary, parse_patch_bundle_json, parse_patch_document,
+    parse_patch_json, patch_binary,
+};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -517,6 +520,88 @@ impl Store {
             )
             .map_err(internal)?;
         Ok(digest)
+    }
+
+    fn commit_patch_mutation(
+        &self,
+        principal: &str,
+        project_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+        patch_digest: &str,
+        patched: Vec<u8>,
+    ) -> Result<PatchReply, Status> {
+        let expected = i64::try_from(expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        let binary_sha256 = sha256(&patched);
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(internal)?;
+        let prior: Option<(i64, String, i64, String)> = tx
+            .query_row(
+                "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
+                params![project_id, idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some((prior_expected, prior_digest, revision, prior_binary_sha)) = prior {
+            if prior_expected != expected || prior_digest != patch_digest {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to a different patch request",
+                ));
+            }
+            return Ok(PatchReply {
+                project_id: project_id.to_owned(),
+                revision: revision as u64,
+                artifact_sha256: prior_binary_sha.clone(),
+                binary_sha256: prior_binary_sha,
+            });
+        }
+        let current: i64 = tx
+            .query_row(
+                "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
+                params![project_id, principal],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if current != expected {
+            return Err(Status::aborted("stale project revision"));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
+            params![binary_sha256, patched],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+            params![project_id, next, binary_sha256],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "UPDATE projects SET current_revision=?1 WHERE id=?2",
+            params![next, project_id],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO artifacts(project_id,revision,sha256,media_type,content) SELECT ?1,?2,sha256,'application/x-elf',content FROM binaries WHERE sha256=?3",
+            params![project_id, next, binary_sha256],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO patch_requests(project_id,idempotency_key,expected_revision,patch_sha256,new_revision,binary_sha256) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![project_id, idempotency_key, expected, patch_digest, next, binary_sha256],
+        )
+        .map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(PatchReply {
+            project_id: project_id.to_owned(),
+            revision: next as u64,
+            artifact_sha256: binary_sha256.clone(),
+            binary_sha256,
+        })
     }
 
     fn job(&self, principal: &str, project_id: &str, job_id: &str) -> Result<JobReply, Status> {
@@ -1083,8 +1168,8 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
                 .ok_or("patch envelope length overflow")?;
             let patch_json = bytes.get(4..end).ok_or("patch envelope is truncated")?;
             let binary = bytes.get(end..).ok_or("patch envelope lacks binary")?;
-            let patch = parse_patch_json(patch_json)?;
-            let result = patch_binary(binary, &patch)?;
+            let (document, _) = parse_patch_document(patch_json)?;
+            let result = compile_patch_binary(binary, &document)?;
             let bundle = serde_json::to_vec(&result.bundle).map_err(|error| error.to_string())?;
             pack_worker_parts(&[&result.content, &bundle])
         }
@@ -1998,77 +2083,14 @@ impl Hydir for Store {
         if patched.len() != binary.len() {
             return Err(Status::internal("patch worker changed ELF file size"));
         }
-        let binary_sha256 = sha256(&patched);
-        let next = expected
-            .checked_add(1)
-            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
-        {
-            let mut conn = self.connection()?;
-            let tx = conn.transaction().map_err(internal)?;
-            let raced: Option<(i64, String, i64, String)> = tx
-                .query_row(
-                    "SELECT expected_revision,patch_sha256,new_revision,binary_sha256 FROM patch_requests WHERE project_id=?1 AND idempotency_key=?2",
-                    params![input.project_id, input.idempotency_key],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(internal)?;
-            if let Some((prior_expected, prior_digest, revision, prior_binary_sha)) = raced {
-                if prior_expected != expected || prior_digest != patch_digest {
-                    return Err(Status::already_exists(
-                        "idempotency key belongs to a different patch request",
-                    ));
-                }
-                return Ok(Response::new(PatchReply {
-                    project_id: input.project_id,
-                    revision: revision as u64,
-                    artifact_sha256: prior_binary_sha.clone(),
-                    binary_sha256: prior_binary_sha,
-                }));
-            }
-            let current: i64 = tx
-                .query_row(
-                    "SELECT current_revision FROM projects WHERE id=?1 AND owner=?2",
-                    params![input.project_id, principal],
-                    |row| row.get(0),
-                )
-                .map_err(internal)?;
-            if current != expected {
-                return Err(Status::aborted("stale project revision"));
-            }
-            tx.execute(
-                "INSERT OR IGNORE INTO binaries(sha256,content) VALUES(?1,?2)",
-                params![binary_sha256, patched],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
-                params![input.project_id, next, binary_sha256],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "UPDATE projects SET current_revision=?1 WHERE id=?2",
-                params![next, input.project_id],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO artifacts(project_id,revision,sha256,media_type,content) SELECT ?1,?2,sha256,'application/x-elf',content FROM binaries WHERE sha256=?3",
-                params![input.project_id, next, binary_sha256],
-            )
-            .map_err(internal)?;
-            tx.execute(
-                "INSERT INTO patch_requests(project_id,idempotency_key,expected_revision,patch_sha256,new_revision,binary_sha256) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![input.project_id, input.idempotency_key, expected, patch_digest, next, binary_sha256],
-            )
-            .map_err(internal)?;
-            tx.commit().map_err(internal)?;
-        }
-        Ok(Response::new(PatchReply {
-            project_id: input.project_id,
-            revision: next as u64,
-            artifact_sha256: binary_sha256.clone(),
-            binary_sha256,
-        }))
+        Ok(Response::new(self.commit_patch_mutation(
+            &principal,
+            &input.project_id,
+            input.expected_revision,
+            &input.idempotency_key,
+            &patch_digest,
+            patched,
+        )?))
     }
 
     async fn get_artifact(
@@ -2516,11 +2538,6 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
         &self,
         request: Request<api_v2::PatchRequest>,
     ) -> Result<Response<api_v2::MutationReply>, Status> {
-        let authorization = request
-            .metadata()
-            .get("authorization")
-            .cloned()
-            .ok_or_else(|| Status::unauthenticated("missing bearer credential"))?;
         let principal = self.principal(&request)?;
         let input = request.into_inner();
         validate_v2_patch_request(&input)?;
@@ -2528,30 +2545,28 @@ impl api_v2::hydir_v2_server::HydirV2 for Store {
             self.binary_at_revision(&principal, &input.project_id, input.expected_revision)?;
         let envelope = patch_worker_envelope(&input.patch_json, &binary)?;
         let packed = run_worker("patch-v2", None, envelope).await?;
-        let [_patched, bundle] = unpack_worker_parts::<2>(&packed)?;
-        parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
+        let [patched, bundle] = unpack_worker_parts::<2>(&packed)?;
+        let parsed_bundle = parse_patch_bundle_json(bundle).map_err(Status::invalid_argument)?;
+        if sha256(patched) != parsed_bundle.patched_sha256 {
+            return Err(Status::internal(
+                "v2 patch worker output differs from its PatchBundle digest",
+            ));
+        }
         let bundle_digest = self.store_artifact(
             &input.project_id,
             input.expected_revision,
             "application/vnd.hydir.patch-bundle+json;version=2",
             bundle,
         )?;
-
-        let mut legacy_request = Request::new(PatchRequest {
-            project_id: input.project_id.clone(),
-            expected_revision: input.expected_revision,
-            patch_json: input.patch_json,
-            idempotency_key: input.idempotency_key,
-            trusted_fixture: input.trusted_fixture,
-            assume_u64x2: input.assume_u64x2,
-            assume_entry_only: input.assume_entry_only,
-        });
-        legacy_request
-            .metadata_mut()
-            .insert("authorization", authorization);
-        let reply = <Store as Hydir>::apply_patch(self, legacy_request)
-            .await?
-            .into_inner();
+        let patch_digest = sha256(&input.patch_json);
+        let reply = self.commit_patch_mutation(
+            &principal,
+            &input.project_id,
+            input.expected_revision,
+            &input.idempotency_key,
+            &patch_digest,
+            patched.to_vec(),
+        )?;
         Ok(Response::new(api_v2::MutationReply {
             project_id: reply.project_id,
             revision: reply.revision,
@@ -2828,7 +2843,7 @@ mod tests {
             binary_sha256: sha256(&binary),
             function_symbol: "hydir_max2".to_owned(),
             prototype: "u64(u64,u64)".to_owned(),
-            replacement: "return arg0;".to_owned(),
+            replacement: "u64 sum = arg0 + arg1;\nsum = sum - arg1;\nreturn sum;".to_owned(),
         })
         .unwrap();
         let patch_request = api_v2::PatchRequest {
@@ -2849,6 +2864,8 @@ mod tests {
         .into_inner();
         let bundle = parse_patch_bundle_json(&compiled.content).unwrap();
         assert!(!bundle.stable_verified);
+        assert!(bundle.typed_patch_ir.expression.is_none());
+        assert!(bundle.typed_patch_ir.resolved_return.is_some());
         let verified = api_v2::hydir_v2_server::HydirV2::verify_patch(
             &store,
             authorized(

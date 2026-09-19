@@ -9,7 +9,7 @@ mod patchlang;
 
 pub use patchlang::{
     PATCH_LANG_VERSION, PatchExpression, PatchExpressionKind, PatchProgram, PatchStatement,
-    PatchType, lower_scalar_return, parse_patch_program,
+    PatchType, lower_scalar_return, parse_patch_program, resolved_return,
 };
 
 use hydir_backend::{import_elf, lift_symbol, region_contract};
@@ -80,7 +80,10 @@ pub struct SourceRange {
 pub struct PatchIr {
     pub schema_version: u32,
     pub prototype: String,
-    pub expression: ReturnExpression,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<ReturnExpression>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_return: Option<PatchExpression>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statements: Vec<PatchStatement>,
     pub inputs: Vec<String>,
@@ -186,7 +189,7 @@ pub fn parse_return_expression(source: &str) -> Result<ReturnExpression, String>
     lower_scalar_return(&program)
 }
 
-pub fn parse_patch_json(bytes: &[u8]) -> Result<ValidatedPatch, String> {
+pub fn parse_patch_document(bytes: &[u8]) -> Result<(PatchDocument, PatchProgram), String> {
     if bytes.len() > MAX_PATCH_BYTES {
         return Err("patch document exceeds 4096 bytes".to_owned());
     }
@@ -212,7 +215,13 @@ pub fn parse_patch_json(bytes: &[u8]) -> Result<ValidatedPatch, String> {
     if document.prototype != "u64(u64,u64)" {
         return Err("patch requires explicit prototype u64(u64,u64)".to_owned());
     }
-    let expression = parse_return_expression(&document.replacement)?;
+    let program = parse_patch_program(&document.replacement)?;
+    Ok((document, program))
+}
+
+pub fn parse_patch_json(bytes: &[u8]) -> Result<ValidatedPatch, String> {
+    let (document, program) = parse_patch_document(bytes)?;
+    let expression = lower_scalar_return(&program)?;
     Ok(ValidatedPatch {
         document,
         expression,
@@ -264,12 +273,44 @@ pub fn validate_patch_bundle(bundle: &PatchBundle) -> Result<(), String> {
     {
         return Err("PatchBundle PatchIR must end in a return terminator".to_owned());
     }
+    if !bundle.typed_patch_ir.statements.is_empty()
+        && bundle.typed_patch_ir.expression.is_none()
+        && bundle.typed_patch_ir.resolved_return.is_none()
+    {
+        return Err("PatchBundle PatchIR has no resolved return expression".to_owned());
+    }
     let original = decode_hex(&bundle.original_region_hex, "original region")?;
     let compiled = decode_hex(&bundle.compiled_bytes_hex, "compiled bytes")?;
     if format!("{:x}", Sha256::digest(&original)) != bundle.region_digest
         || format!("{:x}", Sha256::digest(&compiled)) != bundle.compiled_bytes_sha256
     {
         return Err("PatchBundle embedded byte digest mismatch".to_owned());
+    }
+    let source_json = serde_json::to_vec(&bundle.source)
+        .map_err(|error| format!("PatchBundle source {error}"))?;
+    let (_, source_program) = parse_patch_document(&source_json)?;
+    if !bundle.typed_patch_ir.statements.is_empty()
+        && bundle.typed_patch_ir.statements != source_program.statements
+    {
+        return Err("PatchBundle statements differ from PatchLang source".to_owned());
+    }
+    let source_return = resolved_return(&source_program)?;
+    if bundle
+        .typed_patch_ir
+        .resolved_return
+        .as_ref()
+        .is_some_and(|resolved| resolved != &source_return)
+    {
+        return Err("PatchBundle resolved return differs from PatchLang source".to_owned());
+    }
+    if let Some(expression) = bundle.typed_patch_ir.expression {
+        if lower_scalar_return(&source_program)? != expression || encode(expression)? != compiled {
+            return Err("PatchBundle scalar expression differs from source or bytes".to_owned());
+        }
+    } else if bundle.typed_patch_ir.resolved_return.is_some()
+        && encode_patch_expression(&source_return)? != compiled
+    {
+        return Err("PatchBundle resolved return differs from compiled bytes".to_owned());
     }
     if bundle.placement_plan.original_size != original.len() as u64
         || bundle.placement_plan.replacement_size != compiled.len() as u64
@@ -422,6 +463,73 @@ fn encode(expression: ReturnExpression) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
+fn emit_patch_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> {
+    if output.len().saturating_add(bytes.len()) > MAX_PATCH_BYTES {
+        return Err(format!(
+            "PatchIR compiled code exceeds {MAX_PATCH_BYTES} bytes"
+        ));
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_patch_expression_into(
+    expression: &PatchExpression,
+    output: &mut Vec<u8>,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or("PatchIR expression node count overflows")?;
+    if *nodes > MAX_PATCH_BYTES {
+        return Err("PatchIR expression is too complex".to_owned());
+    }
+    match &expression.expression {
+        PatchExpressionKind::Variable { name } if name == "arg0" => {
+            emit_patch_bytes(output, &[0x48, 0x89, 0xf8])
+        }
+        PatchExpressionKind::Variable { name } if name == "arg1" => {
+            emit_patch_bytes(output, &[0x48, 0x89, 0xf0])
+        }
+        PatchExpressionKind::Variable { name } => Err(format!(
+            "PatchIR variable `{name}` was not resolved before compilation"
+        )),
+        PatchExpressionKind::Constant { value } => {
+            emit_patch_bytes(output, &[0x48, 0xb8])?;
+            emit_patch_bytes(output, &value.to_le_bytes())
+        }
+        PatchExpressionKind::Add { left, right }
+        | PatchExpressionKind::Subtract { left, right } => {
+            encode_patch_expression_into(left, output, nodes)?;
+            emit_patch_bytes(output, &[0x50])?;
+            encode_patch_expression_into(right, output, nodes)?;
+            emit_patch_bytes(output, &[0x48, 0x89, 0xc1, 0x58])?;
+            match expression.expression {
+                PatchExpressionKind::Add { .. } => emit_patch_bytes(output, &[0x48, 0x01, 0xc8]),
+                PatchExpressionKind::Subtract { .. } => {
+                    emit_patch_bytes(output, &[0x48, 0x29, 0xc8])
+                }
+                _ => unreachable!("matched arithmetic expression"),
+            }
+        }
+    }
+}
+
+fn encode_patch_expression(expression: &PatchExpression) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut nodes = 0;
+    encode_patch_expression_into(expression, &mut output, &mut nodes)?;
+    emit_patch_bytes(&mut output, &[0xc3])?;
+    Ok(output)
+}
+
+fn expression_uses_stack(expression: &PatchExpression) -> bool {
+    matches!(
+        &expression.expression,
+        PatchExpressionKind::Add { .. } | PatchExpressionKind::Subtract { .. }
+    )
+}
+
 fn relative_jump(from: u64, to: u64) -> Result<[u8; 5], String> {
     let next = from
         .checked_add(5)
@@ -448,14 +556,61 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
     if lower_scalar_return(&patch_program)? != patch.expression {
         return Err("validated patch expression differs from its PatchLang source".to_owned());
     }
+    let replacement_bytes = encode(patch.expression)?;
+    patch_binary_compiled(
+        bytes,
+        &patch.document,
+        patch_program,
+        replacement_bytes,
+        Some(patch.expression),
+        "builtin-x86_64-scalar-v1",
+    )
+}
+
+/// Compile the complete currently supported HydIR PatchLang expression tree
+/// and apply it through the same fail-closed ELF placement pipeline as v1.
+pub fn compile_patch_binary(
+    bytes: &[u8],
+    document: &PatchDocument,
+) -> Result<PatchedBinary, String> {
+    let encoded_document =
+        serde_json::to_vec(document).map_err(|error| format!("patch JSON {error}"))?;
+    let (document, patch_program) = parse_patch_document(&encoded_document)?;
+    let resolved = resolved_return(&patch_program)?;
+    let replacement_bytes = encode_patch_expression(&resolved)?;
+    patch_binary_compiled(
+        bytes,
+        &document,
+        patch_program,
+        replacement_bytes,
+        None,
+        "builtin-x86_64-patchir-v2",
+    )
+}
+
+fn patch_binary_compiled(
+    bytes: &[u8],
+    document: &PatchDocument,
+    patch_program: PatchProgram,
+    replacement_bytes: Vec<u8>,
+    legacy_expression: Option<ReturnExpression>,
+    compiler: &str,
+) -> Result<PatchedBinary, String> {
+    let resolved = resolved_return(&patch_program)?;
+    let memory_effects =
+        if compiler == "builtin-x86_64-patchir-v2" && expression_uses_stack(&resolved) {
+            vec!["balanced temporary stack scratch below entry rsp".to_owned()]
+        } else {
+            Vec::new()
+        };
     let digest = format!("{:x}", Sha256::digest(bytes));
-    if digest != patch.document.binary_sha256 {
+    if digest != document.binary_sha256 {
         return Err("patch binary hash does not match the supplied ELF".to_owned());
     }
-    lift_symbol(bytes, &patch.document.function_symbol).map_err(|error| {
+    lift_symbol(bytes, &document.function_symbol).map_err(|error| {
         format!("original function is outside the scalar lift contract: {error}")
     })?;
-    let contract = region_contract(bytes, &patch.document.function_symbol)
+    let contract = region_contract(bytes, &document.function_symbol)
         .map_err(|error| format!("region contract unavailable: {error}"))?;
     if !contract.observed_interior_entries.is_empty() {
         return Err("patch target has an observed entry into its interior".to_owned());
@@ -486,7 +641,7 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
         symbol.kind() == SymbolKind::Text
             && symbol.is_definition()
             && symbol.size() > 0
-            && symbol.name().ok() == Some(patch.document.function_symbol.as_str())
+            && symbol.name().ok() == Some(document.function_symbol.as_str())
     });
     let symbol = matches.next().ok_or("patch function symbol not found")?;
     if matches.next().is_some() {
@@ -519,7 +674,6 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
             return Err("patch target contains a relocation".to_owned());
         }
     }
-    let replacement_bytes = encode(patch.expression)?;
     let function_size = usize::try_from(symbol.size()).map_err(|_| "patch function too large")?;
     if function_size > 4096 {
         return Err("patch function exceeds the 4096-byte region limit".to_owned());
@@ -601,7 +755,7 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
     if reimported.binary_sha256 != patched_sha256 {
         return Err("patched ELF re-import digest differs from produced bytes".to_owned());
     }
-    let patched_contract = region_contract(&content, &patch.document.function_symbol)
+    let patched_contract = region_contract(&content, &document.function_symbol)
         .map_err(|error| format!("patched region failed re-import: {error}"))?;
     if patched_contract.entry.0 != symbol.address() || patched_contract.byte_length != symbol.size()
     {
@@ -612,24 +766,24 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
     let compiled_bytes_sha256 = format!("{:x}", Sha256::digest(&replacement_bytes));
     let toolchain_digest = format!(
         "{:x}",
-        Sha256::digest(concat!(
-            "hydir-patch/",
-            env!("CARGO_PKG_VERSION"),
-            "/builtin-x86_64-scalar-v1"
+        Sha256::digest(format!(
+            "hydir-patch/{}/{compiler}",
+            env!("CARGO_PKG_VERSION")
         ))
     );
     let bundle = PatchBundle {
         schema_version: PATCH_BUNDLE_VERSION,
-        source: patch.document.clone(),
+        source: document.clone(),
         typed_patch_ir: PatchIr {
             schema_version: 1,
-            prototype: patch.document.prototype.clone(),
-            expression: patch.expression,
+            prototype: document.prototype.clone(),
+            expression: legacy_expression,
+            resolved_return: Some(resolved),
             statements: patch_program.statements,
             inputs: vec!["rdi:u64(arg0)".to_owned(), "rsi:u64(arg1)".to_owned()],
             outputs: vec!["rax:u64(return)".to_owned()],
             exits: contract.exits.clone(),
-            memory_effects: Vec::new(),
+            memory_effects,
             source_range: patch_program.source_range,
         },
         region_digest: contract.bytes_sha256.clone(),
@@ -900,12 +1054,77 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("statements");
+        legacy["typed_patch_ir"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_return");
         let placement = legacy["placement_plan"].as_object_mut().unwrap();
         placement.remove("region_entry");
         placement.remove("entry_bytes_hex");
         placement.remove("executable_segment");
         let parsed_legacy = parse_patch_bundle_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(parsed_legacy.typed_patch_ir.statements.is_empty());
+        assert!(parsed_legacy.typed_patch_ir.resolved_return.is_none());
+    }
+
+    #[test]
+    fn patchir_v2_compiles_nested_assignments_and_reverts_exactly() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
+        let document = PatchDocument {
+            schema_version: PATCH_SCHEMA_VERSION,
+            binary_sha256: format!("{:x}", Sha256::digest(binary)),
+            function_symbol: "hydir_nop_identity".to_owned(),
+            prototype: "u64(u64,u64)".to_owned(),
+            replacement: "u64 sum = arg0 + arg1;\nsum = sum - arg1;\nreturn sum;".to_owned(),
+        };
+        let json = serde_json::to_vec(&document).unwrap();
+        assert!(parse_patch_document(&json).is_ok());
+        assert!(
+            parse_patch_json(&json)
+                .unwrap_err()
+                .contains("nested subtraction")
+        );
+
+        let result = compile_patch_binary(binary, &document).unwrap();
+        assert_eq!(
+            result.bundle.placement_plan.strategy,
+            PlacementStrategy::EntryTrampoline
+        );
+        assert!(result.bundle.typed_patch_ir.expression.is_none());
+        assert!(matches!(
+            result
+                .bundle
+                .typed_patch_ir
+                .resolved_return
+                .as_ref()
+                .map(|expression| &expression.expression),
+            Some(PatchExpressionKind::Subtract { .. })
+        ));
+        assert_eq!(result.bundle.typed_patch_ir.statements.len(), 3);
+        assert_eq!(
+            result.bundle.typed_patch_ir.memory_effects,
+            ["balanced temporary stack scratch below entry rsp"]
+        );
+        assert_eq!(
+            result.replacement_bytes,
+            [
+                0x48, 0x89, 0xf8, 0x50, 0x48, 0x89, 0xf0, 0x48, 0x89, 0xc1, 0x58, 0x48, 0x01, 0xc8,
+                0x50, 0x48, 0x89, 0xf0, 0x48, 0x89, 0xc1, 0x58, 0x48, 0x29, 0xc8, 0xc3,
+            ]
+        );
+        assert_eq!(
+            revert_patch_binary(&result.content, &result.bundle).unwrap(),
+            binary.as_slice()
+        );
+
+        let mut tampered = serde_json::to_value(&result.bundle).unwrap();
+        tampered["typed_patch_ir"]["resolved_return"]["expression"]["kind"] =
+            serde_json::Value::String("add".to_owned());
+        assert!(
+            parse_patch_bundle_json(&serde_json::to_vec(&tampered).unwrap())
+                .unwrap_err()
+                .contains("resolved return differs")
+        );
     }
 
     #[test]

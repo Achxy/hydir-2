@@ -452,7 +452,7 @@ fn atom(expression: &PatchExpression) -> Option<Atom> {
     }
 }
 
-pub fn lower_scalar_return(program: &PatchProgram) -> Result<ReturnExpression, String> {
+pub fn resolved_return(program: &PatchProgram) -> Result<PatchExpression, String> {
     let mut values = BTreeMap::new();
     for statement in &program.statements {
         match statement {
@@ -462,35 +462,37 @@ pub fn lower_scalar_return(program: &PatchProgram) -> Result<ReturnExpression, S
                 values.insert(name.clone(), value);
             }
             PatchStatement::Return { value, .. } => {
-                let value = resolve_expression(value, &values)?;
-                if let Some(value) = atom(&value) {
-                    return Ok(ReturnExpression::Atom(value));
-                }
-                return match &value.expression {
-                    PatchExpressionKind::Add { left, right } => atom(left)
-                        .zip(atom(right))
-                        .map(|(left, right)| ReturnExpression::Add(left, right))
-                        .ok_or_else(|| {
-                            "PatchLang program is valid, but the scalar backend cannot lower nested addition"
-                                .to_owned()
-                        }),
-                    PatchExpressionKind::Subtract { left, right } => atom(left)
-                        .zip(atom(right))
-                        .map(|(left, right)| ReturnExpression::Sub(left, right))
-                        .ok_or_else(|| {
-                            "PatchLang program is valid, but the scalar backend cannot lower nested subtraction"
-                                .to_owned()
-                        }),
-                    PatchExpressionKind::Variable { .. }
-                    | PatchExpressionKind::Constant { .. } => Err(
-                        "PatchLang program is valid, but the scalar backend has no lowering"
-                            .to_owned(),
-                    ),
-                };
+                return resolve_expression(value, &values);
             }
         }
     }
     Err("PatchIR has no return terminator".to_owned())
+}
+
+pub fn lower_scalar_return(program: &PatchProgram) -> Result<ReturnExpression, String> {
+    let value = resolved_return(program)?;
+    if let Some(value) = atom(&value) {
+        return Ok(ReturnExpression::Atom(value));
+    }
+    match &value.expression {
+        PatchExpressionKind::Add { left, right } => atom(left)
+            .zip(atom(right))
+            .map(|(left, right)| ReturnExpression::Add(left, right))
+            .ok_or_else(|| {
+                "PatchLang program is valid, but the scalar backend cannot lower nested addition"
+                    .to_owned()
+            }),
+        PatchExpressionKind::Subtract { left, right } => atom(left)
+            .zip(atom(right))
+            .map(|(left, right)| ReturnExpression::Sub(left, right))
+            .ok_or_else(|| {
+                "PatchLang program is valid, but the scalar backend cannot lower nested subtraction"
+                    .to_owned()
+            }),
+        PatchExpressionKind::Variable { .. } | PatchExpressionKind::Constant { .. } => {
+            Err("PatchLang program is valid, but the scalar backend has no lowering".to_owned())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +520,10 @@ mod tests {
         };
         assert_eq!(value.source_range.start_column, 11);
         assert_eq!(value.source_range.end_column, 24);
+        assert!(matches!(
+            resolved_return(&program).unwrap().expression,
+            PatchExpressionKind::Subtract { .. }
+        ));
         assert!(
             lower_scalar_return(&program)
                 .unwrap_err()

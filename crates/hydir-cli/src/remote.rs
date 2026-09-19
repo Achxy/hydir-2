@@ -452,7 +452,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 return Err("patch document exceeds 4096 bytes".into());
             }
             let patch_json = fs::read(patch_path)?;
-            hydir_patch::parse_patch_json(&patch_json)?;
+            hydir_patch::parse_patch_document(&patch_json)?;
             let request_digest = format!("{:x}", Sha256::digest(&patch_json));
             let artifact = client_v2
                 .compile_patch(authorized(
@@ -618,7 +618,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 return Err("patch document exceeds 4096 bytes".into());
             }
             let patch_json = fs::read(patch_path)?;
-            hydir_patch::parse_patch_json(&patch_json)?;
+            hydir_patch::parse_patch_document(&patch_json)?;
             let reply = client_v2
                 .apply_patch(authorized(
                     PatchRequestV2 {
