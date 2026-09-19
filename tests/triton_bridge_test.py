@@ -89,6 +89,20 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertIn("bvadd", output["final_registers"]["rax"])
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_function_longer_than_instruction_window(self) -> None:
+        result = self.run_bridge(
+            {
+                "schema_version": 1,
+                "binary_sha256": "0" * 64,
+                "function_symbol": "longer_than_15_bytes",
+                "entry_address": 0x401000,
+                "code_hex": "90" * 16 + "c3",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["instructions"]), 17)
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_symbolic_max2_merges_both_paths(self) -> None:
         result = self.run_bridge(
             {

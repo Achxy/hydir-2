@@ -3,133 +3,60 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="HydIR's bounded ELF import, control-flow recovery, LLVM lift, C output, and differential checks, examined through a 16-byte x86-64 fixture.">
+  <meta name="description" content="HydIR is an integrated binary analysis workbench for program recovery, semantic exploration, artifact generation, and controlled evaluation.">
   <link rel="canonical" href="https://hydir.wiki/">
-  <link rel="stylesheet" href="styles.css">
-  <title>HydIR</title>
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/styles.css">
+  <title>HydIR — binary analysis workbench</title>
 </head>
-<body>
-  <a class="skip" href="#article">Skip to article</a>
-  <main id="article">
-    <article>
-      <h1>HydIR</h1>
-
-      <p><a href="/blogs.html">Read the new technical articles →</a></p>
-
-      <p>HydIR reads x86-64 ELF binaries, recovers a limited class of functions, and emits LLVM IR and C. This article follows one function, <code>hydir_max2</code>, from its bytes to a differential test. It also shows where the tool stops. Importing a binary, recovering its control flow, lifting a function, and rebuilding an executable are separate operations with separate contracts.</p>
-
-      <h2>Input and extent</h2>
-
-      <p>The importer accepts little-endian x86-64 ELF and caps input at 64 MiB. It records sections, mapped segments, symbols, imports, and relocations with their provenance. This is an inventory, not proof that every instruction has a modeled meaning. Ordinary inspection reports call and reference recovery as <code>not_attempted</code>; an empty list would be an unjustified claim.</p>
-
-      <p>The function-level lift starts from either a nonzero ELF function symbol or an analyst-supplied virtual address and byte count. For the fixture below, the symbol table gives entry <code>0x401138</code> and extent 16 bytes. The command-line flag <code>--assume-u64x2</code> supplies the prototype <code>u64(u64, u64)</code> under SysV AMD64. HydIR does not infer that prototype from the bytes. For a stripped copy of the fixture, the demo repeats recovery with <code>cfg-at</code> and <code>lift-at</code> using the explicit entry and extent.</p>
-
-      <p>The checked-in assembly fixture is short enough to read in full:</p>
-
-      <pre><code class="language-asm"><span class="tok-directive">.globl</span> hydir_max2
-<span class="tok-directive">.type</span> hydir_max2, @function
-<span class="tok-label">hydir_max2:</span>
-    <span class="tok-keyword">movq</span> <span class="tok-var">%rdi</span>, <span class="tok-var">%rax</span>
-    <span class="tok-keyword">cmpq</span> <span class="tok-var">%rsi</span>, <span class="tok-var">%rdi</span>
-    <span class="tok-keyword">jae</span> <span class="tok-label">.Ldone</span>
-    <span class="tok-keyword">movq</span> <span class="tok-var">%rsi</span>, <span class="tok-var">%rax</span>
-<span class="tok-label">.Ldone:</span>
-    <span class="tok-keyword">ret</span></code></pre>
-
-      <p>This is unsigned maximum. The first move makes the first argument the provisional return value. <code>cmpq %rsi, %rdi</code> sets flags for <code>rdi - rsi</code>. <code>jae</code> keeps that value when the first argument is above or equal to the second; otherwise the following move loads the second argument into RAX. The comparison is unsigned, so replacing <code>jae</code> with a signed condition would change the function for values with the top bit set.</p>
-
-      <figure>
-        <a href="assets/egui-disassembly.webp"><img src="assets/egui-disassembly.webp" width="1440" height="358" alt="HydIR egui disassembly of hydir_max2 with five instruction addresses and their machine bytes"></a>
-        <figcaption>Decoded bytes in the egui workbench.</figcaption>
-      </figure>
-
-      <h2>Recovering the CFG</h2>
-
-      <p>HydIR uses <code>iced-x86</code> to decode reachable instructions. Recovery begins at the declared entry and follows a worklist. A return has no successor; an unconditional direct jump has one; a conditional branch has its taken target and fallthrough address. Every successor must remain within the selected extent. An ownership map prevents two decoded instructions from claiming the same byte. Invalid encodings, overlapping instructions, indirect branches, unsupported instructions, and edges that escape the extent fail recovery. The function-level path also caps the selected extent at 4,096 bytes.</p>
-
-      <p>For <code>hydir_max2</code>, the result contains five instruction blocks and five edges. The <code>jae</code> at <code>0x40113e</code> has a taken edge to the return at <code>0x401147</code> and a fallthrough edge to the second move at <code>0x401144</code>. Both paths meet at the return. The CFG artifact retains addresses, original byte strings, edge kinds, a binary SHA-256, the symbol extent, and a recovery-scope statement. Its block count is not a claim that arbitrary x86-64 has been analyzed.</p>
-
-      <figure>
-        <a href="assets/egui-cfg.webp"><img src="assets/egui-cfg.webp" width="1440" height="427" alt="HydIR egui CFG view listing five reachable instructions and the taken and fallthrough edges of jae" loading="lazy"></a>
-        <figcaption>The branch has two successors; both reach the return.</figcaption>
-      </figure>
-
-      <figure class="inspector">
-        <a href="assets/egui-inspector.webp"><img src="assets/egui-inspector.webp" width="610" height="995" alt="HydIR egui inspector showing the 16-byte symbol extent, asserted ABI, and five CFG blocks and edges" loading="lazy"></a>
-        <figcaption>Symbol extent, ABI assertion, and recovered CFG counts.</figcaption>
-      </figure>
-
-      <h2>Lowering machine state</h2>
-
-      <p>The lift models five full-width integer registers—RAX, RDI, RSI, RDX, and RCX—and four flags: ZF, SF, OF, and CF. Inputs enter RDI and RSI. Before emitting IR, a dataflow pass computes which fields are definitely initialized at each instruction. At a join, it intersects the outgoing sets of all predecessors. A read that is undefined on even one reachable path is rejected; every return path must define RAX.</p>
-
-      <p>Each recovered instruction becomes an LLVM basic block. Incoming register and flag values are represented by <code>phi</code> nodes. The IR is intentionally close to machine state rather than reconstructed source structure. For this fixture, unsigned carry is the decisive flag. The generated comparison sets CF when RDI is below RSI; the <code>jae</code> branch negates CF. At the return, a <code>phi</code> selects the RAX value from the direct branch or the fallthrough move.</p>
-
-      <p>Selected lines from the generated <code>max2-lifted.ll</code>:</p>
-
-      <pre><code class="language-llvm"><span class="tok-var">%cf_out_40113b</span> = <span class="tok-keyword">icmp ult</span> <span class="tok-type">i64</span> <span class="tok-var">%rdi_in_40113b</span>, <span class="tok-var">%rsi_in_40113b</span>
-<span class="tok-var">%t_40113e_0</span> = <span class="tok-keyword">xor</span> <span class="tok-type">i1</span> <span class="tok-var">%cf_in_40113e</span>, <span class="tok-const">true</span>
-<span class="tok-keyword">br</span> <span class="tok-type">i1</span> <span class="tok-var">%t_40113e_0</span>, <span class="tok-keyword">label</span> <span class="tok-var">%b401147</span>, <span class="tok-keyword">label</span> <span class="tok-var">%b401144</span>
-<span class="tok-var">%rax_in_401147</span> = <span class="tok-keyword">phi</span> <span class="tok-type">i64</span> [<span class="tok-var">%rax_in_40113e</span>, <span class="tok-var">%b40113e</span>], [<span class="tok-var">%rax_out_401144</span>, <span class="tok-var">%b401144</span>]
-<span class="tok-keyword">ret</span> <span class="tok-type">i64</span> <span class="tok-var">%rax_in_401147</span></code></pre>
-
-      <p>The excerpt omits the other register and flag transfers; the generated file keeps them explicit. <code>cmp</code> computes ZF, SF, OF, and CF even though this branch only needs CF. Wrapping arithmetic is emitted without <code>nsw</code> or <code>nuw</code>, because those promises would assert more than the machine operation supplies.</p>
-
-      <p>The C output follows the same direct CFG. It uses labels, gotos, and parallel copies for SSA edges; it does not claim to recover the programmer's original control structures. For the comparison above, its carry expression is an unsigned comparison of the two input values. The C generator can fail independently of CFG and LLVM lifting.</p>
-
-      <h2>What the tests establish</h2>
-
-      <p><a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-local.sh"><code>demo-local.sh</code></a> compiles the assembly fixtures, imports an ELF, lifts functions, emits C, and checks the output against native execution. It invokes LLVM's IR verifier when <code>opt</code> is available. It also strips a copy of <code>hydir_max2</code> and reruns the address-and-size path. <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-corpus.sh"><code>demo-corpus.sh</code></a> covers 16 additional scalar functions and requires <code>opt</code>. Together with the four distinct functions in the local demo, the documented scalar set has 20 functions.</p>
-
-      <pre><code class="language-shell"><span class="tok-keyword">bash</span> <span class="tok-string">scripts/demo-local.sh</span>
-<span class="tok-keyword">bash</span> <span class="tok-string">scripts/demo-corpus.sh</span></code></pre>
-
-      <p>For each output path, validation runs 1,008 controlled input pairs. It compares the lifted runner and the compiled C runner with the original fixture, including stdout, stderr, and exit status. One recorded <code>hydir_max2</code> report has the following fields:</p>
-
-      <pre><code class="language-json">{
-  <span class="tok-string">"cases_attempted"</span>: <span class="tok-number">1008</span>,
-  <span class="tok-string">"cases_matched"</span>: <span class="tok-number">1008</span>,
-  <span class="tok-string">"cases_mismatched"</span>: <span class="tok-number">0</span>,
-  <span class="tok-string">"result"</span>: <span class="tok-string">"pass"</span>,
-  <span class="tok-string">"sandbox"</span>: <span class="tok-string">"none; trusted fixtures only"</span>
-}</code></pre>
-
-      <p>The report is finite test evidence, not a proof over all 64-bit input pairs. <code>opt -passes=verify</code> checks that the generated LLVM IR is well formed; it does not prove equivalence to the binary. Validation executes the original binary, so the CLI requires <code>--trusted-fixture</code>. There is no hostile-input sandbox in this path. The demos require Linux x86-64; the repository provides a Docker-based runner for macOS.</p>
-
-      <h2>Refusal and separate contracts</h2>
-
-      <p>Global-effect analysis is a separate bounded pass over ELF function symbols. On the <code>hydir_max2</code> demo ELF, it marks the selected function <code>BOUNDED</code> but marks <code>_start</code> <code>UNKNOWN EFFECTS</code>. The function lift does not imply that the whole executable has known effects.</p>
-
-      <figure>
-        <a href="assets/egui-effects.webp"><img src="assets/egui-effects.webp" width="1440" height="121" alt="HydIR egui global-effects rows marking hydir_max2 bounded and _start unknown effects" loading="lazy"></a>
-        <figcaption>Per-function effect status in the max2 ELF.</figcaption>
-      </figure>
-
-      <p>A separate fixture shows the program-call view. It resolves direct edges from <code>_start</code> to <code>hydir_parent</code> and from <code>hydir_parent</code> to <code>hydir_leaf</code>. <code>hydir_indirect</code> has no resolved edge in this view; missing edges remain unknown, not proven absent.</p>
-
-      <figure>
-        <a href="assets/egui-program-calls.webp"><img src="assets/egui-program-calls.webp" width="1440" height="529" alt="HydIR egui program-call graph with direct edges from _start to hydir_parent to hydir_leaf and a separate hydir_indirect node" loading="lazy"></a>
-        <figcaption>Only resolved direct calls become edges.</figcaption>
-      </figure>
-
-      <p>In that fixture, <code>hydir_leaf</code> writes <code>hydir_counter</code> in <code>.data</code>. The effect summary for its direct caller, <code>hydir_parent</code>, includes the possible write at <code>0x402000</code>. This is a may-write result within the bounded analysis scope.</p>
-
-      <figure>
-        <a href="assets/egui-propagated-write.webp"><img src="assets/egui-propagated-write.webp" width="628" height="250" alt="HydIR egui global-effects view listing hydir_parent calling hydir_leaf and a possible write to .data address 0x402000" loading="lazy"></a>
-        <figcaption>The caller carries the callee's possible global write.</figcaption>
-      </figure>
-
-      <p>The workbench keeps stage failures distinct. In the separate <code>global-effects</code> fixture shown below, C output reports an unsupported <code>Call</code> at <code>0x401012</code>. The message says that this C-generation failure does not discard a valid CFG or LLVM lift. It does not imply that the call has been modeled by the function-level scalar lift.</p>
-
-      <figure>
-        <a href="assets/egui-refusal.webp"><img src="assets/egui-refusal.webp" width="1440" height="212" alt="HydIR egui C output tab reporting unsupported Call at address 0x401012" loading="lazy"></a>
-        <figcaption>C output stops at an unsupported call.</figcaption>
-      </figure>
-
-      <p>The scalar lift rejects memory operations, calls, indirect control flow, partial-register operations, uninitialized reads, and unknown instruction semantics. An import can still succeed: parsing an ELF and translating its behavior are different tasks. The desktop app opens a local ELF without uploading it; transfer to a remote project is a separate, labelled action. Analyst names, comments, and assumptions are stored as local project data and do not become recovered machine facts.</p>
-
-      <p>Whole-executable rebuilding uses a different path. <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-recompile.sh"><code>demo-recompile.sh</code></a> exercises three trusted, static freestanding fixtures. The rebuild contract requires bounded mapped data, complete text coverage, direct calls and branches, and statically checked read/write/exit syscall sites and buffers. The output goes to a new directory. The script compares stdout, stderr, and exit status for selected inputs, and checks that unsupported instructions, uninitialized reads, forbidden writes, unmapped buffers, and unsupported syscalls fail. Passing that gate does not expand the function lift into a general decompiler or establish equivalence for arbitrary executables.</p>
-    </article>
+<body class="latex-dark-auto">
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="/">HydIR</a>
+    <nav class="site-nav" aria-label="Main navigation">
+      <a href="/" aria-current="page">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs">Blogs</a>
+    </nav>
+  </header>
+  <main class="site-main" id="content">
+    <div class="hero">
+      <p class="eyebrow">Binary analysis and transformation</p>
+      <h1>From executable bytes to analyzable program representations.</h1>
+      <p class="lead">HydIR connects executable bytes to structured program representations and reproducible analysis artifacts. Examine disassembly and control flow, inspect LLVM IR and C output, explore symbolic behavior with Triton, and evaluate transformations against observed execution.</p>
+      <div class="actions"><a href="/start">Documentation</a><a href="/blogs">Technical articles</a><a href="https://github.com/Achxy/hydir-2">Source code</a></div>
+    </div>
+    <figure class="hero-image">
+      <a href="/assets/studio-lift.png"><img src="/assets/studio-lift.png" width="2800" height="1764" alt="HydIR egui workbench with a selected ELF function, lifted LLVM IR, function inspector, diagnostics, and console"></a>
+      <figcaption>The workbench displays the selected <code>hydir_max2</code> function, its disassembly, lifted LLVM IR, and analysis context.</figcaption>
+    </figure>
+    <div class="prose">
+      <h2>Analysis workflow</h2>
+      <p>HydIR links recovered program facts, derived representations, and evaluation results to the binary under analysis. Addresses, machine bytes, analyst assertions, and generated artifacts remain available for inspection throughout the workflow.</p>
+      <div class="feature-grid">
+        <section><h3>Program recovery</h3><p>Inspect ELF structure, symbols, instructions, control-flow graphs, call relationships, and effect summaries.</p></section>
+        <section><h3>Semantic analysis</h3><p>Examine lifted LLVM IR and C output. Use Triton expressions and path conditions to analyze relationships between inputs and results.</p></section>
+        <section><h3>Transformation and evaluation</h3><p>Generate patch and rebuild artifacts, compare their behavior with the original, and retain the associated reports.</p></section>
+      </div>
+      <hr class="section-rule">
+      <h2>Technical articles</h2>
+      <div class="story-grid">
+        <article>
+          <p class="eyebrow">Binary lifting</p>
+          <h3><a href="/articles/max2">How HydIR Lifts a 16-Byte Function</a></h3>
+          <p>A worked example of ELF function selection, CFG recovery, LLVM lowering, C generation, and differential evaluation.</p>
+        </article>
+        <article>
+          <p class="eyebrow">Symbolic analysis</p>
+          <h3><a href="/articles/triton-api">Finding an Input with Triton</a></h3>
+          <p>A model query and an examination of HydIR's Triton bridge, path exploration, and symbolic return expressions.</p>
+        </article>
+      </div>
+      <p class="more-link"><a href="/blogs">View all articles →</a></p>
+      <hr class="section-rule">
+      <h2>Interfaces</h2>
+      <p>The desktop workbench supports interactive analysis. The CLI produces artifacts for scripted workflows. An authenticated service and Python SDK provide revisioned project operations. See the <a href="/architecture">architecture guide</a> for the relationship between these components.</p>
+      <p><a href="/start">Read the quick start →</a></p>
+    </div>
   </main>
+  <footer class="site-footer"><p>HydIR is open source under <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a>. <a href="https://github.com/Achxy/hydir-2">Explore the source</a>.</p></footer>
 </body>
 </html>
