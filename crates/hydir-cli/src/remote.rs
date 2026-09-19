@@ -114,6 +114,19 @@ fn validate_endpoint(endpoint: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn valid_bearer_token(token: &str) -> bool {
+    let static_token = token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let compact_jwt = token.len() <= 16 * 1024
+        && token.split('.').count() == 3
+        && token.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    static_token || compact_jwt
+}
+
 fn write_executable_new(path: &str, content: &[u8]) -> Result<(), Box<dyn Error>> {
     let target = Path::new(path);
     if target.exists() {
@@ -151,8 +164,10 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
     let token = fs::read_to_string(token_path)?.trim().to_owned();
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("credential file does not contain a 64-character hex token".into());
+    if !valid_bearer_token(&token) {
+        return Err(
+            "credential file does not contain a bounded static token or compact JWT".into(),
+        );
     }
     let credential = format!("Bearer {token}").parse::<MetadataValue<_>>()?;
     let channel = Channel::from_shared(endpoint)?.connect().await?;
@@ -773,7 +788,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_endpoint;
+    use super::{valid_bearer_token, validate_endpoint};
 
     #[test]
     fn endpoint_policy_allows_tls_and_only_loopback_plaintext() {
@@ -783,5 +798,17 @@ mod tests {
         assert!(validate_endpoint("https://hydir.example:443").is_ok());
         assert!(validate_endpoint("https://hydir.example/api").is_err());
         assert!(validate_endpoint("https://user@hydir.example").is_err());
+    }
+
+    #[test]
+    fn bearer_policy_accepts_static_tokens_and_bounded_compact_jwts() {
+        assert!(valid_bearer_token(&"a".repeat(64)));
+        assert!(valid_bearer_token("eyJhbGciOiJSUzI1NiJ9.e30.signature"));
+        assert!(!valid_bearer_token("not a token"));
+        assert!(!valid_bearer_token("a..b"));
+        assert!(!valid_bearer_token(&format!(
+            "a.b.{}",
+            "c".repeat(16 * 1024)
+        )));
     }
 }

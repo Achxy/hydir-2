@@ -26,6 +26,14 @@ class ClientBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             HydirClient("https://hydir.example:50051/api", self.token)
 
+    def test_compact_jwt_credential_is_accepted_without_network_use(self):
+        self.token.write_text("eyJhbGciOiJSUzI1NiJ9.e30.signature", encoding="ascii")
+        with HydirClient("https://hydir.example:50051", self.token):
+            pass
+        self.token.write_text("header..signature", encoding="ascii")
+        with self.assertRaises(ValueError):
+            HydirClient("https://hydir.example:50051", self.token)
+
     @unittest.skipUnless(os.name == "posix", "Unix file modes required")
     def test_non_private_credential_is_refused(self):
         os.chmod(self.token, 0o644)

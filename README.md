@@ -208,7 +208,28 @@ cargo run --locked --bin hydird -- serve-tls /path/to/hydird.sqlite 0.0.0.0:5005
 export HYDIR_ENDPOINT=https://hydir.example:50051
 ```
 
-This TLS/static-token/SQLite mode is a secure transport foundation, not the completed production deployment profile. OIDC, project roles, PostgreSQL, object storage, quotas, audit export, and Kubernetes packaging remain required before that profile is release-ready.
+`serve-oidc` replaces static-token authentication with a pinned RS256 JWKS while
+retaining mandatory TLS. Tokens must carry a matching issuer and audience plus
+valid `exp`, optional `nbf`, and non-empty `sub` claims. The JWKS path is
+absolute and bounded; unknown keys or algorithms fail closed:
+
+```bash
+cargo run --locked --bin hydird -- serve-oidc \
+  /path/to/hydird.sqlite 0.0.0.0:50051 \
+  /run/secrets/tls.crt /run/secrets/tls.key \
+  https://identity.example/tenant hydir-api /run/config/oidc-jwks.json
+export HYDIR_ENDPOINT=https://hydir.example:50051
+export HYDIR_TOKEN_FILE=/private/path/access.jwt
+```
+
+OIDC subjects are registered as deterministic opaque HydIR principals on first
+successful authentication. A database operator can resolve those principals
+for ACL administration with `hydird identity list-oidc <database.sqlite>`.
+
+The TLS/OIDC/SQLite mode is a secure authentication foundation, not the
+completed production deployment profile. Automatic discovery/key refresh,
+PostgreSQL, object storage, quotas, audit export, and Kubernetes packaging
+remain required before that profile is release-ready.
 
 Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent `remote inspect`, `cfg`, `lift`, `decompile`, `artifact`, or `job-*` operations. Credential files must not be group- or world-readable.
 

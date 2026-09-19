@@ -87,8 +87,11 @@ does not infer signatures. No sample is uploaded without a call to
 `upload_binary`. Artifact bytes are SHA-256 checked before being returned,
 and `export_artifact` refuses to overwrite an existing path. The client
 rejects plaintext non-loopback endpoints and non-private credential files.
-`https://host:port` endpoints use gRPC TLS with platform trust roots; callers
+`https://host:port` endpoints use gRPC TLS with its default trust roots; callers
 using a private CA may pass its PEM bytes as `root_certificates`.
+Credential files may contain either a local 64-character static token or a
+bounded compact OIDC JWT; the server remains responsible for signature and
+claim validation.
 
 Generated `hydir*_pb2.py` and `hydir*_pb2_grpc.py` correspond to the v1 and v2
 schemas in `crates/hydir-api/proto/`, produced with `grpcio-tools==1.84.0`.
