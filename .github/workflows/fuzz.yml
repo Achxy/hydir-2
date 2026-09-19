@@ -9,9 +9,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install nightly Rust and cargo-fuzz
         run: |
-          # rust-toolchain.toml pins stable, so every fuzz command selects nightly explicitly.
+          # Build the pinned cargo-fuzz with the repository toolchain, then use
+          # nightly explicitly for libFuzzer because rust-toolchain.toml pins stable.
           rustup toolchain install nightly
-          cargo +nightly install cargo-fuzz --version 0.12.0 --locked
+          cargo install cargo-fuzz --version 0.12.0 --locked
       - name: ELF import and region corpus
         run: |
           cargo +nightly fuzz build elf_import
