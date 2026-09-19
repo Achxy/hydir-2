@@ -4,6 +4,7 @@
 //! x86-64 backend. Valid programs outside that lowering contract are refused
 //! explicitly rather than silently simplified.
 
+mod elf;
 mod patchlang;
 
 pub use patchlang::{
@@ -108,10 +109,29 @@ pub enum PlacementStrategy {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlacementPlan {
     pub strategy: PlacementStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_entry: Option<Address>,
     pub virtual_address: Address,
     pub original_size: u64,
     pub replacement_size: u64,
     pub padding_byte: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_bytes_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_segment: Option<ExecutableSegmentPlacement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExecutableSegmentPlacement {
+    pub original_file_size: u64,
+    pub original_program_header_offset: u64,
+    pub original_program_header_count: u16,
+    pub program_header_offset: u64,
+    pub file_offset: u64,
+    pub virtual_address: Address,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub alignment: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -253,9 +273,88 @@ pub fn validate_patch_bundle(bundle: &PatchBundle) -> Result<(), String> {
     }
     if bundle.placement_plan.original_size != original.len() as u64
         || bundle.placement_plan.replacement_size != compiled.len() as u64
-        || bundle.placement_plan.replacement_size > bundle.placement_plan.original_size
     {
         return Err("PatchBundle placement sizes do not match embedded bytes".to_owned());
+    }
+    let entry_bytes = bundle
+        .placement_plan
+        .entry_bytes_hex
+        .as_deref()
+        .map(|value| decode_hex(value, "entry bytes"))
+        .transpose()?;
+    if entry_bytes
+        .as_ref()
+        .is_some_and(|entry| entry.len() != original.len())
+    {
+        return Err("PatchBundle entry bytes do not cover the original region".to_owned());
+    }
+    match bundle.placement_plan.strategy {
+        PlacementStrategy::InPlace => {
+            if bundle.placement_plan.replacement_size > bundle.placement_plan.original_size
+                || bundle.placement_plan.executable_segment.is_some()
+                || bundle
+                    .placement_plan
+                    .region_entry
+                    .is_some_and(|entry| entry != bundle.placement_plan.virtual_address)
+            {
+                return Err("PatchBundle in-place placement is inconsistent".to_owned());
+            }
+            if let Some(entry) = entry_bytes
+                && (!entry.starts_with(&compiled)
+                    || entry[compiled.len()..]
+                        .iter()
+                        .any(|byte| Some(*byte) != bundle.placement_plan.padding_byte))
+            {
+                return Err("PatchBundle in-place entry bytes are inconsistent".to_owned());
+            }
+        }
+        PlacementStrategy::EntryTrampoline => {
+            let entry = entry_bytes.ok_or("PatchBundle trampoline entry bytes are missing")?;
+            let region_entry = bundle
+                .placement_plan
+                .region_entry
+                .ok_or("PatchBundle trampoline region entry is missing")?;
+            let segment = bundle
+                .placement_plan
+                .executable_segment
+                .as_ref()
+                .ok_or("PatchBundle executable segment placement is missing")?;
+            let segment_end = segment
+                .virtual_address
+                .0
+                .checked_add(segment.memory_size)
+                .ok_or("PatchBundle executable segment address overflows")?;
+            let replacement_end = bundle
+                .placement_plan
+                .virtual_address
+                .0
+                .checked_add(bundle.placement_plan.replacement_size)
+                .ok_or("PatchBundle replacement address overflows")?;
+            let displacement = i32::from_le_bytes(
+                entry
+                    .get(1..5)
+                    .ok_or("PatchBundle trampoline encoding is truncated")?
+                    .try_into()
+                    .map_err(|_| "PatchBundle trampoline displacement is malformed")?,
+            );
+            let jump_target = i128::from(region_entry.0) + 5 + i128::from(displacement);
+            if entry.len() < 5
+                || entry.first() != Some(&0xe9)
+                || entry[5..].iter().any(|byte| *byte != 0x90)
+                || jump_target != i128::from(bundle.placement_plan.virtual_address.0)
+                || segment.file_size != segment.memory_size
+                || segment.original_file_size > segment.file_offset
+                || segment.original_program_header_count == 0
+                || segment.alignment < 0x1000
+                || !segment.alignment.is_power_of_two()
+                || segment.file_offset % segment.alignment
+                    != segment.virtual_address.0 % segment.alignment
+                || bundle.placement_plan.virtual_address.0 < segment.virtual_address.0
+                || replacement_end > segment_end
+            {
+                return Err("PatchBundle trampoline placement is inconsistent".to_owned());
+            }
+        }
     }
     if bundle.stable_verified
         && (bundle
@@ -323,12 +422,27 @@ fn encode(expression: ReturnExpression) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-/// Apply a whole-function, entry-only in-place patch to a new ELF byte vector.
+fn relative_jump(from: u64, to: u64) -> Result<[u8; 5], String> {
+    let next = from
+        .checked_add(5)
+        .ok_or("trampoline entry address overflows")?;
+    let displacement = i128::from(to) - i128::from(next);
+    let displacement = i32::try_from(displacement)
+        .map_err(|_| "replacement segment is outside rel32 trampoline reach")?;
+    let mut jump = [0u8; 5];
+    jump[0] = 0xe9;
+    jump[1..].copy_from_slice(&displacement.to_le_bytes());
+    Ok(jump)
+}
+
+/// Apply a whole-function, entry-only patch to a new ELF byte vector.
 ///
 /// The caller must separately assert the prototype and that no control flow
 /// enters the interior of the patched symbol. This library checks hash,
 /// format, original liftability, exact symbol extent, relocation absence,
-/// and replacement fit. It never mutates the source slice.
+/// and placement safety. It prefers an in-place replacement and otherwise
+/// uses a five-byte entry trampoline into an appended RX segment. It never
+/// mutates the source slice.
 pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinary, String> {
     let patch_program = parse_patch_program(&patch.document.replacement)?;
     if lower_scalar_return(&patch_program)? != patch.expression {
@@ -407,12 +521,8 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
     }
     let replacement_bytes = encode(patch.expression)?;
     let function_size = usize::try_from(symbol.size()).map_err(|_| "patch function too large")?;
-    if function_size > 4096 || replacement_bytes.len() > function_size {
-        return Err(format!(
-            "replacement needs {} bytes but function region has {} bytes",
-            replacement_bytes.len(),
-            function_size
-        ));
+    if function_size > 4096 {
+        return Err("patch function exceeds the 4096-byte region limit".to_owned());
     }
     let file_start = usize::try_from(
         section_offset
@@ -433,9 +543,58 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
     {
         return Err("patch region bytes or symbol extent changed after contract export".to_owned());
     }
-    let mut content = bytes.to_vec();
-    content[file_start..file_start + replacement_bytes.len()].copy_from_slice(&replacement_bytes);
-    content[file_start + replacement_bytes.len()..file_end].fill(0x90);
+    let (content, placement_plan) = if replacement_bytes.len() <= function_size {
+        let mut entry_bytes = vec![0x90; function_size];
+        entry_bytes[..replacement_bytes.len()].copy_from_slice(&replacement_bytes);
+        let mut content = bytes.to_vec();
+        content[file_start..file_end].copy_from_slice(&entry_bytes);
+        let plan = PlacementPlan {
+            strategy: PlacementStrategy::InPlace,
+            region_entry: Some(Address(symbol.address())),
+            virtual_address: Address(symbol.address()),
+            original_size: symbol.size(),
+            replacement_size: replacement_bytes.len() as u64,
+            padding_byte: Some(0x90),
+            entry_bytes_hex: Some(hex_encode(&entry_bytes)),
+            executable_segment: None,
+        };
+        (content, plan)
+    } else {
+        if function_size < 5 {
+            return Err(format!(
+                "replacement needs {} bytes and the {}-byte function cannot hold a 5-byte entry trampoline",
+                replacement_bytes.len(),
+                function_size
+            ));
+        }
+        let appended = elf::append_executable_segment(bytes, &replacement_bytes)?;
+        let jump = relative_jump(symbol.address(), appended.code_address)?;
+        let mut entry_bytes = vec![0x90; function_size];
+        entry_bytes[..jump.len()].copy_from_slice(&jump);
+        let mut content = appended.content;
+        content[file_start..file_end].copy_from_slice(&entry_bytes);
+        let plan = PlacementPlan {
+            strategy: PlacementStrategy::EntryTrampoline,
+            region_entry: Some(Address(symbol.address())),
+            virtual_address: Address(appended.code_address),
+            original_size: symbol.size(),
+            replacement_size: replacement_bytes.len() as u64,
+            padding_byte: Some(0x90),
+            entry_bytes_hex: Some(hex_encode(&entry_bytes)),
+            executable_segment: Some(ExecutableSegmentPlacement {
+                original_file_size: appended.original_file_size,
+                original_program_header_offset: appended.original_program_header_offset,
+                original_program_header_count: appended.original_program_header_count,
+                program_header_offset: appended.program_header_offset,
+                file_offset: appended.file_offset,
+                virtual_address: Address(appended.virtual_address),
+                file_size: appended.file_size,
+                memory_size: appended.file_size,
+                alignment: appended.alignment,
+            }),
+        };
+        (content, plan)
+    };
     let patched_sha256 = format!("{:x}", Sha256::digest(&content));
     let reimported = import_elf(&content)
         .map_err(|error| format!("patched ELF failed native re-import: {error}"))?;
@@ -487,13 +646,7 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
                 "entry and exit stack alignment residues are not established".to_owned(),
             ],
         }],
-        placement_plan: PlacementPlan {
-            strategy: PlacementStrategy::InPlace,
-            virtual_address: Address(symbol.address()),
-            original_size: symbol.size(),
-            replacement_size: replacement_bytes.len() as u64,
-            padding_byte: Some(0x90),
-        },
+        placement_plan,
         relocation_records: Vec::new(),
         toolchain_digest,
         original_sha256: digest.clone(),
@@ -531,6 +684,102 @@ pub fn patch_binary(bytes: &[u8], patch: &ValidatedPatch) -> Result<PatchedBinar
         exit_rsp_delta: contract.stack_delta.expect("proven above"),
         bundle,
     })
+}
+
+/// Reverse a HydIR patch after verifying the complete patched-file digest and
+/// every placement field needed to identify the modified entry and ELF layout.
+pub fn revert_patch_binary(bytes: &[u8], bundle: &PatchBundle) -> Result<Vec<u8>, String> {
+    validate_patch_bundle(bundle)?;
+    if format!("{:x}", Sha256::digest(bytes)) != bundle.patched_sha256 {
+        return Err("patched binary hash does not match the PatchBundle".to_owned());
+    }
+    let region_entry = bundle
+        .placement_plan
+        .region_entry
+        .ok_or("PatchBundle predates reversible region-entry metadata")?;
+    let expected_entry = decode_hex(
+        bundle
+            .placement_plan
+            .entry_bytes_hex
+            .as_deref()
+            .ok_or("PatchBundle predates reversible entry-byte metadata")?,
+        "entry bytes",
+    )?;
+    let original_region = decode_hex(&bundle.original_region_hex, "original region")?;
+
+    let (file_start, file_end) = {
+        let file = object::File::parse(bytes)
+            .map_err(|error| format!("patched ELF parse failed: {error}"))?;
+        let mut matches = file.symbols().filter(|symbol| {
+            symbol.kind() == SymbolKind::Text
+                && symbol.is_definition()
+                && symbol.size() > 0
+                && symbol.name().ok() == Some(bundle.source.function_symbol.as_str())
+        });
+        let symbol = matches.next().ok_or("patched function symbol not found")?;
+        if matches.next().is_some() {
+            return Err("patched function symbol is ambiguous".to_owned());
+        }
+        if symbol.address() != region_entry.0 || symbol.size() != original_region.len() as u64 {
+            return Err("patched function extent differs from the PatchBundle".to_owned());
+        }
+        let section = file
+            .section_by_index(
+                symbol
+                    .section_index()
+                    .ok_or("patched function has no section")?,
+            )
+            .map_err(|error| format!("patched function section unavailable: {error}"))?;
+        let relative = symbol
+            .address()
+            .checked_sub(section.address())
+            .ok_or("patched function precedes its section")?;
+        let (section_offset, section_file_size) = section
+            .file_range()
+            .ok_or("patched function section has no file-backed bytes")?;
+        let end = relative
+            .checked_add(symbol.size())
+            .ok_or("patched function extent overflows")?;
+        if end > section_file_size {
+            return Err("patched function exceeds its file-backed section".to_owned());
+        }
+        let start = usize::try_from(
+            section_offset
+                .checked_add(relative)
+                .ok_or("patched function file offset overflows")?,
+        )
+        .map_err(|_| "patched function file offset is too large")?;
+        let end = start
+            .checked_add(original_region.len())
+            .ok_or("patched function file range overflows")?;
+        (start, end)
+    };
+
+    if bytes.get(file_start..file_end) != Some(expected_entry.as_slice()) {
+        return Err("patched entry bytes differ from the PatchBundle".to_owned());
+    }
+    let mut restored = bytes.to_vec();
+    restored[file_start..file_end].copy_from_slice(&original_region);
+    if bundle.placement_plan.strategy == PlacementStrategy::EntryTrampoline {
+        let segment = bundle
+            .placement_plan
+            .executable_segment
+            .as_ref()
+            .ok_or("PatchBundle executable segment placement is missing")?;
+        elf::restore_original_layout(
+            &mut restored,
+            segment.program_header_offset,
+            segment.original_file_size,
+            segment.original_program_header_offset,
+            segment.original_program_header_count,
+        )?;
+    }
+    if format!("{:x}", Sha256::digest(&restored)) != bundle.original_sha256 {
+        return Err("reversed binary does not match the original digest".to_owned());
+    }
+    import_elf(&restored)
+        .map_err(|error| format!("reversed ELF failed native re-import: {error}"))?;
+    Ok(restored)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -631,6 +880,10 @@ mod tests {
             result.bundle.typed_patch_ir.statements.last(),
             Some(PatchStatement::Return { .. })
         ));
+        assert_eq!(
+            revert_patch_binary(&result.content, &result.bundle).unwrap(),
+            binary.as_slice()
+        );
         let serialized = serde_json::to_vec(&result.bundle).unwrap();
         let parsed = parse_patch_bundle_json(&serialized).unwrap();
         assert_eq!(parsed.patched_sha256, result.patched_sha256);
@@ -647,7 +900,52 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("statements");
+        let placement = legacy["placement_plan"].as_object_mut().unwrap();
+        placement.remove("region_entry");
+        placement.remove("entry_bytes_hex");
+        placement.remove("executable_segment");
         let parsed_legacy = parse_patch_bundle_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(parsed_legacy.typed_patch_ir.statements.is_empty());
+    }
+
+    #[test]
+    fn oversized_scalar_replacement_uses_a_reimportable_rx_segment_trampoline() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/frame.elf");
+        let patch = ValidatedPatch {
+            document: PatchDocument {
+                schema_version: PATCH_SCHEMA_VERSION,
+                binary_sha256: format!("{:x}", Sha256::digest(binary)),
+                function_symbol: "hydir_nop_identity".to_owned(),
+                prototype: "u64(u64,u64)".to_owned(),
+                replacement: "return 0x0123456789abcdef;".to_owned(),
+            },
+            expression: ReturnExpression::Atom(Atom::Constant(0x0123_4567_89ab_cdef)),
+        };
+        let result = patch_binary(binary, &patch).unwrap();
+        assert_eq!(
+            result.bundle.placement_plan.strategy,
+            PlacementStrategy::EntryTrampoline
+        );
+        assert!(result.content.len() > binary.len());
+        let entry = decode_hex(
+            result
+                .bundle
+                .placement_plan
+                .entry_bytes_hex
+                .as_deref()
+                .unwrap(),
+            "test entry",
+        )
+        .unwrap();
+        assert_eq!(entry.len(), 5);
+        assert_eq!(entry[0], 0xe9);
+        let original_segments = import_elf(binary).unwrap().mapped_segments.len();
+        let patched_segments = import_elf(&result.content).unwrap().mapped_segments.len();
+        assert_eq!(patched_segments, original_segments + 1);
+        validate_patch_bundle(&result.bundle).unwrap();
+        assert_eq!(
+            revert_patch_binary(&result.content, &result.bundle).unwrap(),
+            binary.as_slice()
+        );
     }
 }
