@@ -16,9 +16,9 @@
   <a href="#authenticated-service">Remote API</a>
 </p>
 
-[![HydIR desktop GUI showing the native decompiler summary for hydir_max2, the function tree, and the inspector](assets/screenshots/gui-native-summary.jpg)](assets/screenshots/gui-native-summary.jpg)
+[![HydIR egui workbench with a selected ELF function, its lifted LLVM IR, inspector, diagnostics, and console](assets/screenshots/studio-lift.png)](assets/screenshots/studio-lift.png)
 
-*HydIR with the checked-in `max2.elf` open: the native decompiler summary reports recovered ABI facts and verification status alongside the function tree and inspector.*
+*The native egui workbench analyzing `hydir_max2`: local ELF, machine-byte-derived LLVM IR, and the selected function's scope in one view.*
 
 HydIR opens little-endian x86-64 ELF files locally, shows a function's bytes and
 reachable branches, and turns supported semantics into inspectable LLVM IR and
@@ -216,23 +216,24 @@ contracts as the CLI and write new output paths.
 
 ### GUI screenshots
 
-These captures show the current desktop application analyzing the checked-in
-`fuzz/corpus/elf_import/max2.elf` fixture.
+The full workbench screenshot at the top of this README shows the program tree,
+LLVM IR, inspector, diagnostics, and console together. The following captures
+show individual views of the desktop application.
 
-**ELF overview.** The workbench reports the file inventory, discovery count,
-native lifting stages, C availability, and any remaining uncertainty.
+**Disassembly.** Recovered instructions retain their addresses, original
+machine bytes, and decoded operations.
 
-[![HydIR GUI ELF overview showing one discovered function and completed native lifting and C generation stages](assets/screenshots/gui-elf-overview-current.jpg)](assets/screenshots/gui-elf-overview-current.jpg)
+[![HydIR GUI disassembly view showing addresses, machine bytes, and decoded instructions for hydir_max2](assets/screenshots/egui-disassembly.webp)](assets/screenshots/egui-disassembly.webp)
 
-**Disassembly.** The selected function retains instruction addresses, original
-machine bytes, decoded operations, and operand details.
+**Function inspector.** The selected function's entry, byte extent, ELF symbol
+source, asserted ABI, and reachable CFG size appear beside the analysis views.
 
-[![HydIR GUI disassembly showing the five decoded instructions of hydir_max2](assets/screenshots/gui-disassembly-current.jpg)](assets/screenshots/gui-disassembly-current.jpg)
+[![HydIR GUI inspector showing the selected function's ELF facts, ABI assertion, and CFG size](assets/screenshots/egui-inspector.webp)](assets/screenshots/egui-inspector.webp)
 
-**Control-flow graph.** The graph view lays out recovered blocks and labeled
-edges for the selected function; the inspector remains visible beside it.
+**C output and diagnostics.** The GUI reports an unsupported call explicitly
+while retaining the independently recovered CFG and LLVM lift.
 
-[![HydIR GUI graph view showing the recovered control-flow blocks of hydir_max2](assets/screenshots/gui-cfg-current.jpg)](assets/screenshots/gui-cfg-current.jpg)
+[![HydIR GUI C output view reporting an unsupported call without discarding the CFG or LLVM lift](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
 
 Remote projects do not reconnect automatically. Plaintext service connections
 remain loopback-only; non-loopback connections require TLS.
