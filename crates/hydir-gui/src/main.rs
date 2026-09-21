@@ -7075,10 +7075,11 @@ impl AnalystApp {
             metric_readout(ui, "PARTIAL", &report.partial_functions.to_string(), BAD);
         });
         ui.add_space(8.0);
+        let progress_width = ui.available_width();
         ui.add(
             egui::ProgressBar::new(lift_ratio)
                 .text(format!("Function lift rate: {:.1}%", lift_ratio * 100.0))
-                .desired_width(f32::INFINITY),
+                .desired_width(progress_width),
         );
         ui.add(
             egui::ProgressBar::new(exact_ratio)
@@ -7088,7 +7089,7 @@ impl AnalystApp {
                     report.exact_instructions,
                     report.opaque_instructions
                 ))
-                .desired_width(f32::INFINITY),
+                .desired_width(progress_width),
         );
         ui.add_space(10.0);
 
@@ -8834,6 +8835,30 @@ mod tests {
         assert!(matches!(app.tab, Tab::Coverage));
         assert!(app.native_coverage.is_some());
         assert!(app.failure.is_none());
+    }
+
+    #[test]
+    fn prism_coverage_completes_on_gui_worker_stack() {
+        let binary = include_bytes!("../../../demo/hydir-prism.elf");
+        let report = std::thread::spawn(move || measure_native_coverage(binary))
+            .join()
+            .expect("coverage worker should not panic")
+            .expect("PRISM coverage should succeed");
+        assert_eq!(report.discovered_functions, 13);
+        assert_eq!(report.lifted_functions, 13);
+
+        let context = eframe::egui::Context::default();
+        let mut app = AnalystApp::new(&context);
+        app.native_coverage = Some(report);
+        let input = eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = context.run_ui(input, |ui| app.coverage_view(ui));
+        output.textures_delta.clear();
     }
 
     #[test]
