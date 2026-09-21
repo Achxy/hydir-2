@@ -15,6 +15,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod typed_cache;
+use typed_cache::carry_typed_c_cache;
+
 const MAX_BINARY_BYTES: usize = 64 * 1024 * 1024;
 
 const SCHEMA: &str = "CREATE TABLE local_projects (
@@ -73,7 +76,21 @@ CREATE TABLE model_requests (
     new_revision INTEGER NOT NULL,
     PRIMARY KEY(project_id, idempotency_key)
 );
-PRAGMA user_version=3;";
+CREATE TABLE local_typed_c_cache (
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    binary_sha256 TEXT NOT NULL,
+    model_revision INTEGER NOT NULL,
+    analysis_version INTEGER NOT NULL,
+    options_sha256 TEXT NOT NULL,
+    entry_address_space INTEGER NOT NULL,
+    entry_value TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    type_ids_json BLOB NOT NULL,
+    calls_json BLOB NOT NULL,
+    PRIMARY KEY(project_id,binary_sha256,model_revision,analysis_version,options_sha256,entry_address_space,entry_value)
+);
+PRAGMA user_version=4;";
 
 const MIGRATE_V1_TO_V2: &str = "CREATE TABLE workbench_settings (
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -102,6 +119,22 @@ CREATE TABLE IF NOT EXISTS model_requests (
     PRIMARY KEY(project_id, idempotency_key)
 );
 PRAGMA user_version=3;";
+
+const MIGRATE_V3_TO_V4: &str = "CREATE TABLE IF NOT EXISTS local_typed_c_cache (
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    binary_sha256 TEXT NOT NULL,
+    model_revision INTEGER NOT NULL,
+    analysis_version INTEGER NOT NULL,
+    options_sha256 TEXT NOT NULL,
+    entry_address_space INTEGER NOT NULL,
+    entry_value TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    type_ids_json BLOB NOT NULL,
+    calls_json BLOB NOT NULL,
+    PRIMARY KEY(project_id,binary_sha256,model_revision,analysis_version,options_sha256,entry_address_space,entry_value)
+);
+PRAGMA user_version=4;";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkbenchSettings {
@@ -268,9 +301,14 @@ impl LocalProjectStore {
             1 => {
                 tx.execute_batch(MIGRATE_V1_TO_V2).map_err(db_error)?;
                 tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?;
+                tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?;
             }
-            2 => tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?,
-            3 => {}
+            2 => {
+                tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?;
+                tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?;
+            }
+            3 => tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?,
+            4 => {}
             _ => {
                 return Err(
                     "Local project database schema is not supported by this build".to_owned(),
@@ -649,6 +687,15 @@ impl LocalProjectStore {
             .ok_or("Local project revision overflow")?;
         let mut stored_model = model.clone();
         stored_model.revision = next as u64;
+        let previous_json: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT model_json FROM local_models WHERE project_id=?1 AND binary_sha256=?2 AND created_revision<=?3 ORDER BY created_revision DESC LIMIT 1",
+                params![project.id, project.binary_sha256, expected],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let previous_model = previous_json.as_deref().map(parse_model).transpose()?;
         let json = serde_json::to_vec(&stored_model).map_err(|error| error.to_string())?;
         if json.len() > MAX_MODEL_BYTES {
             return Err("Analysis model exceeds 16 MiB".to_owned());
@@ -666,6 +713,9 @@ impl LocalProjectStore {
             params![next, project.id],
         )
         .map_err(db_error)?;
+        if let Some(previous_model) = previous_model.as_ref() {
+            carry_typed_c_cache(&tx, project, previous_model, &stored_model)?;
+        }
         tx.commit().map_err(db_error)?;
         Ok(LocalProject {
             revision: next as u64,
@@ -984,7 +1034,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -1109,7 +1159,7 @@ mod tests {
 
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
         let store = LocalProjectStore::open(&database).unwrap();
-        store.conn.execute_batch("PRAGMA user_version=4;").unwrap();
+        store.conn.execute_batch("PRAGMA user_version=5;").unwrap();
         drop(store);
         assert!(
             LocalProjectStore::open(&database)

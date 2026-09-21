@@ -37,9 +37,15 @@ model program.elf` reads the saved model, and `hydirctl local decompile-typed
 program.elf <function>` uses it. The private SQLite project checks the ELF
 digest and expected revision, records each model edit as a new revision, and
 rejects stale writes. An ELF change starts a fresh digest-scoped model view.
+The local typed-C cache checks content hashes and keys entries by binary
+digest, model revision, analysis version, options, and function entry. On a
+model edit it carries only entries whose referenced types, own function facts,
+and transitive callees are unchanged.
 
 `HighLevelCIR v1` lowers complete, linear functions whose supported 64-bit
-operations have exact native effects. It carries instruction-address
+operations have exact native effects. It recognizes a closed `rbp` frame with
+fixed, aligned 64-bit spills and reloads, so the scalar pair fixture emits
+typed C at both `-O0` and `-O2`. It carries instruction-address
 provenance and produces a C11 typed view with checked field offsets. Branches,
 calls, indexed accesses, unsupported widths, and opaque effects currently
 return a diagnostic. The native `low` and `structured` views remain available
@@ -53,5 +59,5 @@ for the current binary revision, so `HighLevelCIR.model_revision` matches the
 model artifact's `revision`. The desktop native explorer has Typed C and Types
 tabs; selecting a type evidence or C statement address links to the existing
 MachineIR and Evidence views. A saved local project model takes precedence in
-the desktop view. Remote model edits and selective artifact caching are later
+the desktop view. Remote model edits and server-side artifact caching are later
 work.

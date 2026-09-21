@@ -125,8 +125,16 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 .ok_or("Local project has no saved analysis model")?;
             let selected = resolve_native_function(&bytes, selector)?;
             let native = decompile_native_selection(&bytes, &selected)?;
-            let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
-            print!("{}", emit_typed_c(&ir, &model)?);
+            if let Some(cached) =
+                store.cached_typed_c(&project, &model, native.machine_ir.entry, "")?
+            {
+                print!("{cached}");
+            } else {
+                let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
+                let c = emit_typed_c(&ir, &model)?;
+                store.cache_typed_c(&project, &model, &ir, &native.function_ir, &c, "")?;
+                print!("{c}");
+            }
         }
         _ => return Err(HELP.into()),
     }

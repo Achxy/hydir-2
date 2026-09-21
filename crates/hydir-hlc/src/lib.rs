@@ -438,6 +438,44 @@ fn operand_value(
     }
 }
 
+fn frame_slot(operand: &MachineOperand) -> Option<i64> {
+    let MachineOperand::Memory {
+        segment: None,
+        base: Some(base),
+        index: None,
+        displacement,
+        absolute: None,
+        width_bits: 64,
+        ..
+    } = operand
+    else {
+        return None;
+    };
+    (base == "rbp" && (-65_536..=-8).contains(displacement) && displacement % 8 == 0)
+        .then_some(*displacement)
+}
+
+fn closed_rbp_frame(instructions: &[&MachineInstruction]) -> bool {
+    let family = |index: usize| match &instructions[index].operation {
+        MachineOperation::Exact { family } => family.as_str(),
+        _ => "",
+    };
+    let rbp = |operand: &MachineOperand| matches!(operand, MachineOperand::Register { name, width_bits: 64 } if name == "rbp");
+    let rsp = |operand: &MachineOperand| matches!(operand, MachineOperand::Register { name, width_bits: 64 } if name == "rsp");
+    instructions.len() >= 4
+        && family(0) == "push"
+        && instructions[0].operands.as_slice().first().is_some_and(rbp)
+        && family(1) == "mov"
+        && matches!(instructions[1].operands.as_slice(), [left, right] if rbp(left) && rsp(right))
+        && family(instructions.len() - 2) == "pop"
+        && instructions[instructions.len() - 2]
+            .operands
+            .as_slice()
+            .first()
+            .is_some_and(rbp)
+        && family(instructions.len() - 1) == "ret"
+}
+
 /// Lower a complete linear function with exact 64-bit operations. Other
 /// functions retain their existing low-level and structured views.
 pub fn lower_high_level_cir(
@@ -453,6 +491,7 @@ pub fn lower_high_level_cir(
         return Err("typed C artifact identity differs from model".to_owned());
     }
     let instructions = ordered_instructions(machine)?;
+    let frame_mode = closed_rbp_frame(&instructions);
     let model_row = model
         .functions
         .iter()
@@ -490,7 +529,9 @@ pub fn lower_high_level_cir(
         })
         .collect::<BTreeMap<_, _>>();
     let mut statements = Vec::new();
-    for instruction in instructions {
+    let mut stack_slots = BTreeMap::<i64, Value>::new();
+    let instruction_count = instructions.len();
+    for (index, instruction) in instructions.into_iter().enumerate() {
         let MachineOperation::Exact { family } = &instruction.operation else {
             unreachable!()
         };
@@ -507,8 +548,36 @@ pub fn lower_high_level_cir(
             });
             continue;
         }
+        if frame_mode && (index == 0 || index == 1 || index + 2 == instruction_count) {
+            continue;
+        }
         let operands = instruction.operands.as_slice();
         let result = match (family.as_str(), operands) {
+            (
+                "mov",
+                [
+                    MachineOperand::Register {
+                        name,
+                        width_bits: 64,
+                    },
+                    source,
+                ],
+            ) if frame_mode && frame_slot(source).is_some() => {
+                let slot = frame_slot(source).unwrap();
+                let value = stack_slots
+                    .get(&slot)
+                    .cloned()
+                    .ok_or("typed C reads an uninitialized frame slot")?;
+                Some((name.clone(), value))
+            }
+            ("mov", [destination @ MachineOperand::Memory { .. }, source])
+                if frame_mode && frame_slot(destination).is_some() =>
+            {
+                let slot = frame_slot(destination).unwrap();
+                let value = operand_value(source, &registers, model)?;
+                stack_slots.insert(slot, value);
+                None
+            }
             (
                 "mov",
                 [
