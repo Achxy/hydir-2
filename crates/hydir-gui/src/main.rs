@@ -2,7 +2,7 @@
 //! native import, CFG recovery, and lifting operations used by the CLI.
 
 use eframe::egui::{self, Color32, RichText};
-use egui_graph::{NodeId, layout_from_sizes};
+use egui_graph::{LayoutNode, LayoutParams, NodeId, layout_from_sizes, layout_routed};
 use egui_graph_egui::Direction as GraphDirection;
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
@@ -4561,12 +4561,12 @@ impl AnalystApp {
         ui.label(RichText::new(&spec.recovery_scope).size(11.0).color(MUTED));
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            metric_badge(ui, "ELF", &spec.file_kind, INFO);
-            metric_badge(ui, "TARGET", &spec.target_triple, VIOLET);
-            metric_badge(ui, "FUNCTIONS", &indexed_functions.to_string(), ACCENT);
-            metric_badge(ui, "IMPORTS", &spec.imports.len().to_string(), TEXT);
-            metric_badge(ui, "RELOCATIONS", &spec.relocations.len().to_string(), TEXT);
-            metric_badge(
+            metric_readout(ui, "ELF", &spec.file_kind, INFO);
+            metric_readout(ui, "TARGET", &spec.target_triple, VIOLET);
+            metric_readout(ui, "FUNCTIONS", &indexed_functions.to_string(), ACCENT);
+            metric_readout(ui, "IMPORTS", &spec.imports.len().to_string(), TEXT);
+            metric_readout(ui, "RELOCATIONS", &spec.relocations.len().to_string(), TEXT);
+            metric_readout(
                 ui,
                 "UNCERTAINTIES",
                 &spec.uncertainties.len().to_string(),
@@ -4626,7 +4626,7 @@ impl AnalystApp {
 
         ui.columns(2, |columns| {
             columns[0].heading(RichText::new("Pipeline").size(15.0).color(ACCENT));
-            stage_card(
+            stage_status(
                 &mut columns[0],
                 "01",
                 "ELF loader",
@@ -4638,14 +4638,14 @@ impl AnalystApp {
                 ),
                 true,
             );
-            stage_card(
+            stage_status(
                 &mut columns[0],
                 "02",
                 "Function discovery",
                 &format!("{indexed_functions} evidence-backed entries"),
                 self.function_index.is_some(),
             );
-            stage_card(
+            stage_status(
                 &mut columns[0],
                 "03",
                 "Native lifting",
@@ -4656,7 +4656,7 @@ impl AnalystApp {
                 },
                 native_ready,
             );
-            stage_card(
+            stage_status(
                 &mut columns[0],
                 "04",
                 "C generation",
@@ -4803,14 +4803,14 @@ impl AnalystApp {
         let patch_ready = self.patch_preview.is_some();
         let applied = self.patch_digest.is_some();
         ui.columns(5, |columns| {
-            stage_card(
+            stage_status(
                 &mut columns[0],
                 "01",
                 "REGION CONTRACT",
                 if contract_ready { "BOUND" } else { "PENDING" },
                 contract_ready,
             );
-            stage_card(
+            stage_status(
                 &mut columns[1],
                 "02",
                 "PHYSICAL IR",
@@ -4821,14 +4821,14 @@ impl AnalystApp {
                 },
                 machine_ready,
             );
-            stage_card(
+            stage_status(
                 &mut columns[2],
                 "03",
                 "DECOMPILE",
                 if c_ready { "AVAILABLE" } else { "BLOCKED" },
                 c_ready,
             );
-            stage_card(
+            stage_status(
                 &mut columns[3],
                 "04",
                 "PATCH PLAN",
@@ -4839,7 +4839,7 @@ impl AnalystApp {
                 },
                 patch_ready,
             );
-            stage_card(
+            stage_status(
                 &mut columns[4],
                 "05",
                 "OUTPUT ELF",
@@ -4850,20 +4850,15 @@ impl AnalystApp {
         ui.add_space(8.0);
 
         if self.spec.is_none() {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(egui::Stroke::new(1.0, MUTED))
-                .inner_margin(egui::Margin::same(18))
-                .show(ui, |ui| {
-                    ui.heading("Open a Linux x86-64 ELF to begin");
-                    ui.label(
-                        RichText::new(
-                            "HydIR keeps the input immutable and derives every displayed artifact from its SHA-256-bound bytes.",
-                        )
-                        .color(MUTED),
-                    );
-                    ui.label("Use the Program panel on the left, or reopen your saved local ELF.");
-                });
+            ui.add_space(32.0);
+            ui.heading("Open a Linux x86-64 ELF to begin");
+            ui.label(
+                RichText::new(
+                    "HydIR keeps the input immutable and derives every displayed artifact from its SHA-256-bound bytes.",
+                )
+                .color(MUTED),
+            );
+            ui.label("Use the Program panel on the left, or reopen your saved local ELF.");
             return;
         }
         if self.symbol.is_none() {
@@ -4872,26 +4867,24 @@ impl AnalystApp {
                 .as_ref()
                 .and_then(|spec| spec.functions.first())
                 .map(|function| function.name.clone());
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(egui::Stroke::new(1.0, ACCENT))
-                .inner_margin(egui::Margin::same(18))
-                .show(ui, |ui| {
-                    ui.heading("Choose a function-sized region");
-                    ui.label(
-                        RichText::new(
-                            "Select any symbol from the function navigator. HydIR will recover the boundary contract, physical operations, deterministic C, and patch eligibility together.",
-                        )
-                        .color(MUTED),
-                    );
-                    if let Some(name) = first
-                        && ui
-                            .add_enabled(!self.busy, egui::Button::new(format!("Open first region · {name}")))
-                            .clicked()
-                    {
-                        self.select(name);
-                    }
-                });
+            ui.add_space(32.0);
+            ui.heading("Choose a function-sized region");
+            ui.label(
+                RichText::new(
+                    "Select any symbol from the function navigator. HydIR will recover the boundary contract, physical operations, deterministic C, and patch eligibility together.",
+                )
+                .color(MUTED),
+            );
+            if let Some(name) = first
+                && ui
+                    .add_enabled(
+                        !self.busy,
+                        egui::Button::new(format!("Open first region · {name}")),
+                    )
+                    .clicked()
+            {
+                self.select(name);
+            }
             return;
         }
 
@@ -4933,70 +4926,66 @@ impl AnalystApp {
             return;
         };
         ui.columns(2, |columns| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .inner_margin(egui::Margin::same(14))
-                .show(&mut columns[0], |ui| {
-                    ui.heading(RichText::new(&region.symbol_name).monospace().color(ACCENT));
-                    field(ui, "REGION", &format!("0x{:016x} + {} bytes", region.entry.0, region.byte_length));
-                    field(ui, "REGION SHA-256", &region.bytes_sha256);
-                    field(ui, "EXITS", &format_addresses(&region.exits));
-                    field(ui, "DIRECT CALL CONTRACTS", &region.calls.len().to_string());
-                    field(ui, "RELOCATIONS", &region.relocations.len().to_string());
-                    field(
-                        ui,
-                        "STACK",
-                        &region.stack_delta.map_or_else(
-                            || "unresolved".to_owned(),
-                            |delta| format!("RSP {delta:+} at return · entry alignment {}", region.stack_entry_alignment.map_or_else(|| "unknown".to_owned(), |value| value.to_string())),
-                        ),
-                    );
-                    ui.separator();
-                    ui.label(RichText::new("PHYSICAL LIVE-IN").size(10.0).strong().color(INFO));
-                    physical_location_chips(ui, &region.physical_live_in);
-                    ui.label(RichText::new("PHYSICAL LIVE-OUT").size(10.0).strong().color(VIOLET));
-                    physical_location_chips(ui, &region.physical_live_out);
-                });
-            egui::Frame::new()
-                .fill(PANEL)
-                .inner_margin(egui::Margin::same(14))
-                .show(&mut columns[1], |ui| {
-                    let stable = region.replacement_ready && region.unresolved_facts.is_empty();
-                    ui.heading(
-                        RichText::new(if stable {
-                            "Replacement boundary proven"
-                        } else {
-                            "Safety gate is holding"
-                        })
-                        .color(if stable { GOOD } else { BAD }),
-                    );
-                    ui.label(
-                        RichText::new(if stable {
-                            "The region contract contains the required boundary state."
-                        } else {
-                            "HydIR recovered useful semantics but will not promote missing facts into assumptions."
-                        })
-                        .color(MUTED),
-                    );
-                    ui.add_space(8.0);
-                    if region.unresolved_facts.is_empty() {
-                        ui.colored_label(GOOD, "✓ No unresolved RegionSpec facts");
+            columns[0].vertical(|ui| {
+                ui.heading(RichText::new(&region.symbol_name).monospace().color(ACCENT));
+                ui.separator();
+                field(ui, "REGION", &format!("0x{:016x} + {} bytes", region.entry.0, region.byte_length));
+                field(ui, "REGION SHA-256", &region.bytes_sha256);
+                field(ui, "EXITS", &format_addresses(&region.exits));
+                field(ui, "DIRECT CALL CONTRACTS", &region.calls.len().to_string());
+                field(ui, "RELOCATIONS", &region.relocations.len().to_string());
+                field(
+                    ui,
+                    "STACK",
+                    &region.stack_delta.map_or_else(
+                        || "unresolved".to_owned(),
+                        |delta| format!("RSP {delta:+} at return · entry alignment {}", region.stack_entry_alignment.map_or_else(|| "unknown".to_owned(), |value| value.to_string())),
+                    ),
+                );
+                ui.separator();
+                ui.label(RichText::new("PHYSICAL LIVE-IN").size(10.0).strong().color(INFO));
+                physical_location_chips(ui, &region.physical_live_in);
+                ui.label(RichText::new("PHYSICAL LIVE-OUT").size(10.0).strong().color(VIOLET));
+                physical_location_chips(ui, &region.physical_live_out);
+            });
+            columns[1].vertical(|ui| {
+                let stable = region.replacement_ready && region.unresolved_facts.is_empty();
+                ui.heading(
+                    RichText::new(if stable {
+                        "Replacement boundary proven"
                     } else {
-                        for fact in &region.unresolved_facts {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.colored_label(BAD, "●");
-                                ui.label(fact);
-                            });
-                        }
+                        "Safety gate is holding"
+                    })
+                    .color(if stable { GOOD } else { BAD }),
+                );
+                ui.separator();
+                ui.label(
+                    RichText::new(if stable {
+                        "The region contract contains the required boundary state."
+                    } else {
+                        "HydIR recovered useful semantics but will not promote missing facts into assumptions."
+                    })
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                if region.unresolved_facts.is_empty() {
+                    ui.colored_label(GOOD, "✓ No unresolved RegionSpec facts");
+                } else {
+                    for fact in &region.unresolved_facts {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(BAD, "●");
+                            ui.label(fact);
+                        });
                     }
-                    if !region.observed_interior_entries.is_empty() {
-                        ui.separator();
-                        ui.colored_label(BAD, "OBSERVED INTERIOR ENTRIES");
-                        for entry in &region.observed_interior_entries {
-                            ui.label(format!("0x{:016x} · {}", entry.entry.0, entry.reason));
-                        }
+                }
+                if !region.observed_interior_entries.is_empty() {
+                    ui.separator();
+                    ui.colored_label(BAD, "OBSERVED INTERIOR ENTRIES");
+                    for entry in &region.observed_interior_entries {
+                        ui.label(format!("0x{:016x} · {}", entry.entry.0, entry.reason));
                     }
-                });
+                }
+            });
         });
     }
 
@@ -5015,17 +5004,17 @@ impl AnalystApp {
             return;
         };
         ui.horizontal_wrapped(|ui| {
-            metric_badge(ui, "INSTRUCTIONS", &ir.instructions.len().to_string(), INFO);
-            metric_badge(ui, "INPUTS", &ir.physical_inputs.len().to_string(), INFO);
-            metric_badge(
+            metric_readout(ui, "INSTRUCTIONS", &ir.instructions.len().to_string(), INFO);
+            metric_readout(ui, "INPUTS", &ir.physical_inputs.len().to_string(), INFO);
+            metric_readout(
                 ui,
                 "OUTPUTS",
                 &ir.physical_outputs.len().to_string(),
                 VIOLET,
             );
-            metric_badge(ui, "EXITS", &ir.exits.len().to_string(), ACCENT);
-            metric_badge(ui, "CALLS", &ir.calls.len().to_string(), ACCENT);
-            metric_badge(
+            metric_readout(ui, "EXITS", &ir.exits.len().to_string(), ACCENT);
+            metric_readout(ui, "CALLS", &ir.calls.len().to_string(), ACCENT);
+            metric_readout(
                 ui,
                 "LOWERING",
                 if ir.lowering_ready { "READY" } else { "GATED" },
@@ -5055,39 +5044,37 @@ impl AnalystApp {
                 for instruction in &ir.instructions {
                     let selected = self.selected_address == Some(instruction.address.0);
                     let operation = format!("{:?}", instruction.operation);
-                    let response = egui::Frame::new()
-                        .fill(if selected { Color32::from_rgb(63, 55, 43) } else { PANEL })
-                        .inner_margin(egui::Margin::symmetric(10, 7))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "0x{:016x}  {:<18}",
-                                        instruction.address.0, instruction.bytes_hex
-                                    ))
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(if selected { ACCENT } else { TEXT }),
-                                );
-                                ui.label(RichText::new(&instruction.mnemonic).monospace().strong());
-                                ui.label(RichText::new(operation).monospace().size(11.0).color(INFO));
-                            });
+                    let response = ui.scope(|ui| {
+                        ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "reads {:?} · writes {:?} · flags {:?}/{:?} · memory {:?} · control {:?} · next {}",
-                                    instruction.effects.read_registers,
-                                    instruction.effects.written_registers,
-                                    instruction.effects.read_flags,
-                                    instruction.effects.written_flags,
-                                    instruction.effects.memory,
-                                    instruction.effects.control,
-                                    format_addresses(&instruction.successors),
+                                    "0x{:016x}  {:<18}",
+                                    instruction.address.0, instruction.bytes_hex
                                 ))
                                 .monospace()
-                                .size(10.0)
-                                .color(MUTED),
+                                .size(11.0)
+                                .color(if selected { ACCENT } else { TEXT }),
                             );
+                            ui.label(RichText::new(&instruction.mnemonic).monospace().strong());
+                            ui.label(RichText::new(operation).monospace().size(11.0).color(INFO));
                         });
+                        ui.label(
+                            RichText::new(format!(
+                                "reads {:?} · writes {:?} · flags {:?}/{:?} · memory {:?} · control {:?} · next {}",
+                                instruction.effects.read_registers,
+                                instruction.effects.written_registers,
+                                instruction.effects.read_flags,
+                                instruction.effects.written_flags,
+                                instruction.effects.memory,
+                                instruction.effects.control,
+                                format_addresses(&instruction.successors),
+                            ))
+                            .monospace()
+                            .size(10.0)
+                            .color(MUTED),
+                        );
+                        ui.separator();
+                    });
                     if response.response.interact(egui::Sense::click()).clicked() {
                         self.selected_address = Some(instruction.address.0);
                     }
@@ -5096,38 +5083,84 @@ impl AnalystApp {
     }
 
     fn decompile_patch_view(&mut self, ui: &mut egui::Ui) {
-        let c_source = self
+        let structured_c = self
             .decompilation
             .as_ref()
             .map(|unit| unit.c_source.clone())
             .or_else(|| self.c.clone());
+        let native_fallback = if structured_c.is_none() {
+            self.native_decompilation.as_ref().map(|native| {
+                (
+                    native_function_excerpt(&native.low_level_c).to_owned(),
+                    format!("{:?}", native.cir.semantic_fidelity),
+                    native_opaque_instruction_count(native),
+                    native.cir.rewrite_ready,
+                )
+            })
+        } else {
+            None
+        };
+        let structured_error = self
+            .decompilation_error
+            .as_deref()
+            .or(self.c_error.as_deref())
+            .unwrap_or("this region is outside the structured recovery contract")
+            .to_owned();
         ui.columns(2, |columns| {
-            columns[0].heading(RichText::new("Deterministic C").color(INFO));
-            columns[0].label(
-                RichText::new("Read-only decompilation · machine-address provenance retained")
-                    .size(10.0)
-                    .color(MUTED),
+            columns[0].heading(
+                RichText::new(if native_fallback.is_some() {
+                    "Native low-level C"
+                } else {
+                    "Deterministic C"
+                })
+                .color(INFO),
             );
-            egui::Frame::new()
-                .fill(Color32::from_rgb(17, 21, 24))
-                .inner_margin(egui::Margin::same(12))
+            columns[0].label(
+                RichText::new(if native_fallback.is_some() {
+                    "Native function excerpt · complete C and diagnostics in the native view"
+                } else {
+                    "Read-only decompilation · machine-address provenance retained"
+                })
+                .size(10.0)
+                .color(MUTED),
+            );
+            if let Some((_, fidelity, opaque, rewrite_ready)) = &native_fallback {
+                columns[0].label(
+                    RichText::new(format!("Structured C unavailable: {structured_error}"))
+                    .size(11.0)
+                    .color(ACCENT),
+                );
+                columns[0].label(
+                    RichText::new(format!(
+                        "Native fidelity: {fidelity} · {opaque} opaque instruction{} · rewrite ready: {}",
+                        if *opaque == 1 { "" } else { "s" },
+                        if *rewrite_ready { "yes" } else { "no" }
+                    ))
+                    .size(11.0)
+                    .color(if *opaque == 0 { MUTED } else { ACCENT }),
+                );
+                if columns[0].small_button("Open native IR, C and diagnostics").clicked() {
+                    self.tab = Tab::Native;
+                }
+            }
+            egui::ScrollArea::both()
+                .id_salt("region_studio_c")
+                .max_height(430.0)
                 .show(&mut columns[0], |ui| {
-                    egui::ScrollArea::both()
-                        .id_salt("region_studio_c")
-                        .max_height(430.0)
-                        .show(ui, |ui| {
-                            if let Some(source) = &c_source {
-                                ui.code(source);
-                            } else {
-                                ui.colored_label(
-                                    BAD,
-                                    self.decompilation_error
-                                        .as_deref()
-                                        .or(self.c_error.as_deref())
-                                        .unwrap_or("Structured C is unavailable for this region."),
-                                );
-                            }
-                        });
+                    if let Some(source) = structured_c
+                        .as_deref()
+                        .or_else(|| native_fallback.as_ref().map(|native| native.0.as_str()))
+                    {
+                        ui.code(source);
+                    } else {
+                        ui.colored_label(
+                            BAD,
+                            self.decompilation_error
+                                .as_deref()
+                                .or(self.c_error.as_deref())
+                                .unwrap_or("Structured C is unavailable for this region."),
+                        );
+                    }
                 });
 
             columns[1].heading(RichText::new("HydIR PatchLang").color(VIOLET));
@@ -5257,44 +5290,41 @@ impl AnalystApp {
             PlacementStrategy::EntryTrampoline => "ENTRY TRAMPOLINE → NEW RX SEGMENT",
         };
         ui.add_space(10.0);
-        egui::Frame::new()
-            .fill(PANEL)
-            .stroke(egui::Stroke::new(1.0, GOOD))
-            .inner_margin(egui::Margin::same(12))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(GOOD, "✓ STRUCTURALLY VERIFIED");
-                    ui.separator();
-                    ui.label(RichText::new(placement).strong().color(ACCENT));
-                    ui.separator();
-                    ui.label(format!(
-                        "{} region bytes → {} compiled bytes · {} PatchIR statements",
-                        bundle.placement_plan.original_size,
-                        bundle.placement_plan.replacement_size,
-                        bundle.typed_patch_ir.statements.len(),
-                    ));
-                });
-                if let Some(segment) = &bundle.placement_plan.executable_segment {
-                    ui.label(
-                        RichText::new(format!(
-                            "RX segment: file 0x{:x} · VA 0x{:x} · {} bytes",
-                            segment.file_offset, segment.virtual_address.0, segment.file_size,
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(MUTED),
-                    );
-                }
-                egui::CollapsingHeader::new("Byte-level delta")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        field(ui, "ORIGINAL REGION", &bundle.original_region_hex);
-                        field(ui, "COMPILED CODE", &bundle.compiled_bytes_hex);
-                        if let Some(entry) = &bundle.placement_plan.entry_bytes_hex {
-                            field(ui, "NEW ENTRY", entry);
-                        }
-                    });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(GOOD, "✓ STRUCTURALLY VERIFIED");
+                ui.separator();
+                ui.label(RichText::new(placement).strong().color(ACCENT));
+                ui.separator();
+                ui.label(format!(
+                    "{} region bytes → {} compiled bytes · {} PatchIR statements",
+                    bundle.placement_plan.original_size,
+                    bundle.placement_plan.replacement_size,
+                    bundle.typed_patch_ir.statements.len(),
+                ));
             });
+            if let Some(segment) = &bundle.placement_plan.executable_segment {
+                ui.label(
+                    RichText::new(format!(
+                        "RX segment: file 0x{:x} · VA 0x{:x} · {} bytes",
+                        segment.file_offset, segment.virtual_address.0, segment.file_size,
+                    ))
+                    .monospace()
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            }
+            egui::CollapsingHeader::new("Byte-level delta")
+                .default_open(true)
+                .show(ui, |ui| {
+                    field(ui, "ORIGINAL REGION", &bundle.original_region_hex);
+                    field(ui, "COMPILED CODE", &bundle.compiled_bytes_hex);
+                    if let Some(entry) = &bundle.placement_plan.entry_bytes_hex {
+                        field(ui, "NEW ENTRY", entry);
+                    }
+                });
+        });
     }
 
     fn region_evidence_view(&mut self, ui: &mut egui::Ui) {
@@ -6056,18 +6086,10 @@ impl AnalystApp {
                     let rect =
                         egui::Rect::from_min_size(position, egui::vec2(node_size[0], node_size[1]));
                     rects.insert(*id, rect);
-                    painter.rect_filled(
-                        rect,
-                        6.0,
-                        if *selected {
-                            Color32::from_rgb(82, 66, 45)
-                        } else {
-                            PANEL
-                        },
-                    );
+                    painter.rect_filled(rect, 0.0, PANEL);
                     painter.rect_stroke(
                         rect,
-                        6.0,
+                        0.0,
                         egui::Stroke::new(1.0, if *selected { ACCENT } else { MUTED }),
                         egui::StrokeKind::Outside,
                     );
@@ -6258,7 +6280,16 @@ impl AnalystApp {
             }
         }
 
-        if let Some(action) = render_workbench_graph(ui, &nodes, &edges, self.graph_zoom) {
+        if let Some(action) = render_workbench_graph(
+            ui,
+            &nodes,
+            &edges,
+            self.graph_zoom,
+            (
+                "native_function_graph",
+                native.machine_ir.function_id.as_str(),
+            ),
+        ) {
             self.apply_graph_action(action);
         }
     }
@@ -6398,7 +6429,9 @@ impl AnalystApp {
             ui.colored_label(MUTED, "No functions match the graph filter.");
             return;
         }
-        if let Some(action) = render_workbench_graph(ui, &nodes, &edges, self.graph_zoom) {
+        if let Some(action) =
+            render_workbench_graph(ui, &nodes, &edges, self.graph_zoom, "native_program_graph")
+        {
             self.apply_graph_action(action);
         }
     }
@@ -6947,26 +6980,26 @@ impl AnalystApp {
         };
         ui.heading(RichText::new("Native semantic coverage").size(20.0));
         ui.horizontal_wrapped(|ui| {
-            metric_badge(
+            metric_readout(
                 ui,
                 "DISCOVERED",
                 &report.discovered_functions.to_string(),
                 INFO,
             );
-            metric_badge(ui, "LIFTED", &report.lifted_functions.to_string(), GOOD);
-            metric_badge(
+            metric_readout(ui, "LIFTED", &report.lifted_functions.to_string(), GOOD);
+            metric_readout(
                 ui,
                 "EXACT FUNCTIONS",
                 &report.exact_functions.to_string(),
                 GOOD,
             );
-            metric_badge(
+            metric_readout(
                 ui,
                 "CONSERVATIVE",
                 &report.conservative_functions.to_string(),
                 ACCENT,
             );
-            metric_badge(ui, "PARTIAL", &report.partial_functions.to_string(), BAD);
+            metric_readout(ui, "PARTIAL", &report.partial_functions.to_string(), BAD);
         });
         ui.add_space(8.0);
         ui.add(
@@ -7226,24 +7259,38 @@ fn indexed_function_action(
     }
 }
 
+fn workbench_graph_layout(
+    nodes: &[WorkbenchGraphNode],
+    edges: &[WorkbenchGraphEdge],
+    zoom: f32,
+) -> (egui_graph::Layout, egui_graph::EdgeRoutes) {
+    let node_size = [210.0_f32 * zoom, 72.0_f32 * zoom];
+    layout_routed(
+        nodes
+            .iter()
+            .map(|node| (node.id, LayoutNode::new(node_size))),
+        edges
+            .iter()
+            .map(|edge| ((edge.source, 0), (edge.target, 0))),
+        LayoutParams::new(GraphDirection::LeftToRight)
+            .layer_gap(100.0 * zoom)
+            .node_gap(40.0 * zoom),
+    )
+}
+
 fn render_workbench_graph(
     ui: &mut egui::Ui,
     nodes: &[WorkbenchGraphNode],
     edges: &[WorkbenchGraphEdge],
     zoom: f32,
+    canvas_salt: impl std::hash::Hash + std::fmt::Debug,
 ) -> Option<GraphNodeAction> {
     if nodes.is_empty() {
         ui.label(RichText::new("No graph nodes recovered.").color(MUTED));
         return None;
     }
     let node_size = [210.0_f32 * zoom, 72.0_f32 * zoom];
-    let layout = layout_from_sizes(
-        nodes
-            .iter()
-            .map(|node| (node.id, egui_graph_egui::vec2(node_size[0], node_size[1]))),
-        edges.iter().map(|edge| (edge.source, edge.target)),
-        GraphDirection::LeftToRight,
-    );
+    let (layout, routes) = workbench_graph_layout(nodes, edges, zoom);
     let min_x = layout
         .values()
         .map(|position| position.x)
@@ -7266,9 +7313,9 @@ fn render_workbench_graph(
     );
     let mut clicked = None;
     egui::ScrollArea::both()
-        .id_salt("native_graph_canvas")
+        .id_salt(canvas_salt)
         .show(ui, |ui| {
-            let (canvas, _) = ui.allocate_exact_size(canvas_size, egui::Sense::drag());
+            let (canvas, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
             let painter = ui.painter_at(canvas);
             let offset = canvas.min + egui::vec2(50.0 - min_x, 50.0 - min_y);
             let rects = nodes
@@ -7285,6 +7332,7 @@ fn render_workbench_graph(
                 })
                 .collect::<std::collections::HashMap<_, _>>();
 
+            let mut occurrences = std::collections::HashMap::new();
             for edge in edges {
                 let (Some(source_rect), Some(target_rect)) =
                     (rects.get(&edge.source), rects.get(&edge.target))
@@ -7294,10 +7342,26 @@ fn render_workbench_graph(
                 let start = source_rect.right_center();
                 let end = target_rect.left_center();
                 let color = if edge.unresolved { BAD } else { ACCENT };
-                painter.line_segment([start, end], egui::Stroke::new(1.5, color));
-                let delta = end - start;
-                if delta.length_sq() > 1.0 {
-                    let direction = delta.normalized();
+                let occurrence = occurrences.entry((edge.source, edge.target)).or_insert(0);
+                let mut points = vec![start];
+                if let Some(waypoints) =
+                    routes.route((edge.source, 0), (edge.target, 0), *occurrence)
+                {
+                    points.extend(
+                        waypoints
+                            .iter()
+                            .map(|point| offset + egui::vec2(point.x, point.y)),
+                    );
+                }
+                *occurrence += 1;
+                points.push(end);
+                for segment in points.windows(2) {
+                    painter.line_segment([segment[0], segment[1]], egui::Stroke::new(1.5, color));
+                }
+                if let Some(direction) = points.windows(2).rev().find_map(|segment| {
+                    let delta = segment[1] - segment[0];
+                    (delta.length_sq() > 1.0).then(|| delta.normalized())
+                }) {
                     let left = end - direction * 10.0 + egui::vec2(-direction.y, direction.x) * 4.0;
                     let right =
                         end - direction * 10.0 - egui::vec2(-direction.y, direction.x) * 4.0;
@@ -7308,29 +7372,46 @@ fn render_workbench_graph(
                     ));
                 }
                 if !edge.label.is_empty() {
-                    let center = start + delta * 0.5;
-                    painter.text(
-                        center,
-                        egui::Align2::CENTER_CENTER,
-                        &edge.label,
-                        egui::FontId::monospace((9.0 * zoom).max(8.0)),
+                    let galley = painter.layout_no_wrap(
+                        edge.label.clone(),
+                        egui::FontId::monospace((10.0 * zoom).max(9.0)),
                         color,
                     );
+                    let label_size = galley.size() + egui::vec2(8.0, 4.0);
+                    let center = points
+                        .windows(2)
+                        .map(|segment| {
+                            let delta = segment[1] - segment[0];
+                            (delta.length_sq(), segment[0] + delta * 0.5)
+                        })
+                        .filter(|(_, center)| {
+                            let label_rect = egui::Rect::from_center_size(*center, label_size);
+                            !rects
+                                .values()
+                                .any(|rect| rect.expand(3.0).intersects(label_rect))
+                        })
+                        .max_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, center)| center);
+                    if let Some(center) = center {
+                        let label_rect = egui::Rect::from_center_size(center, label_size);
+                        painter.rect_filled(label_rect, 0.0, BG);
+                        painter.galley(label_rect.min + egui::vec2(4.0, 2.0), galley, color);
+                    }
                 }
             }
 
             for node in nodes {
                 let rect = rects[&node.id];
-                let (fill, stroke) = match node.tone {
-                    GraphNodeTone::Normal => (PANEL, MUTED),
-                    GraphNodeTone::Selected => (Color32::from_rgb(82, 66, 45), ACCENT),
-                    GraphNodeTone::Opaque => (Color32::from_rgb(71, 42, 40), BAD),
-                    GraphNodeTone::External => (Color32::from_rgb(37, 48, 57), INFO),
+                let stroke = match node.tone {
+                    GraphNodeTone::Normal => MUTED,
+                    GraphNodeTone::Selected => ACCENT,
+                    GraphNodeTone::Opaque => BAD,
+                    GraphNodeTone::External => INFO,
                 };
-                painter.rect_filled(rect, 6.0, fill);
+                painter.rect_filled(rect, 0.0, PANEL);
                 painter.rect_stroke(
                     rect,
-                    6.0,
+                    0.0,
                     egui::Stroke::new(1.2, stroke),
                     egui::StrokeKind::Outside,
                 );
@@ -7379,6 +7460,12 @@ fn native_opaque_instruction_count(native: &NativeDecompilation) -> usize {
             matches!(instruction.operation, MachineOperation::OpaqueEffect { .. })
         })
         .count()
+}
+
+fn native_function_excerpt(source: &str) -> &str {
+    source
+        .rfind("\nvoid hydir_")
+        .map_or(source, |start| &source[start + 1..])
 }
 
 fn code_artifact_view(ui: &mut egui::Ui, label: &str, source: &str, id: &str) {
@@ -7659,49 +7746,33 @@ fn native_evidence_view(
     clicked_address
 }
 
-fn stage_card(ui: &mut egui::Ui, number: &str, title: &str, status: &str, ready: bool) {
-    egui::Frame::new()
-        .fill(if ready {
-            Color32::from_rgb(29, 48, 42)
-        } else {
-            PANEL
-        })
-        .stroke(egui::Stroke::new(1.0, if ready { GOOD } else { MUTED }))
-        .inner_margin(egui::Margin::same(10))
-        .show(ui, |ui| {
-            ui.set_min_height(54.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(number)
-                        .monospace()
-                        .size(10.0)
-                        .strong()
-                        .color(if ready { GOOD } else { MUTED }),
-                );
-                ui.label(RichText::new(title).size(10.0).strong());
-            });
-            ui.label(RichText::new(status).size(11.0).strong().color(if ready {
-                GOOD
-            } else {
-                MUTED
-            }));
-        });
+fn stage_status(ui: &mut egui::Ui, number: &str, title: &str, status: &str, ready: bool) {
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(number).monospace().size(11.0).color(MUTED));
+        ui.label(RichText::new(title).size(12.0).strong());
+    });
+    ui.label(
+        RichText::new(status)
+            .size(12.0)
+            .color(if ready { GOOD } else { MUTED }),
+    );
+    ui.add_space(6.0);
+    ui.separator();
 }
 
-fn metric_badge(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-    egui::Frame::new()
-        .fill(PANEL)
-        .stroke(egui::Stroke::new(1.0, color))
-        .inner_margin(egui::Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(format!("{label}  {value}"))
-                    .monospace()
-                    .size(10.0)
-                    .strong()
-                    .color(color),
-            );
-        });
+fn metric_readout(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).monospace().size(11.0).color(MUTED));
+        ui.label(
+            RichText::new(value)
+                .monospace()
+                .size(12.0)
+                .strong()
+                .color(color),
+        );
+    });
+    ui.add_space(8.0);
 }
 
 fn format_addresses(addresses: &[Address]) -> String {
@@ -7722,21 +7793,18 @@ fn physical_location_chips(ui: &mut egui::Ui, locations: &[hydir_core::PhysicalL
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        for location in locations {
-            egui::Frame::new()
-                .fill(Color32::from_rgb(37, 45, 50))
-                .stroke(egui::Stroke::new(1.0, MUTED))
-                .inner_margin(egui::Margin::symmetric(7, 3))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · {:?} · {}b",
-                            location.name, location.kind, location.width_bits
-                        ))
-                        .monospace()
-                        .size(10.0),
-                    );
-                });
+        for (index, location) in locations.iter().enumerate() {
+            if index > 0 {
+                ui.label(RichText::new("·").color(MUTED));
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{} · {:?} · {}b",
+                    location.name, location.kind, location.width_bits
+                ))
+                .monospace()
+                .size(11.0),
+            );
         }
     });
 }
@@ -8444,16 +8512,62 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, Event, GraphNodeAction, NativeViewMode, Tab, indexed_function_action, ir_slice,
-        local_region_artifacts, native_instruction_count, preview_patch_local,
-        resized_console_height, valid_bearer_token, validate_endpoint,
+        AnalystApp, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab, WorkbenchGraphEdge,
+        WorkbenchGraphNode, indexed_function_action, ir_slice, local_region_artifacts,
+        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
+        preview_patch_local, resized_console_height, valid_bearer_token, validate_endpoint,
+        workbench_graph_layout,
     };
+    use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
-    use hydir_decompile::{decompile_function_at, discover_functions, measure_native_coverage};
+    use hydir_decompile::{
+        decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
+    };
     use std::sync::mpsc;
+
+    #[test]
+    fn graph_layout_leaves_label_space_and_routes_long_edges_around_nodes() {
+        let ids = [
+            NodeId::new("entry"),
+            NodeId::new("middle"),
+            NodeId::new("exit"),
+        ];
+        let nodes = ids
+            .iter()
+            .map(|id| WorkbenchGraphNode {
+                id: *id,
+                label: String::new(),
+                tone: GraphNodeTone::Normal,
+                action: None,
+            })
+            .collect::<Vec<_>>();
+        let edges = [(0, 1), (1, 2), (0, 2)]
+            .into_iter()
+            .map(|(source, target)| WorkbenchGraphEdge {
+                source: ids[source],
+                target: ids[target],
+                label: "fallthrough".to_owned(),
+                unresolved: false,
+            })
+            .collect::<Vec<_>>();
+
+        let (layout, routes) = workbench_graph_layout(&nodes, &edges, 1.0);
+        let label_gap = layout[&ids[1]].x - (layout[&ids[0]].x + 210.0);
+        assert!(label_gap >= 99.0, "edge labels need space between layers");
+        let route = routes
+            .route((ids[0], 0), (ids[2], 0), 0)
+            .expect("the long edge must route around the middle block");
+        let middle = layout[&ids[1]];
+        assert!(route.iter().all(|point| {
+            point.x < middle.x
+                || point.x > middle.x + 210.0
+                || point.y < middle.y
+                || point.y > middle.y + 72.0
+        }));
+    }
 
     #[test]
     fn annotation_refresh_overlays_once_and_rejects_stale_binary_events() {
@@ -8553,6 +8667,23 @@ mod tests {
         assert!(matches!(app.tab, Tab::Overview));
         assert!(!app.console_visible);
         assert_eq!(app.console_height, 220.0);
+    }
+
+    #[test]
+    fn prism_syscall_helper_retains_native_c_when_structured_lift_refuses_it() {
+        let binary = include_bytes!("../../../demo/hydir-prism.elf");
+        let symbol = "prism_write_banner";
+        let ir = lift_symbol(binary, symbol).map_err(|error| error.to_string());
+        let artifacts = local_region_artifacts(binary, symbol, &ir);
+        assert!(artifacts.decompilation.is_err());
+
+        let native = decompile_symbol(binary, symbol).unwrap();
+        assert!(native_opaque_instruction_count(&native) > 0);
+        assert!(native.low_level_c.contains("hydir_opaque_effect"));
+        assert!(native.low_level_c.contains("0x20141c"));
+        assert!(native_function_excerpt(&native.low_level_c).starts_with("void hydir_"));
+        assert!(native_function_excerpt(&native.low_level_c).contains("hydir_opaque_effect"));
+        assert!(!native.cir.rewrite_ready);
     }
 
     #[test]
