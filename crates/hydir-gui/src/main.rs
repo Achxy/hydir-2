@@ -2275,6 +2275,11 @@ enum Tab {
     Analysis,
 }
 
+enum COutputSource<'a> {
+    Scalar(&'a str),
+    Native(&'a NativeDecompilation),
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RegionStudioMode {
     Contract,
@@ -6675,26 +6680,94 @@ impl AnalystApp {
     }
 
     fn c_view(&mut self, ui: &mut egui::Ui) {
-        if let Some(c) = &self.c {
-            ui.label(
-                RichText::new("SCALAR LLVM-TO-C · EXPLICIT CFG / SSA COPIES")
+        let mut open_native = false;
+        match self.c_output_source() {
+            Some(COutputSource::Scalar(c)) => {
+                ui.label(
+                    RichText::new("SCALAR LLVM-TO-C · EXPLICIT CFG / SSA COPIES")
+                        .size(11.0)
+                        .color(ACCENT),
+                );
+                egui::ScrollArea::both().id_salt("c_view").show(ui, |ui| {
+                    ui.code(c);
+                });
+            }
+            Some(COutputSource::Native(native)) => {
+                ui.label(
+                    RichText::new("NATIVE LOW-LEVEL C · EXPLICIT MACHINE STATE")
+                        .size(11.0)
+                        .color(INFO),
+                );
+                if let Some(error) = self
+                    .c_error
+                    .as_deref()
+                    .or(self.decompilation_error.as_deref())
+                {
+                    ui.label(
+                        RichText::new(format!("Scalar C unavailable: {error}"))
+                            .size(11.0)
+                            .color(ACCENT),
+                    );
+                }
+                let opaque = native_opaque_instruction_count(native);
+                ui.label(
+                    RichText::new(format!(
+                        "Native fidelity: {:?} · {opaque} opaque instruction{} · rewrite ready: {}",
+                        native.cir.semantic_fidelity,
+                        if opaque == 1 { "" } else { "s" },
+                        if native.cir.rewrite_ready {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    ))
                     .size(11.0)
-                    .color(ACCENT),
-            );
-            egui::ScrollArea::both().id_salt("c_view").show(ui, |ui| {
-                ui.code(c);
-            });
-        } else if let Some(error) = &self.c_error {
-            ui.colored_label(BAD, error);
-            ui.label(
-                RichText::new("A C-generation failure does not discard a valid CFG or LLVM lift.")
-                    .color(MUTED),
-            );
-        } else {
-            ui.label(
-                RichText::new("Select a supported scalar function to generate C.").color(MUTED),
-            );
+                    .color(if opaque == 0 { MUTED } else { ACCENT }),
+                );
+                if ui.small_button("Open complete C and diagnostics").clicked() {
+                    open_native = true;
+                }
+                ui.label(
+                    RichText::new("Function excerpt; complete C is in the native view.")
+                        .color(MUTED),
+                );
+                egui::ScrollArea::both()
+                    .id_salt("c_view_native")
+                    .show(ui, |ui| {
+                        ui.code(native_function_excerpt(&native.low_level_c));
+                    });
+            }
+            None => {
+                if let Some(error) = &self.c_error {
+                    ui.colored_label(BAD, error);
+                    ui.label(
+                        RichText::new("C generation and native decompilation are unavailable for this function.")
+                            .color(MUTED),
+                    );
+                } else {
+                    ui.label(RichText::new("Select a function to generate C.").color(MUTED));
+                }
+            }
         }
+        if open_native {
+            self.tab = Tab::Native;
+        }
+    }
+
+    fn c_output_source(&self) -> Option<COutputSource<'_>> {
+        self.c
+            .as_deref()
+            .or_else(|| {
+                self.decompilation
+                    .as_ref()
+                    .map(|unit| unit.c_source.as_str())
+            })
+            .map(COutputSource::Scalar)
+            .or_else(|| {
+                self.native_decompilation
+                    .as_ref()
+                    .map(COutputSource::Native)
+            })
     }
 
     fn native_view(&mut self, ui: &mut egui::Ui) {
@@ -8512,11 +8585,11 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab, WorkbenchGraphEdge,
-        WorkbenchGraphNode, indexed_function_action, ir_slice, local_region_artifacts,
-        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
-        preview_patch_local, resized_console_height, valid_bearer_token, validate_endpoint,
-        workbench_graph_layout,
+        AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
+        WorkbenchGraphEdge, WorkbenchGraphNode, indexed_function_action, ir_slice,
+        local_region_artifacts, native_function_excerpt, native_instruction_count,
+        native_opaque_instruction_count, preview_patch_local, resized_console_height,
+        valid_bearer_token, validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -8684,6 +8757,19 @@ mod tests {
         assert!(native_function_excerpt(&native.low_level_c).starts_with("void hydir_"));
         assert!(native_function_excerpt(&native.low_level_c).contains("hydir_opaque_effect"));
         assert!(!native.cir.rewrite_ready);
+
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        app.c_error = Some("unsupported Syscall at 0x20141c".to_owned());
+        app.native_decompilation = Some(native);
+        assert!(matches!(
+            app.c_output_source(),
+            Some(COutputSource::Native(_))
+        ));
+        app.c = Some("return arg0;".to_owned());
+        assert!(matches!(
+            app.c_output_source(),
+            Some(COutputSource::Scalar(_))
+        ));
     }
 
     #[test]
