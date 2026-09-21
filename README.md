@@ -28,11 +28,12 @@ shows the path on a 16-byte function.
 
 ## Quick start
 
-Use the checked-in ELF to open the desktop workbench or inspect the new native
-decompiler stages. Run these commands from the repository root with Rust 1.96:
+Open the checked-in PRISM ELF for a tour of the workbench. Use the smaller
+`max2.elf` for a focused command-line walkthrough. Run these commands from the
+repository root with Rust 1.96:
 
 ```bash
-cargo run --locked --bin hydir -- --open-local fuzz/corpus/elf_import/max2.elf hydir_max2
+cargo run --locked --bin hydir -- --open-local demo/hydir-prism.elf hydir_stage_decision
 cargo run --locked --bin hydirctl -- discover fuzz/corpus/elf_import/max2.elf
 cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/max2.elf --function hydir_max2 --ir state
 cargo run --locked --bin hydirctl -- decompile fuzz/corpus/elf_import/max2.elf --function hydir_max2 --view unit
@@ -43,6 +44,30 @@ FunctionIndex IDs for entries without usable names. The GUI also opens an ELF
 through its local file control. [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.
+
+### Showcase ELF
+
+[`demo/hydir-prism.elf`](demo/hydir-prism.elf) is a ready-to-open, 3.2 KB
+Linux x86-64 executable with 13 named functions. Its source is
+[`hydir_prism_showcase.S`](tests/fixtures/hydir_prism_showcase.S). Select
+`hydir_stage_decision` for a branching CFG and C output, `hydir_stage_stack_mix`
+for physical stack state, `hydir_stage_call_chain` for a direct call,
+`hydir_stage_loop_sum` for a back edge, and `hydir_stage_record_parent` for
+mapped-global effects. `hydir_stage_leaf_add` is a compact Triton example;
+`hydir_stage_patch_portal` is sized to demonstrate a verified entry trampoline
+into a new ELF copy.
+
+Seven functions have exact native instruction coverage. The Linux entry point
+and three `prism_write_*` runtime helpers contain `syscall`; their native C
+keeps those instructions as explicit opaque effects. Region Studio shows that
+low-level C and its fidelity status when structured C is unavailable. Select
+`hydir_stage_patch_portal` for the PatchLang demonstration.
+
+The [PRISM presenter guide](docs/PRISM_DEMO.md) gives a short GUI route,
+commands, and the expected evidence. The binary can be inspected on Windows;
+native execution and whole-executable rebuild require Linux x86-64. Triton
+requires its optional Python dependency, and remote features require a running
+authenticated service.
 
 ## Native ELF decompiler
 
