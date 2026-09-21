@@ -45,8 +45,8 @@ only when the configured Triton bridge is available.
 On this fixture, native coverage lifts all 13 discovered functions: seven
 have exact native coverage, while six are conservative. In total, 117
 instruction occurrences are exact under the modeled semantics and six
-`syscall` occurrences remain opaque. Region Studio displays the native
-low-level C with its fidelity and rewrite status when the older structured C
+`syscall` occurrences remain opaque. Region Studio and C output display the
+native low-level C with its fidelity and rewrite status when structured C
 path rejects an instruction. In `prism_write_banner`, for example, the
 `syscall` at `0x20141c` appears as an explicit opaque effect in native C.
 The `prism_write_*` symbols and `_start` are runtime context for the program
