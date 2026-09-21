@@ -2,10 +2,11 @@ use crate::{
     BinaryOp, HIGH_LEVEL_CIR_VERSION, HighExpr, HighLevelCir, HighStatement,
     validate_high_level_cir,
 };
+use hydir_core::Location;
 use hydir_model::{
     AnalysisModel, PrimitiveType, TypeDefinition, TypeDefinitionKind, TypeRef, validate_structure,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn primitive_name(value: PrimitiveType) -> &'static str {
     match value {
@@ -213,7 +214,47 @@ fn emit_expr(expr: &HighExpr) -> String {
             format!("({} {op} {})", emit_expr(left), emit_expr(right))
         }
         HighExpr::Field { base, field } => format!("({})->{field}", emit_expr(base)),
+        HighExpr::Call {
+            name, arguments, ..
+        } => format!(
+            "{name}({})",
+            arguments
+                .iter()
+                .map(emit_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
+}
+
+fn collect_calls(
+    expr: &HighExpr,
+    calls: &mut BTreeMap<Location, (String, usize)>,
+) -> Result<(), String> {
+    match expr {
+        HighExpr::Call {
+            callee,
+            name,
+            arguments,
+        } => {
+            if calls
+                .insert(*callee, (name.clone(), arguments.len()))
+                .is_some_and(|old| old != (name.clone(), arguments.len()))
+            {
+                return Err("HighLevelCIR call target has inconsistent name/arity".to_owned());
+            }
+            for argument in arguments {
+                collect_calls(argument, calls)?;
+            }
+        }
+        HighExpr::Binary { left, right, .. } => {
+            collect_calls(left, calls)?;
+            collect_calls(right, calls)?;
+        }
+        HighExpr::Field { base, .. } => collect_calls(base, calls)?,
+        HighExpr::Variable { .. } | HighExpr::Constant { .. } => {}
+    }
+    Ok(())
 }
 
 /// Emit C11 source for a HighLevelCIR artifact. Exact field offsets are
@@ -235,6 +276,45 @@ pub fn emit_typed_c(ir: &HighLevelCir, model: &AnalysisModel) -> Result<String, 
     for statement in &ir.statements {
         if let HighStatement::Let { ty, .. } = statement {
             collect_used_types(ty, model, &mut used, 0)?;
+        }
+    }
+    let mut calls = BTreeMap::new();
+    for statement in &ir.statements {
+        match statement {
+            HighStatement::Let { value, .. } | HighStatement::Return { value, .. } => {
+                collect_calls(value, &mut calls)?;
+            }
+            HighStatement::StoreField { base, value, .. } => {
+                collect_calls(base, &mut calls)?;
+                collect_calls(value, &mut calls)?;
+            }
+        }
+    }
+    for (callee, (name, arity)) in &calls {
+        if *callee != ir.entry && *name == ir.name {
+            return Err("typed C call target collides with emitted function name".to_owned());
+        }
+        let row = model
+            .functions
+            .iter()
+            .find(|row| row.entry == *callee && row.name == *name)
+            .ok_or("typed C call target differs from model")?;
+        let prototype = row
+            .prototype
+            .as_ref()
+            .ok_or("typed C call prototype is missing")?;
+        if prototype.variadic
+            || prototype.parameters.len() != *arity
+            || prototype.return_type
+                != (TypeRef::Primitive {
+                    name: PrimitiveType::U64,
+                })
+        {
+            return Err("typed C call prototype is unsupported".to_owned());
+        }
+        collect_used_types(&prototype.return_type, model, &mut used, 0)?;
+        for parameter in &prototype.parameters {
+            collect_used_types(&parameter.ty, model, &mut used, 0)?;
         }
     }
     let definitions = model
@@ -288,6 +368,29 @@ pub fn emit_typed_c(ir: &HighLevelCir, model: &AnalysisModel) -> Result<String, 
         }
     }
     output.push_str("#pragma pack(pop)\n\n");
+    for (callee, (name, _)) in &calls {
+        let row = model
+            .functions
+            .iter()
+            .find(|row| row.entry == *callee)
+            .unwrap();
+        let prototype = row.prototype.as_ref().unwrap();
+        output.push_str(&c_decl(&prototype.return_type, name, model)?);
+        output.push('(');
+        if prototype.parameters.is_empty() {
+            output.push_str("void");
+        }
+        for (index, parameter) in prototype.parameters.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&c_decl(&parameter.ty, &parameter.name, model)?);
+        }
+        output.push_str(");\n");
+    }
+    if !calls.is_empty() {
+        output.push('\n');
+    }
     output.push_str(&c_decl(&ir.return_type, &ir.name, model)?);
     output.push('(');
     if ir.parameters.is_empty() {

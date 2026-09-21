@@ -4,7 +4,7 @@
 
 use super::{LocalProject, LocalProjectStore, db_error};
 use hydir_core::{Address, Location};
-use hydir_hlc::{HIGH_LEVEL_CIR_VERSION, HighLevelCir, HighStatement, emit_typed_c};
+use hydir_hlc::{HIGH_LEVEL_CIR_VERSION, HighExpr, HighLevelCir, HighStatement, emit_typed_c};
 use hydir_ir::FunctionIr;
 use hydir_model::{AnalysisModel, TypeDefinitionKind, TypeRef, validate_structure};
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -60,6 +60,35 @@ fn collect_types(ty: &TypeRef, model: &AnalysisModel, ids: &mut BTreeSet<String>
     }
 }
 
+fn collect_expr_call_types(expr: &HighExpr, model: &AnalysisModel, ids: &mut BTreeSet<String>) {
+    match expr {
+        HighExpr::Call {
+            callee, arguments, ..
+        } => {
+            if let Some(prototype) = model
+                .functions
+                .iter()
+                .find(|row| row.entry == *callee)
+                .and_then(|row| row.prototype.as_ref())
+            {
+                collect_types(&prototype.return_type, model, ids);
+                for parameter in &prototype.parameters {
+                    collect_types(&parameter.ty, model, ids);
+                }
+            }
+            for argument in arguments {
+                collect_expr_call_types(argument, model, ids);
+            }
+        }
+        HighExpr::Binary { left, right, .. } => {
+            collect_expr_call_types(left, model, ids);
+            collect_expr_call_types(right, model, ids);
+        }
+        HighExpr::Field { base, .. } => collect_expr_call_types(base, model, ids),
+        HighExpr::Variable { .. } | HighExpr::Constant { .. } => {}
+    }
+}
+
 fn used_type_ids(ir: &HighLevelCir, model: &AnalysisModel) -> Vec<String> {
     let mut ids = BTreeSet::new();
     collect_types(&ir.return_type, model, &mut ids);
@@ -67,8 +96,18 @@ fn used_type_ids(ir: &HighLevelCir, model: &AnalysisModel) -> Vec<String> {
         collect_types(&parameter.ty, model, &mut ids);
     }
     for statement in &ir.statements {
-        if let HighStatement::Let { ty, .. } = statement {
-            collect_types(ty, model, &mut ids);
+        match statement {
+            HighStatement::Let { ty, value, .. } => {
+                collect_types(ty, model, &mut ids);
+                collect_expr_call_types(value, model, &mut ids);
+            }
+            HighStatement::StoreField { base, value, .. } => {
+                collect_expr_call_types(base, model, &mut ids);
+                collect_expr_call_types(value, model, &mut ids);
+            }
+            HighStatement::Return { value, .. } => {
+                collect_expr_call_types(value, model, &mut ids);
+            }
         }
     }
     ids.into_iter().collect()

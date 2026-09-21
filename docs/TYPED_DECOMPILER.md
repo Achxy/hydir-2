@@ -53,11 +53,14 @@ their original source labels.
 
 `HighLevelCIR v1` lowers complete, linear functions whose supported 64-bit
 operations have exact native effects. It recognizes a closed `rbp` frame with
-fixed, aligned 64-bit spills and reloads, so the scalar pair fixture emits
-typed C at both `-O0` and `-O2`. It carries instruction-address
-provenance and produces a C11 typed view with checked field offsets. Branches,
-calls, indexed accesses, unsupported widths, and opaque effects currently
-return a diagnostic. The native `low` and `structured` views remain available
+fixed, aligned 64-bit spills and reloads, and balanced stack adjustment.
+Resolved direct calls with a fixed, explicit SysV prototype become C call
+expressions; their caller-saved registers are invalidated. The scalar pair
+and direct-call fixtures emit typed C at both `-O0` and `-O2`. It carries
+instruction-address provenance and produces a C11 typed view with checked
+field offsets. Branches, indirect calls, unknown call prototypes, indexed
+accesses, unsupported widths, and opaque effects currently return a
+diagnostic. The native `low` and `structured` views remain available
 for those functions. Typed C is marked semantically conservative and never
 rewrite ready; the source-level view does not model all machine fault and
 environment behavior.

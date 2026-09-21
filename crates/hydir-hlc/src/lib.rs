@@ -53,6 +53,11 @@ pub enum HighExpr {
         base: Box<HighExpr>,
         field: String,
     },
+    Call {
+        callee: Location,
+        name: String,
+        arguments: Vec<HighExpr>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -167,6 +172,17 @@ fn validate_expr(expr: &HighExpr, declared: &BTreeSet<String>, depth: usize) -> 
             }
             validate_expr(base, declared, depth + 1)
         }
+        HighExpr::Call {
+            name, arguments, ..
+        } => {
+            if !valid_ident(name) || arguments.len() > 6 {
+                return Err("HighLevelCIR call name/arity is invalid".to_owned());
+            }
+            for argument in arguments {
+                validate_expr(argument, declared, depth + 1)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -237,7 +253,17 @@ fn ordered_instructions(machine: &MachineFunctionIr) -> Result<Vec<&MachineInstr
     if machine.structural_completeness != StructuralCompleteness::Complete {
         return Err("typed C requires a complete recovered function CFG".to_owned());
     }
-    if machine.semantic_fidelity != SemanticFidelity::ExactUnderModel {
+    let bounded_direct_calls = machine.semantic_fidelity == SemanticFidelity::Conservative
+        && machine
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| instruction.effects.control == MachineControlEffect::DirectCall)
+        && machine
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.blocks_stable_operation);
+    if machine.semantic_fidelity != SemanticFidelity::ExactUnderModel && !bounded_direct_calls {
         return Err("typed C requires exact modeled instruction effects".to_owned());
     }
     if machine.blocks.len() > 4096 {
@@ -290,12 +316,26 @@ fn ordered_instructions(machine: &MachineFunctionIr) -> Result<Vec<&MachineInstr
         let Some(next) = targets.next() else {
             return Err("typed C requires a linear fallthrough path".to_owned());
         };
-        if targets.next().is_some()
-            || last
-                .edges
+        let extra_edges_ok = if last.effects.control == MachineControlEffect::DirectCall {
+            last.edges
                 .iter()
-                .any(|edge| edge.kind != MachineEdgeKind::Fallthrough)
-        {
+                .filter(|edge| edge.kind == MachineEdgeKind::Call && edge.target.is_some())
+                .count()
+                == 1
+                && last.edges.iter().all(|edge| {
+                    matches!(
+                        edge.kind,
+                        MachineEdgeKind::Call | MachineEdgeKind::Fallthrough
+                    )
+                })
+        } else {
+            last.effects.control == MachineControlEffect::Next
+                && last
+                    .edges
+                    .iter()
+                    .all(|edge| edge.kind == MachineEdgeKind::Fallthrough)
+        };
+        if targets.next().is_some() || !extra_edges_ok {
             return Err("typed C branch/exception edge is unsupported".to_owned());
         }
         current = next;
@@ -476,6 +516,24 @@ fn closed_rbp_frame(instructions: &[&MachineInstruction]) -> bool {
         && family(instructions.len() - 1) == "ret"
 }
 
+fn closed_frame_allocation(instructions: &[&MachineInstruction]) -> Option<u64> {
+    if instructions.len() < 7 || !closed_rbp_frame(instructions) {
+        return None;
+    }
+    let adjustment = |instruction: &MachineInstruction, family: &str| {
+        matches!(&instruction.operation, MachineOperation::Exact { family: found } if found == family)
+            .then_some(instruction.operands.as_slice())
+            .and_then(|operands| match operands {
+                [MachineOperand::Register { name, width_bits: 64 }, MachineOperand::Immediate { value, width_bits: 64 }]
+                    if name == "rsp" && *value > 0 && *value <= 65_536 && *value % 8 == 0 => Some(*value),
+                _ => None,
+            })
+    };
+    let allocation = adjustment(instructions[2], "sub")?;
+    (adjustment(instructions[instructions.len() - 3], "add") == Some(allocation))
+        .then_some(allocation)
+}
+
 /// Lower a complete linear function with exact 64-bit operations. Other
 /// functions retain their existing low-level and structured views.
 pub fn lower_high_level_cir(
@@ -492,6 +550,7 @@ pub fn lower_high_level_cir(
     }
     let instructions = ordered_instructions(machine)?;
     let frame_mode = closed_rbp_frame(&instructions);
+    let frame_allocation = closed_frame_allocation(&instructions);
     let model_row = model
         .functions
         .iter()
@@ -530,6 +589,7 @@ pub fn lower_high_level_cir(
         .collect::<BTreeMap<_, _>>();
     let mut statements = Vec::new();
     let mut stack_slots = BTreeMap::<i64, Value>::new();
+    let mut pushed = Vec::<Option<Value>>::new();
     let instruction_count = instructions.len();
     for (index, instruction) in instructions.into_iter().enumerate() {
         let MachineOperation::Exact { family } = &instruction.operation else {
@@ -551,8 +611,93 @@ pub fn lower_high_level_cir(
         if frame_mode && (index == 0 || index == 1 || index + 2 == instruction_count) {
             continue;
         }
+        if frame_allocation.is_some() && (index == 2 || index + 3 == instruction_count) {
+            continue;
+        }
         let operands = instruction.operands.as_slice();
         let result = match (family.as_str(), operands) {
+            (
+                "push",
+                [
+                    MachineOperand::Register {
+                        name,
+                        width_bits: 64,
+                    },
+                ],
+            ) if pushed.len() < 64 => {
+                pushed.push(registers.get(name).cloned());
+                None
+            }
+            (
+                "pop",
+                [
+                    MachineOperand::Register {
+                        name,
+                        width_bits: 64,
+                    },
+                ],
+            ) => {
+                let saved = pushed.pop().ok_or("typed C pop has no matching push")?;
+                if saved.is_none() {
+                    registers.remove(name);
+                }
+                saved.map(|value| (name.clone(), value))
+            }
+            ("call", [_]) if instruction.effects.control == MachineControlEffect::DirectCall => {
+                let mut call_edges = instruction
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.kind == MachineEdgeKind::Call)
+                    .filter_map(|edge| edge.target);
+                let callee = call_edges
+                    .next()
+                    .ok_or("typed C call target is unresolved")?;
+                if call_edges.next().is_some() {
+                    return Err("typed C call has multiple targets".to_owned());
+                }
+                let row = model
+                    .functions
+                    .iter()
+                    .find(|row| row.entry == callee)
+                    .ok_or("typed C call target has no model function")?;
+                let prototype = row
+                    .prototype
+                    .as_ref()
+                    .ok_or("typed C call target has no asserted prototype")?;
+                if !valid_ident(&row.name)
+                    || prototype.variadic
+                    || prototype.calling_convention != "sysv_amd64"
+                    || prototype.parameters.len() > 6
+                    || prototype.return_type != u64_type()
+                {
+                    return Err("typed C call prototype is unsupported".to_owned());
+                }
+                let arg_registers = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+                let mut arguments = Vec::new();
+                for (parameter, register) in prototype.parameters.iter().zip(arg_registers) {
+                    let value = registers
+                        .get(register)
+                        .ok_or("typed C call argument register has unknown value")?;
+                    if value.ty != parameter.ty {
+                        return Err("typed C call argument type differs from prototype".to_owned());
+                    }
+                    arguments.push(value.expr.clone());
+                }
+                for register in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
+                    registers.remove(register);
+                }
+                Some((
+                    "rax".to_owned(),
+                    Value {
+                        expr: HighExpr::Call {
+                            callee,
+                            name: row.name.clone(),
+                            arguments,
+                        },
+                        ty: u64_type(),
+                    },
+                ))
+            }
             (
                 "mov",
                 [
@@ -665,6 +810,9 @@ pub fn lower_high_level_cir(
                 },
             );
         }
+    }
+    if !pushed.is_empty() {
+        return Err("typed C has unmatched stack pushes".to_owned());
     }
     if !matches!(statements.last(), Some(HighStatement::Return { .. })) {
         return Err("typed C has no return statement".to_owned());
