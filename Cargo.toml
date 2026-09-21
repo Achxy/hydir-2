@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hydir-core", "crates/hydir-ir", "crates/hydir-loader", "crates/hydir-semantics", "crates/hydir-project", "crates/hydir-backend", "crates/hydir-analysis", "crates/hydir-c", "crates/hydir-decompile", "crates/hydir-vm", "crates/hydir-patch", "crates/hydir-transform", "crates/hydir-recompile", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-interchange", "crates/hydir-server", "crates/hydir-gui"]
+members = ["crates/hydir-core", "crates/hydir-ir", "crates/hydir-loader", "crates/hydir-model", "crates/hydir-hlc", "crates/hydir-semantics", "crates/hydir-project", "crates/hydir-backend", "crates/hydir-analysis", "crates/hydir-c", "crates/hydir-decompile", "crates/hydir-vm", "crates/hydir-patch", "crates/hydir-transform", "crates/hydir-recompile", "crates/hydir-cli", "crates/hydir-api", "crates/hydir-interchange", "crates/hydir-server", "crates/hydir-gui"]
 resolver = "2"
 
 [workspace.package]

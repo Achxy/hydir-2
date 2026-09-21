@@ -28,14 +28,16 @@ use hydir_core::{
     parse_annotation_address, parse_program_spec_json, validate_analyst_annotation,
 };
 use hydir_decompile::{
-    decompile_function_unit_at, discover_functions, export_function_ir_llvm,
-    lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
-    measure_native_coverage,
+    decompile_function_unit_at, decompile_indexed_function, discover_functions,
+    export_function_ir_llvm, lift_machine_function_at, lower_cir, lower_function_ir,
+    lower_state_ir, measure_native_coverage,
 };
+use hydir_hlc::{emit_typed_c, lower_high_level_cir};
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
     STATE_FUNCTION_IR_VERSION,
 };
+use hydir_model::{import_dwarf, infer_model, init_model};
 use hydir_patch::{
     MAX_PATCH_BYTES, compile_patch_binary, parse_patch_bundle_json, parse_patch_document,
     parse_patch_json, patch_binary,
@@ -2044,8 +2046,29 @@ fn native_artifact_media_type(stage: &str) -> Option<&'static str> {
         "cir" => Some("application/vnd.hydir.cir+json;version=1"),
         "llvm" => Some("text/x-llvm-ir"),
         "unit" => Some("application/vnd.hydir.decompilation-unit+json;version=2"),
+        "analysis_model" => Some("application/vnd.hydir.analysis-model+json;version=1"),
+        "high_level_cir" => Some("application/vnd.hydir.high-level-cir+json;version=1"),
+        "typed_c" => Some("text/x-c;view=typed"),
         _ => None,
     }
+}
+
+fn automatic_analysis_model(bytes: &[u8]) -> Result<hydir_model::AnalysisModel, String> {
+    let mut model = init_model(bytes)?;
+    import_dwarf(bytes, &mut model)?;
+    let index = discover_functions(bytes)?;
+    let native = index
+        .functions
+        .iter()
+        .take(256)
+        .filter_map(|row| decompile_indexed_function(bytes, &index, &row.id).ok())
+        .collect::<Vec<_>>();
+    let inputs = native
+        .iter()
+        .map(|unit| (&unit.machine_ir, &unit.function_ir))
+        .collect::<Vec<_>>();
+    infer_model(&mut model, &inputs)?;
+    Ok(model)
 }
 
 fn native_function_entry(bytes: &[u8], selector: &str) -> Result<Location, String> {
@@ -2092,6 +2115,10 @@ fn native_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String>
         "coverage" => {
             serde_json::to_vec(&measure_native_coverage(bytes)?).map_err(|error| error.to_string())
         }
+        "analysis_model" => {
+            let model = automatic_analysis_model(bytes)?;
+            serde_json::to_vec(&model).map_err(|error| error.to_string())
+        }
         stage => {
             let entry = native_function_entry(bytes, &selector.function)?;
             if stage == "unit" {
@@ -2109,6 +2136,15 @@ fn native_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String>
             let function = lower_function_ir(&machine, &state)?;
             if stage == "function" {
                 return serde_json::to_vec(&function).map_err(|error| error.to_string());
+            }
+            if matches!(stage, "high_level_cir" | "typed_c") {
+                let model = automatic_analysis_model(bytes)?;
+                let high = lower_high_level_cir(&machine, &function, &model)?;
+                return if stage == "typed_c" {
+                    emit_typed_c(&high, &model).map(String::into_bytes)
+                } else {
+                    serde_json::to_vec(&high).map_err(|error| error.to_string())
+                };
             }
             if stage == "llvm" {
                 return export_function_ir_llvm(&function).map(String::into_bytes);
@@ -3815,7 +3851,14 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             .ok_or_else(|| Status::invalid_argument("unsupported native artifact stage"))?;
         if matches!(
             input.stage.as_str(),
-            "machine" | "state" | "function" | "cir" | "llvm" | "unit"
+            "machine"
+                | "state"
+                | "function"
+                | "cir"
+                | "llvm"
+                | "unit"
+                | "high_level_cir"
+                | "typed_c"
         ) {
             valid_symbol(&input.function_selector)?;
         } else if !input.function_selector.is_empty() {
@@ -4991,6 +5034,7 @@ mod tests {
 
         for stage in [
             "program_spec",
+            "analysis_model",
             "coverage",
             "machine",
             "state",
@@ -5086,6 +5130,55 @@ mod tests {
         .into_inner();
         assert_eq!(mutation.revision, uploaded.revision + 1);
         assert_eq!(mutation.binary_sha256, uploaded.binary_sha256);
+    }
+
+    #[test]
+    fn v3_typed_artifact_stages_emit_versioned_model_ir_and_c() {
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_pair.c");
+        let object = directory.path().join("typed_pair.o");
+        let output = Command::new("clang")
+            .args(["--target=x86_64-unknown-linux-gnu", "-g", "-O2", "-c"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&object)
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let binary = std::fs::read(object).unwrap();
+        let mut model_revision = None;
+        for (stage, selector) in [
+            ("analysis_model", ""),
+            ("high_level_cir", "hydir_pair_sum"),
+            ("typed_c", "hydir_pair_sum"),
+        ] {
+            let request = serde_json::to_string(&NativeArtifactSelector {
+                stage: stage.to_owned(),
+                function: selector.to_owned(),
+            })
+            .unwrap();
+            let content = native_artifact(&binary, &request).unwrap();
+            if stage == "typed_c" {
+                assert!(String::from_utf8(content).unwrap().contains("->left"));
+            } else {
+                let artifact: serde_json::Value = serde_json::from_slice(&content).unwrap();
+                assert_eq!(artifact["schema_version"], 1);
+                if stage == "analysis_model" {
+                    model_revision = artifact["revision"].as_u64();
+                } else {
+                    assert_eq!(artifact["model_revision"].as_u64(), model_revision);
+                }
+            }
+            assert!(native_artifact_media_type(stage).is_some());
+        }
     }
 
     #[cfg(unix)]

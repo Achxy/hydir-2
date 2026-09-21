@@ -4,6 +4,7 @@ use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
     annotation_address_in_spec, parse_annotation_address, validate_analyst_annotation,
 };
+use hydir_model::{AnalysisModel, MAX_MODEL_BYTES, parse_model, validate_model};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -54,7 +55,25 @@ CREATE TABLE workbench_settings (
     inspector_width REAL NOT NULL,
     recent_local_path TEXT
 );
-PRAGMA user_version=2;";
+CREATE TABLE local_models (
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    created_revision INTEGER NOT NULL,
+    binary_sha256 TEXT NOT NULL,
+    model_sha256 TEXT NOT NULL,
+    model_json BLOB NOT NULL,
+    PRIMARY KEY(project_id, created_revision)
+);
+CREATE INDEX local_models_digest
+    ON local_models(project_id, binary_sha256, created_revision);
+CREATE TABLE model_requests (
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    new_revision INTEGER NOT NULL,
+    PRIMARY KEY(project_id, idempotency_key)
+);
+PRAGMA user_version=3;";
 
 const MIGRATE_V1_TO_V2: &str = "CREATE TABLE workbench_settings (
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -63,6 +82,26 @@ const MIGRATE_V1_TO_V2: &str = "CREATE TABLE workbench_settings (
     recent_local_path TEXT
 );
 PRAGMA user_version=2;";
+
+const MIGRATE_V2_TO_V3: &str = "CREATE TABLE IF NOT EXISTS local_models (
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    created_revision INTEGER NOT NULL,
+    binary_sha256 TEXT NOT NULL,
+    model_sha256 TEXT NOT NULL,
+    model_json BLOB NOT NULL,
+    PRIMARY KEY(project_id, created_revision)
+);
+CREATE INDEX IF NOT EXISTS local_models_digest
+    ON local_models(project_id, binary_sha256, created_revision);
+CREATE TABLE IF NOT EXISTS model_requests (
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    new_revision INTEGER NOT NULL,
+    PRIMARY KEY(project_id, idempotency_key)
+);
+PRAGMA user_version=3;";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkbenchSettings {
@@ -226,8 +265,12 @@ impl LocalProjectStore {
             .map_err(db_error)?;
         match version {
             0 => tx.execute_batch(SCHEMA).map_err(db_error)?,
-            1 => tx.execute_batch(MIGRATE_V1_TO_V2).map_err(db_error)?,
-            2 => {}
+            1 => {
+                tx.execute_batch(MIGRATE_V1_TO_V2).map_err(db_error)?;
+                tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?;
+            }
+            2 => tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?,
+            3 => {}
             _ => {
                 return Err(
                     "Local project database schema is not supported by this build".to_owned(),
@@ -491,6 +534,133 @@ impl LocalProjectStore {
         tx.execute("INSERT INTO annotation_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision) \
                     VALUES(?1,?2,?3,?4,?5)",
             params![project.id, idempotency_key, expected, request_sha256, next]).map_err(db_error)?;
+        tx.execute(
+            "UPDATE local_projects SET current_revision=?1 WHERE id=?2",
+            params![next, project.id],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(LocalProject {
+            revision: next as u64,
+            ..project.clone()
+        })
+    }
+
+    pub fn load_model(&self, project: &LocalProject) -> Result<Option<AnalysisModel>, String> {
+        self.verify_current(project)?;
+        let row: Option<(String, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT model_sha256,model_json FROM local_models \
+             WHERE project_id=?1 AND binary_sha256=?2 AND created_revision<=?3 \
+             ORDER BY created_revision DESC LIMIT 1",
+                params![project.id, project.binary_sha256, project.revision as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let Some((digest, json)) = row else {
+            return Ok(None);
+        };
+        if digest != format!("{:x}", Sha256::digest(&json)) {
+            return Err("Stored analysis model digest does not match content".to_owned());
+        }
+        let model = parse_model(&json)?;
+        let bytes =
+            fs::read(&project.path).map_err(|error| format!("Cannot read local ELF: {error}"))?;
+        validate_model(&bytes, &model)?;
+        Ok(Some(model))
+    }
+
+    pub fn save_model(
+        &mut self,
+        project: &LocalProject,
+        model: &AnalysisModel,
+        idempotency_key: &str,
+    ) -> Result<LocalProject, String> {
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || !idempotency_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(
+                "Model idempotency key must be 1..=128 ASCII letters, digits, '-', '_' or '.'"
+                    .to_owned(),
+            );
+        }
+        if binary_digest(&project.path)? != project.binary_sha256 {
+            return Err("Local ELF changed after import; reopen it before editing".to_owned());
+        }
+        let bytes =
+            fs::read(&project.path).map_err(|error| format!("Cannot read local ELF: {error}"))?;
+        validate_model(&bytes, model)?;
+        let expected =
+            i64::try_from(project.revision).map_err(|_| "Local project revision overflow")?;
+        let request = serde_json::to_vec(model).map_err(|error| error.to_string())?;
+        if request.len() > MAX_MODEL_BYTES {
+            return Err("Analysis model exceeds 16 MiB".to_owned());
+        }
+        let request_sha256 = format!("{:x}", Sha256::digest(&request));
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if let Some((prior_expected, prior_sha, new_revision, prior_digest)) = tx
+            .query_row(
+                "SELECT m.expected_revision,m.request_sha256,m.new_revision,r.binary_sha256 \
+             FROM model_requests m JOIN local_revisions r \
+             ON r.project_id=m.project_id AND r.revision=m.new_revision \
+             WHERE m.project_id=?1 AND m.idempotency_key=?2",
+                params![project.id, idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)?
+        {
+            if prior_expected != expected || prior_sha != request_sha256 {
+                return Err("Idempotency key belongs to a different model request".to_owned());
+            }
+            return Ok(LocalProject {
+                revision: new_revision as u64,
+                binary_sha256: prior_digest,
+                ..project.clone()
+            });
+        }
+        let (current, digest): (i64, String) = tx
+            .query_row(
+                "SELECT current_revision,binary_sha256 FROM local_projects WHERE id=?1",
+                [&project.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(db_error)?;
+        if current != expected || digest != project.binary_sha256 {
+            return Err("Stale local project revision; reopen the ELF before editing".to_owned());
+        }
+        let next = expected
+            .checked_add(1)
+            .ok_or("Local project revision overflow")?;
+        let mut stored_model = model.clone();
+        stored_model.revision = next as u64;
+        let json = serde_json::to_vec(&stored_model).map_err(|error| error.to_string())?;
+        if json.len() > MAX_MODEL_BYTES {
+            return Err("Analysis model exceeds 16 MiB".to_owned());
+        }
+        let model_sha256 = format!("{:x}", Sha256::digest(&json));
+        tx.execute(
+            "INSERT INTO local_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+            params![project.id, next, project.binary_sha256],
+        )
+        .map_err(db_error)?;
+        tx.execute("INSERT INTO local_models(project_id,created_revision,binary_sha256,model_sha256,model_json) VALUES(?1,?2,?3,?4,?5)", params![project.id, next, project.binary_sha256, model_sha256, json]).map_err(db_error)?;
+        tx.execute("INSERT INTO model_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision) VALUES(?1,?2,?3,?4,?5)", params![project.id, idempotency_key, expected, request_sha256, next]).map_err(db_error)?;
         tx.execute(
             "UPDATE local_projects SET current_revision=?1 WHERE id=?2",
             params![next, project.id],
@@ -814,7 +984,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -842,6 +1012,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_models_are_revision_checked_idempotent_and_digest_scoped() {
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("pair.o");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_pair.c");
+        let output = Command::new("clang")
+            .args(["--target=x86_64-unknown-linux-gnu", "-g", "-O2", "-c"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&binary)
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&binary).unwrap();
+        let spec = hydir_loader::import_elf(&bytes).unwrap();
+        let mut model = hydir_model::init_model(&bytes).unwrap();
+        assert!(hydir_model::import_dwarf(&bytes, &mut model).unwrap() > 0);
+        let mut store = LocalProjectStore::open(&directory.path().join("local.sqlite")).unwrap();
+        let initial = store.open_binary(&binary, &spec).unwrap();
+        assert_eq!(initial.revision, 1);
+        assert!(store.load_model(&initial).unwrap().is_none());
+        let saved = store.save_model(&initial, &model, "model-1").unwrap();
+        assert_eq!(saved.revision, 2);
+        assert_eq!(
+            store
+                .save_model(&initial, &model, "model-1")
+                .unwrap()
+                .revision,
+            2
+        );
+        assert!(
+            store
+                .save_model(&initial, &model, "model-2")
+                .unwrap_err()
+                .contains("Stale")
+        );
+        let mut loaded = store.load_model(&saved).unwrap().unwrap();
+        assert_eq!(loaded.revision, 2);
+        if let hydir_model::TypeDefinitionKind::Struct { fields } = &mut loaded.types[0].kind {
+            fields[0].name = "renamed_left".to_owned();
+        }
+        let edited = store.save_model(&saved, &loaded, "model-2").unwrap();
+        assert_eq!(edited.revision, 3);
+        let latest = store.load_model(&edited).unwrap().unwrap();
+        assert_eq!(latest.revision, 3);
+        assert!(
+            serde_json::to_string(&latest)
+                .unwrap()
+                .contains("renamed_left")
+        );
+        assert!(store.load_model(&saved).unwrap_err().contains("Stale"));
+        let output = Command::new("clang")
+            .args(["--target=x86_64-unknown-linux-gnu", "-g", "-O0", "-c"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let changed = fs::read(&binary).unwrap();
+        let changed_spec = hydir_loader::import_elf(&changed).unwrap();
+        let reopened = store.open_binary(&binary, &changed_spec).unwrap();
+        assert_eq!(reopened.revision, 4);
+        assert!(store.load_model(&reopened).unwrap().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_database_refuses_public_files_symlinks_and_newer_schema() {
@@ -861,7 +1109,7 @@ mod tests {
 
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
         let store = LocalProjectStore::open(&database).unwrap();
-        store.conn.execute_batch("PRAGMA user_version=3;").unwrap();
+        store.conn.execute_batch("PRAGMA user_version=4;").unwrap();
         drop(store);
         assert!(
             LocalProjectStore::open(&database)

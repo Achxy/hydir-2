@@ -13,13 +13,15 @@ use hydir_core::{
 };
 use hydir_decompile::{
     NativeDecompilation, decompile_function_at, decompile_function_unit_at,
-    decompile_indexed_function_unit, decompile_symbol, decompile_symbol_unit,
-    discover_function_candidates, discover_functions, export_function_ir_llvm,
-    lift_machine_function, lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
-    measure_native_coverage,
+    decompile_indexed_function, decompile_indexed_function_unit, decompile_symbol,
+    decompile_symbol_unit, discover_function_candidates, discover_functions,
+    export_function_ir_llvm, lift_machine_function, lift_machine_function_at, lower_cir,
+    lower_function_ir, lower_state_ir, measure_native_coverage,
 };
+use hydir_hlc::{emit_typed_c, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
+use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod local;
 mod passes;
@@ -60,13 +62,19 @@ Usage:
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
   hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|function|cir|llvm>
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir high-level --model <model.json>
   hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
   hydirctl decompile <elf> --function <function-id-or-symbol> --view <low|structured|unit>
+  hydirctl decompile <elf> --function <function-id-or-symbol> --view typed --model <model.json>
   hydirctl decompile-all <elf> --output-dir <new-directory>
   hydirctl explain <elf> --function <function-id-or-symbol> [--address <hex-address>]
   hydirctl coverage <elf>
+  hydirctl model init <elf> [--output <model.json>]
+  hydirctl model verify <elf> <model.json>
+  hydirctl model import-dwarf <elf> <model.json> [--output <new-model.json>]
+  hydirctl model infer <elf> <model.json> [--output <new-model.json>]
   hydirctl vm-profile <linked-elf> <profile.json>
   hydirctl vm-explore <linked-elf> <profile.json>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
@@ -80,6 +88,9 @@ Usage:
   hydirctl validate-c-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl local <project|inspect|analyze-spec|annotations> <elf> [--db <private-sqlite>]
   hydirctl local annotate <elf> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value> [--db <private-sqlite>]
+  hydirctl local model <elf> [--db <private-sqlite>]
+  hydirctl local model-put <elf> <revision> <idempotency-key> <model.json> [--db <private-sqlite>]
+  hydirctl local decompile-typed <elf> <function-id-or-symbol> [--db <private-sqlite>]
   hydirctl remote <operation> ...
 
 Legacy symbol mode requires a non-stripped function symbol. Native --function
@@ -113,6 +124,109 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("init")
+                && (args.len() == 3 || args.len() == 5) =>
+        {
+            let output = if args.len() == 5 {
+                if args[3] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[4].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let model = init_model(&bytes)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("model") if args.get(1).map(String::as_str) == Some("verify") && args.len() == 4 => {
+            let bytes = read_binary(&args[2])?;
+            let model = parse_model(&fs::read(&args[3])?)?;
+            validate_model(&bytes, &model)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"schema_version": 1, "valid": true, "binary_sha256": model.binary_sha256, "model_revision": model.revision, "types": model.types.len(), "functions": model.functions.len()})
+                )?
+            );
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("import-dwarf")
+                && (args.len() == 4 || args.len() == 6) =>
+        {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let mut model = parse_model(&fs::read(&args[3])?)?;
+            validate_model(&bytes, &model)?;
+            import_dwarf(&bytes, &mut model)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("infer")
+                && (args.len() == 4 || args.len() == 6) =>
+        {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let mut model = parse_model(&fs::read(&args[3])?)?;
+            validate_model(&bytes, &model)?;
+            let index = discover_function_candidates(&bytes)?;
+            let mut native = Vec::new();
+            let mut lift_failures = Vec::new();
+            for row in index.functions.iter().take(256) {
+                match decompile_indexed_function(&bytes, &index, &row.id) {
+                    Ok(value) => native.push(value),
+                    Err(error) => {
+                        lift_failures.push(json!({"function_id": row.id, "error": error}))
+                    }
+                }
+            }
+            let inputs = native
+                .iter()
+                .map(|unit| (&unit.machine_ir, &unit.function_ir))
+                .collect::<Vec<_>>();
+            let mut report = infer_model(&mut model, &inputs)?;
+            report.skipped_functions +=
+                index.functions.len().saturating_sub(256) + lift_failures.len();
+            report.bounded |= index.functions.len() > 256 || !lift_failures.is_empty();
+            validate_model(&bytes, &model)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            let summary = json!({"inference": report, "index_functions": index.functions.len(), "lift_failures": lift_failures});
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+                eprintln!("inference: {}", serde_json::to_string(&summary)?);
+            }
+        }
         Some("disassemble") if args.len() == 2 => {
             let bytes = read_binary(&args[1])?;
             println!(
@@ -602,6 +716,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             let cfg = recover_at_cfg(&bytes, address, size)?;
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
+        Some("lift")
+            if args.len() == 8
+                && args[2] == "--function"
+                && args[4] == "--ir"
+                && args[5] == "high-level"
+                && args[6] == "--model" =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let model = parse_model(&fs::read(&args[7])?)?;
+            validate_model(&bytes, &model)?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let native = decompile_native_selection(&bytes, &selection)?;
+            let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
+            println!("{}", serde_json::to_string_pretty(&ir)?);
+        }
         Some("lift") if args.len() == 6 && args[2] == "--function" && args[4] == "--ir" => {
             let bytes = read_binary(&args[1])?;
             let selection = resolve_native_function(&bytes, &args[3])?;
@@ -697,6 +826,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 print!("{ir}");
             }
+        }
+        Some("decompile")
+            if args.len() == 8
+                && args[2] == "--function"
+                && args[4] == "--view"
+                && args[5] == "typed"
+                && args[6] == "--model" =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let model = parse_model(&fs::read(&args[7])?)?;
+            validate_model(&bytes, &model)?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let native = decompile_native_selection(&bytes, &selection)?;
+            let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
+            print!("{}", emit_typed_c(&ir, &model)?);
         }
         Some("decompile") if args.len() == 6 && args[2] == "--function" && args[4] == "--view" => {
             let bytes = read_binary(&args[1])?;

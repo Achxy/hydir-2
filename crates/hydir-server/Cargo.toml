@@ -22,6 +22,8 @@ hydir-analysis = { path = "../hydir-analysis" }
 hydir-decompile = { path = "../hydir-decompile" }
 hydir-ir = { path = "../hydir-ir" }
 hydir-loader = { path = "../hydir-loader" }
+hydir-model = { path = "../hydir-model" }
+hydir-hlc = { path = "../hydir-hlc" }
 tonic.workspace = true
 tonic-health.workspace = true
 tokio.workspace = true

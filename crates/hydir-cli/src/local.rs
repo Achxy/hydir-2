@@ -1,12 +1,14 @@
 //! Explicit local-project operations backed by the same analyst fact model.
 
-use super::read_binary;
+use super::{decompile_native_selection, read_binary, resolve_native_function};
 use hydir_analysis::analyze_spec_elf;
 use hydir_backend::import_elf;
 use hydir_core::{AnnotationKind, overlay_analyst_assumptions, parse_annotation_address};
+use hydir_hlc::{emit_typed_c, lower_high_level_cir};
+use hydir_model::{init_model, parse_model};
 use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore};
 use serde_json::json;
-use std::{error::Error, path::Path};
+use std::{error::Error, fs, path::Path};
 
 const HELP: &str = "Local project operations:
   hydirctl local project <elf> [--db <private-sqlite>]
@@ -14,6 +16,9 @@ const HELP: &str = "Local project operations:
   hydirctl local analyze-spec <elf> [--db <private-sqlite>]
   hydirctl local annotations <elf> [--db <private-sqlite>]
   hydirctl local annotate <elf> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value> [--db <private-sqlite>]
+  hydirctl local model <elf> [--db <private-sqlite>]
+  hydirctl local model-put <elf> <revision> <idempotency-key> <model.json> [--db <private-sqlite>]
+  hydirctl local decompile-typed <elf> <function-id-or-symbol> [--db <private-sqlite>]
 
 The project is keyed by the canonical ELF path. Changed bytes advance its
 revision; facts for another binary digest are not applied. The original ELF
@@ -89,6 +94,39 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&project_json(&updated))?);
+        }
+        [command, binary] if command == "model" => {
+            let bytes = read_binary(binary)?;
+            let spec = import_elf(&bytes)?;
+            let project = store.open_binary(Path::new(binary), &spec)?;
+            let model = store
+                .load_model(&project)?
+                .map_or_else(|| init_model(&bytes), Ok)?;
+            println!("{}", serde_json::to_string_pretty(&model)?);
+        }
+        [command, binary, expected, key, model_path] if command == "model-put" => {
+            let bytes = read_binary(binary)?;
+            let spec = import_elf(&bytes)?;
+            let project = store.open_binary(Path::new(binary), &spec)?;
+            let requested = LocalProject {
+                revision: expected.parse()?,
+                ..project
+            };
+            let model = parse_model(&fs::read(model_path)?)?;
+            let updated = store.save_model(&requested, &model, key)?;
+            println!("{}", serde_json::to_string_pretty(&project_json(&updated))?);
+        }
+        [command, binary, selector] if command == "decompile-typed" => {
+            let bytes = read_binary(binary)?;
+            let spec = import_elf(&bytes)?;
+            let project = store.open_binary(Path::new(binary), &spec)?;
+            let model = store
+                .load_model(&project)?
+                .ok_or("Local project has no saved analysis model")?;
+            let selected = resolve_native_function(&bytes, selector)?;
+            let native = decompile_native_selection(&bytes, &selected)?;
+            let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
+            print!("{}", emit_typed_c(&ir, &model)?);
         }
         _ => return Err(HELP.into()),
     }

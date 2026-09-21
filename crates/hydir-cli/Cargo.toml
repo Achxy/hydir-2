@@ -20,6 +20,8 @@ hydir-api = { path = "../hydir-api" }
 hydir-core = { path = "../hydir-core" }
 hydir-decompile = { path = "../hydir-decompile" }
 hydir-ir = { path = "../hydir-ir" }
+hydir-model = { path = "../hydir-model" }
+hydir-hlc = { path = "../hydir-hlc" }
 hydir-vm = { path = "../hydir-vm" }
 hydir-interchange = { path = "../hydir-interchange" }
 hydir-project = { path = "../hydir-project" }
