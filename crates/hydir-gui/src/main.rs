@@ -2,7 +2,7 @@
 //! native import, CFG recovery, and lifting operations used by the CLI.
 
 use eframe::egui::{self, Color32, RichText};
-use egui_graph::{NodeId, layout_from_sizes};
+use egui_graph::{LayoutNode, LayoutParams, NodeId, layout_from_sizes, layout_routed};
 use egui_graph_egui::Direction as GraphDirection;
 use hydir_analysis::{AnalysisReport, analyze_elf};
 use hydir_api::v1::{
@@ -5083,23 +5083,74 @@ impl AnalystApp {
     }
 
     fn decompile_patch_view(&mut self, ui: &mut egui::Ui) {
-        let c_source = self
+        let structured_c = self
             .decompilation
             .as_ref()
             .map(|unit| unit.c_source.clone())
             .or_else(|| self.c.clone());
+        let native_fallback = if structured_c.is_none() {
+            self.native_decompilation.as_ref().map(|native| {
+                (
+                    native_function_excerpt(&native.low_level_c).to_owned(),
+                    format!("{:?}", native.cir.semantic_fidelity),
+                    native_opaque_instruction_count(native),
+                    native.cir.rewrite_ready,
+                )
+            })
+        } else {
+            None
+        };
+        let structured_error = self
+            .decompilation_error
+            .as_deref()
+            .or(self.c_error.as_deref())
+            .unwrap_or("this region is outside the structured recovery contract")
+            .to_owned();
         ui.columns(2, |columns| {
-            columns[0].heading(RichText::new("Deterministic C").color(INFO));
-            columns[0].label(
-                RichText::new("Read-only decompilation · machine-address provenance retained")
-                    .size(10.0)
-                    .color(MUTED),
+            columns[0].heading(
+                RichText::new(if native_fallback.is_some() {
+                    "Native low-level C"
+                } else {
+                    "Deterministic C"
+                })
+                .color(INFO),
             );
+            columns[0].label(
+                RichText::new(if native_fallback.is_some() {
+                    "Native function excerpt · complete C and diagnostics in the native view"
+                } else {
+                    "Read-only decompilation · machine-address provenance retained"
+                })
+                .size(10.0)
+                .color(MUTED),
+            );
+            if let Some((_, fidelity, opaque, rewrite_ready)) = &native_fallback {
+                columns[0].label(
+                    RichText::new(format!("Structured C unavailable: {structured_error}"))
+                    .size(11.0)
+                    .color(ACCENT),
+                );
+                columns[0].label(
+                    RichText::new(format!(
+                        "Native fidelity: {fidelity} · {opaque} opaque instruction{} · rewrite ready: {}",
+                        if *opaque == 1 { "" } else { "s" },
+                        if *rewrite_ready { "yes" } else { "no" }
+                    ))
+                    .size(11.0)
+                    .color(if *opaque == 0 { MUTED } else { ACCENT }),
+                );
+                if columns[0].small_button("Open native IR, C and diagnostics").clicked() {
+                    self.tab = Tab::Native;
+                }
+            }
             egui::ScrollArea::both()
                 .id_salt("region_studio_c")
                 .max_height(430.0)
                 .show(&mut columns[0], |ui| {
-                    if let Some(source) = &c_source {
+                    if let Some(source) = structured_c
+                        .as_deref()
+                        .or_else(|| native_fallback.as_ref().map(|native| native.0.as_str()))
+                    {
                         ui.code(source);
                     } else {
                         ui.colored_label(
@@ -6229,7 +6280,16 @@ impl AnalystApp {
             }
         }
 
-        if let Some(action) = render_workbench_graph(ui, &nodes, &edges, self.graph_zoom) {
+        if let Some(action) = render_workbench_graph(
+            ui,
+            &nodes,
+            &edges,
+            self.graph_zoom,
+            (
+                "native_function_graph",
+                native.machine_ir.function_id.as_str(),
+            ),
+        ) {
             self.apply_graph_action(action);
         }
     }
@@ -6369,7 +6429,9 @@ impl AnalystApp {
             ui.colored_label(MUTED, "No functions match the graph filter.");
             return;
         }
-        if let Some(action) = render_workbench_graph(ui, &nodes, &edges, self.graph_zoom) {
+        if let Some(action) =
+            render_workbench_graph(ui, &nodes, &edges, self.graph_zoom, "native_program_graph")
+        {
             self.apply_graph_action(action);
         }
     }
@@ -7197,24 +7259,38 @@ fn indexed_function_action(
     }
 }
 
+fn workbench_graph_layout(
+    nodes: &[WorkbenchGraphNode],
+    edges: &[WorkbenchGraphEdge],
+    zoom: f32,
+) -> (egui_graph::Layout, egui_graph::EdgeRoutes) {
+    let node_size = [210.0_f32 * zoom, 72.0_f32 * zoom];
+    layout_routed(
+        nodes
+            .iter()
+            .map(|node| (node.id, LayoutNode::new(node_size))),
+        edges
+            .iter()
+            .map(|edge| ((edge.source, 0), (edge.target, 0))),
+        LayoutParams::new(GraphDirection::LeftToRight)
+            .layer_gap(100.0 * zoom)
+            .node_gap(40.0 * zoom),
+    )
+}
+
 fn render_workbench_graph(
     ui: &mut egui::Ui,
     nodes: &[WorkbenchGraphNode],
     edges: &[WorkbenchGraphEdge],
     zoom: f32,
+    canvas_salt: impl std::hash::Hash + std::fmt::Debug,
 ) -> Option<GraphNodeAction> {
     if nodes.is_empty() {
         ui.label(RichText::new("No graph nodes recovered.").color(MUTED));
         return None;
     }
     let node_size = [210.0_f32 * zoom, 72.0_f32 * zoom];
-    let layout = layout_from_sizes(
-        nodes
-            .iter()
-            .map(|node| (node.id, egui_graph_egui::vec2(node_size[0], node_size[1]))),
-        edges.iter().map(|edge| (edge.source, edge.target)),
-        GraphDirection::LeftToRight,
-    );
+    let (layout, routes) = workbench_graph_layout(nodes, edges, zoom);
     let min_x = layout
         .values()
         .map(|position| position.x)
@@ -7237,9 +7313,9 @@ fn render_workbench_graph(
     );
     let mut clicked = None;
     egui::ScrollArea::both()
-        .id_salt("native_graph_canvas")
+        .id_salt(canvas_salt)
         .show(ui, |ui| {
-            let (canvas, _) = ui.allocate_exact_size(canvas_size, egui::Sense::drag());
+            let (canvas, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
             let painter = ui.painter_at(canvas);
             let offset = canvas.min + egui::vec2(50.0 - min_x, 50.0 - min_y);
             let rects = nodes
@@ -7256,6 +7332,7 @@ fn render_workbench_graph(
                 })
                 .collect::<std::collections::HashMap<_, _>>();
 
+            let mut occurrences = std::collections::HashMap::new();
             for edge in edges {
                 let (Some(source_rect), Some(target_rect)) =
                     (rects.get(&edge.source), rects.get(&edge.target))
@@ -7265,10 +7342,26 @@ fn render_workbench_graph(
                 let start = source_rect.right_center();
                 let end = target_rect.left_center();
                 let color = if edge.unresolved { BAD } else { ACCENT };
-                painter.line_segment([start, end], egui::Stroke::new(1.5, color));
-                let delta = end - start;
-                if delta.length_sq() > 1.0 {
-                    let direction = delta.normalized();
+                let occurrence = occurrences.entry((edge.source, edge.target)).or_insert(0);
+                let mut points = vec![start];
+                if let Some(waypoints) =
+                    routes.route((edge.source, 0), (edge.target, 0), *occurrence)
+                {
+                    points.extend(
+                        waypoints
+                            .iter()
+                            .map(|point| offset + egui::vec2(point.x, point.y)),
+                    );
+                }
+                *occurrence += 1;
+                points.push(end);
+                for segment in points.windows(2) {
+                    painter.line_segment([segment[0], segment[1]], egui::Stroke::new(1.5, color));
+                }
+                if let Some(direction) = points.windows(2).rev().find_map(|segment| {
+                    let delta = segment[1] - segment[0];
+                    (delta.length_sq() > 1.0).then(|| delta.normalized())
+                }) {
                     let left = end - direction * 10.0 + egui::vec2(-direction.y, direction.x) * 4.0;
                     let right =
                         end - direction * 10.0 - egui::vec2(-direction.y, direction.x) * 4.0;
@@ -7279,14 +7372,31 @@ fn render_workbench_graph(
                     ));
                 }
                 if !edge.label.is_empty() {
-                    let center = start + delta * 0.5;
-                    painter.text(
-                        center,
-                        egui::Align2::CENTER_CENTER,
-                        &edge.label,
-                        egui::FontId::monospace((9.0 * zoom).max(8.0)),
+                    let galley = painter.layout_no_wrap(
+                        edge.label.clone(),
+                        egui::FontId::monospace((10.0 * zoom).max(9.0)),
                         color,
                     );
+                    let label_size = galley.size() + egui::vec2(8.0, 4.0);
+                    let center = points
+                        .windows(2)
+                        .map(|segment| {
+                            let delta = segment[1] - segment[0];
+                            (delta.length_sq(), segment[0] + delta * 0.5)
+                        })
+                        .filter(|(_, center)| {
+                            let label_rect = egui::Rect::from_center_size(*center, label_size);
+                            !rects
+                                .values()
+                                .any(|rect| rect.expand(3.0).intersects(label_rect))
+                        })
+                        .max_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, center)| center);
+                    if let Some(center) = center {
+                        let label_rect = egui::Rect::from_center_size(center, label_size);
+                        painter.rect_filled(label_rect, 0.0, BG);
+                        painter.galley(label_rect.min + egui::vec2(4.0, 2.0), galley, color);
+                    }
                 }
             }
 
@@ -7350,6 +7460,12 @@ fn native_opaque_instruction_count(native: &NativeDecompilation) -> usize {
             matches!(instruction.operation, MachineOperation::OpaqueEffect { .. })
         })
         .count()
+}
+
+fn native_function_excerpt(source: &str) -> &str {
+    source
+        .rfind("\nvoid hydir_")
+        .map_or(source, |start| &source[start + 1..])
 }
 
 fn code_artifact_view(ui: &mut egui::Ui, label: &str, source: &str, id: &str) {
@@ -8396,16 +8512,62 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, Event, GraphNodeAction, NativeViewMode, Tab, indexed_function_action, ir_slice,
-        local_region_artifacts, native_instruction_count, preview_patch_local,
-        resized_console_height, valid_bearer_token, validate_endpoint,
+        AnalystApp, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab, WorkbenchGraphEdge,
+        WorkbenchGraphNode, indexed_function_action, ir_slice, local_region_artifacts,
+        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
+        preview_patch_local, resized_console_height, valid_bearer_token, validate_endpoint,
+        workbench_graph_layout,
     };
+    use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
-    use hydir_decompile::{decompile_function_at, discover_functions, measure_native_coverage};
+    use hydir_decompile::{
+        decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
+    };
     use std::sync::mpsc;
+
+    #[test]
+    fn graph_layout_leaves_label_space_and_routes_long_edges_around_nodes() {
+        let ids = [
+            NodeId::new("entry"),
+            NodeId::new("middle"),
+            NodeId::new("exit"),
+        ];
+        let nodes = ids
+            .iter()
+            .map(|id| WorkbenchGraphNode {
+                id: *id,
+                label: String::new(),
+                tone: GraphNodeTone::Normal,
+                action: None,
+            })
+            .collect::<Vec<_>>();
+        let edges = [(0, 1), (1, 2), (0, 2)]
+            .into_iter()
+            .map(|(source, target)| WorkbenchGraphEdge {
+                source: ids[source],
+                target: ids[target],
+                label: "fallthrough".to_owned(),
+                unresolved: false,
+            })
+            .collect::<Vec<_>>();
+
+        let (layout, routes) = workbench_graph_layout(&nodes, &edges, 1.0);
+        let label_gap = layout[&ids[1]].x - (layout[&ids[0]].x + 210.0);
+        assert!(label_gap >= 99.0, "edge labels need space between layers");
+        let route = routes
+            .route((ids[0], 0), (ids[2], 0), 0)
+            .expect("the long edge must route around the middle block");
+        let middle = layout[&ids[1]];
+        assert!(route.iter().all(|point| {
+            point.x < middle.x
+                || point.x > middle.x + 210.0
+                || point.y < middle.y
+                || point.y > middle.y + 72.0
+        }));
+    }
 
     #[test]
     fn annotation_refresh_overlays_once_and_rejects_stale_binary_events() {
@@ -8505,6 +8667,23 @@ mod tests {
         assert!(matches!(app.tab, Tab::Overview));
         assert!(!app.console_visible);
         assert_eq!(app.console_height, 220.0);
+    }
+
+    #[test]
+    fn prism_syscall_helper_retains_native_c_when_structured_lift_refuses_it() {
+        let binary = include_bytes!("../../../demo/hydir-prism.elf");
+        let symbol = "prism_write_banner";
+        let ir = lift_symbol(binary, symbol).map_err(|error| error.to_string());
+        let artifacts = local_region_artifacts(binary, symbol, &ir);
+        assert!(artifacts.decompilation.is_err());
+
+        let native = decompile_symbol(binary, symbol).unwrap();
+        assert!(native_opaque_instruction_count(&native) > 0);
+        assert!(native.low_level_c.contains("hydir_opaque_effect"));
+        assert!(native.low_level_c.contains("0x20141c"));
+        assert!(native_function_excerpt(&native.low_level_c).starts_with("void hydir_"));
+        assert!(native_function_excerpt(&native.low_level_c).contains("hydir_opaque_effect"));
+        assert!(!native.cir.rewrite_ready);
     }
 
     #[test]

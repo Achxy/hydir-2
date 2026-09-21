@@ -5,9 +5,20 @@ whose functions are deliberately shaped to make the product's strongest
 capabilities visible. It is a trusted demonstration fixture, not an obfuscated
 sample or a security challenge.
 
-## Launch on Windows
+## Open the ready-made ELF
 
 From the repository root:
+
+```powershell
+cargo run --locked --bin hydir -- --open-local demo/hydir-prism.elf hydir_stage_decision
+```
+
+The checked-in [`hydir-prism.elf`](../demo/hydir-prism.elf) is a 3,264-byte
+ELF64 executable with 13 named functions. Its SHA-256 is
+`4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0`.
+HydIR inspects the binary locally on Windows without executing it.
+
+To prepare a patched copy and supporting reports as well, run:
 
 ```powershell
 .\scripts\launch-prism-demo.cmd
@@ -21,12 +32,32 @@ directory under `target/hydir-prism/`; the original is never overwritten.
 Use `-NoOpen` to prepare artifacts without launching the GUI. Use `-RunTriton`
 only when the configured Triton bridge is available.
 
+| Select this function or view | Demonstrates |
+| --- | --- |
+| `hydir_stage_decision` | Function discovery, bytes and disassembly, branch CFG, native IR stages, low-level C, structured decision C, and RegionSpec evidence. |
+| `hydir_stage_stack_mix` | Frame setup, stack-local store and load, physical register state, and instruction provenance. |
+| `hydir_stage_call_chain` and `hydir_stage_leaf_add` | Direct call edges, ABI recovery, call graph, and a small symbolic Triton trace. |
+| `hydir_stage_loop_sum` and `hydir_stage_bit_gate` | Back-edge recovery, loop control, `TEST` flags, and conditional branches. |
+| `hydir_stage_record_parent` | A direct callee and propagated write to the mapped `hydir_prism_counter` global. |
+| `hydir_stage_patch_portal` | PatchLang, PatchIR, structural verification, and entry-trampoline placement in a separate ELF. |
+| `_start` and Coverage | Program entry, local calls, mapped data, Linux syscalls, and explicit opaque-effect reporting. |
+
+On this fixture, native coverage lifts all 13 discovered functions: seven
+have exact native coverage, while six are conservative. In total, 117
+instruction occurrences are exact under the modeled semantics and six
+`syscall` occurrences remain opaque. Region Studio displays the native
+low-level C with its fidelity and rewrite status when the older structured C
+path rejects an instruction. In `prism_write_banner`, for example, the
+`syscall` at `0x20141c` appears as an explicit opaque effect in native C.
+The `prism_write_*` symbols and `_start` are runtime context for the program
+graph and coverage views; use `hydir_stage_patch_portal` for the patch flow.
+
 ## The six-minute route
 
 ### 1. Start with the proof chain
 
-Region Studio opens on `hydir_stage_decision`. The five cards across the top
-tell the story immediately:
+Region Studio opens on `hydir_stage_decision`. The five stage readouts across
+the top summarize the proof chain:
 
 ```text
 ELF bytes -> RegionSpec -> PhysicalRegionIR -> C/PatchIR -> verified ELF copy
