@@ -215,3 +215,134 @@ fn fixed_array_element_accesses_agree_with_dwarf_bounds() {
                 .any(|item| item.source == ModelSource::NativeAnalysis)
     }));
 }
+
+#[test]
+fn recursive_call_use_proves_a_recursive_pointer_field() {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_recursive.c");
+    let temp = tempfile::tempdir().unwrap();
+    for debug in [false, true] {
+        let object = temp.path().join(if debug {
+            "recursive_debug.o"
+        } else {
+            "recursive_stripped.o"
+        });
+        let mut command = Command::new("clang");
+        command.args([
+            "--target=x86_64-unknown-linux-gnu",
+            "-O1",
+            "-fno-optimize-sibling-calls",
+            "-c",
+        ]);
+        if debug {
+            command.arg("-g");
+        }
+        let output = command.arg(&source).arg("-o").arg(&object).output();
+        let Ok(output) = output else { return };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(object).unwrap();
+        let native = decompile_symbol(&bytes, "hydir_recursive_sum").unwrap();
+        let mut model = init_model(&bytes).unwrap();
+        if debug {
+            import_dwarf(&bytes, &mut model).unwrap();
+        }
+        let report = infer_model(&mut model, &[(&native.machine_ir, &native.function_ir)]).unwrap();
+        assert!(model.conflicts.is_empty(), "{:?}", model.conflicts);
+        if !debug {
+            assert!(report.inferred_pointer_fields > 0, "{report:?}");
+        }
+        let function = model
+            .functions
+            .iter()
+            .find(|row| row.entry == native.machine_ir.entry)
+            .unwrap();
+        let ty = if debug {
+            &function.prototype.as_ref().unwrap().parameters[0].ty
+        } else {
+            &function.inferred_parameters["rdi"]
+        };
+        let TypeRef::Pointer { to } = ty else {
+            panic!("pointer parameter expected")
+        };
+        let TypeRef::Named { id } = to.as_ref() else {
+            panic!("named referent expected")
+        };
+        let TypeDefinitionKind::Struct { fields } =
+            &model.types.iter().find(|ty| ty.id == *id).unwrap().kind
+        else {
+            panic!("struct expected")
+        };
+        let next = fields.iter().find(|field| field.offset_bytes == 8).unwrap();
+        assert_eq!(
+            next.ty,
+            TypeRef::Pointer {
+                to: Box::new(TypeRef::Named { id: id.clone() })
+            }
+        );
+    }
+}
+
+#[test]
+fn incompatible_field_call_types_remain_unresolved() {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_conflict.c");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_conflict.o");
+    let output = Command::new("clang")
+        .args([
+            "--target=x86_64-unknown-linux-gnu",
+            "-O1",
+            "-fno-optimize-sibling-calls",
+            "-c",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output();
+    let Ok(output) = output else { return };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(object).unwrap();
+    let read_a = decompile_symbol(&bytes, "hydir_read_a").unwrap();
+    let read_b = decompile_symbol(&bytes, "hydir_read_b").unwrap();
+    let caller = decompile_symbol(&bytes, "hydir_conflicting_next").unwrap();
+    let mut model = init_model(&bytes).unwrap();
+    let inputs = [
+        (&read_a.machine_ir, &read_a.function_ir),
+        (&read_b.machine_ir, &read_b.function_ir),
+        (&caller.machine_ir, &caller.function_ir),
+    ];
+    let report = infer_model(&mut model, &inputs).unwrap();
+    assert_eq!(report.inferred_pointer_fields, 0);
+    assert!(!model.conflicts.is_empty());
+    let row = model
+        .functions
+        .iter()
+        .find(|row| row.entry == caller.machine_ir.entry)
+        .unwrap();
+    let TypeRef::Pointer { to } = &row.inferred_parameters["rdi"] else {
+        panic!("pointer expected")
+    };
+    let TypeRef::Named { id } = to.as_ref() else {
+        panic!("named type expected")
+    };
+    let TypeDefinitionKind::Struct { fields } =
+        &model.types.iter().find(|ty| ty.id == *id).unwrap().kind
+    else {
+        panic!("struct expected")
+    };
+    let next = fields.iter().find(|field| field.offset_bytes == 8).unwrap();
+    assert_eq!(
+        next.ty,
+        TypeRef::Primitive {
+            name: PrimitiveType::U64
+        }
+    );
+}
