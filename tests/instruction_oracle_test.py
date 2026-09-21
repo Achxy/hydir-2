@@ -17,7 +17,7 @@ FLAGS = ("cf", "zf", "sf", "of")
 
 def step(hex_bytes, *, address=0x1000, memory=None, **registers):
     context = TritonContext(ARCH.X86_64)
-    for name, value in {"rsp": 0x9000, **registers}.items():
+    for name, value in {"rip": address, "rsp": 0x9000, **registers}.items():
         context.setConcreteRegisterValue(getattr(context.registers, name), value)
     for location, value in (memory or {}).items():
         context.setConcreteMemoryAreaValue(location, value.to_bytes(8, "little"))
