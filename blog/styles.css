@@ -25,6 +25,10 @@ a:focus-visible { outline: 2px solid var(--site-accent); outline-offset: 3px; }
 img { height: auto; }
 pre { overflow-x: auto; border-left: 2px solid var(--site-rule); }
 pre code { white-space: pre; }
+/* Keep hidden MathML positioned within its formula, including on small screens. */
+.katex { position: relative; }
+.prose code { overflow-wrap: anywhere; }
+.prose h1, .prose h2, .prose h3 { overflow-wrap: break-word; }
 .math-block, .katex-display { overflow-x: auto; overflow-y: hidden; }
 .katex-display { padding: .25rem 0; }
 .skip { position: absolute; left: -10000px; top: auto; }
