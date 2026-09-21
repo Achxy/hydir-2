@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="HydIR engineering blogs about jump-table recovery, PatchLang and PatchIR, bounded binary lifting, Triton symbolic exploration, and worked x86-64 examples.">
+  <meta name="description" content="HydIR engineering blogs about bitvector mathematics, compiler theory, jump-table recovery, PatchLang and PatchIR, binary lifting, and Triton symbolic exploration.">
   <link rel="canonical" href="https://hydir.wiki/blogs">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
   <link rel="stylesheet" href="/styles.css">
@@ -15,6 +15,18 @@
   <main class="site-main prose" id="content">
     <p class="eyebrow">Engineering notes</p>
     <h1>Blogs</h1>
+    <hr class="section-rule">
+    <article>
+      <h2><a href="/articles/bitvectors-to-behavior">From Bitvectors to Behavior: The Mathematics of a Binary Lift</a></h2>
+      <p>Derive modular arithmetic, carry and overflow, signed branch conditions, and the obligations behind a faithful lift. Work through the equations with an interactive flag example and reproducible SMT queries.</p>
+      <p><a href="/articles/bitvectors-to-behavior">Read the mathematics deep dive →</a></p>
+    </article>
+    <hr class="section-rule">
+    <article>
+      <h2><a href="/articles/graphs-to-code">From Graphs to Code: The Compiler Theory Inside HydIR</a></h2>
+      <p>Follow control-flow recovery through fixed-point analysis, SSA, memory effects, and C output. See how these ideas connect the scalar backend to HydIR's native compiler pipeline.</p>
+      <p><a href="/articles/graphs-to-code">Read the compiler theory deep dive →</a></p>
+    </article>
     <hr class="section-rule">
     <article>
       <h2><a href="/articles/recovering-jump-tables">Recovering Jump Tables from x86-64 ELF</a></h2>

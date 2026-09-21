@@ -1,0 +1,22 @@
+[
+  {
+    "slug": "bitvectors-to-behavior",
+    "number": "01",
+    "category": "Mathematics",
+    "title": "From Bitvectors to Behavior",
+    "subtitle": "The Mathematics of a Binary Lift",
+    "description": "Deriving machine arithmetic, condition flags, path semantics, and the proof obligations behind HydIR's bounded x86-64 lift.",
+    "lead": "A register holds bits. A branch gives those bits an interpretation. Preserving that distinction is the first obligation of a binary lifter.",
+    "date": "2026-09-21"
+  },
+  {
+    "slug": "graphs-to-code",
+    "number": "02",
+    "category": "Compiler theory",
+    "title": "From Graphs to Code",
+    "subtitle": "The Compiler Theory Inside HydIR",
+    "description": "A detailed walk through bounded CFG recovery, fixed-point dataflow analysis, explicit SSA, parallel phi copies, and conservative effect summaries.",
+    "lead": "The hard part of lifting is deciding what every value means on every incoming edge. Control-flow graphs and fixed points make that question precise.",
+    "date": "2026-09-21"
+  }
+]
