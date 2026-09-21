@@ -1,7 +1,7 @@
 use hydir_decompile::decompile_symbol;
 use hydir_model::{
     ModelSource, PrimitiveType, TypeDefinitionKind, TypeRef, import_dwarf, infer_model, init_model,
-    parse_model, validate_model,
+    parse_model, record_analyst_edits, validate_model,
 };
 use std::{fs, path::PathBuf, process::Command};
 
@@ -54,6 +54,65 @@ fn dwarf_import_recovers_array_and_recursive_pointer_layout() {
     let mut bad = model.clone();
     bad.binary_sha256 = "0".repeat(64);
     assert!(validate_model(&bytes, &bad).is_err());
+}
+
+#[test]
+fn local_edit_provenance_preserves_machine_evidence_without_claiming_imports() {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/type_layout.c");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("type_layout.o");
+    let output = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-g", "-O0", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output();
+    let Ok(output) = output else { return };
+    assert!(output.status.success());
+    let bytes = fs::read(object).unwrap();
+    let baseline = init_model(&bytes).unwrap();
+    let mut imported = baseline.clone();
+    import_dwarf(&bytes, &mut imported).unwrap();
+    record_analyst_edits(&baseline, &mut imported).unwrap();
+    assert!(imported.types.iter().all(|ty| {
+        ty.evidence
+            .iter()
+            .all(|item| item.source != ModelSource::AnalystAssertion)
+    }));
+    let mut edited = imported.clone();
+    let TypeDefinitionKind::Struct { fields } = &mut edited.types[0].kind else {
+        panic!("expected struct")
+    };
+    fields[1].name = "analyst_next".to_owned();
+    fields[1].ty = TypeRef::Primitive {
+        name: PrimitiveType::U64,
+    };
+    fields[1].evidence.clear();
+    record_analyst_edits(&imported, &mut edited).unwrap();
+    validate_model(&bytes, &edited).unwrap();
+    let TypeDefinitionKind::Struct { fields } = &edited.types[0].kind else {
+        panic!("expected struct")
+    };
+    assert!(
+        fields[1]
+            .evidence
+            .iter()
+            .any(|item| item.source == ModelSource::AnalystAssertion)
+    );
+    assert!(
+        fields[1]
+            .evidence
+            .iter()
+            .any(|item| item.source == ModelSource::Dwarf)
+    );
+    assert!(edited.conflicts.iter().any(|conflict| {
+        conflict.subject.contains("field:40")
+            && conflict
+                .evidence
+                .iter()
+                .any(|item| item.source == ModelSource::Dwarf)
+    }));
 }
 
 #[test]

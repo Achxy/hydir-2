@@ -45,6 +45,11 @@ The local typed-C cache checks content hashes and keys entries by binary
 digest, model revision, analysis version, options, and function entry. On a
 model edit it carries only entries whose referenced types, own function facts,
 and transitive callees are unchanged.
+Local model saves mark changed facts as analyst assertions while retaining
+earlier native and DWARF evidence, even when an editor omits it from the JSON.
+An analyst field type that differs from the previous model type also creates
+a visible conflict with the earlier evidence. New DWARF and native facts keep
+their original source labels.
 
 `HighLevelCIR v1` lowers complete, linear functions whose supported 64-bit
 operations have exact native effects. It recognizes a closed `rbp` frame with
