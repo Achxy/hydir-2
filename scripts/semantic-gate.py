@@ -108,6 +108,13 @@ def parse_solver_witnesses(output):
     return witnesses
 
 
+def annotate_failure(message):
+    """Expose gate failures in the public Actions job annotations."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=Semantic gate failure::{escaped}", file=sys.stderr)
+
+
 def main():
     started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -391,6 +398,22 @@ def main():
     if oracle_status == "failed":
         print("Triton instruction-state oracle failed", file=sys.stderr)
         failed = True
+    if failed:
+        failing_rows = [row for row in rows if row["status"] in
+                        ("mismatch", "build_error", "inventory_error", "invalid_ir", "validation_error")]
+        for row in failing_rows[:20]:
+            label = f"{row['compiler']}-{row['optimization']}-{row['function']}"
+            annotate_failure(f"{label}: {row['status']}: {row.get('reason', 'no reason recorded')[:240]}")
+        if len(failing_rows) > 20:
+            annotate_failure(f"{len(failing_rows) - 20} additional rows failed; see report artifact")
+        if args.require_triton_witness and counts["solver_branch_functions"] == 0:
+            annotate_failure("No Triton witness for a branched function")
+        if args.require_triton_conditions and missing_conditions:
+            annotate_failure("Missing Triton condition paths: " + ", ".join(missing_conditions))
+        if args.require_assembly_coverage and counts["hand_assembly_matched"] != len(ASSEMBLY_FUNCTIONS):
+            annotate_failure(f"Hand-assembly coverage: {counts['hand_assembly_matched']}/{len(ASSEMBLY_FUNCTIONS)} matched")
+        if oracle_status == "failed":
+            annotate_failure("Triton instruction-state oracle failed: " + (oracle_error or "unknown error")[:240])
     return int(failed)
 
 
