@@ -413,7 +413,7 @@ def main():
         if args.require_assembly_coverage and counts["hand_assembly_matched"] != len(ASSEMBLY_FUNCTIONS):
             annotate_failure(f"Hand-assembly coverage: {counts['hand_assembly_matched']}/{len(ASSEMBLY_FUNCTIONS)} matched")
         if oracle_status == "failed":
-            annotate_failure("Triton instruction-state oracle failed: " + (oracle_error or "unknown error")[:240])
+            annotate_failure("Triton instruction-state oracle failed: " + (oracle_error or "unknown error")[:1800])
     return int(failed)
 
 
