@@ -9,14 +9,14 @@ fn typed_pair_views_compile_and_match_source_for_debug_and_stripped_elf() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_pair.c");
     let temp = tempfile::tempdir().unwrap();
     let source = fs::read_to_string(&fixture).unwrap();
-    for debug in [false, true] {
+    for (optimization, debug) in [("-O0", false), ("-O0", true), ("-O2", false), ("-O2", true)] {
         let input = temp.path().join(if debug {
             "pair_debug.o"
         } else {
             "pair_stripped.o"
         });
         let mut compile = Command::new("clang");
-        compile.args(["--target=x86_64-unknown-linux-gnu", "-O2", "-c"]);
+        compile.args(["--target=x86_64-unknown-linux-gnu", optimization, "-c"]);
         if debug {
             compile.arg("-g");
         }
@@ -78,7 +78,7 @@ fn typed_pair_views_compile_and_match_source_for_debug_and_stripped_elf() {
                 .unwrap();
             assert!(
                 result.status.success(),
-                "{}",
+                "{optimization}: {}",
                 String::from_utf8_lossy(&result.stderr)
             );
             if Command::new("gcc").arg("--version").output().is_ok() {
@@ -119,7 +119,7 @@ fn typed_pair_views_compile_and_match_source_for_debug_and_stripped_elf() {
                 .unwrap();
             assert!(
                 compile.status.success(),
-                "{}",
+                "{optimization}: {}",
                 String::from_utf8_lossy(&compile.stderr)
             );
             assert!(Command::new(&exe).status().unwrap().success());

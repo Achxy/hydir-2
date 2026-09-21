@@ -8,11 +8,14 @@ license.workspace = true
 [dependencies]
 hydir-core = { path = "../hydir-core" }
 hydir-model = { path = "../hydir-model" }
+hydir-hlc = { path = "../hydir-hlc" }
+hydir-ir = { path = "../hydir-ir" }
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+hydir-decompile = { path = "../hydir-decompile" }
 hydir-loader = { path = "../hydir-loader" }
 tempfile = "3.23"

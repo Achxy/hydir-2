@@ -2330,6 +2330,9 @@ name = "hydir-project"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "hydir-decompile",
+ "hydir-hlc",
+ "hydir-ir",
  "hydir-loader",
  "hydir-model",
  "rusqlite",
