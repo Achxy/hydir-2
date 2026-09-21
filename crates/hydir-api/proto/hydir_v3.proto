@@ -1,0 +1,98 @@
+syntax = "proto3";
+package hydir.v3;
+
+// Native whole-program analysis contract. v1 and v2 remain available for
+// compatibility; this service never requires an external decompiler.
+service HydirV3 {
+  rpc Discover (DiscoverRequest) returns (DiscoverReply);
+  rpc StartProgramAnalysis (StartProgramAnalysisRequest) returns (JobReply);
+  rpc GetAnalysisJob (JobRequest) returns (JobReply);
+  rpc CancelAnalysisJob (JobRequest) returns (JobReply);
+  rpc StreamAnalysisEvents (JobEventRequest) returns (stream JobEvent);
+  rpc GetProgramArtifact (ProgramArtifactRequest) returns (ArtifactReply);
+  rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
+}
+
+message DiscoverRequest {}
+message DiscoverReply {
+  uint32 api_version = 1;
+  uint32 program_spec_version = 2;
+  uint32 function_index_version = 3;
+  uint32 machine_ir_version = 4;
+  uint32 state_ir_version = 5;
+  uint32 function_ir_version = 6;
+  uint32 cir_version = 7;
+  uint32 decompilation_unit_version = 8;
+  string stable_contract = 9;
+  bool isolated_analysis_jobs = 10;
+  bool analyst_fact_updates = 11;
+}
+
+message StartProgramAnalysisRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+}
+
+message JobRequest {
+  string project_id = 1;
+  string job_id = 2;
+}
+
+message JobReply {
+  string project_id = 1;
+  string job_id = 2;
+  uint64 project_revision = 3;
+  string kind = 4;
+  string state = 5;
+  string artifact_sha256 = 6;
+  string diagnostic = 7;
+}
+
+message JobEventRequest {
+  string project_id = 1;
+  string job_id = 2;
+  uint64 after_sequence = 3;
+}
+
+message JobEvent {
+  uint64 sequence = 1;
+  string job_id = 2;
+  string state = 3;
+  string message = 4;
+  string artifact_sha256 = 5;
+}
+
+// stage is one of program_spec, function_index, coverage, machine, state,
+// function, cir, llvm, or unit. Function-scoped stages require a FunctionIndex
+// id or an unambiguous discovered name in function_selector.
+message ProgramArtifactRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string stage = 3;
+  string function_selector = 4;
+}
+
+message ArtifactReply {
+  string sha256 = 1;
+  string media_type = 2;
+  bytes content = 3;
+  uint64 project_revision = 4;
+}
+
+// Facts are revision-checked project mutations and retain analyst provenance.
+message AnalystFactRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+  string kind = 4;
+  string address = 5;
+  string value = 6;
+  string scope = 7;
+}
+
+message MutationReply {
+  string project_id = 1;
+  uint64 revision = 2;
+  string binary_sha256 = 3;
+}

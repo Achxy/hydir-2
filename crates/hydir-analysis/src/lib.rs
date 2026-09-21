@@ -6,8 +6,8 @@
 
 use hydir_backend::{HydirError, MAX_BINARY_BYTES, import_elf};
 use hydir_core::{
-    Address, AssumptionSpec, CallSpec, FactProvenance, FactSource, ProgramSpec, RecoveryState,
-    ReferenceSpec,
+    Address, AssumptionSpec, CallSpec, FactProvenance, FactSource, Location, ProgramSpec,
+    RecoveryState, ReferenceSpec,
 };
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
@@ -19,6 +19,138 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_FUNCTIONS: usize = 512;
 const MAX_FUNCTION_BYTES: u64 = 4096;
+pub const MAX_INDIRECT_TABLE_TARGETS: usize = 256;
+
+/// Recover a consecutive little-endian pointer table whose targets all stay
+/// inside one executable function scope. Recovery stops at the first invalid
+/// or out-of-scope entry and never treats a later value as evidence across a
+/// gap. Callers decide whether one target is sufficient or table evidence
+/// requires at least two entries.
+pub fn recover_pointer_table_targets(
+    bytes: &[u8],
+    spec: &ProgramSpec,
+    table: Location,
+    function_start: Location,
+    function_size: u64,
+    max_targets: usize,
+) -> Vec<Location> {
+    if max_targets == 0
+        || max_targets > MAX_INDIRECT_TABLE_TARGETS
+        || table.address_space != function_start.address_space
+    {
+        return Vec::new();
+    }
+    let Some(function_end) = function_start.value.0.checked_add(function_size) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for index in 0..max_targets {
+        let Some(slot_value) = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(8))
+            .and_then(|offset| table.value.0.checked_add(offset))
+        else {
+            break;
+        };
+        let slot = Location {
+            address_space: table.address_space,
+            value: Address(slot_value),
+        };
+        let Some(raw_target) = read_location_u64(bytes, spec, slot) else {
+            break;
+        };
+        let target = Location {
+            address_space: function_start.address_space,
+            value: Address(raw_target),
+        };
+        if !(function_start.value.0..function_end).contains(&raw_target)
+            || !is_executable_location(spec, target)
+        {
+            break;
+        }
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn read_location_u64(bytes: &[u8], spec: &ProgramSpec, location: Location) -> Option<u64> {
+    if let Some(target) = spec
+        .pointer_arrays
+        .iter()
+        .flat_map(|array| &array.entries)
+        .find(|entry| entry.slot == location)
+        .and_then(|entry| entry.target)
+    {
+        return (target.address_space == location.address_space).then_some(target.value.0);
+    }
+    if let Some(value) = spec.relocations.iter().find_map(|relocation| {
+        (relocation.location_ref == Some(location)).then(|| match &relocation.target {
+            hydir_core::RelocationTargetSpec::Absolute => u64::try_from(relocation.addend).ok(),
+            hydir_core::RelocationTargetSpec::Symbol {
+                location: Some(target),
+                defined: true,
+                ..
+            }
+            | hydir_core::RelocationTargetSpec::Section {
+                location: Some(target),
+                ..
+            } if target.address_space == location.address_space => {
+                target.value.0.checked_add_signed(relocation.addend)
+            }
+            _ => None,
+        })
+    }) {
+        return value;
+    }
+    let file_offset = if location.address_space == 0 && spec.file_kind != "Relocatable" {
+        spec.mapped_segments.iter().find_map(|segment| {
+            let relative = location.value.0.checked_sub(segment.virtual_address.0)?;
+            (relative.checked_add(8)? <= segment.file_size)
+                .then(|| segment.file_offset.0.checked_add(relative))
+                .flatten()
+        })
+    } else {
+        spec.sections.iter().find_map(|section| {
+            let start = section.location?;
+            if start.address_space != location.address_space {
+                return None;
+            }
+            let relative = location.value.0.checked_sub(start.value.0)?;
+            (relative.checked_add(8)? <= section.size)
+                .then(|| section.file_offset?.0.checked_add(relative))
+                .flatten()
+        })
+    }?;
+    let start = usize::try_from(file_offset).ok()?;
+    let raw: [u8; 8] = bytes.get(start..start.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_le_bytes(raw))
+}
+
+fn is_executable_location(spec: &ProgramSpec, location: Location) -> bool {
+    spec.mapped_segments.iter().any(|segment| {
+        segment.address_space == location.address_space
+            && segment.executable
+            && segment.virtual_address.0 <= location.value.0
+            && segment
+                .virtual_address
+                .0
+                .checked_add(segment.memory_size)
+                .is_some_and(|end| location.value.0 < end)
+    }) || spec.sections.iter().any(|section| {
+        section.kind == "Text"
+            && section.location.is_some_and(|start| {
+                start.address_space == location.address_space
+                    && start.value.0 <= location.value.0
+                    && start
+                        .value
+                        .0
+                        .checked_add(section.size)
+                        .is_some_and(|end| location.value.0 < end)
+            })
+    })
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct GlobalReference {
@@ -697,6 +829,40 @@ mod tests {
         assert_eq!(
             report.functions[0].possible_global_writes[0].address,
             Address(0x3000)
+        );
+    }
+
+    #[test]
+    fn pointer_table_recovery_is_consecutive_executable_and_scope_bounded() {
+        let bytes = include_bytes!("../../../fuzz/corpus/elf_import/dynamic_metadata.elf");
+        let spec = import_elf(bytes).unwrap();
+        let table = spec.pointer_arrays[0].location;
+        let targets = recover_pointer_table_targets(
+            bytes,
+            &spec,
+            table,
+            Location {
+                address_space: 0,
+                value: Address(0x1400),
+            },
+            0x100,
+            1,
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].value, Address(0x1443));
+        assert!(
+            recover_pointer_table_targets(
+                bytes,
+                &spec,
+                table,
+                Location {
+                    address_space: 0,
+                    value: Address(0x1434),
+                },
+                15,
+                1,
+            )
+            .is_empty()
         );
     }
 }

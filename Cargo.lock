@@ -1776,6 +1776,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gimli"
+version = "0.32.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2148,6 +2154,7 @@ name = "hydir-backend"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "hydir-loader",
  "hydir-semantics",
  "iced-x86",
  "object",
@@ -2160,6 +2167,7 @@ version = "0.1.0"
 dependencies = [
  "hydir-backend",
  "hydir-core",
+ "hydir-ir",
  "serde_json",
  "sha2 0.10.9",
 ]
@@ -2173,7 +2181,9 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-decompile",
  "hydir-interchange",
+ "hydir-ir",
  "hydir-patch",
  "hydir-project",
  "hydir-recompile",
@@ -2197,6 +2207,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydir-decompile"
+version = "0.1.0"
+dependencies = [
+ "hydir-analysis",
+ "hydir-backend",
+ "hydir-c",
+ "hydir-core",
+ "hydir-ir",
+ "hydir-loader",
+ "hydir-semantics",
+ "iced-x86",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "hydir-gui"
 version = "0.1.0"
 dependencies = [
@@ -2208,6 +2235,8 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-decompile",
+ "hydir-ir",
  "hydir-patch",
  "hydir-project",
  "hydir-recompile",
@@ -2229,6 +2258,25 @@ dependencies = [
  "hydir-core",
  "object",
  "prost",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "hydir-ir"
+version = "0.1.0"
+dependencies = [
+ "hydir-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hydir-loader"
+version = "0.1.0"
+dependencies = [
+ "gimli",
+ "hydir-core",
+ "object",
  "sha2 0.10.9",
 ]
 
@@ -2286,7 +2334,10 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-decompile",
  "hydir-interchange",
+ "hydir-ir",
+ "hydir-loader",
  "hydir-patch",
  "hydir-recompile",
  "hydir-transform",

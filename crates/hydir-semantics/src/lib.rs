@@ -193,6 +193,10 @@ pub const ZF: u8 = 1 << 0;
 pub const SF: u8 = 1 << 1;
 pub const OF: u8 = 1 << 2;
 pub const CF: u8 = 1 << 3;
+pub const PF: u8 = 1 << 4;
+pub const AF: u8 = 1 << 5;
+// The legacy classifier's flag contract predates PF/AF. Native lifting adds
+// their exact or explicitly undefined effects in `hydir-decompile`.
 const ALL_FLAGS: u8 = ZF | SF | OF | CF;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

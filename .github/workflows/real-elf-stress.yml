@@ -1,0 +1,27 @@
+name: real ELF stress
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+jobs:
+  stripped-go-x86-64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install C compilers
+        run: sudo apt-get update && sudo apt-get install -y clang gcc
+      - name: Decompile and compile every recovered function
+        run: bash scripts/demo-real-elf-stress.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-elf-stress-summary
+          path: |
+            target/demo-real-elf-stress/*/coverage.json
+            target/demo-real-elf-stress/*/manifest.json
+            target/demo-real-elf-stress/*/summary.json

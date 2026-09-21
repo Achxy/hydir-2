@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A deep dive into HydIR jump-table recovery: linked absolute pointers, relocation-backed relative entries, CFG edges, and unresolved switch defaults.">
+  <link rel="canonical" href="https://hydir.wiki/articles/recovering-jump-tables">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Recovering Jump Tables from x86-64 ELF — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#article">Skip to article</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs" aria-current="page">Blogs</a></nav></header>
+  <main class="site-main prose" id="article">
+    <article>
+      <p class="eyebrow"><a href="/blogs">Blogs</a> / Control-flow recovery</p>
+      <h1>Recovering Jump Tables from x86-64 ELF</h1>
+      <p class="lead">An indirect jump does not encode its destination in the instruction. To recover a switch, HydIR must connect the jump's addressing expression to bytes or relocations in a table, then justify each target as executable code within the selected function. Two checked-in fixtures show both routes: an absolute pointer table in a linked ELF and a relative table in an unlinked object.</p>
+
+      <h2>The control-flow problem</h2>
+      <p>A direct branch carries an encoded destination. An instruction such as <code>jmp qword ptr [rdi * 8 + jump_targets]</code> instead reads a destination from memory. Recursive decoding can follow the preceding comparison and the branch to the default case, but without table recovery it stops at that indirect jump. The case blocks might be present elsewhere in <code>.text</code>; their mere proximity does not prove that the jump can reach them.</p>
+      <p>The fixtures implement the same broad pattern. A 32-bit unsigned comparison routes out-of-range inputs to a default return of zero. In-range inputs select a table entry and return 10, 20, 30, or (in the relative fixture) 40. The <code>ja</code> guard is an unsigned “above” test, so a negative signed value in EDI also takes the default path when viewed as an unsigned 32-bit index. HydIR records the machine-level guard and target evidence rather than assuming a recovered source-language <code>switch</code>.</p>
+
+      <h2>Case one: a linked table of absolute pointers</h2>
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/tests/fixtures/jump_table.S">absolute-table fixture</a> contains this dispatch:</p>
+      <pre><code class="language-asm">table_dispatch:
+    cmp edi, 2
+    ja .Ldefault
+    jmp qword ptr [rdi * 8 + jump_targets]
+
+jump_targets:
+    .quad .Lcase0
+    .quad .Lcase1
+    .quad .Lcase2</code></pre>
+      <p>In the checked-in linked ELF, <code>table_dispatch</code> begins at <code>0x201214</code> and its symbol and unwind records both give a 33-byte extent. The indirect jump is at <code>0x201219</code>. Its decoded operand has an eight-byte scale and a table displacement of <code>0x2001b0</code>. ProgramSpec maps that virtual table address to file offset <code>0x1b0</code>; the table occupies 24 bytes of <code>.rodata</code>.</p>
+      <section class="table-scroll" tabindex="0" aria-label="Absolute jump-table entries"><table>
+        <thead><tr><th>Table slot</th><th>Little-endian bytes</th><th>Decoded pointer</th><th>Case result</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x2001b0</code></td><td><code>20 12 20 00 00 00 00 00</code></td><td><code>0x201220</code></td><td>10</td></tr>
+          <tr><td><code>0x2001b8</code></td><td><code>26 12 20 00 00 00 00 00</code></td><td><code>0x201226</code></td><td>20</td></tr>
+          <tr><td><code>0x2001c0</code></td><td><code>2c 12 20 00 00 00 00 00</code></td><td><code>0x20122c</code></td><td>30</td></tr>
+        </tbody>
+      </table></section>
+      <p>For this indexed memory operand, HydIR reads consecutive 64-bit little-endian entries, subject to a 256-entry cap. A candidate must land in executable text and inside the selected function extent. Recovery stops at the first unreadable or out-of-scope slot; it does not skip over a gap and resume at a convenient later value. At least two valid entries are required before an indexed pointer table is accepted as table evidence. These constraints keep adjacent data or an unrelated function from becoming a case merely because its bytes resemble an address.</p>
+      <p>The resulting MachineIR retains the original <code>jmp</code> bytes, <code>ff24fdb0012000</code>, and adds three <code>indirect_target</code> edges. The branch at <code>0x201217</code> still has its separate taken edge to the default block at <code>0x201232</code> and fallthrough edge to the indirect jump. The recovered paths are:</p>
+      <section class="table-scroll" tabindex="0" aria-label="Absolute-table dispatch graph"><table>
+        <thead><tr><th>Origin</th><th>Edge</th><th>Destination</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x201217</code> <code>ja</code></td><td>Taken, out of range</td><td><code>0x201232</code>, return 0</td></tr>
+          <tr><td><code>0x201217</code> <code>ja</code></td><td>Fallthrough</td><td><code>0x201219</code>, indirect jump</td></tr>
+          <tr><td><code>0x201219</code> <code>jmp</code></td><td>Recovered target 0</td><td><code>0x201220</code>, return 10</td></tr>
+          <tr><td><code>0x201219</code> <code>jmp</code></td><td>Recovered target 1</td><td><code>0x201226</code>, return 20</td></tr>
+          <tr><td><code>0x201219</code> <code>jmp</code></td><td>Recovered target 2</td><td><code>0x20122c</code>, return 30</td></tr>
+        </tbody>
+      </table></section>
+
+      <h3>The evidence required for one edge</h3>
+      <p>For a linked pointer table, four checks support each <code>indirect_target</code> edge. First, the decoded operand must match a supported table-addressing form; an arbitrary memory expression is not sufficient. Second, HydIR must identify a bounded table base from a mapped address or a proven constant register. Third, it must read a consecutive slot from file-backed data or resolve that slot from relocation evidence. Fourth, the resulting address must belong to executable text and to the selected function's extent. Failing any check leaves the jump unresolved instead of manufacturing an edge.</p>
+      <p>The linked fixture's recovered jump can be inspected directly in MachineIR. This abridged JSON retains the dispatch address and all three target edges:</p>
+      <pre><code class="language-json">{
+  "address": {"address_space": 0, "value": "0x0000000000201219"},
+  "mnemonic": "jmp",
+  "bytes_hex": "ff24fdb0012000",
+  "edges": [
+    {"kind": "indirect_target", "target": {"address_space": 0, "value": "0x0000000000201220"}},
+    {"kind": "indirect_target", "target": {"address_space": 0, "value": "0x0000000000201226"}},
+    {"kind": "indirect_target", "target": {"address_space": 0, "value": "0x000000000020122c"}}
+  ]
+}</code></pre>
+      <p>The <code>bounded_indirect_targets</code> diagnostic reports three in-function targets across one indirect site. The index's <code>candidate_targets</code> list contains the same three case entries, while the function's symbol and unwind evidence remain separate. In particular, the table entries are CFG destinations inside <code>table_dispatch</code>; they are not three newly discovered functions.</p>
+
+      <h2>Case two: a relocatable table of signed offsets</h2>
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/tests/fixtures/relative_jump_table.S">relative-table fixture</a> is an ELF relocatable object (<code>ET_REL</code>). Its dispatch computes a destination rather than loading a full pointer:</p>
+      <pre><code class="language-asm">relative_table_dispatch:
+    cmp edi, 3
+    ja .Ldefault
+    lea rax, [rip + .Ltable]
+    movsxd rcx, dword ptr [rax + rdi * 4]
+    add rcx, rax
+    jmp rcx
+
+.Ltable:
+    .long .Lcase0 - .Ltable
+    .long .Lcase1 - .Ltable
+    .long .Lcase2 - .Ltable
+    .long .Lcase3 - .Ltable</code></pre>
+      <p><code>movsxd</code> sign-extends a 32-bit table value. Adding the table base converts that signed relative value into a code target. An <code>ET_REL</code> file has not been assigned final process addresses: in HydIR's ProgramSpec, <code>.text</code> uses address space 2 and <code>.rodata</code> uses address space 4. The dispatch starts at <code>(2, 0x0)</code>; the table starts at <code>(4, 0x0)</code>. Treating both zero offsets as the same virtual address would be incorrect.</p>
+      <p>The encoded <code>lea</code> instruction at <code>(2, 0x5)</code> contains a linker placeholder, not a finalized displacement. A 32-bit PC-relative relocation at <code>(2, 0x8)</code> identifies the <code>.rodata</code> base. Each four-byte table slot has its own PC-relative relocation toward <code>.text</code>. HydIR verifies the contiguous <code>lea</code> → <code>movsxd</code> → <code>add</code> → register <code>jmp</code> pattern, resolves the table base from the instruction relocation, and interprets the slot relocations in their section address spaces. It does not infer targets from placeholder bytes.</p>
+      <p>For this fixture, the slot relocations refer to the start of <code>.text</code> and carry addends 21, 31, 41, and 51. The target offset for slot <code>i</code> is the relocation target base plus its addend minus the slot's <code>4i</code> offset. The resulting calculation is directly checkable:</p>
+      <section class="table-scroll" tabindex="0" aria-label="Relative jump-table relocation arithmetic"><table>
+        <thead><tr><th>Slot in address space 4</th><th>Addend</th><th>Subtract slot offset</th><th>Target in address space 2</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x0</code></td><td>21</td><td>0</td><td><code>0x15</code>, return 10</td></tr>
+          <tr><td><code>0x4</code></td><td>31</td><td>4</td><td><code>0x1b</code>, return 20</td></tr>
+          <tr><td><code>0x8</code></td><td>41</td><td>8</td><td><code>0x21</code>, return 30</td></tr>
+          <tr><td><code>0xc</code></td><td>51</td><td>12</td><td><code>0x27</code>, return 40</td></tr>
+        </tbody>
+      </table></section>
+      <p>The arithmetic above is section-relative. The relocation target is <code>(2, 0x0)</code>, and each slot is <code>(4, 4i)</code>; the calculation yields an offset in address space 2, not a finalized virtual address. Reading the four raw 32-bit slot words as if they were already linked would lose the symbol and addend information that makes those destinations meaningful. The instruction relocation at <code>(2, 0x8)</code> is equally necessary: without it, the <code>lea</code> placeholder does not identify the table's address space or base.</p>
+      <p>Each target must remain in the 48-byte function extent and in executable text. Recovery stops at the first missing, invalid, or out-of-scope relocation and accepts at most 256 consecutive slots. MachineIR for the <code>jmp rcx</code> at <code>(2, 0x13)</code> consequently contains four <code>indirect_target</code> edges to <code>(2, 0x15)</code>, <code>(2, 0x1b)</code>, <code>(2, 0x21)</code>, and <code>(2, 0x27)</code>. The <code>ja</code> at <code>(2, 0x3)</code> separately reaches the default return at <code>(2, 0x2d)</code>.</p>
+
+      <h2>Why recovery iterates</h2>
+      <p>An initial recursive pass reaches the indirect jump but cannot follow its cases until table evidence has supplied targets. HydIR collects bounded targets for recovered indirect sites, decodes the newly reachable blocks, and repeats when those blocks expose more control flow. The process has an explicit 32-pass limit and retains diagnostics for any unresolved outcome. The FunctionIndex keeps candidate targets as evidence; a candidate is not automatically promoted into a new function or an exact source-level case mapping.</p>
+      <p>This distinction matters for both examples. The graph now contains the case bodies, but table recovery by itself does not prove that the preceding guard admits exactly those indices under every machine-state condition. It also does not solve arbitrary register value sets or every compiler's table encoding. HydIR records the discovered destinations and preserves the remaining uncertainty.</p>
+
+      <h2>The unresolved switch default survives C emission</h2>
+      <p>CIR represents the linked dispatch at <code>0x201219</code> as a <code>switch</code> terminator with three target addresses and <code>unresolved_default: true</code>. The relative fixture has the same terminator shape with four targets at <code>(2, 0x13)</code>. The relevant linked CIR fields are:</p>
+      <pre><code class="language-json">{
+  "kind": "switch",
+  "dispatch": {"address_space": 0, "value": "0x0000000000201219"},
+  "targets": [
+    {"address_space": 0, "value": "0x0000000000201220"},
+    {"address_space": 0, "value": "0x0000000000201226"},
+    {"address_space": 0, "value": "0x000000000020122c"}
+  ],
+  "unresolved_default": true
+}</code></pre>
+      <p>The generated switch is over an indirect target expression, not a claimed reconstruction of the original source expression <code>switch (edi)</code>. A shortened excerpt from the linked fixture's low-level C shows the distinction:</p>
+      <pre><code class="language-c">switch (hydir_indirect_target(state, UINT64_C(0x201219))) {
+  case UINT64_C(0x201220): goto case_0;
+  case UINT64_C(0x201226): goto case_1;
+  case UINT64_C(0x20122c): goto case_2;
+  default:
+    hydir_unknown_control(state, UINT64_C(0));
+    return;
+}</code></pre>
+      <p>The labels above abbreviate the generated block labels; the cases, target addresses, and unknown-control branch reflect the emitted artifact. The actual assembly's out-of-range branch to <code>.Ldefault</code> is a separate, known CFG edge. The switch's unresolved default is about the indirect jump if it produces an address outside the recovered target set. Collapsing those two defaults would claim a proof the analysis has not made.</p>
+      <p>For these checked-in artifacts, the reported status is deliberately split into independent claims:</p>
+      <section class="table-scroll" tabindex="0" aria-label="Jump-table artifact status"><table>
+        <thead><tr><th>Fixture</th><th>Graph</th><th>Semantics</th><th>Unit verification</th><th>C views</th><th>Rewrite</th></tr></thead>
+        <tbody>
+          <tr><td>Linked absolute table</td><td><code>complete</code></td><td><code>conservative</code></td><td><code>statically_validated</code></td><td>Low-level and structured</td><td><code>false</code></td></tr>
+          <tr><td>Relocatable relative table</td><td><code>complete</code></td><td><code>conservative</code></td><td><code>statically_validated</code></td><td>Low-level only</td><td><code>false</code></td></tr>
+        </tbody>
+      </table></section>
+      <p><code>complete</code> describes the recovered graph within the selected function boundary. It does not erase the CIR switch's <code>unresolved_default</code> or upgrade conservative semantic fidelity. Static validation checks artifact structure; it is distinct from a differential execution test. Successful C compilation checks the generated C and its helper contract, but does not prove that an arbitrary input can only select the enumerated cases or authorize a binary rewrite.</p>
+
+      <h2>Reproduce the analysis</h2>
+      <p>These commands inspect the exact checked-in fixtures without executing them. Run them from the repository root with the pinned Rust toolchain:</p>
+      <pre><code class="language-shell">cargo run --locked --bin hydirctl -- discover fuzz/corpus/elf_import/jump_table.elf
+cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/jump_table.elf --function table_dispatch --ir machine
+cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/jump_table.elf --function table_dispatch --ir cir
+cargo run --locked --bin hydirctl -- decompile fuzz/corpus/elf_import/jump_table.elf --function table_dispatch --view unit
+
+cargo run --locked --bin hydirctl -- inspect fuzz/corpus/elf_import/relative_jump_table.o
+cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/relative_jump_table.o --function relative_table_dispatch --ir machine
+cargo run --locked --bin hydirctl -- decompile fuzz/corpus/elf_import/relative_jump_table.o --function relative_table_dispatch --view unit</code></pre>
+      <p>In the MachineIR JSON, inspect the <code>edges</code> on each indirect <code>jmp</code> and the <code>bounded_indirect_targets</code> diagnostic. In the CIR JSON, inspect the <code>switch</code> terminator's <code>targets</code> and <code>unresolved_default</code> fields. In the unit, compare <code>structural_completeness</code>, <code>semantic_fidelity</code>, <code>verification</code>, and <code>rewrite_ready</code> independently. The <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/demo-native-decompiler.sh">Linux native fixture gate</a> also runs discovery, coverage, batch C emission, deterministic re-emission, and strict C compilation across the broader pinned corpus.</p>
+      <p>Jump-table recovery is useful because it makes previously unreachable case blocks inspectable. Its output remains a bounded set of justified targets with an explicit unknown remainder, which is the appropriate contract for further analysis.</p>
+    </article>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/blogs">All blogs</a> · <a href="https://github.com/Achxy/hydir-2">Source</a></p></footer>
+</body>
+</html>

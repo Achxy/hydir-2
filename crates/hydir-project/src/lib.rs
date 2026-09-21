@@ -560,7 +560,13 @@ mod tests {
             file_kind: "executable".to_owned(),
             image_base: None,
             entry_point: None,
+            entry_location: None,
             data_layout: None,
+            program_headers: Vec::new(),
+            dynamic_symbols: Vec::new(),
+            runtime_ranges: Vec::new(),
+            unwind_ranges: Vec::new(),
+            pointer_arrays: Vec::new(),
             address_spaces: Vec::new(),
             mapped_segments: vec![MappedSegmentSpec {
                 id: "load-0".to_owned(),

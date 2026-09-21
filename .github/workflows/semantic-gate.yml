@@ -20,6 +20,8 @@ jobs:
         run: cargo test --locked --workspace
       - name: Fuzz target build
         run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
+      - name: Native ELF decompiler artifacts and C11
+        run: bash scripts/demo-native-decompiler.sh
       - name: Triton bridge protocol tests
         env:
           HYDIR_TRITON_PYTHON: .venv/bin/python

@@ -9,9 +9,17 @@ use hydir_c::{
     emit_decision_region_llvm, emit_structured_c,
 };
 use hydir_core::{
-    CallingConvention, ScalarType, annotation_address_in_spec, parse_program_spec_json,
+    CallingConvention, Location, ScalarType, annotation_address_in_spec, parse_program_spec_json,
+};
+use hydir_decompile::{
+    NativeDecompilation, decompile_function_at, decompile_function_unit_at,
+    decompile_indexed_function_unit, decompile_symbol, decompile_symbol_unit,
+    discover_function_candidates, discover_functions, export_function_ir_llvm,
+    lift_machine_function, lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
+    measure_native_coverage,
 };
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
+use hydir_ir::MachineFunctionIr;
 mod local;
 mod passes;
 mod patch;
@@ -36,6 +44,7 @@ Usage:
   hydirctl doctor
   hydirctl inspect <elf>
   hydirctl disassemble <elf>
+  hydirctl discover <elf>
   hydirctl triton <elf> <function-symbol>
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
@@ -46,12 +55,17 @@ Usage:
   hydirctl hydir-spec-decompile <hydir-spec.pb> <linked-elf> <block-uid> [--output <unit.json>]
   hydirctl hydir-spec-report <hydir-spec.pb> <linked-elf>
   hydirctl cfg <elf> <function-symbol>
-  hydirctl region <linked-elf> <function-symbol>
+  hydirctl region <elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|function|cir|llvm>
   hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
+  hydirctl decompile <elf> --function <function-id-or-symbol> --view <low|structured|unit>
+  hydirctl decompile-all <elf> --output-dir <new-directory>
+  hydirctl explain <elf> --function <function-id-or-symbol> [--address <hex-address>]
+  hydirctl coverage <elf>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -65,9 +79,13 @@ Usage:
   hydirctl local annotate <elf> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value> [--db <private-sqlite>]
   hydirctl remote <operation> ...
 
-Symbol mode requires a non-stripped function symbol. Address mode requires an
-analyst-supplied virtual entry and exact byte extent, and works on stripped
-linked ELF files. --assume-u64x2 explicitly
+Legacy symbol mode requires a non-stripped function symbol. Native --function
+mode also accepts a FunctionIndex ID discovered from ELF entry, dynamic symbol,
+unwind FDE, init/fini, or direct-call evidence; candidate extents remain partial. Legacy
+symbol-backed native lifting supports linked and relocatable ELF files;
+relocatable control targets come from ELF relocations, never placeholder bytes.
+address mode requires an analyst-supplied virtual entry and exact byte extent,
+and works on stripped linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
 Rebuild supports local and authenticated-loopback operations for a narrow
@@ -97,6 +115,60 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&disassemble_elf(&bytes)?)?
+            );
+        }
+        Some("discover") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&discover_functions(&bytes)?)?
+            );
+        }
+        Some("coverage") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&measure_native_coverage(&bytes)?)?
+            );
+        }
+        Some("explain") if (args.len() == 4 || args.len() == 6) && args[2] == "--function" => {
+            let requested_address = if args.len() == 6 {
+                if args[4] != "--address" {
+                    return Err(HELP.into());
+                }
+                Some(parse_u64_auto(&args[5], "instruction address")?)
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[1])?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let machine = lift_native_selection(&bytes, &selection)?;
+            let instructions = machine
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+                .filter(|instruction| {
+                    requested_address.is_none_or(|address| instruction.address.value.0 == address)
+                })
+                .collect::<Vec<_>>();
+            if requested_address.is_some() && instructions.is_empty() {
+                return Err(
+                    "requested address is not a recovered instruction in this function".into(),
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "function_id": machine.function_id,
+                    "name": machine.name,
+                    "entry": machine.entry,
+                    "structural_completeness": machine.structural_completeness,
+                    "semantic_fidelity": machine.semantic_fidelity,
+                    "verification": machine.verification,
+                    "instructions": instructions,
+                    "diagnostics": machine.diagnostics,
+                    "rewrite_ready": false,
+                }))?
             );
         }
         Some("doctor") if args.len() == 1 => {
@@ -161,6 +233,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                         triton_helper.display().to_string()
                     },
                     "native_elf_import": true,
+                    "native_decompiler": true,
+                    "native_decompiler_scope": "ProgramSpec v5 -> FunctionIndex v1 -> MachineIR -> StateIR -> FunctionIR -> CIR -> C11; symbol, unwind-FDE, entry, direct-call and init/fini seeds; partial results fail closed",
+                    "native_loader_metadata": "ELF64 program headers, GNU-versioned dynamic symbols, location-aware relocations, PLT/GOT/TLS ranges, linked .eh_frame FDEs, init/fini arrays, and symbol-backed ET_REL lifting",
                     "direct_cfg_scalar_llvm_lift": true,
                     "symbol_scoped_cfg_export": true,
                     "conservative_global_effect_analysis": true,
@@ -505,6 +580,41 @@ fn run() -> Result<(), Box<dyn Error>> {
             let cfg = recover_at_cfg(&bytes, address, size)?;
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
+        Some("lift") if args.len() == 6 && args[2] == "--function" && args[4] == "--ir" => {
+            let bytes = read_binary(&args[1])?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let machine = lift_native_selection(&bytes, &selection)?;
+            match args[5].as_str() {
+                "machine" => println!("{}", serde_json::to_string_pretty(&machine)?),
+                "state" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&lower_state_ir(&machine)?)?
+                ),
+                "function" => {
+                    let state = lower_state_ir(&machine)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&lower_function_ir(&machine, &state)?)?
+                    );
+                }
+                "cir" => {
+                    let state = lower_state_ir(&machine)?;
+                    let function = lower_function_ir(&machine, &state)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&lower_cir(&machine, &function)?)?
+                    );
+                }
+                "llvm" => {
+                    let state = lower_state_ir(&machine)?;
+                    let function = lower_function_ir(&machine, &state)?;
+                    print!("{}", export_function_ir_llvm(&function)?);
+                }
+                _ => {
+                    return Err("native --ir must be machine, state, function, cir, or llvm".into());
+                }
+            }
+        }
         Some("lift") if args.len() == 4 || args.len() == 6 => {
             if args[3] != "--assume-u64x2" {
                 return Err("lift requires explicit --assume-u64x2 prototype assertion".into());
@@ -565,6 +675,177 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 print!("{ir}");
             }
+        }
+        Some("decompile") if args.len() == 6 && args[2] == "--function" && args[4] == "--view" => {
+            let bytes = read_binary(&args[1])?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            match args[5].as_str() {
+                "low" => print!(
+                    "{}",
+                    decompile_native_selection(&bytes, &selection)?.low_level_c
+                ),
+                "structured" => {
+                    let native = decompile_native_selection(&bytes, &selection)?;
+                    let source = native.structured_c.ok_or(
+                        "structured C is unavailable for this function; request --view low or unit",
+                    )?;
+                    print!("{source}");
+                }
+                "unit" => match &selection {
+                    NativeFunctionSelection::Symbol(symbol) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decompile_symbol_unit(&bytes, symbol)?)?
+                    ),
+                    NativeFunctionSelection::Discovered(entry) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decompile_function_unit_at(&bytes, *entry)?)?
+                    ),
+                },
+                _ => return Err("native --view must be low, structured, or unit".into()),
+            }
+        }
+        Some("decompile-all") if args.len() == 4 && args[2] == "--output-dir" => {
+            let bytes = read_binary(&args[1])?;
+            let index = discover_function_candidates(&bytes)?;
+            let output_dir = Path::new(&args[3]);
+            if output_dir.exists() {
+                return Err(format!(
+                    "output directory {} already exists; refusing to merge or overwrite",
+                    output_dir.display()
+                )
+                .into());
+            }
+            fs::create_dir(output_dir)?;
+            let mut results = Vec::new();
+            let mut attempted = std::collections::BTreeSet::new();
+            for function in &index.functions {
+                if !attempted.insert(function.id.clone()) {
+                    continue;
+                }
+                let display_name = function
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("sub_{:x}", function.entry.value.0));
+                let stem = format!(
+                    "{:05}-{}",
+                    results.len(),
+                    native_file_component(&display_name)
+                );
+                let symbol_backed = function
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == "elf_symbol");
+                if !symbol_backed {
+                    match decompile_indexed_function_unit(&bytes, &index, &function.id) {
+                        Ok(unit) => {
+                            let unit_path = output_dir.join(format!("{stem}.unit.json"));
+                            let low_path = output_dir.join(format!("{stem}.low.c"));
+                            write_new_or_identical(&unit_path, &serde_json::to_vec_pretty(&unit)?)?;
+                            write_new_or_identical(
+                                &low_path,
+                                unit.low_level_c
+                                    .as_deref()
+                                    .unwrap_or(&unit.c_source)
+                                    .as_bytes(),
+                            )?;
+                            let structured_path = if let Some(source) = unit.structured_c.as_deref()
+                            {
+                                let path = output_dir.join(format!("{stem}.structured.c"));
+                                write_new_or_identical(&path, source.as_bytes())?;
+                                Some(
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string(),
+                                )
+                            } else {
+                                None
+                            };
+                            results.push(json!({
+                                "function_id": function.id,
+                                "name": display_name,
+                                "status": "decompiled",
+                                "unit": unit_path.file_name().unwrap_or_default().to_string_lossy(),
+                                "low_level_c": low_path.file_name().unwrap_or_default().to_string_lossy(),
+                                "structured_c": structured_path,
+                                "structural_completeness": unit.structural_completeness,
+                                "semantic_fidelity": unit.semantic_fidelity,
+                                "rewrite_ready": unit.rewrite_ready,
+                            }));
+                        }
+                        Err(error) => results.push(json!({
+                            "function_id": function.id,
+                            "name": display_name,
+                            "status": "diagnostic",
+                            "diagnostic": error,
+                        })),
+                    }
+                    continue;
+                }
+                let Some(symbol) = function.name.as_deref() else {
+                    results.push(json!({
+                        "function_id": function.id,
+                        "name": display_name,
+                        "status": "diagnostic",
+                        "diagnostic": "ELF symbol evidence has no name",
+                    }));
+                    continue;
+                };
+                match decompile_symbol_unit(&bytes, symbol) {
+                    Ok(unit) => {
+                        let unit_path = output_dir.join(format!("{stem}.unit.json"));
+                        let low_path = output_dir.join(format!("{stem}.low.c"));
+                        write_new_or_identical(&unit_path, &serde_json::to_vec_pretty(&unit)?)?;
+                        write_new_or_identical(
+                            &low_path,
+                            unit.low_level_c
+                                .as_deref()
+                                .unwrap_or(&unit.c_source)
+                                .as_bytes(),
+                        )?;
+                        let structured_path = if let Some(source) = unit.structured_c.as_deref() {
+                            let path = output_dir.join(format!("{stem}.structured.c"));
+                            write_new_or_identical(&path, source.as_bytes())?;
+                            Some(
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        };
+                        results.push(json!({
+                            "function_id": function.id,
+                            "symbol": symbol,
+                            "status": "decompiled",
+                            "unit": unit_path.file_name().unwrap_or_default().to_string_lossy(),
+                            "low_level_c": low_path.file_name().unwrap_or_default().to_string_lossy(),
+                            "structured_c": structured_path,
+                            "structural_completeness": unit.structural_completeness,
+                            "semantic_fidelity": unit.semantic_fidelity,
+                            "rewrite_ready": unit.rewrite_ready,
+                        }));
+                    }
+                    Err(error) => results.push(json!({
+                        "function_id": function.id,
+                        "symbol": symbol,
+                        "status": "diagnostic",
+                        "diagnostic": error,
+                    })),
+                }
+            }
+            let manifest = json!({
+                "schema_version": 1,
+                "binary_sha256": index.binary_sha256,
+                "function_index_schema_version": index.schema_version,
+                "results": results,
+            });
+            write_new_or_identical(
+                output_dir.join("manifest.json"),
+                &serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
         Some("decompile") if args.len() == 4 || args.len() == 6 => {
             if args[3] != "--assume-u64x2" {
@@ -659,6 +940,82 @@ fn run() -> Result<(), Box<dyn Error>> {
         _ => return Err(HELP.into()),
     }
     Ok(())
+}
+
+enum NativeFunctionSelection {
+    Symbol(String),
+    Discovered(Location),
+}
+
+fn resolve_native_function(
+    bytes: &[u8],
+    selector: &str,
+) -> Result<NativeFunctionSelection, Box<dyn Error>> {
+    let index = discover_function_candidates(bytes)?;
+    let mut matches = index
+        .functions
+        .iter()
+        .filter(|function| function.id == selector || function.name.as_deref() == Some(selector));
+    let function = matches
+        .next()
+        .ok_or_else(|| format!("native function selector {selector:?} was not discovered"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "native function selector {selector:?} is ambiguous; use the FunctionIndex id"
+        )
+        .into());
+    }
+    if function
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "elf_symbol")
+    {
+        function
+            .name
+            .clone()
+            .map(NativeFunctionSelection::Symbol)
+            .ok_or_else(|| "ELF symbol evidence has no symbol name".into())
+    } else {
+        Ok(NativeFunctionSelection::Discovered(function.entry))
+    }
+}
+
+fn lift_native_selection(
+    bytes: &[u8],
+    selection: &NativeFunctionSelection,
+) -> Result<MachineFunctionIr, Box<dyn Error>> {
+    Ok(match selection {
+        NativeFunctionSelection::Symbol(symbol) => lift_machine_function(bytes, symbol)?,
+        NativeFunctionSelection::Discovered(entry) => lift_machine_function_at(bytes, *entry)?,
+    })
+}
+
+fn decompile_native_selection(
+    bytes: &[u8],
+    selection: &NativeFunctionSelection,
+) -> Result<NativeDecompilation, Box<dyn Error>> {
+    Ok(match selection {
+        NativeFunctionSelection::Symbol(symbol) => decompile_symbol(bytes, symbol)?,
+        NativeFunctionSelection::Discovered(entry) => decompile_function_at(bytes, *entry)?,
+    })
+}
+
+fn native_file_component(value: &str) -> String {
+    let mut component = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect::<String>();
+    if component.is_empty() || component == "." || component == ".." {
+        component = "function".to_owned();
+    }
+    component
 }
 
 fn parse_address_extent(address: &str, size: &str) -> Result<(u64, u64), Box<dyn Error>> {

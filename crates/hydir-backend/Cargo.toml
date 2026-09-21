@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 hydir-core = { path = "../hydir-core" }
+hydir-loader = { path = "../hydir-loader" }
 hydir-semantics = { path = "../hydir-semantics" }
 object.workspace = true
 iced-x86.workspace = true

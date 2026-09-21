@@ -323,6 +323,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gimli"
+version = "0.32.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
+
+[[package]]
 name = "h2"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -408,6 +414,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hydir-analysis"
+version = "0.1.0"
+dependencies = [
+ "hydir-backend",
+ "hydir-core",
+ "iced-x86",
+ "object",
+ "serde",
+]
+
+[[package]]
 name = "hydir-api"
 version = "0.1.0"
 dependencies = [
@@ -423,6 +440,7 @@ name = "hydir-backend"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "hydir-loader",
  "hydir-semantics",
  "iced-x86",
  "object",
@@ -434,6 +452,7 @@ name = "hydir-c"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "hydir-ir",
  "serde_json",
 ]
 
@@ -447,13 +466,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydir-decompile"
+version = "0.1.0"
+dependencies = [
+ "hydir-analysis",
+ "hydir-backend",
+ "hydir-c",
+ "hydir-core",
+ "hydir-ir",
+ "hydir-loader",
+ "hydir-semantics",
+ "iced-x86",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hydir-fuzz"
 version = "0.0.0"
 dependencies = [
  "hydir-backend",
  "hydir-c",
+ "hydir-core",
+ "hydir-decompile",
  "hydir-interchange",
+ "hydir-ir",
  "libfuzzer-sys",
+ "serde_json",
 ]
 
 [[package]]
@@ -465,6 +505,24 @@ dependencies = [
  "hydir-core",
  "object",
  "prost",
+ "sha2",
+]
+
+[[package]]
+name = "hydir-ir"
+version = "0.1.0"
+dependencies = [
+ "hydir-core",
+ "serde",
+]
+
+[[package]]
+name = "hydir-loader"
+version = "0.1.0"
+dependencies = [
+ "gimli",
+ "hydir-core",
+ "object",
  "sha2",
 ]
 

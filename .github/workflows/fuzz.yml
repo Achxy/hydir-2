@@ -29,6 +29,14 @@ jobs:
         run: |
           cargo +nightly fuzz build hydir_spec
           cargo +nightly fuzz run hydir_spec -- -max_total_time=30 2>&1 | tee fuzz/fuzz-hydir_spec.log
+      - name: Native ELF pipeline corpus
+        run: |
+          cargo +nightly fuzz build native_pipeline
+          cargo +nightly fuzz run native_pipeline -- -max_total_time=30 2>&1 | tee fuzz/fuzz-native_pipeline.log
+      - name: Native IR JSON validators
+        run: |
+          cargo +nightly fuzz build native_ir_json
+          cargo +nightly fuzz run native_ir_json -- -max_total_time=30 2>&1 | tee fuzz/fuzz-native_ir_json.log
       - name: Report bounded fuzz crash evidence
         if: failure()
         shell: bash

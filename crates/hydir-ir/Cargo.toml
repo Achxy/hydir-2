@@ -1,0 +1,13 @@
+[package]
+name = "hydir-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hydir-core = { path = "../hydir-core" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

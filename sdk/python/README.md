@@ -1,4 +1,4 @@
-# HydIR Python SDK (compatible v1 plus additive v2)
+# HydIR Python SDK (compatible v1/v2 plus additive v3)
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,
@@ -7,8 +7,15 @@ durable lift jobs and event streams, a named allowlisted LLVM 14 pass
 experiment, restricted whole-executable rebuilding, and verified artifact
 download. There is no remote execution endpoint.
 
-`negotiate_api()` prefers `hydir.v2` discovery and falls back to v1 only when
-the endpoint reports `UNIMPLEMENTED`. v2 methods expose digest-checked
+`negotiate_api()` prefers `hydir.v3`, then falls back through v2 to v1 only
+when the newer endpoint reports `UNIMPLEMENTED`. v3 exposes isolated native
+whole-program jobs, replayable events, revision-checked analyst facts, and
+digest/media/schema/revision-checked ProgramSpec, FunctionIndex, coverage,
+MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
+artifacts. `get_program_artifact(...)` never executes the input and requires a
+FunctionIndex selector for function-scoped stages.
+
+v2 methods expose digest-checked
 `RegionSpec` v3, `PhysicalRegionIR` v1, and `DecompilationUnit` v1 JSON, compile scalar patch v1 into
 reversible `PatchBundle` v2, apply it with revision/idempotency protection, and
 request structural bundle verification. Behavioral verification remains false
@@ -93,7 +100,7 @@ Credential files may contain either a local 64-character static token or a
 bounded compact OIDC JWT; the server remains responsible for signature and
 claim validation.
 
-Generated `hydir*_pb2.py` and `hydir*_pb2_grpc.py` correspond to the v1 and v2
+Generated `hydir*_pb2.py` and `hydir*_pb2_grpc.py` correspond to the v1, v2, and v3
 schemas in `crates/hydir-api/proto/`, produced with `grpcio-tools==1.84.0`.
 Regenerate after API changes with:
 
@@ -101,7 +108,8 @@ Regenerate after API changes with:
 python -m grpc_tools.protoc -I../../crates/hydir-api/proto \
   --python_out=hydir_sdk --grpc_python_out=hydir_sdk \
   ../../crates/hydir-api/proto/hydir.proto \
-  ../../crates/hydir-api/proto/hydir_v2.proto
+  ../../crates/hydir-api/proto/hydir_v2.proto \
+  ../../crates/hydir-api/proto/hydir_v3.proto
 ```
 
 After regeneration, change generated sibling imports to relative imports (for

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from hydir_sdk import HydirClient
 from hydir_sdk import hydir_pb2 as proto
 from hydir_sdk import hydir_v2_pb2 as proto_v2
+from hydir_sdk import hydir_v3_pb2 as proto_v3
 
 
 class ClientBoundaryTests(unittest.TestCase):
@@ -106,6 +107,39 @@ class ClientBoundaryTests(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 client.verify_patch_bundle("project", 1, b"")
+
+    def test_v3_native_artifacts_are_hash_media_schema_and_revision_checked(self):
+        content = json.dumps({
+            "schema_version": 5,
+            "binary_sha256": "a" * 64,
+        }).encode("utf-8")
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=__import__("hashlib").sha256(content).hexdigest(),
+                media_type="application/vnd.hydir.program-spec+json;version=5",
+                content=content,
+                project_revision=4,
+            )
+            artifact = client.get_program_artifact("project", 4, "program_spec")
+            self.assertEqual(artifact["schema_version"], 5)
+            with self.assertRaises(ValueError):
+                client.get_program_artifact("project", 4, "machine")
+            with self.assertRaises(ValueError):
+                client.get_program_artifact("project", 4, "coverage", "function")
+
+    def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            with self.assertRaises(ValueError):
+                client.update_analyst_fact_v3(
+                    "project", 1, kind="name", value="entry", scope="binary"
+                )
+            client._call = lambda *_: proto_v3.MutationReply(
+                project_id="other", revision=2, binary_sha256="a" * 64,
+            )
+            with self.assertRaises(RuntimeError):
+                client.update_analyst_fact_v3(
+                    "project", 1, kind="comment", value="reviewed", scope="binary"
+                )
 
     def test_transform_rejects_untrusted_or_unallowlisted_pipeline(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:

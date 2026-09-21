@@ -14,6 +14,10 @@ libfuzzer-sys = "0.4"
 hydir-backend = { path = "../crates/hydir-backend" }
 hydir-c = { path = "../crates/hydir-c" }
 hydir-interchange = { path = "../crates/hydir-interchange" }
+hydir-core = { path = "../crates/hydir-core" }
+hydir-decompile = { path = "../crates/hydir-decompile" }
+hydir-ir = { path = "../crates/hydir-ir" }
+serde_json = "1.0"
 
 [[bin]]
 name = "elf_import"
@@ -39,6 +43,20 @@ bench = false
 [[bin]]
 name = "hydir_spec"
 path = "fuzz_targets/hydir_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_pipeline"
+path = "fuzz_targets/native_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_ir_json"
+path = "fuzz_targets/native_ir_json.rs"
 test = false
 doc = false
 bench = false

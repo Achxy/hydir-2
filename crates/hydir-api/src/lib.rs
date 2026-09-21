@@ -9,6 +9,10 @@ pub mod v2 {
     tonic::include_proto!("hydir.v2");
 }
 
+pub mod v3 {
+    tonic::include_proto!("hydir.v3");
+}
+
 /// Canonical HydIR interchange specification.
 pub mod interchange {
     tonic::include_proto!("hydir.interchange");
