@@ -31,10 +31,12 @@ use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, decompile_function_at, decompile_symbol,
     discover_functions, measure_native_coverage,
 };
+use hydir_hlc::{HighLevelCir, HighStatement, emit_typed_c, lower_high_level_cir};
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
     MachineOperation, StateFunctionIr,
 };
+use hydir_model::{AnalysisModel, TypeDefinitionKind, import_dwarf, infer_model, init_model};
 use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
     parse_patch_document,
@@ -191,6 +193,7 @@ enum Event {
     NativeSelected {
         label: String,
         native: Box<Result<NativeDecompilation, String>>,
+        typed: Box<Result<TypedNativeView, String>>,
     },
     Disassembled(Result<DisassemblyReport, String>),
     Triton(Result<serde_json::Value, String>),
@@ -1883,16 +1886,28 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 label,
                 selector,
                 entry,
-            } => Event::NativeSelected {
-                native: Box::new(match &source {
+            } => {
+                let native = match &source {
                     Source::Local(bytes) => decompile_function_at(bytes, entry),
                     Source::Remote(access) => {
                         runtime.block_on(remote_native_decompilation(access, &selector))
                     }
                     Source::None => Err("Open an ELF before selecting a function".to_owned()),
-                }),
-                label,
-            },
+                };
+                let typed = match (&source, &native) {
+                    (Source::Local(bytes), Ok(native)) => {
+                        local_typed_view(bytes, local_project.as_ref(), native)
+                    }
+                    (Source::Remote(_), _) => Err("Typed model view is local-only in this desktop release".to_owned()),
+                    (_, Err(error)) => Err(error.clone()),
+                    _ => Err("Open a local ELF to inspect typed C".to_owned()),
+                };
+                Event::NativeSelected {
+                    native: Box::new(native),
+                    typed: Box::new(typed),
+                    label,
+                }
+            }
             Task::Disassemble => Event::Disassembled(match &source {
                 Source::Local(bytes) => disassemble_elf(bytes).map_err(|error| error.to_string()),
                 Source::Remote(_) => {
@@ -2304,6 +2319,8 @@ enum GraphMode {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum NativeViewMode {
     Summary,
+    TypedC,
+    Types,
     LowLevelC,
     StructuredC,
     MachineIr,
@@ -2311,6 +2328,127 @@ enum NativeViewMode {
     FunctionIr,
     Cir,
     Evidence,
+}
+
+struct TypedNativeView {
+    model: AnalysisModel,
+    ir: Option<HighLevelCir>,
+    c: Option<String>,
+    diagnostic: Option<String>,
+}
+
+fn local_typed_view(
+    bytes: &[u8],
+    project: Option<&LocalProject>,
+    native: &NativeDecompilation,
+) -> Result<TypedNativeView, String> {
+    let saved = project
+        .map(|project| LocalProjectStore::open_default()?.load_model(project))
+        .transpose()?
+        .flatten();
+    let model = if let Some(model) = saved {
+        model
+    } else {
+        let mut model = init_model(bytes)?;
+        let _ = import_dwarf(bytes, &mut model)?;
+        infer_model(&mut model, &[(&native.machine_ir, &native.function_ir)])?;
+        model
+    };
+    hydir_model::validate_model(bytes, &model)?;
+    let (ir, c, diagnostic) =
+        match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
+            Ok(ir) => match emit_typed_c(&ir, &model) {
+                Ok(c) => (Some(ir), Some(c), None),
+                Err(error) => (Some(ir), None, Some(error)),
+            },
+            Err(error) => (None, None, Some(error)),
+        };
+    // The model remains available for type inspection even when typed C is
+    // outside the current lowering contract.
+    Ok(TypedNativeView {
+        model,
+        ir,
+        c,
+        diagnostic,
+    })
+}
+
+fn typed_source_sites(ui: &mut egui::Ui, ir: &HighLevelCir) -> Option<u64> {
+    let mut selected = None;
+    for statement in &ir.statements {
+        let (label, site) = match statement {
+            HighStatement::Let { name, site, .. } => (format!("local {name}"), site),
+            HighStatement::StoreField { field, site, .. } => (format!("store {field}"), site),
+            HighStatement::Return { site, .. } => ("return".to_owned(), site),
+        };
+        if ui
+            .small_button(format!("0x{:x} · {label}", site.value.0))
+            .clicked()
+        {
+            selected = Some(site.value.0);
+        }
+    }
+    selected
+}
+
+fn typed_types_view(ui: &mut egui::Ui, model: &AnalysisModel) -> Option<u64> {
+    ui.label(format!(
+        "Model revision {} · {} types · {} functions · {} unresolved conflicts",
+        model.revision,
+        model.types.len(),
+        model.functions.len(),
+        model.conflicts.len()
+    ));
+    let mut selected = None;
+    for ty in &model.types {
+        ui.collapsing(
+            format!(
+                "{} · {} bytes{}",
+                ty.name,
+                ty.size_bytes,
+                if ty.size_is_lower_bound {
+                    " or more"
+                } else {
+                    ""
+                }
+            ),
+            |ui| match &ty.kind {
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
+                    for field in fields {
+                        ui.label(format!(
+                            "+0x{:x}  {}: {:?}",
+                            field.offset_bytes, field.name, field.ty
+                        ));
+                        for evidence in &field.evidence {
+                            if let Some(site) = evidence.site {
+                                if ui
+                                    .small_button(format!(
+                                        "0x{:x} · {:?}: {}",
+                                        site.value.0, evidence.source, evidence.detail
+                                    ))
+                                    .clicked()
+                                {
+                                    selected = Some(site.value.0);
+                                }
+                            }
+                        }
+                    }
+                }
+                TypeDefinitionKind::Enum { variants, .. } => {
+                    for (name, value) in variants {
+                        ui.label(format!("{name} = {value}"));
+                    }
+                }
+                TypeDefinitionKind::Alias { target } => {
+                    ui.label(format!("Alias of {target:?}"));
+                }
+            },
+        );
+    }
+    for conflict in &model.conflicts {
+        ui.colored_label(ACCENT, format!("{}: {}", conflict.subject, conflict.detail));
+    }
+    selected
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2404,6 +2542,8 @@ struct AnalystApp {
     decompilation_error: Option<String>,
     native_decompilation: Option<NativeDecompilation>,
     native_decompilation_error: Option<String>,
+    typed_native_view: Option<TypedNativeView>,
+    typed_native_error: Option<String>,
     native_coverage: Option<NativeCoverageReport>,
     native_coverage_error: Option<String>,
     analysis: Option<AnalysisReport>,
@@ -2513,6 +2653,8 @@ impl AnalystApp {
             decompilation_error: None,
             native_decompilation: None,
             native_decompilation_error: None,
+            typed_native_view: None,
+            typed_native_error: None,
             native_coverage: None,
             native_coverage_error: None,
             analysis: None,
@@ -2793,7 +2935,11 @@ impl AnalystApp {
                         .take()
                         .unwrap_or(Tab::RegionStudio);
                 }
-                Event::NativeSelected { label, native } => {
+                Event::NativeSelected {
+                    label,
+                    native,
+                    typed,
+                } => {
                     if self.symbol.as_deref() != Some(&label) {
                         continue;
                     }
@@ -2810,6 +2956,16 @@ impl AnalystApp {
                             self.native_decompilation = None;
                             self.native_decompilation_error = Some(error.clone());
                             self.failure = Some(error);
+                        }
+                    }
+                    match *typed {
+                        Ok(view) => {
+                            self.typed_native_view = Some(view);
+                            self.typed_native_error = None;
+                        }
+                        Err(error) => {
+                            self.typed_native_view = None;
+                            self.typed_native_error = Some(error);
                         }
                     }
                     self.history.push(self.status.clone());
@@ -3368,6 +3524,8 @@ impl AnalystApp {
         self.decompilation_error = None;
         self.native_decompilation = None;
         self.native_decompilation_error = None;
+        self.typed_native_view = None;
+        self.typed_native_error = None;
         self.region_studio_mode = RegionStudioMode::Contract;
         self.native_view_mode = NativeViewMode::Summary;
     }
@@ -6881,6 +7039,8 @@ impl AnalystApp {
         ui.horizontal_wrapped(|ui| {
             for (mode, label) in [
                 (NativeViewMode::Summary, "Summary"),
+                (NativeViewMode::TypedC, "Typed C"),
+                (NativeViewMode::Types, "Types"),
                 (NativeViewMode::LowLevelC, "Low-level C"),
                 (NativeViewMode::StructuredC, "Structured C"),
                 (NativeViewMode::MachineIr, "MachineIR"),
@@ -6945,6 +7105,55 @@ impl AnalystApp {
             NativeViewMode::Summary => {
                 native_summary_view(ui, native);
                 None
+            }
+            NativeViewMode::TypedC => {
+                if let Some(typed) = &self.typed_native_view {
+                    if let Some(c) = &typed.c {
+                        code_artifact_view(
+                            ui,
+                            "TYPED C11 - BOUNDED SUPPORTED OPERATIONS",
+                            c,
+                            "native_typed_c",
+                        );
+                    } else {
+                        ui.colored_label(
+                            ACCENT,
+                            typed
+                                .diagnostic
+                                .as_deref()
+                                .unwrap_or("Typed C is unavailable for this function."),
+                        );
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new(
+                            "Source addresses (select an address, then open MachineIR or Evidence)",
+                        )
+                        .color(MUTED),
+                    );
+                    typed.ir.as_ref().and_then(|ir| typed_source_sites(ui, ir))
+                } else {
+                    ui.colored_label(
+                        ACCENT,
+                        self.typed_native_error
+                            .as_deref()
+                            .unwrap_or("Typed model is unavailable."),
+                    );
+                    None
+                }
+            }
+            NativeViewMode::Types => {
+                if let Some(typed) = &self.typed_native_view {
+                    typed_types_view(ui, &typed.model)
+                } else {
+                    ui.colored_label(
+                        ACCENT,
+                        self.typed_native_error
+                            .as_deref()
+                            .unwrap_or("Typed model is unavailable."),
+                    );
+                    None
+                }
             }
             NativeViewMode::LowLevelC => {
                 code_artifact_view(

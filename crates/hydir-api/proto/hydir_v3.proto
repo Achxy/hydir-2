@@ -64,7 +64,8 @@ message JobEvent {
 }
 
 // stage is one of program_spec, function_index, coverage, machine, state,
-// function, cir, llvm, or unit. Function-scoped stages require a FunctionIndex
+// function, cir, llvm, unit, analysis_model, high_level_cir, or typed_c.
+// Function-scoped stages require a FunctionIndex
 // id or an unambiguous discovered name in function_selector.
 message ProgramArtifactRequest {
   string project_id = 1;

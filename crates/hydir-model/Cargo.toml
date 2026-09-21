@@ -1,18 +1,20 @@
 [package]
-name = "hydir-project"
+name = "hydir-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+gimli.workspace = true
 hydir-core = { path = "../hydir-core" }
-hydir-model = { path = "../hydir-model" }
-rusqlite.workspace = true
+hydir-loader = { path = "../hydir-loader" }
+hydir-ir = { path = "../hydir-ir" }
+object.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
-hydir-loader = { path = "../hydir-loader" }
+hydir-decompile = { path = "../hydir-decompile" }
 tempfile = "3.23"

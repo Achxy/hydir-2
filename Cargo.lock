@@ -2182,8 +2182,10 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-hlc",
  "hydir-interchange",
  "hydir-ir",
+ "hydir-model",
  "hydir-patch",
  "hydir-project",
  "hydir-recompile",
@@ -2237,7 +2239,9 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-hlc",
  "hydir-ir",
+ "hydir-model",
  "hydir-patch",
  "hydir-project",
  "hydir-recompile",
@@ -2248,6 +2252,18 @@ dependencies = [
  "tokio",
  "tonic",
  "uuid",
+]
+
+[[package]]
+name = "hydir-hlc"
+version = "0.1.0"
+dependencies = [
+ "hydir-core",
+ "hydir-decompile",
+ "hydir-ir",
+ "hydir-model",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -2282,6 +2298,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydir-model"
+version = "0.1.0"
+dependencies = [
+ "gimli",
+ "hydir-core",
+ "hydir-decompile",
+ "hydir-ir",
+ "hydir-loader",
+ "object",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "hydir-patch"
 version = "0.1.0"
 dependencies = [
@@ -2298,6 +2330,8 @@ name = "hydir-project"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "hydir-loader",
+ "hydir-model",
  "rusqlite",
  "serde_json",
  "sha2 0.10.9",
@@ -2336,9 +2370,11 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-hlc",
  "hydir-interchange",
  "hydir-ir",
  "hydir-loader",
+ "hydir-model",
  "hydir-patch",
  "hydir-recompile",
  "hydir-transform",
