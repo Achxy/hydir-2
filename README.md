@@ -16,9 +16,9 @@
   <a href="#authenticated-service">Remote API</a>
 </p>
 
-[![HydIR egui workbench with a selected ELF function, its lifted LLVM IR, inspector, diagnostics, and console](assets/screenshots/studio-lift.png)](assets/screenshots/studio-lift.png)
+[![HydIR desktop workbench overview with a loaded ELF, native pipeline status, program inventory, and inspector](assets/screenshots/hydir-elf-overview.png)](assets/screenshots/hydir-elf-overview.png)
 
-*The native egui workbench analyzing `hydir_max2`: local ELF, machine-byte-derived LLVM IR, and the selected function's scope in one view.*
+*The desktop workbench with a local ELF loaded: the overview presents the native analysis pipeline, program inventory, diagnostics, and inspector in one view.*
 
 HydIR opens little-endian x86-64 ELF files locally, shows a function's bytes and
 reachable branches, and turns supported semantics into inspectable LLVM IR and
@@ -157,6 +157,10 @@ keeps explicit labels and gotos. A structured view is optional; if unavailable,
 remain available. C compilation establishes syntax and type consistency for
 the helper contract; it does not establish behavioral equivalence.
 
+[![HydIR low-level C view showing generated helpers and the function's fidelity and rewrite-readiness claims](assets/screenshots/hydir-low-level-c.png)](assets/screenshots/hydir-low-level-c.png)
+
+*The Low-level C view displays generated helper contracts alongside the artifact's fidelity and rewrite-readiness claims. The displayed C is an inspectable analysis output, not a verified replacement for the input function.*
+
 ### Native CLI and evidence
 
 The local CLI exposes the intermediate stages and reports directly:
@@ -216,9 +220,9 @@ contracts as the CLI and write new output paths.
 
 ### GUI screenshots
 
-The full workbench screenshot at the top of this README shows the program tree,
-LLVM IR, inspector, diagnostics, and console together. The following captures
-show individual views of the desktop application.
+The overview at the top of this README shows the loaded ELF and native pipeline
+status. The following captures show individual analysis views of the desktop
+application.
 
 **Disassembly.** Recovered instructions retain their addresses, original
 machine bytes, and decoded operations.
@@ -282,6 +286,10 @@ own supported input subset, output artifact, and acceptance conditions.
 | LLVM pass experiment | The legacy scalar lift is passed to LLVM 14 with a sequence of at most four unique names from `instcombine`, `sccp`, `simplifycfg`, and `dce`. The operation saves raw, canonical-before, after, report, and digest evidence. | Requires an asserted scalar prototype and trusted fixture; LLVM verification does not establish equivalent behavior. Remote experiments create a new immutable revision while retaining the original ELF bytes. |
 | Scalar patch | A versioned JSON document binds the source ELF SHA-256, sized `.text` symbol, asserted `u64(u64,u64)` prototype, and C-like return expression. Compilation checks the original scalar lift, region bytes, exits, stack restoration, interior-entry evidence, and relocations. A `PatchBundle` records typed PatchIR, byte differences, placement, hashes, and structural verification. | Requires explicit trusted-fixture, prototype, and entry-only assertions. A fitting replacement is written in place within a new ELF copy; a larger supported replacement uses an entry jump into a new executable segment. Neither path overwrites the original or claims behavioral verification. |
 | Whole-executable rebuild | The separate freestanding path lifts a static ELF with sized `_start` and complete, non-overlapping `.text` symbol coverage into stateful LLVM IR, then links a bounded read/write/exit runtime. It emits a new ELF, IR, and report. | Requires direct control flow, supported instructions, definite state initialization, and a bounded data image. Stack accesses, indirect edges, and unsupported syscalls are refused. This worker is not an arbitrary-binary sandbox. |
+
+[![HydIR Region Studio showing artifact provenance, verification checks, release-gate warnings, and analyst annotations](assets/screenshots/hydir-region-provenance.png)](assets/screenshots/hydir-region-provenance.png)
+
+*Region Studio keeps source provenance, patch verification checks, release-gate warnings, and analyst annotations visible with the selected region. Warnings identify unmet conditions; they do not constitute approval to rewrite the binary.*
 
 The scalar patch document has this minimal form; the digest must match the
 input ELF exactly:
@@ -380,6 +388,10 @@ console accepts a restricted statement set, one entry at a time. The
 [Triton walkthrough](https://hydir.wiki/articles/triton-api) gives an
 instruction-level example. Triton exploration is separate from the LLVM and
 native C paths; explored paths do not establish whole-program equivalence.
+
+[![HydIR disassembly with decoded machine instructions and a docked Triton symbolic result](assets/screenshots/hydir-disassembly-triton.png)](assets/screenshots/hydir-disassembly-triton.png)
+
+*The disassembly view places decoded instructions beside a docked Triton result, so the selected function and its symbolic exploration can be inspected together.*
 
 ## Authenticated service
 
