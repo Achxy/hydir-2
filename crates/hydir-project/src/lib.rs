@@ -4,7 +4,9 @@ use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
     annotation_address_in_spec, parse_annotation_address, validate_analyst_annotation,
 };
-use hydir_model::{AnalysisModel, MAX_MODEL_BYTES, parse_model, validate_model};
+use hydir_model::{
+    AnalysisModel, MAX_MODEL_BYTES, init_model, parse_model, record_analyst_edits, validate_model,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
@@ -632,7 +634,6 @@ impl LocalProjectStore {
         }
         let bytes =
             fs::read(&project.path).map_err(|error| format!("Cannot read local ELF: {error}"))?;
-        validate_model(&bytes, model)?;
         let expected =
             i64::try_from(project.revision).map_err(|_| "Local project revision overflow")?;
         let request = serde_json::to_vec(model).map_err(|error| error.to_string())?;
@@ -696,6 +697,16 @@ impl LocalProjectStore {
             .optional()
             .map_err(db_error)?;
         let previous_model = previous_json.as_deref().map(parse_model).transpose()?;
+        let baseline = if previous_model.is_none() {
+            Some(init_model(&bytes)?)
+        } else {
+            None
+        };
+        record_analyst_edits(
+            previous_model.as_ref().or(baseline.as_ref()).unwrap(),
+            &mut stored_model,
+        )?;
+        validate_model(&bytes, &stored_model)?;
         let json = serde_json::to_vec(&stored_model).map_err(|error| error.to_string())?;
         if json.len() > MAX_MODEL_BYTES {
             return Err("Analysis model exceeds 16 MiB".to_owned());
@@ -1110,6 +1121,7 @@ mod tests {
         assert_eq!(loaded.revision, 2);
         if let hydir_model::TypeDefinitionKind::Struct { fields } = &mut loaded.types[0].kind {
             fields[0].name = "renamed_left".to_owned();
+            fields[0].evidence.clear();
         }
         let edited = store.save_model(&saved, &loaded, "model-2").unwrap();
         assert_eq!(edited.revision, 3);
@@ -1120,6 +1132,22 @@ mod tests {
                 .unwrap()
                 .contains("renamed_left")
         );
+        if let hydir_model::TypeDefinitionKind::Struct { fields } = &latest.types[0].kind {
+            assert!(
+                fields[0]
+                    .evidence
+                    .iter()
+                    .any(|item| { item.source == hydir_model::ModelSource::AnalystAssertion })
+            );
+            assert!(
+                fields[0]
+                    .evidence
+                    .iter()
+                    .any(|item| { item.source == hydir_model::ModelSource::Dwarf })
+            );
+        } else {
+            panic!("expected imported struct");
+        }
         assert!(store.load_model(&saved).unwrap_err().contains("Stale"));
         let output = Command::new("clang")
             .args(["--target=x86_64-unknown-linux-gnu", "-g", "-O0", "-c"])

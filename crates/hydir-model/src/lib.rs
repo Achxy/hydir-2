@@ -227,6 +227,178 @@ pub fn parse_model(bytes: &[u8]) -> Result<AnalysisModel, String> {
     Ok(model)
 }
 
+fn preserve_evidence(
+    previous: &[ModelEvidence],
+    current: &mut Vec<ModelEvidence>,
+    changed: bool,
+    detail: &str,
+) -> Result<(), String> {
+    let new_machine_evidence = current
+        .iter()
+        .any(|item| item.source != ModelSource::AnalystAssertion && !previous.contains(item));
+    for item in previous {
+        if item.source != ModelSource::AnalystAssertion && !current.contains(item) {
+            current.push(item.clone());
+        }
+    }
+    if changed && !new_machine_evidence {
+        let assertion = ModelEvidence {
+            source: ModelSource::AnalystAssertion,
+            detail: detail.to_owned(),
+            site: None,
+        };
+        if !current.contains(&assertion) {
+            current.push(assertion);
+        }
+    }
+    if current.len() > 256 {
+        return Err("edited model fact exceeds 256 evidence items".to_owned());
+    }
+    Ok(())
+}
+
+/// Record semantic edits made to an existing local model. Newly imported
+/// DWARF/native evidence keeps its own provenance; unchanged machine evidence
+/// survives a JSON edit, including when the editor omitted it from the file.
+pub fn record_analyst_edits(
+    previous: &AnalysisModel,
+    candidate: &mut AnalysisModel,
+) -> Result<(), String> {
+    if previous.binary_sha256 != candidate.binary_sha256 {
+        return Err("cannot compare models for different binaries".to_owned());
+    }
+    let mut edit_conflicts = Vec::new();
+    for definition in &mut candidate.types {
+        if let Some(old) = previous.types.iter().find(|old| old.id == definition.id) {
+            let changed = old.name != definition.name
+                || old.size_bytes != definition.size_bytes
+                || old.size_is_lower_bound != definition.size_is_lower_bound
+                || std::mem::discriminant(&old.kind) != std::mem::discriminant(&definition.kind)
+                || matches!(
+                    (&old.kind, &definition.kind),
+                    (
+                        TypeDefinitionKind::Enum { .. },
+                        TypeDefinitionKind::Enum { .. }
+                    ) | (
+                        TypeDefinitionKind::Alias { .. },
+                        TypeDefinitionKind::Alias { .. }
+                    )
+                ) && old.kind != definition.kind;
+            preserve_evidence(
+                &old.evidence,
+                &mut definition.evidence,
+                changed,
+                "local type edit",
+            )?;
+            if let (
+                TypeDefinitionKind::Struct { fields: old_fields }
+                | TypeDefinitionKind::Union { fields: old_fields },
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields },
+            ) = (&old.kind, &mut definition.kind)
+            {
+                for field in fields {
+                    if let Some(old_field) = old_fields.iter().find(|prior| {
+                        prior.offset_bytes == field.offset_bytes || prior.name == field.name
+                    }) {
+                        let analyst_type_change = old_field.ty != field.ty
+                            && !field.evidence.iter().any(|item| {
+                                item.source != ModelSource::AnalystAssertion
+                                    && !old_field.evidence.contains(item)
+                            });
+                        let changed = old_field.name != field.name
+                            || old_field.offset_bytes != field.offset_bytes
+                            || old_field.ty != field.ty;
+                        preserve_evidence(
+                            &old_field.evidence,
+                            &mut field.evidence,
+                            changed,
+                            "local field edit",
+                        )?;
+                        if analyst_type_change {
+                            let evidence = old_field
+                                .evidence
+                                .iter()
+                                .filter(|item| item.source != ModelSource::AnalystAssertion)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if !evidence.is_empty() {
+                                edit_conflicts.push(ModelConflict {
+                                    subject: format!(
+                                        "type:{}:field:{}",
+                                        definition.id, old_field.offset_bytes
+                                    ),
+                                    detail: format!(
+                                        "analyst type {:?} differs from prior model type {:?}; earlier evidence retained",
+                                        field.ty, old_field.ty
+                                    ),
+                                    evidence,
+                                });
+                            }
+                        }
+                    } else {
+                        preserve_evidence(&[], &mut field.evidence, true, "local field addition")?;
+                    }
+                }
+            }
+        } else {
+            preserve_evidence(&[], &mut definition.evidence, true, "local type addition")?;
+            if let TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } =
+                &mut definition.kind
+            {
+                for field in fields {
+                    preserve_evidence(&[], &mut field.evidence, true, "local field addition")?;
+                }
+            }
+        }
+    }
+    for function in &mut candidate.functions {
+        if let Some(old) = previous
+            .functions
+            .iter()
+            .find(|old| old.entry == function.entry)
+        {
+            let changed = old.name != function.name || old.prototype != function.prototype;
+            preserve_evidence(
+                &old.evidence,
+                &mut function.evidence,
+                changed,
+                "local function edit",
+            )?;
+        } else {
+            preserve_evidence(&[], &mut function.evidence, true, "local function addition")?;
+        }
+    }
+    for object in &mut candidate.stack_objects {
+        if let Some(old) = previous.stack_objects.iter().find(|old| {
+            old.function_entry == object.function_entry
+                && old.entry_rsp_offset == object.entry_rsp_offset
+        }) {
+            let changed = old.size_bytes != object.size_bytes || old.ty != object.ty;
+            preserve_evidence(
+                &old.evidence,
+                &mut object.evidence,
+                changed,
+                "local stack object edit",
+            )?;
+        } else {
+            preserve_evidence(
+                &[],
+                &mut object.evidence,
+                true,
+                "local stack object addition",
+            )?;
+        }
+    }
+    for conflict in edit_conflicts {
+        if !candidate.conflicts.iter().any(|existing| {
+            existing.subject == conflict.subject && existing.detail == conflict.detail
+        }) {
+            candidate.conflicts.push(conflict);
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_model(bytes: &[u8], model: &AnalysisModel) -> Result<(), String> {
     validate_structure(model)?;
     if model.binary_sha256 != format!("{:x}", Sha256::digest(bytes)) {
