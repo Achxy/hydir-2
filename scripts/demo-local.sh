@@ -17,7 +17,7 @@ clang -O0 -no-pie tests/fixtures/add2.S tests/fixtures/add2_main.c -o "$demo_dir
 clang -c tests/fixtures/unsupported.S -o "$demo_dir/unsupported.o"
 cargo build --locked --bin hydirctl
 "${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl" inspect "$demo_dir/add2-original" > "$demo_dir/program-spec.json"
-grep -q '"schema_version": 2' "$demo_dir/program-spec.json"
+grep -q '"schema_version": 3' "$demo_dir/program-spec.json"
 grep -q '"mapped_segments": \[' "$demo_dir/program-spec.json"
 grep -q '"file_size":' "$demo_dir/program-spec.json"
 grep -q '"call_recovery": "not_attempted"' "$demo_dir/program-spec.json"

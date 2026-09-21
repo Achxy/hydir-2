@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://hydir.wiki/</loc></url>
+  <url><loc>https://hydir.wiki/start</loc></url>
+  <url><loc>https://hydir.wiki/architecture</loc></url>
+  <url><loc>https://hydir.wiki/blogs</loc></url>
+  <url><loc>https://hydir.wiki/articles/recovering-jump-tables</loc></url>
+  <url><loc>https://hydir.wiki/articles/patchlang-patchir</loc></url>
+  <url><loc>https://hydir.wiki/articles/max2</loc></url>
+  <url><loc>https://hydir.wiki/articles/triton-api</loc></url>
+  <url><loc>https://hydir.wiki/articles/vm-handler-transfer-function</loc></url>
+</urlset>

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="How HydIR turns an ELF inventory into scoped CFG, LLVM IR, scalar C, and separately checked rebuild artifacts.">
+  <link rel="canonical" href="https://hydir.wiki/architecture">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Architecture — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture" aria-current="page">Architecture</a><a href="/blogs">Blogs</a></nav></header>
+  <main class="site-main prose" id="content">
+    <p class="eyebrow">From bytes to artifacts</p>
+    <h1>Follow the bytes through HydIR</h1>
+    <p class="lead">When you open an ELF, HydIR first records what is in the file. It then follows control flow for a selected function, lifts the instructions it understands, and checks generated output with trusted fixtures. A stop at one step does not undo what an earlier step found.</p>
+
+    <h2>1. Inventory the ELF</h2>
+    <p>The native importer reads a little-endian x86-64 ELF and records file-derived sections, load mappings, symbols, imports, and relocations. Ordinary inspection does not pretend that an empty call or reference list proves there are none; recovery state is explicit. The desktop's broader disassembly scan marks uncertain uncovered regions.</p>
+
+    <h2>2. Recover a bounded CFG</h2>
+    <p>For a selected function symbol or analyst-supplied entry and byte extent, <code>iced-x86</code> decodes reachable instructions and follows direct branches. Recovery rejects overlapping instructions and edges outside the declared extent. The CFG retains instruction addresses, original bytes, edge kinds, and scope provenance.</p>
+
+    <h2>3. Lift supported machine state</h2>
+    <p>The scalar lift accepts an explicit SysV AMD64 <code>u64(u64,u64)</code> assertion. It tracks the supported registers and flags across CFG blocks, rejects reads that may be uninitialized, and emits LLVM IR with explicit joins. Wrapping arithmetic does not acquire LLVM no-overflow promises that the machine operation did not provide.</p>
+
+    <h2>4. Emit and test scoped outputs</h2>
+    <p>The first-party C path consumes only HydIR's supported raw scalar IR grammar. It may produce labels, gotos, and SSA edge copies; a simple recognized branch can become structured C. Demo scripts verify generated IR where LLVM tools are available and compare compiled outputs with trusted originals on finite input sets. Validation executes those originals, so it is restricted to trusted fixtures.</p>
+
+    <p class="note"><strong>Another path:</strong> whole-executable rebuilding is not a consequence of a successful scalar function lift. It requires complete supported text coverage in a static freestanding program, bounded mapped data, and checked read/write/exit syscall behavior. It emits a new executable and a separate report.</p>
+
+    <h2>Interfaces and ownership</h2>
+    <p>The egui workbench and <code>hydirctl</code> use the native analysis path. <code>hydird</code> exposes authenticated loopback projects with immutable revisions and artifacts; the Python SDK covers the implemented remote subset. Local ELF opening stays local until a separate upload action. Local analyst facts live in a private on-device ledger; remote project facts live in the service ledger and do not automatically sync.</p>
+    <p>Read the <a href="/articles/max2">max2 worked example</a> in the blogs, or inspect the <a href="https://github.com/Achxy/hydir-2">source tree</a> and <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">SDK reference</a>.</p>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs">Blogs</a></p></footer>
+</body>
+</html>

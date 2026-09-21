@@ -106,7 +106,7 @@ done
 artifact_sha="$(sed -n 's/.*"sha256": "\([^"]*\)".*/\1/p' "$demo_dir/lift.json")"
 test "${#artifact_sha}" -eq 64
 grep -q '"kind":"taken"' "$demo_dir/cfg.json"
-grep -q '"schema_version":2' "$demo_dir/inspect.json"
+grep -q '"schema_version":3' "$demo_dir/inspect.json"
 if command -v opt >/dev/null 2>&1; then
   opt -passes=verify -disable-output "$demo_dir/remote-lift.ll"
 fi

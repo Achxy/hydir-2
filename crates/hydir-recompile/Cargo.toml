@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+hydir-semantics = { path = "../hydir-semantics" }
 object.workspace = true
 iced-x86.workspace = true
 serde_json.workspace = true

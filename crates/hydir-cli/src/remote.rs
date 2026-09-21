@@ -3,9 +3,12 @@
 use super::{read_binary, write_new_or_identical};
 use hydir_api::v1::{
     AnnotationRequest, ArtifactRequest, CreateProjectRequest, DiscoverRequest, FunctionRequest,
-    JobEventRequest, JobReply, JobRequest, PatchRequest, ProjectReply, ProjectRequest,
-    RebuildRequest, SourceRequest, StartLiftJobRequest, TransformRequest, UploadBinaryRequest,
+    JobEventRequest, JobReply, JobRequest, ProjectReply, ProjectRequest, RebuildRequest,
+    SourceRequest, StartLiftJobRequest, TransformRequest, UploadBinaryRequest,
     hydir_client::HydirClient,
+};
+use hydir_api::v2::{
+    PatchRequest as PatchRequestV2, VerifyPatchRequest, hydir_v2_client::HydirV2Client,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -28,6 +31,7 @@ const HELP: &str = "Remote commands:
   hydirctl remote decompile <project-id> <revision> <function-symbol> --assume-u64x2 --output <file.c>
   hydirctl remote transform <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory>
   hydirctl remote rebuild <project-id> <revision> <idempotency-key> --trusted-fixture --output-dir <new-directory>
+  hydirctl remote patch-preview <project-id> <revision> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <bundle.json>
   hydirctl remote patch <project-id> <revision> <patch-v1.json> <idempotency-key> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
   hydirctl remote artifact <project-id> <sha256> --output <file>
   hydirctl remote job-start-lift <project-id> <revision> <function-symbol> <idempotency-key> --assume-u64x2
@@ -35,8 +39,9 @@ const HELP: &str = "Remote commands:
   hydirctl remote job-cancel <project-id> <job-id>
   hydirctl remote job-events <project-id> <job-id> <after-sequence>
 
-Set HYDIR_ENDPOINT=http://127.0.0.1:50051 and HYDIR_TOKEN_FILE to a private
-credential file. No remote binary upload occurs except the explicit upload command.
+Set HYDIR_ENDPOINT to http://127.0.0.1:50051 for local mode or to an https://
+endpoint for TLS mode, and set HYDIR_TOKEN_FILE to a private credential file.
+No remote binary upload occurs except the explicit upload command.
 ";
 
 fn authorized<T>(value: T, credential: &MetadataValue<tonic::metadata::Ascii>) -> Request<T> {
@@ -80,6 +85,48 @@ fn check_artifact(content: &[u8], digest: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn validate_endpoint(endpoint: &str) -> Result<(), Box<dyn Error>> {
+    let uri: tonic::codegen::http::Uri = endpoint.parse()?;
+    let scheme = uri.scheme_str().ok_or("remote endpoint has no scheme")?;
+    let authority = uri
+        .authority()
+        .ok_or("remote endpoint has no host authority")?;
+    if authority.as_str().contains('@')
+        || uri
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+    {
+        return Err("remote endpoint must not contain credentials, a path, or a query".into());
+    }
+    match scheme {
+        "http" => {
+            let address: std::net::SocketAddr = authority.as_str().parse().map_err(
+                |_| "plaintext endpoint must use an explicit numeric loopback address and port",
+            )?;
+            if !address.ip().is_loopback() {
+                return Err("plaintext remote connections must use loopback".into());
+            }
+        }
+        "https" if !authority.host().is_empty() => {}
+        "https" => return Err("TLS endpoint has no host".into()),
+        _ => return Err("remote endpoint scheme must be http or https".into()),
+    }
+    Ok(())
+}
+
+fn valid_bearer_token(token: &str) -> bool {
+    let static_token = token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let compact_jwt = token.len() <= 16 * 1024
+        && token.split('.').count() == 3
+        && token.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    static_token || compact_jwt
+}
+
 fn write_executable_new(path: &str, content: &[u8]) -> Result<(), Box<dyn Error>> {
     let target = Path::new(path);
     if target.exists() {
@@ -104,14 +151,8 @@ fn write_executable_new(path: &str, content: &[u8]) -> Result<(), Box<dyn Error>
 
 pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let endpoint = env::var("HYDIR_ENDPOINT")
-        .map_err(|_| "HYDIR_ENDPOINT must explicitly name the local service")?;
-    let address: std::net::SocketAddr = endpoint
-        .strip_prefix("http://")
-        .ok_or("current remote client only supports explicit http://loopback-host:port")?
-        .parse()?;
-    if !address.ip().is_loopback() {
-        return Err("current remote client refuses non-loopback plaintext connections".into());
-    }
+        .map_err(|_| "HYDIR_ENDPOINT must explicitly name the HydIR service")?;
+    validate_endpoint(&endpoint)?;
     let token_file = env::var("HYDIR_TOKEN_FILE")
         .map_err(|_| "HYDIR_TOKEN_FILE must point to a private credential file")?;
     let token_path = Path::new(&token_file);
@@ -123,13 +164,17 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
     let token = fs::read_to_string(token_path)?.trim().to_owned();
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("credential file does not contain a 64-character hex token".into());
+    if !valid_bearer_token(&token) {
+        return Err(
+            "credential file does not contain a bounded static token or compact JWT".into(),
+        );
     }
     let credential = format!("Bearer {token}").parse::<MetadataValue<_>>()?;
     let channel = Channel::from_shared(endpoint)?.connect().await?;
-    let mut client =
-        HydirClient::new(channel).max_decoding_message_size(hydir_backend::MAX_BINARY_BYTES + 1024);
+    let mut client = HydirClient::new(channel.clone())
+        .max_decoding_message_size(hydir_backend::MAX_BINARY_BYTES + 1024);
+    let mut client_v2 =
+        HydirV2Client::new(channel).max_decoding_message_size(2 * 1024 * 1024 + 1024);
     match args {
         [command] if command == "discover" => {
             let result = client
@@ -430,6 +475,78 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             command,
             id,
             expected,
+            patch_path,
+            trusted,
+            assume,
+            entry,
+            output,
+            file,
+        ] if command == "patch-preview"
+            && trusted == "--trusted-fixture"
+            && assume == "--assume-u64x2"
+            && entry == "--assume-entry-only"
+            && output == "--output" =>
+        {
+            if fs::metadata(patch_path)?.len() > hydir_patch::MAX_PATCH_BYTES as u64 {
+                return Err("patch document exceeds 4096 bytes".into());
+            }
+            let patch_json = fs::read(patch_path)?;
+            hydir_patch::parse_patch_document(&patch_json)?;
+            let request_digest = format!("{:x}", Sha256::digest(&patch_json));
+            let artifact = client_v2
+                .compile_patch(authorized(
+                    PatchRequestV2 {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                        idempotency_key: format!("preview-{}", &request_digest[..32]),
+                        patch_json,
+                        trusted_fixture: true,
+                        assume_u64x2: true,
+                        assume_entry_only: true,
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            if artifact.project_revision != revision(expected)?
+                || artifact.media_type != "application/vnd.hydir.patch-bundle+json;version=2"
+            {
+                return Err("PatchBundle preview metadata mismatch".into());
+            }
+            check_artifact(&artifact.content, &artifact.sha256)?;
+            hydir_patch::parse_patch_bundle_json(&artifact.content)?;
+            let verification = client_v2
+                .verify_patch(authorized(
+                    VerifyPatchRequest {
+                        project_id: id.clone(),
+                        expected_revision: revision(expected)?,
+                        patch_bundle_json: artifact.content.clone(),
+                    },
+                    &credential,
+                ))
+                .await?
+                .into_inner();
+            if !verification.structurally_valid {
+                return Err("PatchBundle failed structural verification".into());
+            }
+            write_new_or_identical(file, &artifact.content)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "project_id": id,
+                    "project_revision": artifact.project_revision,
+                    "patch_bundle_sha256": artifact.sha256,
+                    "structurally_valid": verification.structurally_valid,
+                    "behavior_verified": verification.behavior_verified,
+                    "verification": serde_json::from_str::<serde_json::Value>(&verification.report_json)?,
+                    "output": file,
+                }))?
+            );
+        }
+        [
+            command,
+            id,
+            expected,
             symbol,
             key,
             assume,
@@ -540,14 +657,14 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 return Err("patch document exceeds 4096 bytes".into());
             }
             let patch_json = fs::read(patch_path)?;
-            hydir_patch::parse_patch_json(&patch_json)?;
-            let reply = client
+            hydir_patch::parse_patch_document(&patch_json)?;
+            let reply = client_v2
                 .apply_patch(authorized(
-                    PatchRequest {
+                    PatchRequestV2 {
                         project_id: id.clone(),
                         expected_revision: revision(expected)?,
-                        patch_json,
                         idempotency_key: key.clone(),
+                        patch_json,
                         trusted_fixture: true,
                         assume_u64x2: true,
                         assume_entry_only: true,
@@ -560,7 +677,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 .get_artifact(authorized(
                     ArtifactRequest {
                         project_id: id.clone(),
-                        sha256: reply.artifact_sha256.clone(),
+                        sha256: reply.binary_sha256.clone(),
                     },
                     &credential,
                 ))
@@ -580,7 +697,7 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "project_id": reply.project_id,
                     "revision": reply.revision,
                     "binary_sha256": reply.binary_sha256,
-                    "artifact_sha256": reply.artifact_sha256,
+                    "patch_bundle_sha256": reply.patch_bundle_sha256,
                     "output": file,
                 }))?
             );
@@ -667,4 +784,31 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         _ => return Err(HELP.into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_bearer_token, validate_endpoint};
+
+    #[test]
+    fn endpoint_policy_allows_tls_and_only_loopback_plaintext() {
+        assert!(validate_endpoint("http://127.0.0.1:50051").is_ok());
+        assert!(validate_endpoint("http://[::1]:50051").is_ok());
+        assert!(validate_endpoint("http://192.0.2.1:50051").is_err());
+        assert!(validate_endpoint("https://hydir.example:443").is_ok());
+        assert!(validate_endpoint("https://hydir.example/api").is_err());
+        assert!(validate_endpoint("https://user@hydir.example").is_err());
+    }
+
+    #[test]
+    fn bearer_policy_accepts_static_tokens_and_bounded_compact_jwts() {
+        assert!(valid_bearer_token(&"a".repeat(64)));
+        assert!(valid_bearer_token("eyJhbGciOiJSUzI1NiJ9.e30.signature"));
+        assert!(!valid_bearer_token("not a token"));
+        assert!(!valid_bearer_token("a..b"));
+        assert!(!valid_bearer_token(&format!(
+            "a.b.{}",
+            "c".repeat(16 * 1024)
+        )));
+    }
 }

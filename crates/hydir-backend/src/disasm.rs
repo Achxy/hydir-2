@@ -3,7 +3,8 @@
 use crate::{HydirError, Result, error, parse_elf};
 use hydir_core::{
     Address, DISASSEMBLY_SCHEMA_VERSION, DisassemblyFlow, DisassemblyFunction, DisassemblyGap,
-    DisassemblyInstruction, DisassemblyReport, DisassemblySection,
+    DisassemblyInstruction, DisassemblyReport, DisassemblySection, FactProvenance, FactSource,
+    FunctionCandidate, RecoveryState,
 };
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
@@ -12,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 const MAX_DISASSEMBLY_SECTIONS: usize = 4096;
 const MAX_DISASSEMBLY_INSTRUCTIONS: usize = 1_000_000;
+const MAX_FUNCTION_CANDIDATES: usize = 8192;
 
 #[derive(Clone)]
 struct SectionBytes {
@@ -54,6 +56,133 @@ fn classify_flow(instruction: &Instruction) -> (DisassemblyFlow, Option<u64>) {
         FlowControl::Return => (DisassemblyFlow::Return, None),
         _ => (DisassemblyFlow::Unknown, None),
     }
+}
+
+fn collect_call_candidates(
+    instructions: &BTreeMap<u64, DisassemblyInstruction>,
+    seeds: &[Seed],
+    executable: &[(object::SectionIndex, usize, SectionBytes)],
+    entry: u64,
+) -> Vec<FunctionCandidate> {
+    let known: BTreeSet<u64> = seeds.iter().map(|seed| seed.address).collect();
+    let mut candidates = BTreeMap::<u64, FunctionCandidate>::new();
+    if entry != 0
+        && !known.contains(&entry)
+        && let Some((_, _, section)) = executable.iter().find(|(_, _, section)| {
+            section.address <= entry
+                && section
+                    .address
+                    .checked_add(section.bytes.len() as u64)
+                    .is_some_and(|end| entry < end)
+        })
+    {
+        let offset = (entry - section.address) as usize;
+        candidates.insert(
+            entry,
+            FunctionCandidate {
+                entry: Address(entry),
+                evidence_site: Address(entry),
+                evidence_bytes_hex: section.bytes[offset..]
+                    .iter()
+                    .take(16)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                reason: "ELF entry point in executable section".to_owned(),
+                extent: None,
+                recovery_state: RecoveryState::NotAttempted,
+                provenance: FactProvenance {
+                    source: FactSource::ElfMetadata,
+                    scope: "entry address only; function extent and return behavior unproven"
+                        .to_owned(),
+                },
+            },
+        );
+    }
+    for instruction in instructions.values() {
+        if instruction.function.is_none() || instruction.flow != DisassemblyFlow::Call {
+            continue;
+        }
+        let Some(target) = instruction.branch_target else {
+            continue;
+        };
+        if known.contains(&target.0)
+            || !executable.iter().any(|(_, _, section)| {
+                section.address <= target.0
+                    && section
+                        .address
+                        .checked_add(section.bytes.len() as u64)
+                        .is_some_and(|end| target.0 < end)
+            })
+        {
+            continue;
+        }
+        if candidates.len() >= MAX_FUNCTION_CANDIDATES && !candidates.contains_key(&target.0) {
+            break;
+        }
+        candidates
+            .entry(target.0)
+            .or_insert_with(|| FunctionCandidate {
+                entry: target,
+                evidence_site: instruction.address,
+                evidence_bytes_hex: instruction.bytes_hex.clone(),
+                reason: "direct call from recursively recovered code".to_owned(),
+                extent: None,
+                recovery_state: RecoveryState::NotAttempted,
+                provenance: FactProvenance {
+                    source: FactSource::NativeAnalysis,
+                    scope: "candidate entry only; function extent and return behavior unproven"
+                        .to_owned(),
+                },
+            });
+    }
+    candidates.into_values().collect()
+}
+
+fn collect_entry_probe_candidates(
+    entry: u64,
+    seeds: &[Seed],
+    executable: &[(object::SectionIndex, usize, SectionBytes)],
+) -> Vec<FunctionCandidate> {
+    if entry == 0 || seeds.iter().any(|seed| seed.address == entry) {
+        return Vec::new();
+    }
+    let Some((_, section_index, section)) = executable.iter().find(|(_, _, section)| {
+        section.address <= entry
+            && section
+                .address
+                .checked_add(section.bytes.len() as u64)
+                .is_some_and(|end| entry < end)
+    }) else {
+        return Vec::new();
+    };
+    let size = (section.bytes.len() as u64)
+        .saturating_sub(entry - section.address)
+        .min(4096);
+    let probe = Seed {
+        name: "<elf-entry-probe>".to_owned(),
+        address: entry,
+        size,
+        section: *section_index,
+        provenance: "ELF entry point; bounded reachability probe with uncertain extent".to_owned(),
+    };
+    let mut occupied = vec![false; section.bytes.len()];
+    let mut records = BTreeMap::new();
+    recover_seed(
+        section,
+        &probe,
+        &mut occupied,
+        &mut records,
+        &mut BTreeSet::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let mut candidates = collect_call_candidates(&records, seeds, executable, 0);
+    for candidate in &mut candidates {
+        candidate.reason = "direct call from bounded ELF-entry reachability probe".to_owned();
+        candidate.provenance.scope =
+            "candidate only; entry probe used an unproven 4096-byte maximum extent".to_owned();
+    }
+    candidates
 }
 
 fn instruction_text(instruction: &Instruction) -> (String, String) {
@@ -269,25 +398,6 @@ pub fn disassemble_elf(bytes: &[u8]) -> Result<DisassemblyReport> {
             });
         }
     }
-    let entry = file.entry();
-    if entry != 0
-        && !seeds.iter().any(|seed| seed.address == entry)
-        && let Some((_, section_index, section)) = executable.iter().find(|(_, _, section)| {
-            entry >= section.address
-                && entry < section.address.saturating_add(section.bytes.len() as u64)
-        })
-    {
-        seeds.push(Seed {
-            name: "<elf-entry>".to_owned(),
-            address: entry,
-            size: section
-                .address
-                .saturating_add(section.bytes.len() as u64)
-                .saturating_sub(entry),
-            section: *section_index,
-            provenance: "ELF entry point; recursive CFG recovery".to_owned(),
-        });
-    }
     seeds.sort_by_key(|seed| (seed.section, seed.address, seed.name.clone()));
 
     let mut instructions = BTreeMap::new();
@@ -369,6 +479,19 @@ pub fn disassemble_elf(bytes: &[u8]) -> Result<DisassemblyReport> {
         }
     }
 
+    let mut candidates = collect_call_candidates(&instructions, &seeds, &executable, file.entry());
+    for candidate in collect_entry_probe_candidates(file.entry(), &seeds, &executable) {
+        if candidates.len() >= MAX_FUNCTION_CANDIDATES {
+            break;
+        }
+        if !candidates
+            .iter()
+            .any(|known| known.entry == candidate.entry)
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.entry);
     let mut functions = Vec::new();
     for seed in seeds {
         let addresses = function_addresses.remove(&seed.address).unwrap_or_default();
@@ -387,6 +510,7 @@ pub fn disassemble_elf(bytes: &[u8]) -> Result<DisassemblyReport> {
         target_triple: super::elf_target_triple(file.flags()).to_owned(),
         sections,
         functions,
+        candidates,
         instructions: instructions.into_values().collect(),
         gaps,
         warnings,
@@ -507,6 +631,79 @@ mod tests {
             instructions.get(&0x1005).unwrap().flow,
             DisassemblyFlow::Return
         );
+    }
+
+    #[test]
+    fn direct_call_candidate_has_no_invented_extent() {
+        let mut instructions = BTreeMap::new();
+        instructions.insert(
+            0x1000,
+            DisassemblyInstruction {
+                address: Address(0x1000),
+                bytes_hex: "e80b000000".to_owned(),
+                mnemonic: "call".to_owned(),
+                operands: "0x1010".to_owned(),
+                flow: DisassemblyFlow::Call,
+                branch_target: Some(Address(0x1010)),
+                function: Some("caller".to_owned()),
+                provenance: "recursive".to_owned(),
+            },
+        );
+        let sections = vec![(
+            object::SectionIndex(0),
+            0,
+            SectionBytes {
+                address: 0x1000,
+                bytes: vec![0; 32],
+            },
+        )];
+        let seeds = vec![Seed {
+            name: "caller".to_owned(),
+            address: 0x1000,
+            size: 5,
+            section: 0,
+            provenance: "test".to_owned(),
+        }];
+        let candidates = collect_call_candidates(&instructions, &seeds, &sections, 0);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entry, Address(0x1010));
+        assert_eq!(candidates[0].extent, None);
+        assert_eq!(candidates[0].recovery_state, RecoveryState::NotAttempted);
+    }
+
+    #[test]
+    fn elf_entry_without_symbol_is_only_a_candidate() {
+        let sections = vec![(
+            object::SectionIndex(0),
+            0,
+            SectionBytes {
+                address: 0x1000,
+                bytes: vec![0x90, 0xc3],
+            },
+        )];
+        let candidates = collect_call_candidates(&BTreeMap::new(), &[], &sections, 0x1000);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].evidence_bytes_hex, "90c3");
+        assert_eq!(candidates[0].extent, None);
+        assert_eq!(candidates[0].recovery_state, RecoveryState::NotAttempted);
+        assert_eq!(candidates[0].provenance.source, FactSource::ElfMetadata);
+    }
+
+    #[test]
+    fn entry_probe_seeds_direct_call_without_function_extent() {
+        let sections = vec![(
+            object::SectionIndex(0),
+            0,
+            SectionBytes {
+                address: 0x1000,
+                bytes: vec![0xe8, 0x01, 0, 0, 0, 0xc3, 0xc3],
+            },
+        )];
+        let candidates = collect_entry_probe_candidates(0x1000, &[], &sections);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entry, Address(0x1006));
+        assert_eq!(candidates[0].evidence_bytes_hex, "e801000000");
+        assert_eq!(candidates[0].extent, None);
     }
 
     #[test]

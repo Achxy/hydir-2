@@ -63,9 +63,14 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             "original_sha256": result.original_sha256,
             "patched_sha256": result.patched_sha256,
             "original_region_hex": result.original_region.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "region_bytes_sha256": result.region_bytes_sha256,
+            "region_exit": format!("0x{:016x}", result.region_exit),
+            "exit_rsp_delta": result.exit_rsp_delta,
             "replacement_hex": result.replacement_bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             "assumptions": ["trusted fixture", "u64(u64,u64) SysV ABI", "no incoming control-flow edges to function interior"],
             "behavior_validation": "not run by patch command; validate intended change and unchanged effects separately",
+            "patch_bundle_version": hydir_core::PATCH_BUNDLE_VERSION,
+            "patch_bundle": result.bundle,
         }))?
     );
     Ok(())

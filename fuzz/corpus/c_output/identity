@@ -1,0 +1,4 @@
+define i64 @hydir_lifted(i64 %arg0, i64 %arg1) {
+prologue:
+  ret i64 %arg0
+}

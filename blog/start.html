@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Build HydIR, open a local x86-64 ELF, and inspect or lift a supported function from the CLI.">
+  <link rel="canonical" href="https://hydir.wiki/start">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/vendor/prism/prism-core.min.js" defer></script>
+  <script src="/vendor/prism/prism-bash.min.js" defer></script>
+  <title>Start locally — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start" aria-current="page">Start</a><a href="/architecture">Architecture</a><a href="/blogs">Blogs</a></nav></header>
+  <main class="site-main prose" id="content">
+    <p class="eyebrow">Quick start</p>
+    <h1>Start with a local ELF</h1>
+    <p class="lead">Start with an ELF you trust. The workbench lets you inspect it without running or uploading it. Once you have a function in mind, the CLI can save its CFG or lift artifacts.</p>
+
+    <h2>Prerequisites</h2>
+    <p>Clone the <a href="https://github.com/Achxy/hydir-2">repository</a> with its submodules. Rust 1.96 is pinned by <code>rust-toolchain.toml</code>, and <code>Cargo.lock</code> fixes Rust dependencies. The full demo path also needs Clang with x86-64 ELF and LLVM IR support. Native execution comparisons require Linux x86-64; the repository documents a Docker path for macOS.</p>
+    <pre><code class="language-bash">cargo test --locked --workspace
+cargo run --locked --bin hydir</code></pre>
+    <p>The desktop app opens local ELF files. If you already know the function you want, select it on launch:</p>
+    <pre><code class="language-bash">cargo run --locked --bin hydir -- \
+  --open-local /path/to/program.elf function_name</code></pre>
+
+    <h2>Inspect before lifting</h2>
+    <p>The CLI exposes the same native import and function-scoped recovery path. Replace <code>function_name</code> with a nonzero-size ELF function symbol. The lift command requires an explicit two-argument unsigned 64-bit ABI assertion; HydIR does not infer that prototype.</p>
+    <pre><code class="language-bash">cargo run --locked --bin hydirctl -- inspect /path/to/program.elf
+cargo run --locked --bin hydirctl -- cfg /path/to/program.elf function_name
+cargo run --locked --bin hydirctl -- lift \
+  /path/to/program.elf function_name \
+  --assume-u64x2 --output lifted.ll</code></pre>
+    <p>It is normal for the import to succeed and the lift to stop: reading a file and modeling its instructions are different steps. The <a href="/architecture">pipeline guide</a> explains what each result means.</p>
+
+    <h2>Use the trusted fixtures</h2>
+    <p>For a reproducible first run on Linux x86-64, use the checked-in demo scripts. They build controlled inputs, save artifacts under <code>target/</code>, and compare finite cases with native execution.</p>
+    <pre><code class="language-bash">bash scripts/demo-local.sh
+bash scripts/demo-corpus.sh</code></pre>
+    <p>The validation path executes its original fixture and requires <code>--trusted-fixture</code>. Use these scripts only with the repository's trusted samples. Follow <a href="/articles/max2">one function in detail</a> in the blogs.</p>
+
+    <h2>Further reference</h2>
+    <p>The <a href="https://github.com/Achxy/hydir-2#quick-start">README quick start</a> carries current commands. The <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Python SDK README</a> covers its authenticated service client.</p>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs">Blogs</a></p></footer>
+</body>
+</html>

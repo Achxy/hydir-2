@@ -4,7 +4,7 @@ use super::read_binary;
 use hydir_analysis::analyze_spec_elf;
 use hydir_backend::import_elf;
 use hydir_core::{AnnotationKind, overlay_analyst_assumptions, parse_annotation_address};
-use hydir_project::{LocalProject, LocalProjectStore};
+use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore};
 use serde_json::json;
 use std::{error::Error, path::Path};
 
@@ -77,8 +77,17 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             };
             let kind = AnnotationKind::parse(kind)?;
             let address = parse_annotation_address(address)?;
-            let updated =
-                store.add_annotation(&requested, &spec, kind, address, value, scope, key)?;
+            let updated = store.add_annotation(
+                &requested,
+                &spec,
+                LocalAnnotationInput {
+                    kind,
+                    address,
+                    value,
+                    scope,
+                    idempotency_key: key,
+                },
+            )?;
             println!("{}", serde_json::to_string_pretty(&project_json(&updated))?);
         }
         _ => return Err(HELP.into()),

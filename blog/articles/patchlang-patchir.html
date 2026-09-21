@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Follow a HydIR PatchLang edit through typed PatchIR, x86-64 lowering, trampoline placement, structural checks, and a reversible PatchBundle.">
+  <link rel="canonical" href="https://hydir.wiki/articles/patchlang-patchir">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/styles.css">
+  <title>From PatchLang to PatchIR: A Reversible ELF Patch — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#article">Skip to article</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs">Blogs</a></nav></header>
+  <main class="site-main prose" id="article">
+    <article>
+      <p class="eyebrow"><a href="/blogs">Blogs</a> / Binary transformation</p>
+      <h1>From PatchLang to PatchIR: A Reversible ELF Patch</h1>
+
+      <p>A binary patch has to connect two very different descriptions of a program: the change an analyst intends and the bytes a processor will execute. HydIR keeps the intermediate decisions visible. A small PatchLang program becomes typed PatchIR, PatchIR becomes x86-64 code, and the code receives an explicit placement plan. The resulting PatchBundle records enough source, byte, boundary, and digest information to inspect the change and reverse it later.</p>
+
+      <p>This walkthrough uses <code>hydir_stage_patch_portal</code> from the checked-in <a href="https://github.com/Achxy/hydir-2/blob/main/tests/fixtures/hydir_prism_showcase.S">PRISM fixture</a>. The original function is deliberately only five bytes long:</p>
+
+      <pre><code class="language-asm"><span class="tok-label">hydir_stage_patch_portal:</span>
+    <span class="tok-keyword">nop</span>
+    <span class="tok-keyword">mov</span> <span class="tok-var">%rdi</span>, <span class="tok-var">%rax</span>
+    <span class="tok-keyword">ret</span></code></pre>
+
+      <p>Under the asserted SysV AMD64 prototype <code>u64(u64,u64)</code>, RDI is <code>arg0</code>, RSI is <code>arg1</code>, and RAX carries the return value. The original function therefore returns its first argument.</p>
+
+      <h2>Write the change in PatchLang</h2>
+
+      <p>Open <strong>C ↔ PatchLang</strong> in Region Studio and replace the identity behavior with subtraction:</p>
+
+      <pre><code class="language-c"><span class="tok-type">u64</span> <span class="tok-var">delta</span> = <span class="tok-var">arg0</span> - <span class="tok-var">arg1</span>;
+<span class="tok-keyword">return</span> <span class="tok-var">delta</span>;</code></pre>
+
+      <p>HydIR's current PatchLang is intentionally small. It accepts <code>u64</code> declarations, assignments, a final <code>return</code>, unsigned literals, the immutable inputs <code>arg0</code> and <code>arg1</code>, parentheses, addition, and subtraction. Names must be defined before use, inputs cannot be assigned to, and statements after <code>return</code> are rejected. Parser errors carry replacement line and column positions.</p>
+
+      <p>The language is broader than the original scalar compatibility adapter. Region Studio and the v2 service compile the current typed expression tree, including nested addition and subtraction. The local <code>hydirctl patch</code> command still uses the narrower scalar-v1 adapter, which accepts only the expression shapes it can lower directly. Both routes fail closed when a parsed program exceeds their backend contract.</p>
+
+      <h2>Preserve intent as typed PatchIR</h2>
+
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-patch/src/patchlang.rs">PatchLang frontend</a> does not throw the source away after parsing it. It produces a typed statement list and attaches a source range to every statement and expression. For this edit, the PatchIR portion of the bundle contains two statements: a <code>declare</code> whose value is a typed <code>subtract</code>, followed by a <code>return</code> of <code>delta</code>.</p>
+
+      <pre><code class="language-json">{
+  <span class="tok-string">"statements"</span>: [
+    { <span class="tok-string">"kind"</span>: <span class="tok-string">"declare"</span>, <span class="tok-string">"name"</span>: <span class="tok-string">"delta"</span>, <span class="tok-string">"type"</span>: <span class="tok-string">"u64"</span>, … },
+    { <span class="tok-string">"kind"</span>: <span class="tok-string">"return"</span>, … }
+  ],
+  <span class="tok-string">"inputs"</span>: [<span class="tok-string">"rdi:u64(arg0)"</span>, <span class="tok-string">"rsi:u64(arg1)"</span>],
+  <span class="tok-string">"outputs"</span>: [<span class="tok-string">"rax:u64(return)"</span>]
+}</code></pre>
+
+      <p>HydIR also resolves local variables before code generation. In this example, <code>return delta</code> resolves back to <code>arg0 - arg1</code>. Keeping both the statements and the resolved return matters: the statements preserve what the analyst wrote, while the resolved expression gives the backend an unambiguous value to compile. Bundle validation reparses the PatchLang and checks that both forms still agree with it.</p>
+
+      <h2>Check the binary boundary before changing bytes</h2>
+
+      <p>PatchIR describes the new computation, but it does not by itself establish that the target region is safe to replace. Before placement, HydIR checks the exact input SHA-256, the named symbol and its file-backed <code>.text</code> extent, the little-endian x86-64 ELF format, the original scalar lift contract, relocations in the region, observed interior entries, and the return/stack facts.</p>
+
+      <p>The analyst must still make two explicit assertions: the target uses the <code>u64(u64,u64)</code> ABI and external control flow enters only at the function entry. HydIR rejects an interior entry it observes, but it does not claim to have found every possible indirect transfer in an arbitrary program.</p>
+
+      <aside class="note"><strong>Structural verification is not behavioral equivalence.</strong> This patch is supposed to change the function. The structural checks establish that the source, PatchIR, bytes, placement, and recorded region agree. They do not prove that every intended and unintended runtime effect has been tested.</aside>
+
+      <h2>Choose in-place bytes or a trampoline</h2>
+
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-patch/src/lib.rs">PatchIR compiler and placement pipeline</a> first emits bounded x86-64 code. If those bytes fit in the original symbol, HydIR writes them into a copy of the ELF and pads the unused region with NOPs.</p>
+
+      <p>The PRISM portal is only five bytes, so its replacement does not fit. That forces the second placement strategy:</p>
+
+      <ol>
+        <li>Append a new executable, read-only ELF segment containing the compiled replacement.</li>
+        <li>Replace the original entry with a five-byte relative jump to that code.</li>
+        <li>Record the segment offset, virtual address, alignment, entry bytes, and replacement extent in the placement plan.</li>
+      </ol>
+
+      <p>If the original region were shorter than the five-byte jump, or the new code were outside the signed 32-bit relative-jump range, HydIR would refuse the patch. It does not truncate either the old region or the replacement to make the operation appear successful.</p>
+
+      <h2>Carry the evidence in a PatchBundle</h2>
+
+      <p>The produced PatchBundle binds the transformation together. It includes the PatchLang document, typed PatchIR, original region bytes and digest, compiled bytes and digest, ABI boundary adapters, the placement plan, the original and patched ELF hashes, toolchain identity, and verification evidence. Re-importing the new ELF must succeed and retain the selected symbol's entry and extent.</p>
+
+      <p>The bundle deliberately reports <code>stable_verified: false</code>. Its structural evidence marks the original-region digest and patched-ELF re-import as passed, while differential behavior remains <code>not_run</code>. The boundary adapter also records unresolved physical live-outs and stack-alignment residues rather than quietly treating them as known.</p>
+
+      <p>Reversion uses the same evidence. HydIR first checks the complete patched-file digest and validates the placement metadata. It can then restore the original region and, for a trampoline patch, remove the appended executable layout. A modified binary or tampered bundle is rejected instead of being “best effort” reverted.</p>
+
+      <h2>Try the complete flow</h2>
+
+      <p>On Windows, the <a href="https://github.com/Achxy/hydir-2/blob/main/scripts/launch-prism-demo.ps1">PRISM launcher</a> builds the trusted fixture, prepares the analysis and patch artifacts, and opens Region Studio:</p>
+
+      <pre><code class="language-powershell">.\scripts\launch-prism-demo.cmd</code></pre>
+
+      <p>Select <code>hydir_stage_patch_portal</code>, open <strong>C ↔ PatchLang</strong>, enter the two-line patch above, enable the trusted-fixture and entry-only assertions, and choose <strong>Compile + verify plan</strong>. The preview shows the typed statement count, byte delta, entry trampoline, appended RX segment, and structural evidence before any new ELF is written.</p>
+
+      <p>On Linux x86-64, execute only the checked-in trusted fixture when validating behavior. The PRISM program passes <code>72</code> and <code>1</code> to the portal: the original identity returns <code>72</code>, while the subtraction patch returns <code>71</code> and deliberately changes the program's route. That observed change is useful evidence, but it remains separate from the PatchBundle's structural checks.</p>
+
+      <p>That separation is the point of the pipeline. PatchLang states the edit, PatchIR makes the edit inspectable, the placement plan explains where the bytes go, and the PatchBundle records what HydIR proved—and what it did not.</p>
+    </article>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs">All blogs</a></p></footer>
+</body>
+</html>
