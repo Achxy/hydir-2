@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "blog"
-ROUTES = ("/", "/start", "/architecture", "/blogs", "/articles/recovering-jump-tables", "/articles/patchlang-patchir", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function")
+ROUTES = ("/", "/start", "/architecture", "/blogs", "/articles/recovering-jump-tables", "/articles/patchlang-patchir", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code")
 
 
 class Page(HTMLParser):
@@ -21,9 +21,12 @@ class Page(HTMLParser):
         self.titles = 0
         self.headings = 0
         self.descriptions = 0
+        self.in_head = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        if tag == "head":
+            self.in_head = True
         if tag == "a" and "href" in attrs:
             self.links.append(attrs["href"])
         elif tag == "img":
@@ -37,12 +40,16 @@ class Page(HTMLParser):
                 self.links.append(attrs.get("href", ""))
         elif tag == "script" and "src" in attrs:
             self.links.append(attrs["src"])
-        elif tag == "title":
+        elif tag == "title" and self.in_head:
             self.titles += 1
         elif tag == "h1":
             self.headings += 1
         elif tag == "meta" and attrs.get("name") == "description":
             self.descriptions += 1
+
+    def handle_endtag(self, tag):
+        if tag == "head":
+            self.in_head = False
 
 
 def file_for_route(route):
