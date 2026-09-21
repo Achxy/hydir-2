@@ -20,6 +20,7 @@ hydir-api = { path = "../hydir-api" }
 hydir-core = { path = "../hydir-core" }
 hydir-decompile = { path = "../hydir-decompile" }
 hydir-ir = { path = "../hydir-ir" }
+hydir-vm = { path = "../hydir-vm" }
 hydir-interchange = { path = "../hydir-interchange" }
 hydir-project = { path = "../hydir-project" }
 object.workspace = true

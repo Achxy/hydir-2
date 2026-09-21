@@ -2188,6 +2188,7 @@ dependencies = [
  "hydir-project",
  "hydir-recompile",
  "hydir-transform",
+ "hydir-vm",
  "iced-x86",
  "object",
  "serde_json",
@@ -2363,6 +2364,18 @@ dependencies = [
 name = "hydir-transform"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
+]
+
+[[package]]
+name = "hydir-vm"
+version = "0.1.0"
+dependencies = [
+ "hydir-core",
+ "hydir-loader",
+ "iced-x86",
+ "serde",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

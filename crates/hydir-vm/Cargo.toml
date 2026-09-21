@@ -1,0 +1,16 @@
+[package]
+name = "hydir-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hydir-core = { path = "../hydir-core" }
+hydir-loader = { path = "../hydir-loader" }
+iced-x86.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
