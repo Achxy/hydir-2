@@ -59,9 +59,10 @@ into a new ELF copy.
 
 Seven functions have exact native instruction coverage. The Linux entry point
 and three `prism_write_*` runtime helpers contain `syscall`; their native C
-keeps those instructions as explicit opaque effects. Region Studio shows that
-low-level C and its fidelity status when structured C is unavailable. Select
-`hydir_stage_patch_portal` for the PatchLang demonstration.
+keeps those instructions as explicit opaque effects. Region Studio and the
+C output tab show that low-level C and its fidelity status when structured C
+is unavailable. Select `hydir_stage_patch_portal` for the PatchLang
+demonstration.
 
 The [PRISM presenter guide](docs/PRISM_DEMO.md) gives a short GUI route,
 commands, and the expected evidence. The binary can be inspected on Windows;
