@@ -20,6 +20,7 @@ use hydir_decompile::{
 };
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
+use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod local;
 mod passes;
 mod patch;
@@ -66,6 +67,8 @@ Usage:
   hydirctl decompile-all <elf> --output-dir <new-directory>
   hydirctl explain <elf> --function <function-id-or-symbol> [--address <hex-address>]
   hydirctl coverage <elf>
+  hydirctl vm-profile <linked-elf> <profile.json>
+  hydirctl vm-explore <linked-elf> <profile.json>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -130,6 +133,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "{}",
                 serde_json::to_string_pretty(&measure_native_coverage(&bytes)?)?
             );
+        }
+        Some("vm-profile" | "vm-explore") if args.len() == 3 => {
+            const MAX_VM_PROFILE_BYTES: u64 = 1024 * 1024;
+            if fs::metadata(&args[2])?.len() > MAX_VM_PROFILE_BYTES {
+                return Err("VM profile exceeds the 1 MiB size limit".into());
+            }
+            let bytes = read_binary(&args[1])?;
+            let profile: VmProfile = serde_json::from_slice(&fs::read(&args[2])?)?;
+            if args[0] == "vm-profile" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&validate_profile(&bytes, &profile)?)?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&explore_profile(&bytes, &profile)?)?
+                );
+            }
         }
         Some("explain") if (args.len() == 4 || args.len() == 6) && args[2] == "--function" => {
             let requested_address = if args.len() == 6 {
