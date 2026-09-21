@@ -19,6 +19,9 @@ hydir-patch = { path = "../hydir-patch" }
 hydir-transform = { path = "../hydir-transform" }
 hydir-recompile = { path = "../hydir-recompile" }
 hydir-analysis = { path = "../hydir-analysis" }
+hydir-decompile = { path = "../hydir-decompile" }
+hydir-ir = { path = "../hydir-ir" }
+hydir-loader = { path = "../hydir-loader" }
 tonic.workspace = true
 tonic-health.workspace = true
 tokio.workspace = true

@@ -5,9 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub const SPEC_VERSION: u32 = 1;
-pub const PROGRAM_SPEC_VERSION: u32 = 4;
+pub const PROGRAM_SPEC_VERSION: u32 = 5;
 pub const REGION_SPEC_VERSION: u32 = 3;
-pub const DECOMPILATION_UNIT_VERSION: u32 = 1;
+pub const DECOMPILATION_UNIT_VERSION: u32 = 2;
 pub const PATCH_BUNDLE_VERSION: u32 = 2;
 
 /// JSON addresses are strings so no consumer can round a 64-bit address via f64.
@@ -32,6 +32,15 @@ impl<'de> Deserialize<'de> for Address {
     }
 }
 
+/// Unambiguous location within one ProgramSpec address space. Linked ELF
+/// files use address space zero for process virtual memory; relocatable ELF
+/// files use a distinct address space for each section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct Location {
+    pub address_space: u32,
+    pub value: Address,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProgramSpec {
     pub schema_version: u32,
@@ -41,7 +50,30 @@ pub struct ProgramSpec {
     pub file_kind: String,
     pub image_base: Option<Address>,
     pub entry_point: Option<Address>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_location: Option<Location>,
     pub data_layout: Option<String>,
+    /// Raw ELF program-header inventory. This includes non-loadable headers
+    /// such as PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME, and PT_GNU_RELRO.
+    #[serde(default)]
+    pub program_headers: Vec<ProgramHeaderSpec>,
+    /// Dynamic symbols are retained independently from normalized imports and
+    /// function seeds so symbol versions and undefined entries are not lost.
+    #[serde(default)]
+    pub dynamic_symbols: Vec<DynamicSymbolSpec>,
+    /// File-derived ranges used by runtime linkage, unwinding, TLS, and
+    /// language runtimes. An unwind section range is not an FDE claim.
+    #[serde(default)]
+    pub runtime_ranges: Vec<RuntimeRangeSpec>,
+    /// Individually decoded frame-description ranges. These are entry and
+    /// extent evidence from unwind metadata, not proof that every covered
+    /// byte is reachable machine code.
+    #[serde(default)]
+    pub unwind_ranges: Vec<UnwindRangeSpec>,
+    /// Parsed init/fini pointer slots. Individual unresolved entries remain
+    /// explicit instead of being omitted or guessed.
+    #[serde(default)]
+    pub pointer_arrays: Vec<RuntimePointerArraySpec>,
     /// Address space zero is the ELF process image for linked files. No
     /// runtime load bias is asserted for position-independent executables.
     pub address_spaces: Vec<AddressSpaceSpec>,
@@ -99,6 +131,109 @@ pub struct MappedSegmentSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProgramHeaderSpec {
+    pub index: u32,
+    pub type_value: u32,
+    pub type_name: String,
+    pub flags: u32,
+    pub file_offset: Address,
+    pub location: Location,
+    pub physical_address: Address,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub alignment: u64,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DynamicSymbolSpec {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_file: Option<String>,
+    #[serde(default)]
+    pub version_hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    pub size: u64,
+    pub kind: String,
+    pub binding: String,
+    pub visibility: String,
+    pub defined: bool,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRangeKind {
+    Plt,
+    Got,
+    Tls,
+    Unwind,
+    InitArray,
+    FiniArray,
+    PreinitArray,
+    LanguageMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeRangeSpec {
+    pub id: String,
+    pub kind: RuntimeRangeKind,
+    pub section_name: String,
+    pub location: Location,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_offset: Option<Address>,
+    pub size: u64,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnwindRangeSpec {
+    pub id: String,
+    pub section_name: String,
+    /// Byte offset of the FDE record inside its unwind section.
+    pub record_offset: u64,
+    pub initial_location: Location,
+    pub address_range: u64,
+    /// True only when the complete range lies in a mapped executable segment.
+    pub executable: bool,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePointerArrayKind {
+    Init,
+    Fini,
+    Preinit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimePointerEntrySpec {
+    pub slot: Location,
+    pub raw_value: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Location>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_provenance: Option<FactProvenance>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimePointerArraySpec {
+    pub id: String,
+    pub kind: RuntimePointerArrayKind,
+    pub section_name: String,
+    pub location: Location,
+    pub entry_width_bits: u16,
+    pub entries: Vec<RuntimePointerEntrySpec>,
+    pub trailing_bytes: u8,
+    pub provenance: FactProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportSpec {
     pub library: String,
     pub name: String,
@@ -108,6 +243,8 @@ pub struct ImportSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelocationSpec {
     pub location: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_ref: Option<Location>,
     pub address_kind: AddressKind,
     pub source_section: Option<String>,
     pub kind: String,
@@ -125,10 +262,26 @@ pub struct RelocationSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RelocationTargetSpec {
-    Symbol { id: String, name: Option<String> },
-    Section { name: String },
+    Symbol {
+        id: String,
+        name: Option<String>,
+        /// Canonical base location when the referenced symbol is defined in
+        /// this ELF. The relocation addend and encoding still determine the
+        /// final relocated value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<Location>,
+        #[serde(default)]
+        defined: bool,
+    },
+    Section {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<Location>,
+    },
     Absolute,
-    Unresolved { description: String },
+    Unresolved {
+        description: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -308,6 +461,8 @@ pub enum FactSource {
 pub struct SectionSpec {
     pub name: String,
     pub address: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
     pub address_kind: AddressKind,
     pub file_offset: Option<Address>,
     pub size: u64,
@@ -319,6 +474,8 @@ pub struct FunctionSpec {
     pub id: String,
     pub name: String,
     pub address: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
     pub address_kind: AddressKind,
     pub section_name: String,
     pub size: u64,
@@ -429,10 +586,11 @@ pub struct UncertaintySpec {
 pub fn migrate_program_spec(mut spec: ProgramSpec) -> Result<ProgramSpec, String> {
     let legacy_version = spec.schema_version;
     match legacy_version {
-        2 | 3 => spec.schema_version = PROGRAM_SPEC_VERSION,
+        1..=4 => spec.schema_version = PROGRAM_SPEC_VERSION,
         PROGRAM_SPEC_VERSION => {}
         other => return Err(format!("unsupported ProgramSpec schema version {other}")),
     }
+    populate_program_locations(&mut spec);
     if legacy_version < PROGRAM_SPEC_VERSION
         && spec.unresolved_control_flow
         && !spec
@@ -458,6 +616,90 @@ pub fn migrate_program_spec(mut spec: ProgramSpec) -> Result<ProgramSpec, String
     Ok(spec)
 }
 
+fn populate_program_locations(spec: &mut ProgramSpec) {
+    let has_section_relative = spec
+        .sections
+        .iter()
+        .any(|section| section.address_kind == AddressKind::SectionRelative);
+    if spec.address_spaces.is_empty() {
+        if has_section_relative {
+            for (index, section) in spec.sections.iter().enumerate() {
+                spec.address_spaces.push(AddressSpaceSpec {
+                    id: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    name: format!("ELF section {}", section.name),
+                    address_kind: AddressKind::SectionRelative,
+                    provenance: FactProvenance {
+                        source: FactSource::ElfMetadata,
+                        scope: "derived while migrating a section-relative ProgramSpec".to_owned(),
+                    },
+                });
+            }
+        } else {
+            spec.address_spaces.push(AddressSpaceSpec {
+                id: 0,
+                name: "ELF process virtual memory".to_owned(),
+                address_kind: AddressKind::Virtual,
+                provenance: FactProvenance {
+                    source: FactSource::ElfMetadata,
+                    scope: "derived while migrating a linked ProgramSpec".to_owned(),
+                },
+            });
+        }
+    }
+    let section_space = |name: &str, sections: &[SectionSpec]| {
+        sections
+            .iter()
+            .position(|section| section.name == name)
+            .and_then(|index| u32::try_from(index + 1).ok())
+    };
+    for (index, section) in spec.sections.iter_mut().enumerate() {
+        if section.location.is_none() {
+            section.location = Some(Location {
+                address_space: if section.address_kind == AddressKind::Virtual {
+                    0
+                } else {
+                    u32::try_from(index + 1).unwrap_or(u32::MAX)
+                },
+                value: section.address,
+            });
+        }
+    }
+    for function in &mut spec.functions {
+        if function.location.is_none() {
+            function.location = Some(Location {
+                address_space: if function.address_kind == AddressKind::Virtual {
+                    0
+                } else {
+                    section_space(&function.section_name, &spec.sections).unwrap_or(u32::MAX)
+                },
+                value: function.address,
+            });
+        }
+    }
+    for relocation in &mut spec.relocations {
+        if relocation.location_ref.is_none() {
+            relocation.location_ref = Some(Location {
+                address_space: if relocation.address_kind == AddressKind::Virtual {
+                    0
+                } else {
+                    relocation
+                        .source_section
+                        .as_deref()
+                        .and_then(|name| section_space(name, &spec.sections))
+                        .unwrap_or(u32::MAX)
+                },
+                value: relocation.location,
+            });
+        }
+    }
+    if spec.entry_location.is_none() {
+        spec.entry_location = spec.entry_point.map(|value| Location {
+            address_space: 0,
+            value,
+        });
+    }
+}
+
 pub fn validate_program_spec(spec: &ProgramSpec) -> Result<(), String> {
     if spec.schema_version != PROGRAM_SPEC_VERSION {
         return Err(format!(
@@ -466,6 +708,217 @@ pub fn validate_program_spec(spec: &ProgramSpec) -> Result<(), String> {
         ));
     }
     validate_sha256("ProgramSpec binary", &spec.binary_sha256)?;
+    let mut address_space_ids = std::collections::BTreeSet::new();
+    if spec.address_spaces.iter().any(|space| {
+        !address_space_ids.insert(space.id)
+            || space.name.is_empty()
+            || space.name.len() > 4096
+            || space.provenance.scope.is_empty()
+    }) {
+        return Err("ProgramSpec contains invalid or duplicate address spaces".to_owned());
+    }
+    let valid_location = |location: Location| address_space_ids.contains(&location.address_space);
+    if spec
+        .entry_location
+        .is_some_and(|location| !valid_location(location))
+        || spec.sections.iter().any(|section| {
+            section
+                .location
+                .is_none_or(|location| !valid_location(location))
+        })
+        || spec.functions.iter().any(|function| {
+            function
+                .location
+                .is_none_or(|location| !valid_location(location))
+        })
+        || spec.relocations.iter().any(|relocation| {
+            relocation
+                .location_ref
+                .is_none_or(|location| !valid_location(location))
+                || match &relocation.target {
+                    RelocationTargetSpec::Symbol { location, .. }
+                    | RelocationTargetSpec::Section { location, .. } => {
+                        location.is_some_and(|location| !valid_location(location))
+                    }
+                    RelocationTargetSpec::Absolute | RelocationTargetSpec::Unresolved { .. } => {
+                        false
+                    }
+                }
+        })
+    {
+        return Err("ProgramSpec contains a missing or unknown canonical location".to_owned());
+    }
+    if spec.program_headers.len() > 4096
+        || spec.dynamic_symbols.len() > 1_000_000
+        || spec.runtime_ranges.len() > 65_536
+        || spec.unwind_ranges.len() > 65_536
+        || spec.pointer_arrays.len() > 1024
+    {
+        return Err("ProgramSpec exceeds bounded ELF metadata inventories".to_owned());
+    }
+    for relocation in &spec.relocations {
+        let invalid_target = match &relocation.target {
+            RelocationTargetSpec::Symbol {
+                id,
+                name,
+                location,
+                defined,
+            } => {
+                id.is_empty()
+                    || id.len() > 256
+                    || name.as_ref().is_some_and(|name| name.len() > 4096)
+                    || (location.is_some() && !defined)
+            }
+            RelocationTargetSpec::Section { name, .. } => name.is_empty() || name.len() > 4096,
+            RelocationTargetSpec::Absolute => false,
+            RelocationTargetSpec::Unresolved { description } => {
+                description.is_empty() || description.len() > 4096
+            }
+        };
+        if relocation.kind.is_empty()
+            || relocation.kind.len() > 128
+            || relocation.encoding.is_empty()
+            || relocation.encoding.len() > 128
+            || relocation.format_flags.len() > 256
+            || relocation
+                .source_section
+                .as_ref()
+                .is_some_and(|name| name.len() > 4096)
+            || relocation.provenance.scope.is_empty()
+            || invalid_target
+        {
+            return Err("ProgramSpec contains an invalid relocation".to_owned());
+        }
+    }
+    let mut header_indices = std::collections::BTreeSet::new();
+    for header in &spec.program_headers {
+        if !header_indices.insert(header.index)
+            || header.type_name.is_empty()
+            || header.type_name.len() > 128
+            || !valid_location(header.location)
+            || header.provenance.scope.is_empty()
+        {
+            return Err("ProgramSpec contains an invalid program header".to_owned());
+        }
+    }
+    let mut metadata_ids = std::collections::BTreeSet::new();
+    for symbol in &spec.dynamic_symbols {
+        if symbol.id.is_empty()
+            || symbol.id.len() > 256
+            || !metadata_ids.insert(symbol.id.as_str())
+            || symbol.name.len() > 4096
+            || symbol
+                .version
+                .as_ref()
+                .is_some_and(|value| value.len() > 4096)
+            || symbol
+                .version_file
+                .as_ref()
+                .is_some_and(|value| value.len() > 4096)
+            || symbol.kind.is_empty()
+            || symbol.kind.len() > 128
+            || symbol.binding.is_empty()
+            || symbol.binding.len() > 128
+            || symbol.visibility.is_empty()
+            || symbol.visibility.len() > 128
+            || symbol
+                .location
+                .is_some_and(|location| !valid_location(location))
+            || symbol.provenance.scope.is_empty()
+        {
+            return Err("ProgramSpec contains an invalid dynamic symbol".to_owned());
+        }
+    }
+    metadata_ids.clear();
+    for range in &spec.runtime_ranges {
+        if range.id.is_empty()
+            || range.id.len() > 256
+            || !metadata_ids.insert(range.id.as_str())
+            || range.section_name.is_empty()
+            || range.section_name.len() > 4096
+            || range.size == 0
+            || !valid_location(range.location)
+            || range.provenance.scope.is_empty()
+        {
+            return Err("ProgramSpec contains an invalid runtime metadata range".to_owned());
+        }
+    }
+    metadata_ids.clear();
+    for range in &spec.unwind_ranges {
+        let end = range
+            .initial_location
+            .value
+            .0
+            .checked_add(range.address_range);
+        let executable_mapping = end.is_some_and(|end| {
+            spec.mapped_segments.iter().any(|segment| {
+                segment.address_space == range.initial_location.address_space
+                    && segment.executable
+                    && segment.virtual_address.0 <= range.initial_location.value.0
+                    && segment
+                        .virtual_address
+                        .0
+                        .checked_add(segment.memory_size)
+                        .is_some_and(|segment_end| end <= segment_end)
+            })
+        });
+        let executable_section = end.is_some_and(|end| {
+            spec.sections.iter().any(|section| {
+                section.location.is_some_and(|location| {
+                    location.address_space == range.initial_location.address_space
+                        && location.value.0 <= range.initial_location.value.0
+                }) && section.kind == "Text"
+                    && section
+                        .address
+                        .0
+                        .checked_add(section.size)
+                        .is_some_and(|section_end| end <= section_end)
+            })
+        });
+        if range.id.is_empty()
+            || range.id.len() > 256
+            || !metadata_ids.insert(range.id.as_str())
+            || range.section_name.is_empty()
+            || range.section_name.len() > 4096
+            || range.address_range == 0
+            || end.is_none()
+            || !valid_location(range.initial_location)
+            || (range.executable && !executable_mapping && !executable_section)
+            || range.provenance.scope.is_empty()
+        {
+            return Err("ProgramSpec contains an invalid unwind range".to_owned());
+        }
+    }
+    metadata_ids.clear();
+    for array in &spec.pointer_arrays {
+        if array.id.is_empty()
+            || array.id.len() > 256
+            || !metadata_ids.insert(array.id.as_str())
+            || array.section_name.is_empty()
+            || array.section_name.len() > 4096
+            || array.entry_width_bits != 64
+            || array.entries.len() > 65_536
+            || array.trailing_bytes >= 8
+            || !valid_location(array.location)
+            || array.provenance.scope.is_empty()
+        {
+            return Err("ProgramSpec contains an invalid runtime pointer array".to_owned());
+        }
+        for entry in &array.entries {
+            if !valid_location(entry.slot)
+                || entry.target.is_some_and(|target| !valid_location(target))
+                || entry
+                    .target_provenance
+                    .as_ref()
+                    .is_some_and(|provenance| provenance.scope.is_empty())
+                || (entry.target.is_some() != entry.target_provenance.is_some())
+            {
+                return Err(
+                    "ProgramSpec runtime pointer entry uses an unknown address space".to_owned(),
+                );
+            }
+        }
+    }
     if spec.memory_facts.len() > 65_536 || spec.uncertainties.len() > 65_536 {
         return Err("ProgramSpec exceeds bounded memory or uncertainty fact count".to_owned());
     }
@@ -507,7 +960,42 @@ pub fn validate_program_spec(spec: &ProgramSpec) -> Result<(), String> {
 }
 
 pub fn parse_program_spec_json(bytes: &[u8]) -> Result<ProgramSpec, String> {
-    let spec: ProgramSpec = serde_json::from_slice(bytes)
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid ProgramSpec JSON: {error}"))?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+    {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "ProgramSpec JSON must be an object".to_owned())?;
+        for field in [
+            "address_spaces",
+            "mapped_segments",
+            "imports",
+            "relocations",
+            "calls",
+            "references",
+            "assumptions",
+        ] {
+            object
+                .entry(field.to_owned())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        }
+        for field in ["image_base", "entry_point", "data_layout", "entry_location"] {
+            object
+                .entry(field.to_owned())
+                .or_insert(serde_json::Value::Null);
+        }
+        object
+            .entry("call_recovery".to_owned())
+            .or_insert_with(|| serde_json::Value::String("not_attempted".to_owned()));
+        object
+            .entry("reference_recovery".to_owned())
+            .or_insert_with(|| serde_json::Value::String("not_attempted".to_owned()));
+    }
+    let spec: ProgramSpec = serde_json::from_value(value)
         .map_err(|error| format!("invalid ProgramSpec JSON: {error}"))?;
     migrate_program_spec(spec)
 }
@@ -796,6 +1284,44 @@ pub struct StatementAddressProvenance {
     pub provenance: FactProvenance,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecompilationStructuralCompleteness {
+    #[default]
+    Partial,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecompilationSemanticFidelity {
+    #[default]
+    Unknown,
+    Conservative,
+    ExactUnderModel,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecompilationVerificationStatus {
+    #[default]
+    NotRun,
+    StaticallyValidated,
+    DifferentiallyTested,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DecompilationArtifactDigests {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_ir_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_ir_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_ir_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cir_sha256: Option<String>,
+}
+
 /// Versioned output of one region decompilation. `cir` remains optional until
 /// the native structured representation exists; callers can distinguish the
 /// verified LLVM-compatible RegionIR from the deterministic C view.
@@ -804,15 +1330,65 @@ pub struct DecompilationUnit {
     pub schema_version: u32,
     pub binary_sha256: String,
     pub region: RegionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<u64>,
+    #[serde(default)]
+    pub artifacts: DecompilationArtifactDigests,
+    #[serde(default)]
     pub region_ir_llvm: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cir: Option<String>,
     pub c_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_level_c: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_c: Option<String>,
+    #[serde(default)]
+    pub structural_completeness: DecompilationStructuralCompleteness,
+    #[serde(default)]
+    pub semantic_fidelity: DecompilationSemanticFidelity,
+    #[serde(default)]
+    pub verification: DecompilationVerificationStatus,
+    #[serde(default)]
+    pub rewrite_ready: bool,
     #[serde(default)]
     pub statement_provenance: Vec<StatementAddressProvenance>,
     #[serde(default)]
     pub diagnostics: Vec<DecompilationDiagnostic>,
     pub engine_version: String,
+}
+
+pub fn migrate_decompilation_unit(
+    mut unit: DecompilationUnit,
+) -> Result<DecompilationUnit, String> {
+    match unit.schema_version {
+        1 => {
+            unit.schema_version = DECOMPILATION_UNIT_VERSION;
+            if unit.low_level_c.is_none() {
+                unit.low_level_c = Some(unit.c_source.clone());
+            }
+            unit.structural_completeness = DecompilationStructuralCompleteness::Partial;
+            unit.semantic_fidelity = DecompilationSemanticFidelity::Conservative;
+            unit.verification = DecompilationVerificationStatus::NotRun;
+            unit.rewrite_ready = false;
+        }
+        DECOMPILATION_UNIT_VERSION => {}
+        other => {
+            return Err(format!(
+                "unsupported DecompilationUnit schema version {other}"
+            ));
+        }
+    }
+    validate_decompilation_unit(&unit)?;
+    Ok(unit)
+}
+
+pub fn parse_decompilation_unit_json(bytes: &[u8]) -> Result<DecompilationUnit, String> {
+    let unit: DecompilationUnit = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid DecompilationUnit JSON: {error}"))?;
+    migrate_decompilation_unit(unit)
 }
 
 pub fn validate_decompilation_unit(unit: &DecompilationUnit) -> Result<(), String> {
@@ -826,7 +1402,11 @@ pub fn validate_decompilation_unit(unit: &DecompilationUnit) -> Result<(), Strin
     if unit.binary_sha256 != unit.region.binary_sha256 {
         return Err("DecompilationUnit and RegionSpec binary digests differ".to_owned());
     }
-    if unit.region_ir_llvm.is_empty()
+    let has_native_ir = unit.artifacts.machine_ir_sha256.is_some()
+        && unit.artifacts.state_ir_sha256.is_some()
+        && unit.artifacts.function_ir_sha256.is_some()
+        && unit.artifacts.cir_sha256.is_some();
+    if (unit.region_ir_llvm.is_empty() && !has_native_ir)
         || unit.region_ir_llvm.len() > 8 * 1024 * 1024
         || unit.region_ir_llvm.contains('\0')
         || unit.c_source.is_empty()
@@ -836,6 +1416,27 @@ pub fn validate_decompilation_unit(unit: &DecompilationUnit) -> Result<(), Strin
         || unit.engine_version.len() > 128
     {
         return Err("DecompilationUnit source or engine metadata is invalid".to_owned());
+    }
+    if unit.low_level_c.as_deref().is_none_or(|source| {
+        source.is_empty() || source.len() > 8 * 1024 * 1024 || source.contains('\0')
+    }) || unit.structured_c.as_deref().is_some_and(|source| {
+        source.is_empty() || source.len() > 8 * 1024 * 1024 || source.contains('\0')
+    }) || (unit.rewrite_ready
+        && (unit.structural_completeness != DecompilationStructuralCompleteness::Complete
+            || unit.semantic_fidelity != DecompilationSemanticFidelity::ExactUnderModel))
+    {
+        return Err("DecompilationUnit native source or readiness is invalid".to_owned());
+    }
+    for digest in [
+        &unit.artifacts.machine_ir_sha256,
+        &unit.artifacts.state_ir_sha256,
+        &unit.artifacts.function_ir_sha256,
+        &unit.artifacts.cir_sha256,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_sha256("DecompilationUnit artifact", digest)?;
     }
     let c_line_count = unit.c_source.lines().count() as u64;
     let region_end = unit
@@ -1603,7 +2204,16 @@ mod tests {
             file_kind: "Executable".to_owned(),
             image_base: None,
             entry_point: Some(Address(0x401000)),
+            entry_location: Some(Location {
+                address_space: 0,
+                value: Address(0x401000),
+            }),
             data_layout: None,
+            program_headers: Vec::new(),
+            dynamic_symbols: Vec::new(),
+            runtime_ranges: Vec::new(),
+            unwind_ranges: Vec::new(),
+            pointer_arrays: Vec::new(),
             address_spaces: Vec::new(),
             mapped_segments: vec![MappedSegmentSpec {
                 id: "load".to_owned(),
@@ -1643,15 +2253,73 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("memory_facts");
         legacy.as_object_mut().unwrap().remove("uncertainties");
         legacy.as_object_mut().unwrap().remove("provenance");
+        legacy.as_object_mut().unwrap().remove("entry_location");
+        legacy.as_object_mut().unwrap().remove("program_headers");
+        legacy.as_object_mut().unwrap().remove("dynamic_symbols");
+        legacy.as_object_mut().unwrap().remove("runtime_ranges");
+        legacy.as_object_mut().unwrap().remove("unwind_ranges");
+        legacy.as_object_mut().unwrap().remove("pointer_arrays");
         let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
         assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
         assert!(migrated.typed_model.prototypes.is_empty());
+        assert!(migrated.program_headers.is_empty());
+        assert!(migrated.dynamic_symbols.is_empty());
+        assert!(migrated.runtime_ranges.is_empty());
+        assert!(migrated.unwind_ranges.is_empty());
+        assert!(migrated.pointer_arrays.is_empty());
         assert_eq!(migrated.uncertainties.len(), 1);
+
+        legacy["schema_version"] = serde_json::json!(PROGRAM_SPEC_VERSION);
+        let current_with_defaulted_inventories =
+            parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
+        assert!(
+            current_with_defaulted_inventories
+                .program_headers
+                .is_empty()
+        );
+        assert!(
+            current_with_defaulted_inventories
+                .dynamic_symbols
+                .is_empty()
+        );
 
         legacy["schema_version"] = serde_json::json!(3);
         let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
         assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
         assert_eq!(migrated.uncertainties.len(), 1);
+
+        legacy["schema_version"] = serde_json::json!(4);
+        let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
+        assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
+        assert_eq!(
+            migrated.entry_location,
+            Some(Location {
+                address_space: 0,
+                value: Address(0x401000)
+            })
+        );
+
+        legacy["schema_version"] = serde_json::json!(1);
+        for field in [
+            "address_spaces",
+            "mapped_segments",
+            "imports",
+            "relocations",
+            "calls",
+            "references",
+            "call_recovery",
+            "reference_recovery",
+            "assumptions",
+            "image_base",
+            "entry_point",
+            "data_layout",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let migrated = parse_program_spec_json(legacy.to_string().as_bytes()).unwrap();
+        assert_eq!(migrated.schema_version, PROGRAM_SPEC_VERSION);
+        assert_eq!(migrated.entry_location, None);
+        assert_eq!(migrated.call_recovery, RecoveryState::NotAttempted);
 
         spec.typed_model.prototypes.push(PrototypeAssertion {
             id: "prototype-main".to_owned(),
@@ -1728,5 +2396,101 @@ mod tests {
                 .unwrap_err()
                 .contains("digest")
         );
+    }
+
+    #[test]
+    fn decompilation_unit_v1_migrates_without_upgrading_claims() {
+        let code = [0xc3];
+        let region = RegionContract {
+            schema_version: REGION_SPEC_VERSION,
+            binary_sha256: "c".repeat(64),
+            symbol_name: "return_only".to_owned(),
+            address_kind: AddressKind::Virtual,
+            entry: Address(0x401000),
+            byte_length: code.len() as u64,
+            bytes_sha256: format!("{:x}", Sha256::digest(code)),
+            bytes_hex: "c3".to_owned(),
+            exits: Vec::new(),
+            calls: Vec::new(),
+            relocations: Vec::new(),
+            observed_interior_entries: Vec::new(),
+            live_in: None,
+            live_out: None,
+            physical_live_in: Vec::new(),
+            physical_live_out: Vec::new(),
+            stack_delta: None,
+            stack_entry_alignment: None,
+            exit_stack_relations: Vec::new(),
+            global_references: Vec::new(),
+            variable_locations: Vec::new(),
+            assumptions: Vec::new(),
+            unresolved_facts: vec!["legacy boundary state".to_owned()],
+            replacement_ready: false,
+            provenance: FactProvenance {
+                source: FactSource::NativeAnalysis,
+                scope: "test".to_owned(),
+            },
+        };
+        let unit = DecompilationUnit {
+            schema_version: DECOMPILATION_UNIT_VERSION,
+            binary_sha256: region.binary_sha256.clone(),
+            region,
+            function_id: None,
+            model_revision: None,
+            artifacts: DecompilationArtifactDigests::default(),
+            region_ir_llvm: "define i64 @f() { ret i64 0 }".to_owned(),
+            cir: None,
+            c_source: "void f(void) {}\n".to_owned(),
+            low_level_c: Some("void f(void) {}\n".to_owned()),
+            structured_c: None,
+            structural_completeness: DecompilationStructuralCompleteness::Partial,
+            semantic_fidelity: DecompilationSemanticFidelity::Conservative,
+            verification: DecompilationVerificationStatus::NotRun,
+            rewrite_ready: false,
+            statement_provenance: Vec::new(),
+            diagnostics: Vec::new(),
+            engine_version: "hydir/legacy".to_owned(),
+        };
+        let mut legacy = serde_json::to_value(unit).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        for field in [
+            "function_id",
+            "model_revision",
+            "artifacts",
+            "low_level_c",
+            "structured_c",
+            "structural_completeness",
+            "semantic_fidelity",
+            "verification",
+            "rewrite_ready",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let migrated = parse_decompilation_unit_json(legacy.to_string().as_bytes()).unwrap();
+        assert_eq!(migrated.schema_version, DECOMPILATION_UNIT_VERSION);
+        assert_eq!(migrated.low_level_c.as_deref(), Some("void f(void) {}\n"));
+        assert_eq!(
+            migrated.semantic_fidelity,
+            DecompilationSemanticFidelity::Conservative
+        );
+        assert!(!migrated.rewrite_ready);
+    }
+
+    #[test]
+    fn legacy_relocation_symbol_target_defaults_to_unresolved_location() {
+        let target: RelocationTargetSpec = serde_json::from_value(serde_json::json!({
+            "kind": "symbol",
+            "id": "legacy-symbol",
+            "name": "callee"
+        }))
+        .unwrap();
+        assert!(matches!(
+            target,
+            RelocationTargetSpec::Symbol {
+                location: None,
+                defined: false,
+                ..
+            }
+        ));
     }
 }

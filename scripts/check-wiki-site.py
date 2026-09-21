@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "blog"
-ROUTES = ("/", "/start", "/architecture", "/blogs", "/articles/patchlang-patchir", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function")
+ROUTES = ("/", "/start", "/architecture", "/blogs", "/articles/recovering-jump-tables", "/articles/patchlang-patchir", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function")
 
 
 class Page(HTMLParser):

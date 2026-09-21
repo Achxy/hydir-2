@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="HydIR engineering blogs about PatchLang and PatchIR, bounded binary lifting, Triton symbolic exploration, and worked x86-64 examples.">
+  <meta name="description" content="HydIR engineering blogs about jump-table recovery, PatchLang and PatchIR, bounded binary lifting, Triton symbolic exploration, and worked x86-64 examples.">
   <link rel="canonical" href="https://hydir.wiki/blogs">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
   <link rel="stylesheet" href="/styles.css">
@@ -15,6 +15,12 @@
   <main class="site-main prose" id="content">
     <p class="eyebrow">Engineering notes</p>
     <h1>Blogs</h1>
+    <hr class="section-rule">
+    <article>
+      <h2><a href="/articles/recovering-jump-tables">Recovering Jump Tables from x86-64 ELF</a></h2>
+      <p>Compare absolute pointers in a linked ELF with relocation-backed relative entries in an object file. Follow the recovered CFG targets into CIR and see why the generated switch retains an unresolved default.</p>
+      <p><a href="/articles/recovering-jump-tables">Read the jump-table deep dive →</a></p>
+    </article>
     <hr class="section-rule">
     <article>
       <h2><a href="/articles/patchlang-patchir">From PatchLang to PatchIR: A Reversible ELF Patch</a></h2>

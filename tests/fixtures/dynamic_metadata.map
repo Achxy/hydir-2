@@ -1,0 +1,7 @@
+HYDIR_1.0 {
+  global:
+    exported_fn;
+    hydir_tls_value;
+  local:
+    *;
+};

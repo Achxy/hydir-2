@@ -1,0 +1,12 @@
+[package]
+name = "hydir-loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gimli.workspace = true
+hydir-core = { path = "../hydir-core" }
+object.workspace = true
+sha2.workspace = true

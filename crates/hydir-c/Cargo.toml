@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 hydir-core = { path = "../hydir-core" }
+hydir-ir = { path = "../hydir-ir" }
 serde_json.workspace = true
 
 [dev-dependencies]

@@ -14,6 +14,8 @@ use hydir_api::v1::{
 };
 use hydir_api::v2 as api_v2;
 use hydir_api::v2::hydir_v2_server::HydirV2Server;
+use hydir_api::v3 as api_v3;
+use hydir_api::v3::hydir_v3_server::HydirV3Server;
 use hydir_backend::{
     MAX_BINARY_BYTES, import_elf, lift_physical_region, lift_symbol, recover_symbol_cfg,
     region_contract,
@@ -21,9 +23,18 @@ use hydir_backend::{
 use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, DECOMPILATION_UNIT_VERSION, FactProvenance,
-    FactSource, PATCH_BUNDLE_VERSION, PROGRAM_SPEC_VERSION, ProgramSpec, REGION_SPEC_VERSION,
-    annotation_address_in_spec, overlay_analyst_assumptions, parse_annotation_address,
-    parse_program_spec_json, validate_analyst_annotation,
+    FactSource, Location, PATCH_BUNDLE_VERSION, PROGRAM_SPEC_VERSION, ProgramSpec,
+    REGION_SPEC_VERSION, annotation_address_in_spec, overlay_analyst_assumptions,
+    parse_annotation_address, parse_program_spec_json, validate_analyst_annotation,
+};
+use hydir_decompile::{
+    decompile_function_unit_at, discover_functions, export_function_ir_llvm,
+    lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
+    measure_native_coverage,
+};
+use hydir_ir::{
+    CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
+    STATE_FUNCTION_IR_VERSION,
 };
 use hydir_patch::{
     MAX_PATCH_BYTES, compile_patch_binary, parse_patch_bundle_json, parse_patch_document,
@@ -36,7 +47,7 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 #[cfg(not(test))]
@@ -59,7 +70,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{
     Request, Response, Status,
     transport::{Identity, Server, ServerTlsConfig},
@@ -1534,6 +1545,92 @@ impl Store {
             workers.remove(&job_id);
         }
     }
+
+    async fn finish_native_analysis_job(
+        &self,
+        job_id: &str,
+        project_id: &str,
+        revision: u64,
+        result: Result<Vec<u8>, Status>,
+    ) -> Result<(), Status> {
+        let prepared = match result {
+            Ok(content) => Ok(self.content_storage.stage(&content).await?),
+            Err(error) => Err(error.message().chars().take(4096).collect::<String>()),
+        };
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(internal)?;
+        let state: Option<String> = tx
+            .query_row("SELECT state FROM jobs WHERE id=?1", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(internal)?;
+        if state.as_deref() != Some("running") {
+            tx.commit().map_err(internal)?;
+            return Ok(());
+        }
+        match prepared {
+            Ok(staged) => {
+                let digest = staged.digest.clone();
+                insert_artifact(
+                    &tx,
+                    project_id,
+                    revision as i64,
+                    "application/vnd.hydir.native-analysis+json;version=1",
+                    &staged,
+                )?;
+                tx.execute(
+                    "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
+                    params![digest, job_id],
+                )
+                .map_err(internal)?;
+                insert_event(
+                    &tx,
+                    job_id,
+                    "succeeded",
+                    "native program analysis artifact ready",
+                    &digest,
+                )?;
+            }
+            Err(diagnostic) => {
+                tx.execute(
+                    "UPDATE jobs SET state='failed',diagnostic=?1 WHERE id=?2",
+                    params![diagnostic, job_id],
+                )
+                .map_err(internal)?;
+                insert_event(&tx, job_id, "failed", &diagnostic, "")?;
+            }
+        }
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
+    async fn execute_native_analysis_job(
+        self,
+        job_id: String,
+        project_id: String,
+        revision: u64,
+        bytes: Vec<u8>,
+    ) {
+        match self.transition_job(&job_id, "queued", "running", "native worker started") {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("hydird native job transition failed: {error}");
+                return;
+            }
+        }
+        let result = run_worker("native-analysis", None, bytes).await;
+        if let Err(error) = self
+            .finish_native_analysis_job(&job_id, &project_id, revision, result)
+            .await
+        {
+            eprintln!("hydird native job completion failed: {error}");
+        }
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.remove(&job_id);
+        }
+    }
 }
 
 fn insert_event(
@@ -1648,6 +1745,19 @@ fn valid_symbol(symbol: &str) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
+    if action == "native-artifact" {
+        if argument.is_empty() || argument.len() > 1024 || argument.chars().any(char::is_control) {
+            return Err(Status::invalid_argument(
+                "native artifact selector must be 1..=1024 non-control bytes",
+            ));
+        }
+        Ok(())
+    } else {
+        valid_symbol(argument)
+    }
 }
 
 fn annotation_kind(value: &str) -> Result<AnnotationKind, Status> {
@@ -1916,8 +2026,117 @@ fn unpack_worker_parts<const N: usize>(bytes: &[u8]) -> Result<[&[u8]; N], Statu
     Ok(parts)
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct NativeArtifactSelector {
+    stage: String,
+    #[serde(default)]
+    function: String,
+}
+
+fn native_artifact_media_type(stage: &str) -> Option<&'static str> {
+    match stage {
+        "program_spec" => Some("application/vnd.hydir.program-spec+json;version=5"),
+        "function_index" => Some("application/vnd.hydir.function-index+json;version=1"),
+        "coverage" => Some("application/vnd.hydir.coverage+json;version=1"),
+        "machine" => Some("application/vnd.hydir.machine-ir+json;version=1"),
+        "state" => Some("application/vnd.hydir.state-ir+json;version=1"),
+        "function" => Some("application/vnd.hydir.function-ir+json;version=1"),
+        "cir" => Some("application/vnd.hydir.cir+json;version=1"),
+        "llvm" => Some("text/x-llvm-ir"),
+        "unit" => Some("application/vnd.hydir.decompilation-unit+json;version=2"),
+        _ => None,
+    }
+}
+
+fn native_function_entry(bytes: &[u8], selector: &str) -> Result<Location, String> {
+    if selector.is_empty() {
+        return Err("function-scoped native artifact requires a function selector".to_owned());
+    }
+    let index = discover_functions(bytes)?;
+    let mut matches = index
+        .functions
+        .iter()
+        .filter(|function| function.id == selector || function.name.as_deref() == Some(selector));
+    let function = matches
+        .next()
+        .ok_or_else(|| format!("native function selector {selector:?} was not discovered"))?;
+    let entry = function.entry;
+    if matches.next().is_some() {
+        return Err(format!(
+            "native function selector {selector:?} is ambiguous; use the FunctionIndex id"
+        ));
+    }
+    Ok(entry)
+}
+
+fn native_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: NativeArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid selector: {error}"))?;
+    if selector.stage.len() > 32
+        || selector.stage.chars().any(char::is_control)
+        || selector.function.len() > 256
+        || selector.function.chars().any(char::is_control)
+    {
+        return Err("native artifact selector fields exceed their bounds".to_owned());
+    }
+    native_artifact_media_type(&selector.stage)
+        .ok_or_else(|| format!("unsupported native artifact stage {:?}", selector.stage))?;
+    match selector.stage.as_str() {
+        "program_spec" => {
+            serde_json::to_vec(&hydir_loader::import_elf(bytes).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        }
+        "function_index" => {
+            serde_json::to_vec(&discover_functions(bytes)?).map_err(|error| error.to_string())
+        }
+        "coverage" => {
+            serde_json::to_vec(&measure_native_coverage(bytes)?).map_err(|error| error.to_string())
+        }
+        stage => {
+            let entry = native_function_entry(bytes, &selector.function)?;
+            if stage == "unit" {
+                return serde_json::to_vec(&decompile_function_unit_at(bytes, entry)?)
+                    .map_err(|error| error.to_string());
+            }
+            let machine = lift_machine_function_at(bytes, entry)?;
+            if stage == "machine" {
+                return serde_json::to_vec(&machine).map_err(|error| error.to_string());
+            }
+            let state = lower_state_ir(&machine)?;
+            if stage == "state" {
+                return serde_json::to_vec(&state).map_err(|error| error.to_string());
+            }
+            let function = lower_function_ir(&machine, &state)?;
+            if stage == "function" {
+                return serde_json::to_vec(&function).map_err(|error| error.to_string());
+            }
+            if stage == "llvm" {
+                return export_function_ir_llvm(&function).map(String::into_bytes);
+            }
+            let cir = lower_cir(&machine, &function)?;
+            serde_json::to_vec(&cir).map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn native_analysis_bundle(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let program_spec = hydir_loader::import_elf(bytes).map_err(|error| error.to_string())?;
+    let function_index = discover_functions(bytes)?;
+    let coverage = measure_native_coverage(bytes)?;
+    serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "binary_sha256": program_spec.binary_sha256,
+        "program_spec": program_spec,
+        "function_index": function_index,
+        "coverage": coverage,
+    }))
+    .map_err(|error| error.to_string())
+}
+
 fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<Vec<u8>, String> {
     match (action, symbol) {
+        ("native-analysis", None) => native_analysis_bundle(bytes),
+        ("native-artifact", Some(selector)) => native_artifact(bytes, selector),
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
             .and_then(|spec| serde_json::to_vec(&spec).map_err(|error| error.to_string())),
@@ -2035,7 +2254,7 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
 #[cfg(test)]
 async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Result<Vec<u8>, Status> {
     if let Some(symbol) = symbol {
-        valid_symbol(symbol)?;
+        valid_worker_argument(action, symbol)?;
     }
     let output = worker_operation(action, symbol, &bytes).map_err(|error| {
         Status::invalid_argument(format!("analysis worker rejected input: {error}"))
@@ -2051,7 +2270,7 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
     let executable =
         env::current_exe().map_err(|_| Status::internal("worker executable unavailable"))?;
     if let Some(symbol) = symbol {
-        valid_symbol(symbol)?;
+        valid_worker_argument(action, symbol)?;
     }
     let isolation = env::var("HYDIR_WORKER_ISOLATION").unwrap_or_else(|_| "process".to_owned());
     let bubblewrap = env::var_os("HYDIR_BWRAP_PATH")
@@ -3335,6 +3554,327 @@ impl Hydir for Store {
     }
 }
 
+fn v3_job_reply(job: JobReply) -> api_v3::JobReply {
+    api_v3::JobReply {
+        project_id: job.project_id,
+        job_id: job.job_id,
+        project_revision: job.project_revision,
+        kind: job.kind,
+        state: job.state,
+        artifact_sha256: job.artifact_sha256,
+        diagnostic: job.diagnostic,
+    }
+}
+
+fn require_native_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
+    if job.kind != "native-analysis" {
+        return Err(Status::not_found("native analysis job not found"));
+    }
+    Ok(v3_job_reply(job))
+}
+
+#[tonic::async_trait]
+impl api_v3::hydir_v3_server::HydirV3 for Store {
+    async fn discover(
+        &self,
+        request: Request<api_v3::DiscoverRequest>,
+    ) -> Result<Response<api_v3::DiscoverReply>, Status> {
+        self.principal(&request)?;
+        Ok(Response::new(api_v3::DiscoverReply {
+            api_version: 3,
+            program_spec_version: PROGRAM_SPEC_VERSION,
+            function_index_version: FUNCTION_INDEX_VERSION,
+            machine_ir_version: MACHINE_FUNCTION_IR_VERSION,
+            state_ir_version: STATE_FUNCTION_IR_VERSION,
+            function_ir_version: FUNCTION_IR_VERSION,
+            cir_version: CIR_VERSION,
+            decompilation_unit_version: DECOMPILATION_UNIT_VERSION,
+            stable_contract: "native bounded ELF analysis with explicit unknown effects; LLVM is an optional export; partial artifacts are never rewrite-ready".to_owned(),
+            isolated_analysis_jobs: true,
+            analyst_fact_updates: true,
+        }))
+    }
+
+    async fn start_program_analysis(
+        &self,
+        request: Request<api_v3::StartProgramAnalysisRequest>,
+    ) -> Result<Response<api_v3::JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "job idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        self.project(&principal, &input.project_id)?;
+        let prior: Option<(String, i64, String)> = self
+            .connection()?
+            .query_row(
+                "SELECT id,revision,kind FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+                params![input.project_id, input.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some((id, revision, kind)) = prior {
+            if revision != expected || kind != "native-analysis" {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to a different analysis request",
+                ));
+            }
+            return Ok(Response::new(require_native_job(self.job(
+                &principal,
+                &input.project_id,
+                &id,
+            )?)?));
+        }
+        let bytes = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Analyst)?;
+            let retry: Option<(String, i64, String)> = tx
+                .query_row(
+                    "SELECT id,revision,kind FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+                    params![input.project_id, input.idempotency_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(internal)?;
+            if let Some((existing, revision, kind)) = retry {
+                drop(tx);
+                drop(conn);
+                if revision != expected || kind != "native-analysis" {
+                    return Err(Status::already_exists(
+                        "idempotency key belongs to a different analysis request",
+                    ));
+                }
+                return Ok(Response::new(require_native_job(self.job(
+                    &principal,
+                    &input.project_id,
+                    &existing,
+                )?)?));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            let active: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE requested_by=?1 AND state IN ('queued','running')",
+                    [principal.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if active >= MAX_ACTIVE_JOBS_PER_IDENTITY {
+                return Err(Status::resource_exhausted("identity has two active jobs"));
+            }
+            tx.execute(
+                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state,requested_by) \
+                 VALUES(?1,?2,?3,'native-analysis','',?4,'queued',?5)",
+                params![
+                    id,
+                    input.project_id,
+                    expected,
+                    input.idempotency_key,
+                    principal
+                ],
+            )
+            .map_err(internal)?;
+            insert_event(&tx, &id, "queued", "native program analysis queued", "")?;
+            tx.commit().map_err(internal)?;
+        }
+        let (start_sender, start_receiver) = oneshot::channel();
+        let runner = self.clone();
+        let runner_id = id.clone();
+        let project_id = input.project_id.clone();
+        let handle = tokio::spawn(async move {
+            if start_receiver.await.is_ok() {
+                runner
+                    .execute_native_analysis_job(
+                        runner_id,
+                        project_id,
+                        input.expected_revision,
+                        bytes,
+                    )
+                    .await;
+            }
+        });
+        self.workers
+            .lock()
+            .map_err(|_| Status::internal("worker registry lock poisoned"))?
+            .insert(id.clone(), handle);
+        let _ = start_sender.send(());
+        Ok(Response::new(require_native_job(self.job(
+            &principal,
+            &input.project_id,
+            &id,
+        )?)?))
+    }
+
+    async fn get_analysis_job(
+        &self,
+        request: Request<api_v3::JobRequest>,
+    ) -> Result<Response<api_v3::JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        Ok(Response::new(require_native_job(self.job(
+            &principal,
+            &input.project_id,
+            &input.job_id,
+        )?)?))
+    }
+
+    async fn cancel_analysis_job(
+        &self,
+        request: Request<api_v3::JobRequest>,
+    ) -> Result<Response<api_v3::JobReply>, Status> {
+        let metadata = request.metadata().clone();
+        let input = request.into_inner();
+        let mut legacy = Request::new(JobRequest {
+            project_id: input.project_id,
+            job_id: input.job_id,
+        });
+        *legacy.metadata_mut() = metadata;
+        let principal = self.principal(&legacy)?;
+        require_native_job(self.job(
+            &principal,
+            &legacy.get_ref().project_id,
+            &legacy.get_ref().job_id,
+        )?)?;
+        let job = <Store as Hydir>::cancel_job(self, legacy)
+            .await?
+            .into_inner();
+        Ok(Response::new(require_native_job(job)?))
+    }
+
+    type StreamAnalysisEventsStream = ReceiverStream<Result<api_v3::JobEvent, Status>>;
+
+    async fn stream_analysis_events(
+        &self,
+        request: Request<api_v3::JobEventRequest>,
+    ) -> Result<Response<Self::StreamAnalysisEventsStream>, Status> {
+        let metadata = request.metadata().clone();
+        let input = request.into_inner();
+        let mut legacy = Request::new(JobEventRequest {
+            project_id: input.project_id,
+            job_id: input.job_id,
+            after_sequence: input.after_sequence,
+        });
+        *legacy.metadata_mut() = metadata;
+        let principal = self.principal(&legacy)?;
+        require_native_job(self.job(
+            &principal,
+            &legacy.get_ref().project_id,
+            &legacy.get_ref().job_id,
+        )?)?;
+        let mut stream = <Store as Hydir>::stream_job_events(self, legacy)
+            .await?
+            .into_inner();
+        let (sender, receiver) = mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Some(event) = stream.next().await {
+                let mapped = event.map(|event| api_v3::JobEvent {
+                    sequence: event.sequence,
+                    job_id: event.job_id,
+                    state: event.state,
+                    message: event.message,
+                    artifact_sha256: event.artifact_sha256,
+                });
+                if sender.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    async fn get_program_artifact(
+        &self,
+        request: Request<api_v3::ProgramArtifactRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        let media_type = native_artifact_media_type(&input.stage)
+            .ok_or_else(|| Status::invalid_argument("unsupported native artifact stage"))?;
+        if matches!(
+            input.stage.as_str(),
+            "machine" | "state" | "function" | "cir" | "llvm" | "unit"
+        ) {
+            valid_symbol(&input.function_selector)?;
+        } else if !input.function_selector.is_empty() {
+            return Err(Status::invalid_argument(
+                "program-scoped artifact must not include a function selector",
+            ));
+        }
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let selector = serde_json::to_string(&NativeArtifactSelector {
+            stage: input.stage,
+            function: input.function_selector,
+        })
+        .map_err(|_| Status::internal("native artifact selector serialization failed"))?;
+        let content = run_worker("native-artifact", Some(&selector), binary).await?;
+        let digest = self
+            .store_artifact(
+                &input.project_id,
+                input.expected_revision,
+                media_type,
+                &content,
+            )
+            .await?;
+        Ok(Response::new(api_v3::ArtifactReply {
+            sha256: digest,
+            media_type: media_type.to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn update_analyst_fact(
+        &self,
+        request: Request<api_v3::AnalystFactRequest>,
+    ) -> Result<Response<api_v3::MutationReply>, Status> {
+        let metadata = request.metadata().clone();
+        let input = request.into_inner();
+        let mut legacy = Request::new(AnnotationRequest {
+            project_id: input.project_id,
+            expected_revision: input.expected_revision,
+            idempotency_key: input.idempotency_key,
+            kind: input.kind,
+            address: input.address,
+            value: input.value,
+            scope: input.scope,
+        });
+        *legacy.metadata_mut() = metadata;
+        let project = <Store as Hydir>::add_annotation(self, legacy)
+            .await?
+            .into_inner();
+        Ok(Response::new(api_v3::MutationReply {
+            project_id: project.project_id,
+            revision: project.revision,
+            binary_sha256: project.binary_sha256,
+        }))
+    }
+}
+
 #[tonic::async_trait]
 impl api_v2::hydir_v2_server::HydirV2 for Store {
     async fn discover(
@@ -3724,7 +4264,12 @@ async fn serve_rpc(
                 .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
         )
         .add_service(
-            HydirV2Server::new(store)
+            HydirV2Server::new(store.clone())
+                .max_decoding_message_size(MAX_BINARY_BYTES + 1024)
+                .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
+        )
+        .add_service(
+            HydirV3Server::new(store)
                 .max_decoding_message_size(MAX_BINARY_BYTES + 1024)
                 .max_encoding_message_size(MAX_BINARY_BYTES + 1024),
         )
@@ -4376,6 +4921,171 @@ mod tests {
         .into_inner();
         assert_eq!(replay.revision, applied.revision);
         assert_eq!(replay.binary_sha256, applied.binary_sha256);
+    }
+
+    #[tokio::test]
+    async fn v3_native_artifacts_jobs_and_fact_updates_are_revision_bound() {
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("v3-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "v3 native workflow".to_owned(),
+                    idempotency_key: "create-v3".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let discover = HydirV3::discover(&store, authorized(api_v3::DiscoverRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(discover.api_version, 3);
+        assert_eq!(discover.program_spec_version, PROGRAM_SPEC_VERSION);
+        assert_eq!(discover.function_index_version, FUNCTION_INDEX_VERSION);
+
+        let index_artifact = HydirV3::get_program_artifact(
+            &store,
+            authorized(
+                api_v3::ProgramArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: uploaded.revision,
+                    stage: "function_index".to_owned(),
+                    function_selector: String::new(),
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let index: hydir_ir::FunctionIndex =
+            serde_json::from_slice(&index_artifact.content).unwrap();
+        hydir_ir::validate_function_index(&index).unwrap();
+        let selector = index
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("hydir_max2"))
+            .unwrap()
+            .id
+            .clone();
+
+        for stage in [
+            "program_spec",
+            "coverage",
+            "machine",
+            "state",
+            "function",
+            "cir",
+            "llvm",
+            "unit",
+        ] {
+            let function_selector = if matches!(
+                stage,
+                "machine" | "state" | "function" | "cir" | "llvm" | "unit"
+            ) {
+                selector.clone()
+            } else {
+                String::new()
+            };
+            let artifact = HydirV3::get_program_artifact(
+                &store,
+                authorized(
+                    api_v3::ProgramArtifactRequest {
+                        project_id: project.project_id.clone(),
+                        expected_revision: uploaded.revision,
+                        stage: stage.to_owned(),
+                        function_selector,
+                    },
+                    &token,
+                ),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(artifact.sha256, sha256(&artifact.content));
+            assert!(!artifact.content.is_empty(), "{stage} artifact is empty");
+        }
+
+        let request = api_v3::StartProgramAnalysisRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: "native-analysis-1".to_owned(),
+        };
+        let started = HydirV3::start_program_analysis(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        let replay = HydirV3::start_program_analysis(&store, authorized(request, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(started.job_id, replay.job_id);
+        let completed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let job = HydirV3::get_analysis_job(
+                    &store,
+                    authorized(
+                        api_v3::JobRequest {
+                            project_id: project.project_id.clone(),
+                            job_id: started.job_id.clone(),
+                        },
+                        &token,
+                    ),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                if matches!(job.state.as_str(), "succeeded" | "failed") {
+                    break job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.state, "succeeded", "{}", completed.diagnostic);
+        assert!(!completed.artifact_sha256.is_empty());
+
+        let mutation = HydirV3::update_analyst_fact(
+            &store,
+            authorized(
+                api_v3::AnalystFactRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: uploaded.revision,
+                    idempotency_key: "v3-fact-1".to_owned(),
+                    kind: "comment".to_owned(),
+                    address: String::new(),
+                    value: "native analysis reviewed".to_owned(),
+                    scope: "whole binary".to_owned(),
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(mutation.revision, uploaded.revision + 1);
+        assert_eq!(mutation.binary_sha256, uploaded.binary_sha256);
     }
 
     #[cfg(unix)]

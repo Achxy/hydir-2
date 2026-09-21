@@ -15,14 +15,16 @@ import grpc
 
 from . import hydir_pb2 as proto
 from . import hydir_v2_pb2 as proto_v2
+from . import hydir_v3_pb2 as proto_v3
 from .hydir_pb2_grpc import HydirStub
 from .hydir_v2_pb2_grpc import HydirV2Stub
+from .hydir_v3_pb2_grpc import HydirV3Stub
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 
 
 class HydirClient:
-    """Authenticated local-or-TLS client with additive v1/v2 negotiation.
+    """Authenticated local-or-TLS client with additive v1/v2/v3 negotiation.
 
     Mutations accept explicit project revisions. Pass the same idempotency key
     when retrying create-project or lift-job requests after an uncertain reply.
@@ -95,6 +97,7 @@ class HydirClient:
             self._channel = grpc.insecure_channel(target, options=options)
         self._stub = HydirStub(self._channel)
         self._stub_v2 = HydirV2Stub(self._channel)
+        self._stub_v3 = HydirV3Stub(self._channel)
 
     def close(self) -> None:
         self._channel.close()
@@ -120,14 +123,157 @@ class HydirClient:
             raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
         return reply
 
+    def discover_v3(self):
+        reply = self._call(self._stub_v3.Discover, proto_v3.DiscoverRequest())
+        if reply.api_version != 3:
+            raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
+        return reply
+
     def negotiate_api(self) -> tuple[int, object]:
-        """Prefer v2 while retaining a transparent v1 compatibility path."""
+        """Prefer v3 while retaining transparent v2 and v1 compatibility paths."""
+        try:
+            return 3, self.discover_v3()
+        except grpc.RpcError as error:
+            if error.code() != grpc.StatusCode.UNIMPLEMENTED:
+                raise
         try:
             return 2, self.discover_v2()
         except grpc.RpcError as error:
             if error.code() != grpc.StatusCode.UNIMPLEMENTED:
                 raise
         return 1, self.discover()
+
+    def get_program_artifact(
+        self, project_id: str, revision: int, stage: str,
+        function_selector: str | None = None,
+    ) -> dict | bytes:
+        """Fetch a digest-checked native artifact without executing the ELF."""
+        media_types = {
+            "program_spec": ("application/vnd.hydir.program-spec+json;version=5", 5),
+            "function_index": ("application/vnd.hydir.function-index+json;version=1", 1),
+            "coverage": ("application/vnd.hydir.coverage+json;version=1", 1),
+            "machine": ("application/vnd.hydir.machine-ir+json;version=1", 1),
+            "state": ("application/vnd.hydir.state-ir+json;version=1", 1),
+            "function": ("application/vnd.hydir.function-ir+json;version=1", 1),
+            "cir": ("application/vnd.hydir.cir+json;version=1", 1),
+            "llvm": ("text/x-llvm-ir", None),
+            "unit": ("application/vnd.hydir.decompilation-unit+json;version=2", 2),
+        }
+        if stage not in media_types:
+            raise ValueError("Unsupported native artifact stage")
+        function_scoped = stage in {"machine", "state", "function", "cir", "llvm", "unit"}
+        if function_scoped and not function_selector:
+            raise ValueError("Function-scoped native artifact requires a selector")
+        if not function_scoped and function_selector:
+            raise ValueError("Program-scoped native artifact cannot include a selector")
+        if function_selector and (
+            len(function_selector.encode("utf-8")) > 256
+            or any(ord(character) < 32 for character in function_selector)
+        ):
+            raise ValueError("Function selector exceeds the supported bounds")
+        reply = self._call(
+            self._stub_v3.GetProgramArtifact,
+            proto_v3.ProgramArtifactRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                stage=stage,
+                function_selector=function_selector or "",
+            ),
+        )
+        content = self._checked_artifact(reply, revision=revision)
+        expected_media_type, schema_version = media_types[stage]
+        if reply.media_type != expected_media_type:
+            raise RuntimeError("Native artifact media type verification failed")
+        if schema_version is None:
+            return content
+        value = json.loads(content)
+        if not isinstance(value, dict) or value.get("schema_version") != schema_version:
+            raise RuntimeError("Native artifact schema version verification failed")
+        return value
+
+    def start_program_analysis(
+        self, project_id: str, revision: int, *, idempotency_key: str | None = None,
+    ):
+        return self._call(
+            self._stub_v3.StartProgramAnalysis,
+            proto_v3.StartProgramAnalysisRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=idempotency_key or str(uuid4()),
+            ),
+        )
+
+    def get_analysis_job(self, project_id: str, job_id: str):
+        return self._call(
+            self._stub_v3.GetAnalysisJob,
+            proto_v3.JobRequest(project_id=project_id, job_id=job_id),
+        )
+
+    def cancel_analysis_job(self, project_id: str, job_id: str):
+        return self._call(
+            self._stub_v3.CancelAnalysisJob,
+            proto_v3.JobRequest(project_id=project_id, job_id=job_id),
+        )
+
+    def analysis_events(
+        self, project_id: str, job_id: str, after_sequence: int = 0,
+    ) -> Iterator:
+        if after_sequence < 0:
+            raise ValueError("Event sequence cannot be negative")
+        return self._call(
+            self._stub_v3.StreamAnalysisEvents,
+            proto_v3.JobEventRequest(
+                project_id=project_id,
+                job_id=job_id,
+                after_sequence=after_sequence,
+            ),
+        )
+
+    def update_analyst_fact_v3(
+        self, project_id: str, revision: int, *, kind: str, value: str,
+        scope: str, address: str | None = None, idempotency_key: str | None = None,
+    ):
+        """Append a revision-checked analyst fact through the native v3 API."""
+        if kind not in {"name", "comment", "assumption"}:
+            raise ValueError("Analyst fact kind must be name, comment, or assumption")
+        if kind == "name" and not address:
+            raise ValueError("Name facts require an address")
+        if not value.strip() or not scope.strip():
+            raise ValueError("Analyst fact value and scope are required")
+        max_value = {"name": 128, "comment": 2048, "assumption": 1024}[kind]
+        if (
+            len(value.encode("utf-8")) > max_value
+            or "\x00" in value
+            or (kind == "name" and any(character in "\r\n\t" for character in value))
+            or len(scope.encode("utf-8")) > 256
+            or any(ord(character) < 32 for character in scope)
+        ):
+            raise ValueError("Analyst fact value or scope exceeds the supported bounds")
+        if address is not None and (
+            not address.startswith("0x")
+            or not 1 <= len(address[2:]) <= 16
+            or any(character not in "0123456789abcdefABCDEF" for character in address[2:])
+        ):
+            raise ValueError("Address must be 0x plus 1..=16 hex digits")
+        reply = self._call(
+            self._stub_v3.UpdateAnalystFact,
+            proto_v3.AnalystFactRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=idempotency_key or str(uuid4()),
+                kind=kind,
+                address=address or "",
+                value=value,
+                scope=scope,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.revision != revision + 1
+            or len(reply.binary_sha256) != 64
+        ):
+            raise RuntimeError("Analyst fact revision or binary identity differs from request")
+        return reply
 
     @staticmethod
     def _checked_json_artifact(

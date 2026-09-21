@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schemas = [
         "proto/hydir.proto",
         "proto/hydir_v2.proto",
+        "proto/hydir_v3.proto",
         "proto/hydir_interchange/specification.proto",
         "proto/hydir_interchange/service.proto",
         "proto/hydir_patch/service.proto",

@@ -14,6 +14,9 @@ use hydir_api::v2::{
     ArtifactReply as ArtifactReplyV2, PatchRequest as PatchRequestV2, RegionRequest,
     VerifyPatchRequest, hydir_v2_client::HydirV2Client,
 };
+use hydir_api::v3::{
+    ArtifactReply as ArtifactReplyV3, ProgramArtifactRequest, hydir_v3_client::HydirV3Client,
+};
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_physical_region, lift_symbol,
     recover_symbol_cfg, region_contract,
@@ -21,8 +24,16 @@ use hydir_backend::{
 use hydir_c::{build_decompilation_unit, emit_structured_c};
 use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, DecompilationUnit, DisassemblyReport, FactSource,
-    FunctionCfg, FunctionSpec, PhysicalRegionIr, ProgramSpec, RegionSpec,
+    FunctionCfg, FunctionSpec, Location, PhysicalRegionIr, ProgramSpec, RegionSpec,
     overlay_analyst_assumptions, parse_program_spec_json,
+};
+use hydir_decompile::{
+    NativeCoverageReport, NativeDecompilation, decompile_function_at, decompile_symbol,
+    discover_functions, measure_native_coverage,
+};
+use hydir_ir::{
+    Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
+    MachineOperation, StateFunctionIr,
 };
 use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
@@ -85,6 +96,11 @@ enum Task {
         path: PathBuf,
     },
     Select(String),
+    SelectNative {
+        label: String,
+        selector: String,
+        entry: Location,
+    },
     Disassemble,
     Triton {
         path: PathBuf,
@@ -94,6 +110,7 @@ enum Task {
         commands: Vec<String>,
     },
     Analyze,
+    MeasureNativeCoverage,
     RefreshAnnotations {
         binary_sha256: String,
     },
@@ -159,6 +176,7 @@ enum Event {
         whole_rebuild: bool,
         source_offer: Option<String>,
         spec: ProgramSpec,
+        function_index: Result<FunctionIndex, String>,
     },
     GhidraGraphLoaded(Result<GhidraGraph, String>),
     RemoteProjectCreated(String),
@@ -168,6 +186,11 @@ enum Event {
         ir: Result<String, String>,
         c: Result<String, String>,
         region_artifacts: Box<RegionArtifacts>,
+        native: Box<Result<NativeDecompilation, String>>,
+    },
+    NativeSelected {
+        label: String,
+        native: Box<Result<NativeDecompilation, String>>,
     },
     Disassembled(Result<DisassemblyReport, String>),
     Triton(Result<serde_json::Value, String>),
@@ -176,6 +199,7 @@ enum Event {
         result: Result<serde_json::Value, String>,
     },
     Analyzed(Result<AnalysisReport, String>),
+    NativeCoverageMeasured(Result<NativeCoverageReport, String>),
     AnnotationsLoaded {
         binary_sha256: String,
         annotations: Vec<AnalystAnnotation>,
@@ -400,6 +424,17 @@ async fn remote_v2_client(access: &RemoteAccess) -> Result<HydirV2Client<Channel
     Ok(HydirV2Client::new(channel).max_decoding_message_size(2 * 1024 * 1024 + 1024))
 }
 
+async fn remote_v3_client(access: &RemoteAccess) -> Result<HydirV3Client<Channel>, String> {
+    let channel = Channel::from_shared(access.endpoint.clone())
+        .map_err(|e| format!("Invalid endpoint: {e}"))?
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .connect()
+        .await
+        .map_err(|e| format!("Cannot connect to HydIR v3 service: {e}"))?;
+    Ok(HydirV3Client::new(channel).max_decoding_message_size(MAX_BINARY_BYTES + 1024))
+}
+
 fn decode_v2_artifact<T: serde::de::DeserializeOwned>(
     artifact: ArtifactReplyV2,
     access: &RemoteAccess,
@@ -415,6 +450,120 @@ fn decode_v2_artifact<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(&artifact.content)
         .map_err(|error| format!("Invalid remote {expected_media_type} artifact: {error}"))
+}
+
+fn decode_v3_artifact<T: serde::de::DeserializeOwned>(
+    artifact: ArtifactReplyV3,
+    access: &RemoteAccess,
+    expected_media_type: &str,
+) -> Result<T, String> {
+    if artifact.project_revision != access.revision
+        || artifact.media_type != expected_media_type
+        || format!("{:x}", Sha256::digest(&artifact.content)) != artifact.sha256
+    {
+        return Err(format!(
+            "Remote {expected_media_type} artifact failed revision, digest, or media-type verification."
+        ));
+    }
+    serde_json::from_slice(&artifact.content)
+        .map_err(|error| format!("Invalid remote {expected_media_type} artifact: {error}"))
+}
+
+async fn remote_native_json<T: serde::de::DeserializeOwned>(
+    access: &RemoteAccess,
+    stage: &str,
+    function_selector: &str,
+    media_type: &str,
+) -> Result<T, String> {
+    let mut client = remote_v3_client(access).await?;
+    let artifact = client
+        .get_program_artifact(authorized(
+            ProgramArtifactRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                stage: stage.to_owned(),
+                function_selector: function_selector.to_owned(),
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote native {stage} recovery failed: {error}"))?
+        .into_inner();
+    decode_v3_artifact(artifact, access, media_type)
+}
+
+async fn remote_function_index(access: &RemoteAccess) -> Result<FunctionIndex, String> {
+    remote_native_json(
+        access,
+        "function_index",
+        "",
+        "application/vnd.hydir.function-index+json;version=1",
+    )
+    .await
+}
+
+async fn remote_native_decompilation(
+    access: &RemoteAccess,
+    selector: &str,
+) -> Result<NativeDecompilation, String> {
+    let machine_ir: MachineFunctionIr = remote_native_json(
+        access,
+        "machine",
+        selector,
+        "application/vnd.hydir.machine-ir+json;version=1",
+    )
+    .await?;
+    let state_ir: StateFunctionIr = remote_native_json(
+        access,
+        "state",
+        selector,
+        "application/vnd.hydir.state-ir+json;version=1",
+    )
+    .await?;
+    let function_ir: FunctionIr = remote_native_json(
+        access,
+        "function",
+        selector,
+        "application/vnd.hydir.function-ir+json;version=1",
+    )
+    .await?;
+    let cir: Cir = remote_native_json(
+        access,
+        "cir",
+        selector,
+        "application/vnd.hydir.cir+json;version=1",
+    )
+    .await?;
+    let unit: DecompilationUnit = remote_native_json(
+        access,
+        "unit",
+        selector,
+        "application/vnd.hydir.decompilation-unit+json;version=2",
+    )
+    .await?;
+    if machine_ir.binary_sha256 != state_ir.binary_sha256
+        || machine_ir.binary_sha256 != function_ir.binary_sha256
+        || machine_ir.binary_sha256 != cir.binary_sha256
+        || machine_ir.binary_sha256 != unit.binary_sha256
+        || machine_ir.function_id != state_ir.function_id
+        || machine_ir.function_id != function_ir.function_id
+        || machine_ir.function_id != cir.function_id
+        || unit.function_id.as_deref() != Some(machine_ir.function_id.as_str())
+        || machine_ir.entry != state_ir.entry
+        || machine_ir.entry != function_ir.entry
+        || machine_ir.entry != cir.entry
+    {
+        return Err("Remote native artifacts do not share one binary/function identity".to_owned());
+    }
+    Ok(NativeDecompilation {
+        machine_ir,
+        state_ir,
+        function_ir,
+        cir,
+        low_level_c: unit.low_level_c.unwrap_or(unit.c_source),
+        structured_c: unit.structured_c,
+        diagnostics: unit.diagnostics,
+    })
 }
 
 fn local_region_artifacts(
@@ -1597,6 +1746,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Ok((bytes, spec, project))
             }) {
                 Ok((bytes, spec, project)) => {
+                    let function_index = discover_functions(&bytes);
                     source = Source::Local(bytes);
                     let revision = project.revision;
                     local_project = Some(project);
@@ -1608,6 +1758,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         whole_rebuild: false,
                         source_offer: None,
                         spec,
+                        function_index,
                     }
                 }
                 Err(error) => Event::Failed(error),
@@ -1627,6 +1778,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 project_id,
             } => match runtime.block_on(open_remote(endpoint, token_file, project_id)) {
                 Ok((access, spec)) => {
+                    let function_index = runtime.block_on(remote_function_index(&access));
                     local_project = None;
                     let label = format!(
                         "{} · {} · revision {}",
@@ -1645,6 +1797,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         whole_rebuild,
                         source_offer: Some(source_offer),
                         spec,
+                        function_index,
                     }
                 }
                 Err(error) => Event::Failed(error),
@@ -1664,6 +1817,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 path,
             } => match runtime.block_on(upload_remote(endpoint, token_file, project_id, path)) {
                 Ok((access, spec)) => {
+                    let function_index = runtime.block_on(remote_function_index(&access));
                     local_project = None;
                     let label = format!(
                         "{} · {} · revision {}",
@@ -1682,6 +1836,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         whole_rebuild,
                         source_offer: Some(source_offer),
                         spec,
+                        function_index,
                     }
                 }
                 Err(error) => Event::Failed(error),
@@ -1699,12 +1854,14 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         ir,
                         c,
                         region_artifacts: Box::new(region_artifacts),
+                        native: Box::new(decompile_symbol(bytes, &symbol)),
                         symbol,
                     }
                 }
                 Source::Remote(access) => {
                     let (cfg, ir, c, region, physical_ir, decompilation) =
                         runtime.block_on(select_remote(access, &symbol));
+                    let native = runtime.block_on(remote_native_decompilation(access, &symbol));
                     Event::Selected {
                         symbol,
                         cfg,
@@ -1715,11 +1872,26 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                             physical_ir,
                             decompilation,
                         }),
+                        native: Box::new(native),
                     }
                 }
                 Source::None => {
                     Event::Failed("Open a local ELF or remote project first.".to_owned())
                 }
+            },
+            Task::SelectNative {
+                label,
+                selector,
+                entry,
+            } => Event::NativeSelected {
+                native: Box::new(match &source {
+                    Source::Local(bytes) => decompile_function_at(bytes, entry),
+                    Source::Remote(access) => {
+                        runtime.block_on(remote_native_decompilation(access, &selector))
+                    }
+                    Source::None => Err("Open an ELF before selecting a function".to_owned()),
+                }),
+                label,
             },
             Task::Disassemble => Event::Disassembled(match &source {
                 Source::Local(bytes) => disassemble_elf(bytes).map_err(|error| error.to_string()),
@@ -1737,6 +1909,14 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Source::Local(bytes) => analyze_elf(bytes).map_err(|error| error.to_string()),
                 Source::Remote(access) => runtime.block_on(analyze_remote(access)),
                 Source::None => Err("Open a local ELF or remote project first.".to_owned()),
+            }),
+            Task::MeasureNativeCoverage => Event::NativeCoverageMeasured(match &source {
+                Source::Local(bytes) => measure_native_coverage(bytes),
+                Source::Remote(_) => Err(
+                    "Native coverage measurement is currently local-only; remote artifacts remain available through gRPC v3."
+                        .to_owned(),
+                ),
+                Source::None => Err("Open a local ELF before measuring coverage.".to_owned()),
             }),
             Task::RefreshAnnotations { binary_sha256 } => match &source {
                 Source::Local(_) => local_project
@@ -2082,10 +2262,13 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
+    Overview,
     RegionStudio,
+    Native,
     Bytes,
     Graph,
     Cfg,
+    Coverage,
     Llvm,
     Passes,
     C,
@@ -2111,6 +2294,51 @@ enum GraphMode {
     Function,
     Program,
     Ghidra,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NativeViewMode {
+    Summary,
+    LowLevelC,
+    StructuredC,
+    MachineIr,
+    StateIr,
+    FunctionIr,
+    Cir,
+    Evidence,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GraphNodeTone {
+    Normal,
+    Selected,
+    Opaque,
+    External,
+}
+
+#[derive(Clone)]
+enum GraphNodeAction {
+    Address(u64),
+    Function {
+        label: String,
+        selector: String,
+        entry: Location,
+        legacy_symbol: bool,
+    },
+}
+
+struct WorkbenchGraphNode {
+    id: NodeId,
+    label: String,
+    tone: GraphNodeTone,
+    action: Option<GraphNodeAction>,
+}
+
+struct WorkbenchGraphEdge {
+    source: NodeId,
+    target: NodeId,
+    label: String,
+    unresolved: bool,
 }
 
 struct AnalystApp {
@@ -2146,6 +2374,7 @@ struct AnalystApp {
     patch_exported_path: Option<PathBuf>,
     entry_only_assertion: bool,
     search: String,
+    graph_filter: String,
     initial_symbol: Option<String>,
     source_label: Option<String>,
     source_offer: Option<String>,
@@ -2154,6 +2383,8 @@ struct AnalystApp {
     named_pass_transform: bool,
     whole_rebuild: bool,
     spec: Option<ProgramSpec>,
+    function_index: Option<FunctionIndex>,
+    function_index_error: Option<String>,
     ghidra_graph: Option<GhidraGraph>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
@@ -2166,6 +2397,10 @@ struct AnalystApp {
     physical_region_error: Option<String>,
     decompilation: Option<DecompilationUnit>,
     decompilation_error: Option<String>,
+    native_decompilation: Option<NativeDecompilation>,
+    native_decompilation_error: Option<String>,
+    native_coverage: Option<NativeCoverageReport>,
+    native_coverage_error: Option<String>,
     analysis: Option<AnalysisReport>,
     disassembly_report: Option<DisassemblyReport>,
     triton_result: Option<serde_json::Value>,
@@ -2185,9 +2420,12 @@ struct AnalystApp {
     job_symbol: Option<String>,
     last_job_poll: std::time::Instant,
     selected_address: Option<u64>,
+    selection_target_tab: Option<Tab>,
     tab: Tab,
     region_studio_mode: RegionStudioMode,
     graph_mode: GraphMode,
+    native_view_mode: NativeViewMode,
+    graph_zoom: f32,
     busy: bool,
     status: String,
     failure: Option<String>,
@@ -2245,6 +2483,7 @@ impl AnalystApp {
             patch_exported_path: None,
             entry_only_assertion: false,
             search: String::new(),
+            graph_filter: String::new(),
             initial_symbol: None,
             source_label: None,
             source_offer: None,
@@ -2253,6 +2492,8 @@ impl AnalystApp {
             named_pass_transform: false,
             whole_rebuild: false,
             spec: None,
+            function_index: None,
+            function_index_error: None,
             ghidra_graph: None,
             symbol: None,
             cfg: None,
@@ -2265,6 +2506,10 @@ impl AnalystApp {
             physical_region_error: None,
             decompilation: None,
             decompilation_error: None,
+            native_decompilation: None,
+            native_decompilation_error: None,
+            native_coverage: None,
+            native_coverage_error: None,
             analysis: None,
             disassembly_report: None,
             triton_result: None,
@@ -2284,9 +2529,12 @@ impl AnalystApp {
             job_symbol: None,
             last_job_poll: std::time::Instant::now(),
             selected_address: None,
-            tab: Tab::RegionStudio,
+            selection_target_tab: None,
+            tab: Tab::Overview,
             region_studio_mode: RegionStudioMode::Contract,
             graph_mode: GraphMode::Function,
+            native_view_mode: NativeViewMode::Summary,
+            graph_zoom: 1.0,
             busy: false,
             status: "No project open".to_owned(),
             failure: None,
@@ -2346,10 +2594,9 @@ impl AnalystApp {
                     whole_rebuild,
                     source_offer,
                     spec,
+                    function_index,
                 } => {
                     let binary_sha256 = spec.binary_sha256.clone();
-                    let default_symbol =
-                        spec.functions.first().map(|function| function.name.clone());
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.current_local_path = if remote {
@@ -2364,6 +2611,18 @@ impl AnalystApp {
                     self.named_pass_transform = named_pass_transform;
                     self.whole_rebuild = whole_rebuild;
                     self.spec = Some(spec);
+                    match function_index {
+                        Ok(index) => {
+                            self.status =
+                                format!("Opened {} native functions", index.functions.len());
+                            self.function_index = Some(index);
+                            self.function_index_error = None;
+                        }
+                        Err(error) => {
+                            self.function_index = None;
+                            self.function_index_error = Some(error);
+                        }
+                    }
                     self.symbol = None;
                     self.cfg = None;
                     self.ir = None;
@@ -2371,6 +2630,8 @@ impl AnalystApp {
                     self.c_error = None;
                     self.clear_region_artifacts();
                     self.analysis = None;
+                    self.native_coverage = None;
+                    self.native_coverage_error = None;
                     self.disassembly_report = None;
                     self.triton_result = None;
                     self.console_json = false;
@@ -2392,7 +2653,8 @@ impl AnalystApp {
                     self.trusted_fixture = false;
                     self.entry_only_assertion = false;
                     self.failure = None;
-                    if let Some(symbol) = self.initial_symbol.take().or(default_symbol) {
+                    self.tab = Tab::Overview;
+                    if let Some(symbol) = self.initial_symbol.take() {
                         self.select(symbol);
                     }
                     self.enqueue(
@@ -2434,6 +2696,7 @@ impl AnalystApp {
                     ir,
                     c,
                     region_artifacts,
+                    native,
                 } => {
                     if self.symbol.as_deref() != Some(&symbol) {
                         continue;
@@ -2494,6 +2757,16 @@ impl AnalystApp {
                             self.decompilation_error = Some(error);
                         }
                     }
+                    match *native {
+                        Ok(value) => {
+                            self.native_decompilation = Some(value);
+                            self.native_decompilation_error = None;
+                        }
+                        Err(error) => {
+                            self.native_decompilation = None;
+                            self.native_decompilation_error = Some(error);
+                        }
+                    }
                     self.failure = ir_error.or(cfg_error);
                     self.status = if self.ir.is_some() {
                         format!(
@@ -2510,7 +2783,32 @@ impl AnalystApp {
                         format!("{symbol} is outside the current recovery contract")
                     };
                     self.history.push(self.status.clone());
-                    self.tab = Tab::RegionStudio;
+                    self.tab = self
+                        .selection_target_tab
+                        .take()
+                        .unwrap_or(Tab::RegionStudio);
+                }
+                Event::NativeSelected { label, native } => {
+                    if self.symbol.as_deref() != Some(&label) {
+                        continue;
+                    }
+                    match *native {
+                        Ok(value) => {
+                            self.selected_address = Some(value.machine_ir.entry.value.0);
+                            self.status = format!("Native-decompiled {label}");
+                            self.native_decompilation = Some(value);
+                            self.native_decompilation_error = None;
+                            self.failure = None;
+                        }
+                        Err(error) => {
+                            self.status = format!("Native decompilation failed for {label}");
+                            self.native_decompilation = None;
+                            self.native_decompilation_error = Some(error.clone());
+                            self.failure = Some(error);
+                        }
+                    }
+                    self.history.push(self.status.clone());
+                    self.tab = self.selection_target_tab.take().unwrap_or(Tab::Native);
                 }
                 Event::Disassembled(result) => match result {
                     Ok(report) => {
@@ -2625,6 +2923,35 @@ impl AnalystApp {
                     Err(error) => {
                         self.failure = Some(error.clone());
                         self.status = "Global-effect analysis failed".to_owned();
+                        self.history.push(error);
+                    }
+                },
+                Event::NativeCoverageMeasured(result) => match result {
+                    Ok(report) => {
+                        if self.spec.as_ref().map(|spec| &spec.binary_sha256)
+                            != Some(&report.binary_sha256)
+                        {
+                            self.failure = Some(
+                                "Coverage binary digest does not match the open project."
+                                    .to_owned(),
+                            );
+                        } else {
+                            self.status = format!(
+                                "Measured native semantics across {} lifted functions",
+                                report.lifted_functions
+                            );
+                            self.history.push(self.status.clone());
+                            self.native_coverage = Some(report);
+                            self.native_coverage_error = None;
+                            self.tab = Tab::Coverage;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.native_coverage = None;
+                        self.native_coverage_error = Some(error.clone());
+                        self.failure = Some(error.clone());
+                        self.status = "Native coverage measurement failed".to_owned();
                         self.history.push(error);
                     }
                 },
@@ -2780,6 +3107,8 @@ impl AnalystApp {
                     self.c_error = None;
                     self.clear_region_artifacts();
                     self.analysis = None;
+                    self.native_coverage = None;
+                    self.native_coverage_error = None;
                     self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
@@ -3005,6 +3334,26 @@ impl AnalystApp {
             .find(|function| &function.name == symbol)
     }
 
+    fn selected_indexed_function(&self) -> Option<&IndexedFunction> {
+        let index = self.function_index.as_ref()?;
+        if let Some(function_id) = self
+            .native_decompilation
+            .as_ref()
+            .map(|native| native.machine_ir.function_id.as_str())
+            && let Some(function) = index
+                .functions
+                .iter()
+                .find(|function| function.id == function_id)
+        {
+            return Some(function);
+        }
+        let selected = self.symbol.as_deref()?;
+        index
+            .functions
+            .iter()
+            .find(|function| indexed_function_label(function) == selected)
+    }
+
     fn clear_region_artifacts(&mut self) {
         self.region = None;
         self.region_error = None;
@@ -3012,10 +3361,14 @@ impl AnalystApp {
         self.physical_region_error = None;
         self.decompilation = None;
         self.decompilation_error = None;
+        self.native_decompilation = None;
+        self.native_decompilation_error = None;
         self.region_studio_mode = RegionStudioMode::Contract;
+        self.native_view_mode = NativeViewMode::Summary;
     }
 
     fn select(&mut self, name: String) {
+        self.selection_target_tab = None;
         self.symbol = Some(name.clone());
         self.cfg = None;
         self.ir = None;
@@ -3026,6 +3379,25 @@ impl AnalystApp {
         self.enqueue(
             Task::Select(name),
             "Recovering function from machine bytes…",
+        );
+    }
+
+    fn select_native(&mut self, label: String, selector: String, entry: Location) {
+        self.selection_target_tab = None;
+        self.symbol = Some(label.clone());
+        self.cfg = None;
+        self.ir = None;
+        self.c = None;
+        self.c_error = None;
+        self.clear_region_artifacts();
+        self.selected_address = Some(entry.value.0);
+        self.enqueue(
+            Task::SelectNative {
+                label,
+                selector,
+                entry,
+            },
+            "Running bounded native decompilation…",
         );
     }
 
@@ -3343,7 +3715,77 @@ impl AnalystApp {
         } else {
             ui.add_space(16.0);
             ui.label(RichText::new("No functions yet").strong());
-            ui.label(RichText::new("Open an ELF to populate the function tree.").color(MUTED));
+            ui.label(
+                RichText::new("The native FunctionIndex may still contain stripped entries.")
+                    .color(MUTED),
+            );
+        }
+        if let Some(index) = &self.function_index {
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "NATIVE FUNCTION INDEX  ·  {}",
+                    index.functions.len()
+                ))
+                .size(11.0)
+                .strong()
+                .color(ACCENT),
+            );
+            let query = self.search.to_lowercase();
+            let candidates = index
+                .functions
+                .iter()
+                .filter_map(|function| {
+                    let label = function.name.clone().unwrap_or_else(|| {
+                        format!(
+                            "sub_{}_{}",
+                            function.entry.address_space, function.entry.value.0
+                        )
+                    });
+                    (label.to_lowercase().contains(&query)
+                        || function.id.to_lowercase().contains(&query))
+                    .then_some((label, function.id.clone(), function.entry, function.state))
+                })
+                .collect::<Vec<_>>();
+            let mut clicked = None;
+            egui::ScrollArea::vertical()
+                .id_salt("native_function_list")
+                .max_height(220.0)
+                .show_rows(ui, 26.0, candidates.len(), |ui, range| {
+                    for position in range {
+                        let (label, _, entry, state) = &candidates[position];
+                        let selected = self.symbol.as_deref() == Some(label);
+                        if ui
+                            .selectable_label(
+                                selected,
+                                RichText::new(format!(
+                                    "{label}  [{}:0x{:x}]  {:?}",
+                                    entry.address_space, entry.value.0, state
+                                ))
+                                .monospace()
+                                .size(11.0),
+                            )
+                            .clicked()
+                        {
+                            clicked = Some((label.clone(), candidates[position].1.clone(), *entry));
+                        }
+                    }
+                });
+            if let Some((label, selector, entry)) = clicked {
+                let legacy_symbol = self.spec.as_ref().and_then(|spec| {
+                    spec.functions
+                        .iter()
+                        .find(|function| function.name == label)
+                        .map(|function| function.name.clone())
+                });
+                if let Some(symbol) = legacy_symbol {
+                    self.select(symbol);
+                } else {
+                    self.select_native(label, selector, entry);
+                }
+            }
+        } else if let Some(error) = &self.function_index_error {
+            ui.colored_label(MUTED, error);
         }
     }
 
@@ -3375,6 +3817,32 @@ impl AnalystApp {
                     "{} functions · {} skipped",
                     report.functions.len(),
                     report.skipped_functions.len()
+                ),
+            );
+        }
+        let coverage = ui.add_enabled(
+            !self.busy && self.spec.is_some() && !self.remote,
+            egui::Button::new("Measure native coverage"),
+        );
+        if coverage.clicked() {
+            self.enqueue(
+                Task::MeasureNativeCoverage,
+                "Lifting discovered functions and measuring native semantics...",
+            );
+        }
+        coverage.on_disabled_hover_text(
+            "Open a local ELF first. Coverage lifts every discovered function and may take time on large binaries.",
+        );
+        if let Some(report) = &self.native_coverage {
+            field(
+                ui,
+                "NATIVE COVERAGE",
+                &format!(
+                    "{} lifted / {} discovered; {} exact / {} opaque instructions",
+                    report.lifted_functions,
+                    report.discovered_functions,
+                    report.exact_instructions,
+                    report.opaque_instructions
                 ),
             );
         }
@@ -3809,6 +4277,82 @@ impl AnalystApp {
                     },
                 );
             }
+        } else if let Some(function) = self.selected_indexed_function() {
+            ui.label(
+                RichText::new(indexed_function_label(function))
+                    .monospace()
+                    .color(ACCENT),
+            );
+            field(
+                ui,
+                "ENTRY",
+                &format!(
+                    "{}:0x{:016x}",
+                    function.entry.address_space, function.entry.value.0
+                ),
+            );
+            field(ui, "FUNCTION ID", &function.id);
+            field(ui, "EVIDENCE STATE", &format!("{:?}", function.state));
+            field(
+                ui,
+                "BLOCK ENTRIES",
+                &function.block_entries.len().to_string(),
+            );
+            field(ui, "EXTENTS", &function.extents.len().to_string());
+            field(
+                ui,
+                "CANDIDATE TARGETS",
+                &function.candidate_targets.len().to_string(),
+            );
+            if let Some(address) = self.selected_address {
+                field(ui, "SELECTED", &format!("0x{address:016x}"));
+            }
+            if let Some(native) = &self.native_decompilation {
+                field(
+                    ui,
+                    "NATIVE CFG",
+                    &format!(
+                        "{} blocks - {} instructions",
+                        native.machine_ir.blocks.len(),
+                        native_instruction_count(native)
+                    ),
+                );
+                field(
+                    ui,
+                    "SEMANTIC FIDELITY",
+                    &format!("{:?}", native.cir.semantic_fidelity),
+                );
+                field(
+                    ui,
+                    "OPAQUE INSTRUCTIONS",
+                    &native_opaque_instruction_count(native).to_string(),
+                );
+                field(
+                    ui,
+                    "REWRITE READY",
+                    if native.cir.rewrite_ready {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                );
+            }
+            if !function.evidence.is_empty() {
+                egui::CollapsingHeader::new("Entry evidence")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for evidence in &function.evidence {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} - {}",
+                                    evidence.kind, evidence.description
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                    });
+            }
         } else {
             ui.label(
                 RichText::new("Select a function to inspect its scope and assumptions.")
@@ -3841,6 +4385,35 @@ impl AnalystApp {
                 ),
             );
             field(ui, "PROVENANCE", &instruction.provenance);
+        }
+        if let Some(native) = &self.native_decompilation
+            && let Some(address) = self.selected_address
+            && let Some(instruction) = native
+                .machine_ir
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .find(|instruction| instruction.address.value.0 == address)
+        {
+            ui.separator();
+            ui.heading(RichText::new("Selected native instruction").size(14.0));
+            field(
+                ui,
+                "ADDRESS",
+                &format!(
+                    "{}:0x{:016x}",
+                    instruction.address.address_space, instruction.address.value.0
+                ),
+            );
+            field(ui, "BYTES", &instruction.bytes_hex);
+            field(
+                ui,
+                "INSTRUCTION",
+                &format!("{} {:?}", instruction.mnemonic, instruction.operands),
+            );
+            field(ui, "SEMANTICS", &format!("{:?}", instruction.operation));
+            field(ui, "EFFECTS", &format!("{:?}", instruction.effects));
+            field(ui, "EDGES", &format!("{:?}", instruction.edges));
         }
         ui.add_space(12.0);
         ui.separator();
@@ -3916,12 +4489,15 @@ impl AnalystApp {
     }
 
     fn main_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
+                (Tab::Overview, "Overview"),
                 (Tab::RegionStudio, "Region Studio"),
+                (Tab::Native, "Native decompiler"),
                 (Tab::Bytes, "Disassembly"),
                 (Tab::Graph, "Graph"),
                 (Tab::Cfg, "CFG"),
+                (Tab::Coverage, "Coverage"),
                 (Tab::Llvm, "LLVM IR"),
                 (Tab::Passes, "Passes"),
                 (Tab::Analysis, "Global effects"),
@@ -3935,14 +4511,257 @@ impl AnalystApp {
         });
         ui.separator();
         match self.tab {
+            Tab::Overview => self.overview_view(ui),
             Tab::RegionStudio => self.region_studio(ui),
+            Tab::Native => self.native_explorer_view(ui),
             Tab::Bytes => self.disassembly(ui),
             Tab::Graph => self.graph_view(ui),
             Tab::Cfg => self.cfg_view(ui),
+            Tab::Coverage => self.coverage_view(ui),
             Tab::Llvm => self.llvm_view(ui),
             Tab::Passes => self.passes_view(ui),
             Tab::Analysis => self.analysis_view(ui),
             Tab::C => self.c_view(ui),
+        }
+    }
+
+    fn overview_view(&mut self, ui: &mut egui::Ui) {
+        let Some(spec) = &self.spec else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                ui.heading(
+                    RichText::new("Open a Linux x86-64 ELF")
+                        .size(24.0)
+                        .color(ACCENT),
+                );
+                ui.label(
+                    RichText::new(
+                        "Paste a path in the Program pane or drop an ELF anywhere in this window.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(10.0);
+                ui.label("Hydir loads and analyzes bytes without executing the input program.");
+            });
+            return;
+        };
+
+        let indexed_functions = self
+            .function_index
+            .as_ref()
+            .map_or(0, |index| index.functions.len());
+        let first_function_action = self
+            .function_index
+            .as_ref()
+            .and_then(|index| index.functions.first())
+            .map(|function| indexed_function_action(function, Some(spec)));
+        let native_ready = self.native_decompilation.is_some();
+        let selected = self.symbol.as_deref().unwrap_or("none");
+        ui.heading(RichText::new("Native ELF workbench").size(22.0).color(TEXT));
+        ui.label(RichText::new(&spec.recovery_scope).size(11.0).color(MUTED));
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            metric_badge(ui, "ELF", &spec.file_kind, INFO);
+            metric_badge(ui, "TARGET", &spec.target_triple, VIOLET);
+            metric_badge(ui, "FUNCTIONS", &indexed_functions.to_string(), ACCENT);
+            metric_badge(ui, "IMPORTS", &spec.imports.len().to_string(), TEXT);
+            metric_badge(ui, "RELOCATIONS", &spec.relocations.len().to_string(), TEXT);
+            metric_badge(
+                ui,
+                "UNCERTAINTIES",
+                &spec.uncertainties.len().to_string(),
+                if spec.uncertainties.is_empty() {
+                    GOOD
+                } else {
+                    BAD
+                },
+            );
+        });
+        ui.add_space(12.0);
+
+        let mut open_graph = false;
+        let mut open_native = false;
+        let mut open_disassembly = false;
+        let mut run_coverage = false;
+        let mut decompile_first = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Open graph explorer").clicked() {
+                open_graph = true;
+            }
+            if ui
+                .add_enabled(native_ready, egui::Button::new("Inspect native IR / C"))
+                .clicked()
+            {
+                open_native = true;
+            }
+            if ui
+                .add_enabled(
+                    !native_ready && first_function_action.is_some(),
+                    egui::Button::new("Decompile first discovered function"),
+                )
+                .clicked()
+            {
+                decompile_first = true;
+            }
+            if ui
+                .add_enabled(!self.remote, egui::Button::new("Disassemble whole ELF"))
+                .clicked()
+            {
+                open_disassembly = true;
+            }
+            if ui
+                .add_enabled(!self.remote, egui::Button::new("Measure semantic coverage"))
+                .clicked()
+            {
+                run_coverage = true;
+            }
+        });
+        ui.label(
+            RichText::new(format!("Selected function: {selected}"))
+                .monospace()
+                .size(11.0)
+                .color(if native_ready { GOOD } else { MUTED }),
+        );
+        ui.add_space(12.0);
+
+        ui.columns(2, |columns| {
+            columns[0].heading(RichText::new("Pipeline").size(15.0).color(ACCENT));
+            stage_card(
+                &mut columns[0],
+                "01",
+                "ELF loader",
+                &format!(
+                    "{} address spaces / {} mapped segments / {} sections",
+                    spec.address_spaces.len(),
+                    spec.mapped_segments.len(),
+                    spec.sections.len()
+                ),
+                true,
+            );
+            stage_card(
+                &mut columns[0],
+                "02",
+                "Function discovery",
+                &format!("{indexed_functions} evidence-backed entries"),
+                self.function_index.is_some(),
+            );
+            stage_card(
+                &mut columns[0],
+                "03",
+                "Native lifting",
+                if native_ready {
+                    "MachineIR -> StateIR -> FunctionIR -> CIR"
+                } else {
+                    "Select a function to lift"
+                },
+                native_ready,
+            );
+            stage_card(
+                &mut columns[0],
+                "04",
+                "C generation",
+                self.native_decompilation
+                    .as_ref()
+                    .map_or("Waiting for native lift", |native| {
+                        if native.structured_c.is_some() {
+                            "Low-level and structured C available"
+                        } else {
+                            "Compilable low-level C available"
+                        }
+                    }),
+                native_ready,
+            );
+
+            columns[1].heading(RichText::new("Evidence and safety").size(15.0).color(INFO));
+            field(&mut columns[1], "BINARY SHA-256", &spec.binary_sha256);
+            field(
+                &mut columns[1],
+                "ENTRY",
+                &spec.entry_location.map_or_else(
+                    || "not declared".to_owned(),
+                    |entry| format!("{}:0x{:x}", entry.address_space, entry.value.0),
+                ),
+            );
+            field(
+                &mut columns[1],
+                "DYNAMIC SYMBOLS",
+                &spec.dynamic_symbols.len().to_string(),
+            );
+            field(
+                &mut columns[1],
+                "UNWIND RANGES",
+                &spec.unwind_ranges.len().to_string(),
+            );
+            field(
+                &mut columns[1],
+                "RUNTIME RANGES",
+                &spec.runtime_ranges.len().to_string(),
+            );
+            field(
+                &mut columns[1],
+                "UNRESOLVED CONTROL",
+                if spec.unresolved_control_flow {
+                    "yes"
+                } else {
+                    "no"
+                },
+            );
+            if let Some(index) = &self.function_index
+                && !index.diagnostics.is_empty()
+            {
+                columns[1].separator();
+                columns[1].label(
+                    RichText::new(format!(
+                        "Discovery diagnostics ({})",
+                        index.diagnostics.len()
+                    ))
+                    .strong()
+                    .color(BAD),
+                );
+                for diagnostic in index.diagnostics.iter().take(8) {
+                    columns[1].label(
+                        RichText::new(format!("{}: {}", diagnostic.code, diagnostic.message))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+            }
+        });
+
+        if open_graph {
+            self.graph_mode = if self.native_decompilation.is_some() {
+                GraphMode::Function
+            } else {
+                GraphMode::Program
+            };
+            self.tab = Tab::Graph;
+        } else if open_native {
+            self.tab = Tab::Native;
+        } else if decompile_first {
+            if let Some(GraphNodeAction::Function {
+                label,
+                selector,
+                entry,
+                legacy_symbol,
+            }) = first_function_action
+            {
+                if legacy_symbol {
+                    self.select(label);
+                } else {
+                    self.select_native(label, selector, entry);
+                }
+                self.selection_target_tab = Some(Tab::Native);
+            }
+        } else if open_disassembly {
+            self.enqueue(
+                Task::Disassemble,
+                "Disassembling executable ELF sections...",
+            );
+        } else if run_coverage {
+            self.enqueue(
+                Task::MeasureNativeCoverage,
+                "Lifting discovered functions and measuring native semantics...",
+            );
         }
     }
 
@@ -4565,6 +5384,67 @@ impl AnalystApp {
             self.full_disassembly(ui);
             return;
         }
+        if self.native_decompilation.is_some() {
+            let Some(native) = &self.native_decompilation else {
+                ui.label(
+                    RichText::new("Select a function or disassemble the whole ELF.").color(MUTED),
+                );
+                return;
+            };
+            let instructions = native
+                .machine_ir
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .collect::<Vec<_>>();
+            ui.label(
+                RichText::new(format!(
+                    "Native decoded function - {} instructions - source bytes preserved",
+                    instructions.len()
+                ))
+                .size(11.0)
+                .color(MUTED),
+            );
+            let mut clicked = None;
+            egui::ScrollArea::vertical()
+                .id_salt("native_bytes_view")
+                .show_rows(ui, 26.0, instructions.len(), |ui, range| {
+                    for position in range {
+                        let instruction = instructions[position];
+                        let opaque =
+                            matches!(instruction.operation, MachineOperation::OpaqueEffect { .. });
+                        let line = format!(
+                            "{}:0x{:016x}  {:<20} {:<10} {:?}",
+                            instruction.address.address_space,
+                            instruction.address.value.0,
+                            instruction.bytes_hex,
+                            instruction.mnemonic,
+                            instruction.operands
+                        );
+                        if ui
+                            .selectable_label(
+                                self.selected_address == Some(instruction.address.value.0),
+                                RichText::new(line).monospace().size(11.0).color(if opaque {
+                                    BAD
+                                } else {
+                                    TEXT
+                                }),
+                            )
+                            .on_hover_text(format!(
+                                "Operation: {:?}\nEffects: {:?}\nEdges: {:?}",
+                                instruction.operation, instruction.effects, instruction.edges
+                            ))
+                            .clicked()
+                        {
+                            clicked = Some(instruction.address.value.0);
+                        }
+                    }
+                });
+            if let Some(address) = clicked {
+                self.selected_address = Some(address);
+            }
+            return;
+        }
         let Some(cfg) = &self.cfg else {
             ui.label(
                 RichText::new("Select a supported function to decode reachable instructions.")
@@ -4970,6 +5850,15 @@ impl AnalystApp {
             .color(MUTED),
         );
 
+        if self.graph_mode == GraphMode::Function && self.native_decompilation.is_some() {
+            self.native_function_graph_view(ui);
+            return;
+        }
+        if self.graph_mode == GraphMode::Program && self.function_index.is_some() {
+            self.native_program_graph_view(ui);
+            return;
+        }
+
         let mut nodes: Vec<(NodeId, String, bool)> = Vec::new();
         let mut edges: Vec<(NodeId, NodeId)> = Vec::new();
         match self.graph_mode {
@@ -5227,7 +6116,375 @@ impl AnalystApp {
             });
     }
 
+    fn native_function_graph_view(&mut self, ui: &mut egui::Ui) {
+        let Some(native) = &self.native_decompilation else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("ZOOM").size(10.0).color(MUTED));
+            ui.add(egui::Slider::new(&mut self.graph_zoom, 0.6..=1.6).show_value(false));
+            if ui.small_button("Reset").clicked() {
+                self.graph_zoom = 1.0;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{} blocks / {} instructions",
+                    native.machine_ir.blocks.len(),
+                    native_instruction_count(native)
+                ))
+                .size(11.0)
+                .color(MUTED),
+            );
+        });
+
+        let mut nodes = Vec::<WorkbenchGraphNode>::new();
+        let mut edges = Vec::<WorkbenchGraphEdge>::new();
+        let mut block_ids = std::collections::BTreeMap::new();
+        for block in &native.machine_ir.blocks {
+            let id = NodeId::new((
+                "native-block",
+                block.address.address_space,
+                block.address.value.0,
+            ));
+            block_ids.insert(block.address, id);
+            let preview = block
+                .instructions
+                .iter()
+                .take(3)
+                .map(|instruction| instruction.mnemonic.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let truncated = if block.instructions.len() > 3 {
+                "; ..."
+            } else {
+                ""
+            };
+            let opaque = block.instructions.iter().any(|instruction| {
+                matches!(instruction.operation, MachineOperation::OpaqueEffect { .. })
+            });
+            nodes.push(WorkbenchGraphNode {
+                id,
+                label: format!(
+                    "{}\n{}:0x{:x}\n{}{}",
+                    block.label,
+                    block.address.address_space,
+                    block.address.value.0,
+                    preview,
+                    truncated
+                ),
+                tone: if self.selected_address == Some(block.address.value.0) {
+                    GraphNodeTone::Selected
+                } else if opaque {
+                    GraphNodeTone::Opaque
+                } else {
+                    GraphNodeTone::Normal
+                },
+                action: Some(GraphNodeAction::Address(block.address.value.0)),
+            });
+        }
+
+        let mut external_targets = std::collections::BTreeSet::new();
+        for block in &native.machine_ir.blocks {
+            let source = block_ids[&block.address];
+            for (edge_index, edge) in block
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.edges)
+                .enumerate()
+            {
+                let (target, unresolved) = if let Some(location) = edge.target {
+                    if let Some(target) = block_ids.get(&location) {
+                        (*target, false)
+                    } else {
+                        let target = NodeId::new((
+                            "native-external",
+                            location.address_space,
+                            location.value.0,
+                        ));
+                        if external_targets.insert(Some(location)) {
+                            let indexed = self.function_index.as_ref().and_then(|index| {
+                                index
+                                    .functions
+                                    .iter()
+                                    .find(|function| function.entry == location)
+                            });
+                            nodes.push(WorkbenchGraphNode {
+                                id: target,
+                                label: indexed.map_or_else(
+                                    || {
+                                        format!(
+                                            "external target\n{}:0x{:x}",
+                                            location.address_space, location.value.0
+                                        )
+                                    },
+                                    |function| {
+                                        format!(
+                                            "{}\n{}:0x{:x}",
+                                            indexed_function_label(function),
+                                            location.address_space,
+                                            location.value.0
+                                        )
+                                    },
+                                ),
+                                tone: GraphNodeTone::External,
+                                action: indexed.map(|function| {
+                                    indexed_function_action(function, self.spec.as_ref())
+                                }),
+                            });
+                        }
+                        (target, false)
+                    }
+                } else {
+                    let target = NodeId::new((
+                        "native-unresolved",
+                        block.address.address_space,
+                        block.address.value.0,
+                        edge_index,
+                    ));
+                    nodes.push(WorkbenchGraphNode {
+                        id: target,
+                        label: format!("unresolved\n{:?}", edge.kind),
+                        tone: GraphNodeTone::Opaque,
+                        action: None,
+                    });
+                    (target, true)
+                };
+                edges.push(WorkbenchGraphEdge {
+                    source,
+                    target,
+                    label: format!("{:?}", edge.kind),
+                    unresolved,
+                });
+            }
+        }
+
+        if let Some(action) = render_workbench_graph(ui, &nodes, &edges, self.graph_zoom) {
+            self.apply_graph_action(action);
+        }
+    }
+
+    fn native_program_graph_view(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = &self.function_index else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("FILTER").size(10.0).color(MUTED));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.graph_filter)
+                    .hint_text("Function name or stable ID")
+                    .desired_width(240.0),
+            );
+            ui.label(RichText::new("ZOOM").size(10.0).color(MUTED));
+            ui.add(egui::Slider::new(&mut self.graph_zoom, 0.6..=1.6).show_value(false));
+        });
+
+        let mut entries = std::collections::BTreeMap::new();
+        for (position, function) in index.functions.iter().enumerate() {
+            entries.entry(function.entry).or_insert(position);
+        }
+        let mut recovered_edges = std::collections::BTreeSet::new();
+        for (source, function) in index.functions.iter().enumerate() {
+            for target in &function.candidate_targets {
+                if let Some(target) = entries.get(target).copied()
+                    && source != target
+                {
+                    recovered_edges.insert((source, target, "candidate".to_owned()));
+                }
+            }
+        }
+        if let Some(native) = &self.native_decompilation
+            && let Some(source) = index
+                .functions
+                .iter()
+                .position(|function| function.id == native.machine_ir.function_id)
+        {
+            for call in &native.function_ir.calls {
+                if let Some(target) = call.target.and_then(|target| entries.get(&target).copied())
+                    && source != target
+                {
+                    recovered_edges.insert((
+                        source,
+                        target,
+                        if call.tail_call { "tail call" } else { "call" }.to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let selected = self.selected_indexed_function().and_then(|selected| {
+            index
+                .functions
+                .iter()
+                .position(|function| function.id == selected.id)
+        });
+        let query = self.graph_filter.trim().to_lowercase();
+        let mut visible = std::collections::BTreeSet::new();
+        if index.functions.len() <= 180 && query.is_empty() {
+            visible.extend(0..index.functions.len());
+        } else {
+            if query.is_empty() {
+                visible.insert(selected.unwrap_or(0));
+            } else {
+                for (position, function) in index.functions.iter().enumerate() {
+                    let label = indexed_function_label(function);
+                    if label.to_lowercase().contains(&query)
+                        || function.id.to_lowercase().contains(&query)
+                    {
+                        visible.insert(position);
+                        if visible.len() >= 80 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let seeds = visible.clone();
+            for (source, target, _) in &recovered_edges {
+                if seeds.contains(source) || seeds.contains(target) {
+                    visible.insert(*source);
+                    visible.insert(*target);
+                    if visible.len() >= 220 {
+                        break;
+                    }
+                }
+            }
+        }
+        ui.label(
+            RichText::new(format!(
+                "Showing {} of {} functions and their evidence-backed direct neighbors",
+                visible.len(),
+                index.functions.len()
+            ))
+            .size(11.0)
+            .color(MUTED),
+        );
+
+        let mut nodes = Vec::new();
+        let mut ids = std::collections::BTreeMap::new();
+        for position in &visible {
+            let function = &index.functions[*position];
+            let id = NodeId::new(("native-function", function.id.as_str()));
+            ids.insert(*position, id);
+            nodes.push(WorkbenchGraphNode {
+                id,
+                label: format!(
+                    "{}\n{}:0x{:x}\n{:?}",
+                    indexed_function_label(function),
+                    function.entry.address_space,
+                    function.entry.value.0,
+                    function.state
+                ),
+                tone: if selected == Some(*position) {
+                    GraphNodeTone::Selected
+                } else if function.state == FunctionEvidenceState::Ambiguous {
+                    GraphNodeTone::Opaque
+                } else {
+                    GraphNodeTone::Normal
+                },
+                action: Some(indexed_function_action(function, self.spec.as_ref())),
+            });
+        }
+        let edges = recovered_edges
+            .iter()
+            .filter_map(|(source, target, label)| {
+                Some(WorkbenchGraphEdge {
+                    source: *ids.get(source)?,
+                    target: *ids.get(target)?,
+                    label: label.clone(),
+                    unresolved: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            ui.colored_label(MUTED, "No functions match the graph filter.");
+            return;
+        }
+        if let Some(action) = render_workbench_graph(ui, &nodes, &edges, self.graph_zoom) {
+            self.apply_graph_action(action);
+        }
+    }
+
+    fn apply_graph_action(&mut self, action: GraphNodeAction) {
+        match action {
+            GraphNodeAction::Address(address) => {
+                self.selected_address = Some(address);
+            }
+            GraphNodeAction::Function {
+                label,
+                selector,
+                entry,
+                legacy_symbol,
+            } => {
+                self.graph_mode = GraphMode::Function;
+                if legacy_symbol {
+                    self.select(label);
+                } else {
+                    self.select_native(label, selector, entry);
+                }
+                self.selection_target_tab = Some(Tab::Graph);
+            }
+        }
+    }
+
     fn cfg_view(&mut self, ui: &mut egui::Ui) {
+        if self.native_decompilation.is_some() {
+            let Some(native) = &self.native_decompilation else {
+                ui.label(
+                    RichText::new("Select a function to recover its control-flow graph.")
+                        .color(MUTED),
+                );
+                return;
+            };
+            ui.label(
+                RichText::new(format!(
+                    "Native MachineFunctionIR control flow - {} blocks - {:?}",
+                    native.machine_ir.blocks.len(),
+                    native.machine_ir.structural_completeness
+                ))
+                .size(11.0)
+                .color(MUTED),
+            );
+            let mut clicked = None;
+            egui::ScrollArea::vertical()
+                .id_salt("native_cfg_view")
+                .show(ui, |ui| {
+                    for block in &native.machine_ir.blocks {
+                        let edges = block
+                            .instructions
+                            .iter()
+                            .flat_map(|instruction| &instruction.edges)
+                            .map(|edge| {
+                                edge.target.map_or_else(
+                                    || format!("{:?} -> unresolved", edge.kind),
+                                    |target| {
+                                        format!(
+                                            "{:?} -> {}:0x{:x}",
+                                            edge.kind, target.address_space, target.value.0
+                                        )
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("   ");
+                        let text = format!(
+                            "{}:0x{:016x}  {:<18}  {}",
+                            block.address.address_space, block.address.value.0, block.label, edges
+                        );
+                        if ui
+                            .selectable_label(
+                                self.selected_address == Some(block.address.value.0),
+                                RichText::new(text).monospace().size(11.0),
+                            )
+                            .clicked()
+                        {
+                            clicked = Some(block.address.value.0);
+                        }
+                    }
+                });
+            if let Some(address) = clicked {
+                self.selected_address = Some(address);
+            }
+            return;
+        }
         let Some(cfg) = &self.cfg else {
             ui.label(RichText::new("CFG recovery is unavailable for this function.").color(MUTED));
             return;
@@ -5407,6 +6664,391 @@ impl AnalystApp {
         }
     }
 
+    fn native_view(&mut self, ui: &mut egui::Ui) {
+        let Some(native) = &self.native_decompilation else {
+            ui.colored_label(
+                BAD,
+                self.native_decompilation_error
+                    .as_deref()
+                    .unwrap_or("Select a native FunctionIndex entry to decompile it."),
+            );
+            ui.label(
+                RichText::new(
+                    "Native failures remain function-local; ProgramSpec and FunctionIndex artifacts are retained.",
+                )
+                .color(MUTED),
+            );
+            return;
+        };
+        ui.horizontal_wrapped(|ui| {
+            field(ui, "FUNCTION ID", &native.machine_ir.function_id);
+            field(
+                ui,
+                "ENTRY",
+                &format!(
+                    "{}:0x{:x}",
+                    native.machine_ir.entry.address_space, native.machine_ir.entry.value.0
+                ),
+            );
+            field(
+                ui,
+                "FIDELITY",
+                &format!("{:?}", native.cir.semantic_fidelity),
+            );
+            field(
+                ui,
+                "REWRITE READY",
+                if native.cir.rewrite_ready {
+                    "yes"
+                } else {
+                    "no"
+                },
+            );
+        });
+        ui.separator();
+        ui.label(
+            RichText::new("LOW-LEVEL C11 · EXPLICIT STATE / UNKNOWN EFFECTS")
+                .size(11.0)
+                .strong()
+                .color(ACCENT),
+        );
+        egui::ScrollArea::both()
+            .id_salt("native_low_c")
+            .max_height(340.0)
+            .show(ui, |ui| ui.code(&native.low_level_c));
+        if let Some(structured) = &native.structured_c {
+            egui::CollapsingHeader::new("Structured C11")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::both()
+                        .id_salt("native_structured_c")
+                        .max_height(300.0)
+                        .show(ui, |ui| ui.code(structured));
+                });
+        }
+        for (label, value) in [
+            (
+                "MachineFunctionIR v1",
+                serde_json::to_string_pretty(&native.machine_ir),
+            ),
+            (
+                "StateFunctionIR v1",
+                serde_json::to_string_pretty(&native.state_ir),
+            ),
+            (
+                "FunctionIR v1",
+                serde_json::to_string_pretty(&native.function_ir),
+            ),
+            ("CIR v1", serde_json::to_string_pretty(&native.cir)),
+        ] {
+            egui::CollapsingHeader::new(label).show(ui, |ui| match value {
+                Ok(value) => {
+                    ui.code(value);
+                }
+                Err(error) => {
+                    ui.colored_label(BAD, error.to_string());
+                }
+            });
+        }
+        if !native.diagnostics.is_empty() {
+            egui::CollapsingHeader::new(format!("Diagnostics ({})", native.diagnostics.len()))
+                .show(ui, |ui| {
+                    for diagnostic in &native.diagnostics {
+                        ui.colored_label(
+                            if diagnostic.blocks_stable_operation {
+                                BAD
+                            } else {
+                                MUTED
+                            },
+                            format!("{} · {}", diagnostic.code, diagnostic.message),
+                        );
+                    }
+                });
+        }
+    }
+
+    fn native_explorer_view(&mut self, ui: &mut egui::Ui) {
+        if self.native_decompilation.is_none() {
+            self.native_view(ui);
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (mode, label) in [
+                (NativeViewMode::Summary, "Summary"),
+                (NativeViewMode::LowLevelC, "Low-level C"),
+                (NativeViewMode::StructuredC, "Structured C"),
+                (NativeViewMode::MachineIr, "MachineIR"),
+                (NativeViewMode::StateIr, "StateIR"),
+                (NativeViewMode::FunctionIr, "FunctionIR"),
+                (NativeViewMode::Cir, "CIR"),
+                (NativeViewMode::Evidence, "Evidence"),
+            ] {
+                ui.selectable_value(&mut self.native_view_mode, mode, label);
+            }
+        });
+        ui.separator();
+        let Some(native) = &self.native_decompilation else {
+            ui.colored_label(
+                BAD,
+                self.native_decompilation_error
+                    .as_deref()
+                    .unwrap_or("Select a native FunctionIndex entry to decompile it."),
+            );
+            ui.label(
+                RichText::new(
+                    "Native failures remain function-local; ProgramSpec and FunctionIndex artifacts are retained.",
+                )
+                .color(MUTED),
+            );
+            return;
+        };
+
+        let instruction_count = native_instruction_count(native);
+        let opaque_count = native_opaque_instruction_count(native);
+        ui.horizontal_wrapped(|ui| {
+            field(ui, "FUNCTION ID", &native.machine_ir.function_id);
+            field(
+                ui,
+                "ENTRY",
+                &format!(
+                    "{}:0x{:x}",
+                    native.machine_ir.entry.address_space, native.machine_ir.entry.value.0
+                ),
+            );
+            field(
+                ui,
+                "FIDELITY",
+                &format!("{:?}", native.cir.semantic_fidelity),
+            );
+            field(
+                ui,
+                "REWRITE READY",
+                if native.cir.rewrite_ready {
+                    "yes"
+                } else {
+                    "no"
+                },
+            );
+            field(ui, "BLOCKS", &native.machine_ir.blocks.len().to_string());
+            field(ui, "INSTRUCTIONS", &instruction_count.to_string());
+            field(ui, "OPAQUE", &opaque_count.to_string());
+        });
+        ui.separator();
+
+        let clicked_address = match self.native_view_mode {
+            NativeViewMode::Summary => {
+                native_summary_view(ui, native);
+                None
+            }
+            NativeViewMode::LowLevelC => {
+                code_artifact_view(
+                    ui,
+                    "LOW-LEVEL C11 - EXPLICIT MACHINE STATE / UNKNOWN EFFECTS",
+                    &native.low_level_c,
+                    "native_low_c",
+                );
+                None
+            }
+            NativeViewMode::StructuredC => {
+                if let Some(structured) = &native.structured_c {
+                    code_artifact_view(
+                        ui,
+                        "STRUCTURED C11 - BEST EFFORT, SEMANTICS PRESERVED",
+                        structured,
+                        "native_structured_c",
+                    );
+                } else {
+                    ui.colored_label(
+                        ACCENT,
+                        "This function cannot be structured safely; low-level C remains available.",
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Irreducible or unresolved control flow stays explicit instead of being invented.",
+                        )
+                        .color(MUTED),
+                    );
+                }
+                None
+            }
+            NativeViewMode::MachineIr => native_machine_ir_view(ui, native, self.selected_address),
+            NativeViewMode::StateIr => {
+                json_artifact_view(
+                    ui,
+                    "STATEFUNCTIONIR V1",
+                    &native.state_ir,
+                    "native_state_ir",
+                );
+                None
+            }
+            NativeViewMode::FunctionIr => {
+                json_artifact_view(
+                    ui,
+                    "FUNCTIONIR V1",
+                    &native.function_ir,
+                    "native_function_ir",
+                );
+                None
+            }
+            NativeViewMode::Cir => {
+                json_artifact_view(ui, "CIR V1", &native.cir, "native_cir");
+                None
+            }
+            NativeViewMode::Evidence => native_evidence_view(ui, native, self.selected_address),
+        };
+        if let Some(address) = clicked_address {
+            self.selected_address = Some(address);
+        }
+    }
+
+    fn coverage_view(&mut self, ui: &mut egui::Ui) {
+        let Some(report) = &self.native_coverage else {
+            ui.heading(RichText::new("Native semantic coverage").size(20.0));
+            ui.label(
+                RichText::new(
+                    self.native_coverage_error
+                        .as_deref()
+                        .unwrap_or("Run coverage to lift every discovered local function and inventory exact versus opaque semantics."),
+                )
+                .color(if self.native_coverage_error.is_some() { BAD } else { MUTED }),
+            );
+            ui.label(
+                RichText::new(
+                    "This is a bounded static analysis. It does not execute the input ELF, and a large binary can take time.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            if ui
+                .add_enabled(
+                    !self.busy && self.spec.is_some() && !self.remote,
+                    egui::Button::new("Measure native coverage"),
+                )
+                .clicked()
+            {
+                self.enqueue(
+                    Task::MeasureNativeCoverage,
+                    "Lifting discovered functions and measuring native semantics...",
+                );
+            }
+            return;
+        };
+
+        let total_instructions = report.exact_instructions + report.opaque_instructions;
+        let exact_ratio = if total_instructions == 0 {
+            0.0
+        } else {
+            report.exact_instructions as f32 / total_instructions as f32
+        };
+        let lift_ratio = if report.discovered_functions == 0 {
+            0.0
+        } else {
+            report.lifted_functions as f32 / report.discovered_functions as f32
+        };
+        ui.heading(RichText::new("Native semantic coverage").size(20.0));
+        ui.horizontal_wrapped(|ui| {
+            metric_badge(
+                ui,
+                "DISCOVERED",
+                &report.discovered_functions.to_string(),
+                INFO,
+            );
+            metric_badge(ui, "LIFTED", &report.lifted_functions.to_string(), GOOD);
+            metric_badge(
+                ui,
+                "EXACT FUNCTIONS",
+                &report.exact_functions.to_string(),
+                GOOD,
+            );
+            metric_badge(
+                ui,
+                "CONSERVATIVE",
+                &report.conservative_functions.to_string(),
+                ACCENT,
+            );
+            metric_badge(ui, "PARTIAL", &report.partial_functions.to_string(), BAD);
+        });
+        ui.add_space(8.0);
+        ui.add(
+            egui::ProgressBar::new(lift_ratio)
+                .text(format!("Function lift rate: {:.1}%", lift_ratio * 100.0))
+                .desired_width(f32::INFINITY),
+        );
+        ui.add(
+            egui::ProgressBar::new(exact_ratio)
+                .text(format!(
+                    "Exact instruction semantics: {:.1}% ({} exact / {} opaque)",
+                    exact_ratio * 100.0,
+                    report.exact_instructions,
+                    report.opaque_instructions
+                ))
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(10.0);
+
+        ui.columns(2, |columns| {
+            columns[0].heading(RichText::new("Exact semantic families").color(GOOD));
+            egui::ScrollArea::vertical()
+                .id_salt("coverage_exact_families")
+                .max_height(420.0)
+                .show(&mut columns[0], |ui| {
+                    for (family, count) in &report.exact_families {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(family).monospace());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new(count.to_string()).color(GOOD));
+                                },
+                            );
+                        });
+                    }
+                });
+
+            columns[1].heading(RichText::new("Opaque semantic families").color(BAD));
+            egui::ScrollArea::vertical()
+                .id_salt("coverage_opaque_families")
+                .max_height(420.0)
+                .show(&mut columns[1], |ui| {
+                    if report.opaque_families.is_empty() {
+                        ui.colored_label(GOOD, "No opaque instruction occurrences measured.");
+                    }
+                    for (family, count) in &report.opaque_families {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(family).monospace().color(BAD));
+                            ui.label(format!("{count} occurrence(s)"));
+                            if let Some(samples) = report.opaque_samples.get(family) {
+                                for sample in samples {
+                                    if ui
+                                        .small_button(format!(
+                                            "{}:0x{:x}",
+                                            sample.address_space, sample.value.0
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.selected_address = Some(sample.value.0);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+        });
+        if !report.diagnostics.is_empty() {
+            ui.separator();
+            egui::CollapsingHeader::new(format!(
+                "Function-local diagnostics ({})",
+                report.diagnostics.len()
+            ))
+            .default_open(true)
+            .show(ui, |ui| {
+                for diagnostic in &report.diagnostics {
+                    ui.colored_label(BAD, diagnostic);
+                }
+            });
+        }
+    }
+
     fn analysis_view(&mut self, ui: &mut egui::Ui) {
         let Some(report) = &self.analysis else {
             ui.label(
@@ -5557,6 +7199,466 @@ impl AnalystApp {
     }
 }
 
+fn indexed_function_label(function: &IndexedFunction) -> String {
+    function.name.clone().unwrap_or_else(|| {
+        format!(
+            "sub_{}_{}",
+            function.entry.address_space, function.entry.value.0
+        )
+    })
+}
+
+fn indexed_function_action(
+    function: &IndexedFunction,
+    spec: Option<&ProgramSpec>,
+) -> GraphNodeAction {
+    let label = indexed_function_label(function);
+    let legacy_symbol = spec.is_some_and(|spec| {
+        spec.functions
+            .iter()
+            .any(|candidate| candidate.name == label && candidate.location == Some(function.entry))
+    });
+    GraphNodeAction::Function {
+        label,
+        selector: function.id.clone(),
+        entry: function.entry,
+        legacy_symbol,
+    }
+}
+
+fn render_workbench_graph(
+    ui: &mut egui::Ui,
+    nodes: &[WorkbenchGraphNode],
+    edges: &[WorkbenchGraphEdge],
+    zoom: f32,
+) -> Option<GraphNodeAction> {
+    if nodes.is_empty() {
+        ui.label(RichText::new("No graph nodes recovered.").color(MUTED));
+        return None;
+    }
+    let node_size = [210.0_f32 * zoom, 72.0_f32 * zoom];
+    let layout = layout_from_sizes(
+        nodes
+            .iter()
+            .map(|node| (node.id, egui_graph_egui::vec2(node_size[0], node_size[1]))),
+        edges.iter().map(|edge| (edge.source, edge.target)),
+        GraphDirection::LeftToRight,
+    );
+    let min_x = layout
+        .values()
+        .map(|position| position.x)
+        .fold(f32::INFINITY, f32::min);
+    let min_y = layout
+        .values()
+        .map(|position| position.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = layout
+        .values()
+        .map(|position| position.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_y = layout
+        .values()
+        .map(|position| position.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let canvas_size = egui::vec2(
+        (max_x - min_x + node_size[0] + 100.0).max(ui.available_width()),
+        (max_y - min_y + node_size[1] + 100.0).max(300.0),
+    );
+    let mut clicked = None;
+    egui::ScrollArea::both()
+        .id_salt("native_graph_canvas")
+        .show(ui, |ui| {
+            let (canvas, _) = ui.allocate_exact_size(canvas_size, egui::Sense::drag());
+            let painter = ui.painter_at(canvas);
+            let offset = canvas.min + egui::vec2(50.0 - min_x, 50.0 - min_y);
+            let rects = nodes
+                .iter()
+                .map(|node| {
+                    let position = layout
+                        .get(&node.id)
+                        .map(|position| offset + egui::vec2(position.x, position.y))
+                        .unwrap_or(canvas.min);
+                    (
+                        node.id,
+                        egui::Rect::from_min_size(position, egui::vec2(node_size[0], node_size[1])),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+
+            for edge in edges {
+                let (Some(source_rect), Some(target_rect)) =
+                    (rects.get(&edge.source), rects.get(&edge.target))
+                else {
+                    continue;
+                };
+                let start = source_rect.right_center();
+                let end = target_rect.left_center();
+                let color = if edge.unresolved { BAD } else { ACCENT };
+                painter.line_segment([start, end], egui::Stroke::new(1.5, color));
+                let delta = end - start;
+                if delta.length_sq() > 1.0 {
+                    let direction = delta.normalized();
+                    let left = end - direction * 10.0 + egui::vec2(-direction.y, direction.x) * 4.0;
+                    let right =
+                        end - direction * 10.0 - egui::vec2(-direction.y, direction.x) * 4.0;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![end, left, right],
+                        color,
+                        egui::Stroke::NONE,
+                    ));
+                }
+                if !edge.label.is_empty() {
+                    let center = start + delta * 0.5;
+                    painter.text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        &edge.label,
+                        egui::FontId::monospace((9.0 * zoom).max(8.0)),
+                        color,
+                    );
+                }
+            }
+
+            for node in nodes {
+                let rect = rects[&node.id];
+                let (fill, stroke) = match node.tone {
+                    GraphNodeTone::Normal => (PANEL, MUTED),
+                    GraphNodeTone::Selected => (Color32::from_rgb(82, 66, 45), ACCENT),
+                    GraphNodeTone::Opaque => (Color32::from_rgb(71, 42, 40), BAD),
+                    GraphNodeTone::External => (Color32::from_rgb(37, 48, 57), INFO),
+                };
+                painter.rect_filled(rect, 6.0, fill);
+                painter.rect_stroke(
+                    rect,
+                    6.0,
+                    egui::Stroke::new(1.2, stroke),
+                    egui::StrokeKind::Outside,
+                );
+                painter.text(
+                    rect.left_top() + egui::vec2(10.0 * zoom, 8.0 * zoom),
+                    egui::Align2::LEFT_TOP,
+                    &node.label,
+                    egui::FontId::monospace((10.5 * zoom).max(8.0)),
+                    TEXT,
+                );
+                let response = ui.interact(
+                    rect,
+                    ui.id().with(("native-graph-node", node.id.value())),
+                    if node.action.is_some() {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                if response.clicked()
+                    && let Some(action) = &node.action
+                {
+                    clicked = Some(action.clone());
+                }
+            }
+        });
+    clicked
+}
+
+fn native_instruction_count(native: &NativeDecompilation) -> usize {
+    native
+        .machine_ir
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum()
+}
+
+fn native_opaque_instruction_count(native: &NativeDecompilation) -> usize {
+    native
+        .machine_ir
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(instruction.operation, MachineOperation::OpaqueEffect { .. })
+        })
+        .count()
+}
+
+fn code_artifact_view(ui: &mut egui::Ui, label: &str, source: &str, id: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).strong().color(ACCENT));
+        if ui.button("Copy").clicked() {
+            ui.ctx().copy_text(source.to_owned());
+        }
+    });
+    egui::ScrollArea::both().id_salt(id).show(ui, |ui| {
+        ui.code(source);
+    });
+}
+
+fn json_artifact_view<T: serde::Serialize>(ui: &mut egui::Ui, label: &str, artifact: &T, id: &str) {
+    match serde_json::to_string_pretty(artifact) {
+        Ok(json) => code_artifact_view(ui, label, &json, id),
+        Err(error) => {
+            ui.colored_label(BAD, format!("Could not serialize {label}: {error}"));
+        }
+    }
+}
+
+fn native_summary_view(ui: &mut egui::Ui, native: &NativeDecompilation) {
+    ui.columns(2, |columns| {
+        columns[0].heading(RichText::new("Recovered ABI").color(ACCENT));
+        field(
+            &mut columns[0],
+            "CALLING CONVENTION",
+            &native.function_ir.calling_convention,
+        );
+        field(
+            &mut columns[0],
+            "PARAMETERS",
+            &native.function_ir.parameters.len().to_string(),
+        );
+        for parameter in &native.function_ir.parameters {
+            columns[0].label(
+                RichText::new(format!(
+                    "{}: {} @ {}{}",
+                    parameter.name,
+                    parameter.type_name,
+                    parameter.location,
+                    if parameter.inferred {
+                        " (inferred)"
+                    } else {
+                        ""
+                    }
+                ))
+                .monospace()
+                .size(11.0),
+            );
+        }
+        field(
+            &mut columns[0],
+            "RETURNS",
+            &native.function_ir.returns.len().to_string(),
+        );
+        for value in &native.function_ir.returns {
+            columns[0].label(
+                RichText::new(format!(
+                    "{}: {} @ {}",
+                    value.name, value.type_name, value.location
+                ))
+                .monospace()
+                .size(11.0),
+            );
+        }
+        field(
+            &mut columns[0],
+            "STACK OBJECTS",
+            &native.function_ir.stack_objects.len().to_string(),
+        );
+        field(
+            &mut columns[0],
+            "GLOBAL OBJECTS",
+            &native.function_ir.global_objects.len().to_string(),
+        );
+        field(
+            &mut columns[0],
+            "ALIAS SETS",
+            &native.function_ir.alias_sets.len().to_string(),
+        );
+        field(
+            &mut columns[0],
+            "POINTER ORIGINS",
+            &native.function_ir.pointer_provenance.len().to_string(),
+        );
+
+        columns[1].heading(RichText::new("Calls and effects").color(INFO));
+        if native.function_ir.calls.is_empty() {
+            columns[1].label(RichText::new("No calls recovered.").color(MUTED));
+        }
+        for call in &native.function_ir.calls {
+            let target = call.symbol.clone().or_else(|| {
+                call.target
+                    .map(|target| format!("{}:0x{:x}", target.address_space, target.value.0))
+            });
+            columns[1].label(
+                RichText::new(format!(
+                    "{}:0x{:x} -> {}{}{}",
+                    call.site.address_space,
+                    call.site.value.0,
+                    target.as_deref().unwrap_or("unresolved"),
+                    if call.indirect { " [indirect]" } else { "" },
+                    if call.tail_call { " [tail]" } else { "" }
+                ))
+                .monospace()
+                .size(11.0)
+                .color(if call.target.is_some() || call.symbol.is_some() {
+                    TEXT
+                } else {
+                    BAD
+                }),
+            );
+            columns[1].label(RichText::new(&call.evidence).size(10.0).color(MUTED));
+        }
+        columns[1].separator();
+        field(
+            &mut columns[1],
+            "STRUCTURE",
+            &format!("{:?}", native.cir.structural_completeness),
+        );
+        field(
+            &mut columns[1],
+            "VERIFICATION",
+            &format!("{:?}", native.cir.verification),
+        );
+        field(
+            &mut columns[1],
+            "DIAGNOSTICS",
+            &native.diagnostics.len().to_string(),
+        );
+    });
+}
+
+fn native_machine_ir_view(
+    ui: &mut egui::Ui,
+    native: &NativeDecompilation,
+    selected_address: Option<u64>,
+) -> Option<u64> {
+    let mut clicked_address = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("MACHINEFUNCTIONIR V1").strong().color(ACCENT));
+        if ui.button("Copy JSON").clicked()
+            && let Ok(json) = serde_json::to_string_pretty(&native.machine_ir)
+        {
+            ui.ctx().copy_text(json);
+        }
+    });
+    egui::ScrollArea::both()
+        .id_salt("native_machine_ir")
+        .show(ui, |ui| {
+            for block in &native.machine_ir.blocks {
+                ui.label(
+                    RichText::new(format!(
+                        "{}  [{}:0x{:x}]",
+                        block.label, block.address.address_space, block.address.value.0
+                    ))
+                    .monospace()
+                    .strong()
+                    .color(INFO),
+                );
+                for instruction in &block.instructions {
+                    let opaque =
+                        matches!(instruction.operation, MachineOperation::OpaqueEffect { .. });
+                    let text = format!(
+                        "{}:0x{:016x}  {:<20} {:<10} {:?}",
+                        instruction.address.address_space,
+                        instruction.address.value.0,
+                        instruction.bytes_hex,
+                        instruction.mnemonic,
+                        instruction.operands
+                    );
+                    if ui
+                        .selectable_label(
+                            selected_address == Some(instruction.address.value.0),
+                            RichText::new(text).monospace().size(11.0).color(if opaque {
+                                BAD
+                            } else {
+                                TEXT
+                            }),
+                        )
+                        .on_hover_text(format!(
+                            "Effects: {:?}\nEdges: {:?}\nOperation: {:?}",
+                            instruction.effects, instruction.edges, instruction.operation
+                        ))
+                        .clicked()
+                    {
+                        clicked_address = Some(instruction.address.value.0);
+                    }
+                }
+                ui.add_space(5.0);
+            }
+        });
+    clicked_address
+}
+
+fn native_evidence_view(
+    ui: &mut egui::Ui,
+    native: &NativeDecompilation,
+    selected_address: Option<u64>,
+) -> Option<u64> {
+    let mut clicked_address = None;
+    ui.heading(RichText::new("Diagnostics and address provenance").color(ACCENT));
+    if native.diagnostics.is_empty() {
+        ui.colored_label(GOOD, "No native decompilation diagnostics.");
+    }
+    for diagnostic in &native.diagnostics {
+        ui.colored_label(
+            if diagnostic.blocks_stable_operation {
+                BAD
+            } else {
+                ACCENT
+            },
+            format!("{} - {}", diagnostic.code, diagnostic.message),
+        );
+    }
+    for diagnostic in &native.machine_ir.diagnostics {
+        let response = ui.colored_label(
+            if diagnostic.blocks_stable_operation {
+                BAD
+            } else {
+                ACCENT
+            },
+            format!("{} - {}", diagnostic.code, diagnostic.message),
+        );
+        if let Some(address) = diagnostic.address {
+            response.on_hover_text(format!("{}:0x{:x}", address.address_space, address.value.0));
+        }
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt("native_provenance")
+        .show(ui, |ui| {
+            for block in &native.cir.blocks {
+                ui.label(
+                    RichText::new(format!(
+                        "{}  <-  {}:0x{:x}",
+                        block.label, block.address.address_space, block.address.value.0
+                    ))
+                    .monospace()
+                    .strong()
+                    .color(INFO),
+                );
+                for statement in &block.statements {
+                    let (address, description) = match statement {
+                        hydir_ir::CirStatement::Operation {
+                            address, family, ..
+                        } => (*address, format!("exact operation: {family}")),
+                        hydir_ir::CirStatement::OpaqueEffect {
+                            address, reason, ..
+                        } => (*address, format!("opaque effect: {reason}")),
+                    };
+                    if ui
+                        .selectable_label(
+                            selected_address == Some(address.value.0),
+                            RichText::new(format!(
+                                "  {}:0x{:016x}  {}",
+                                address.address_space, address.value.0, description
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        )
+                        .clicked()
+                    {
+                        clicked_address = Some(address.value.0);
+                    }
+                }
+                ui.label(
+                    RichText::new(format!("  terminator: {:?}", block.terminator))
+                        .monospace()
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            }
+        });
+    clicked_address
+}
+
 fn stage_card(ui: &mut egui::Ui, number: &str, title: &str, status: &str, ready: bool) {
     egui::Frame::new()
         .fill(if ready {
@@ -5665,6 +7767,21 @@ fn ir_slice(ir: &str, address: u64) -> Option<String> {
 impl eframe::App for AnalystApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        let dropped_path = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .find(|path| !path.as_os_str().is_empty())
+        });
+        if self.workbench_loaded
+            && !self.busy
+            && let Some(path) = dropped_path
+        {
+            self.path_input = path.display().to_string();
+            self.enqueue(Task::Open(path), "Importing dropped ELF...");
+        }
         if !self.workbench_loaded {
             self.header(ui);
             egui::CentralPanel::default().show(ui, |ui| {
@@ -6327,13 +8444,15 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, Event, Tab, ir_slice, local_region_artifacts, preview_patch_local,
+        AnalystApp, Event, GraphNodeAction, NativeViewMode, Tab, indexed_function_action, ir_slice,
+        local_region_artifacts, native_instruction_count, preview_patch_local,
         resized_console_height, valid_bearer_token, validate_endpoint,
     };
-    use hydir_backend::lift_symbol;
+    use hydir_backend::{import_elf, lift_symbol};
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
+    use hydir_decompile::{decompile_function_at, discover_functions, measure_native_coverage};
     use std::sync::mpsc;
 
     #[test]
@@ -6349,7 +8468,13 @@ mod tests {
             file_kind: "executable".to_owned(),
             image_base: None,
             entry_point: None,
+            entry_location: None,
             data_layout: None,
+            program_headers: Vec::new(),
+            dynamic_symbols: Vec::new(),
+            runtime_ranges: Vec::new(),
+            unwind_ranges: Vec::new(),
+            pointer_arrays: Vec::new(),
             address_spaces: Vec::new(),
             mapped_segments: Vec::new(),
             sections: Vec::new(),
@@ -6425,9 +8550,73 @@ mod tests {
         assert!(!physical.instructions.is_empty());
         assert!(decompilation.c_source.contains("uint64_t hydir_lifted("));
         let app = AnalystApp::new(&eframe::egui::Context::default());
-        assert!(matches!(app.tab, Tab::RegionStudio));
+        assert!(matches!(app.tab, Tab::Overview));
         assert!(!app.console_visible);
         assert_eq!(app.console_height, 220.0);
+    }
+
+    #[test]
+    fn native_workbench_path_opens_stripped_unwind_functions_without_symbols() {
+        let binary =
+            include_bytes!("../../../fuzz/corpus/elf_import/unwind_discovery_stripped.elf");
+        let index = discover_functions(binary).unwrap();
+        assert_eq!(index.functions.len(), 2);
+        assert!(
+            index
+                .functions
+                .iter()
+                .all(|function| function.name.is_none())
+        );
+        for function in index.functions {
+            let native = decompile_function_at(binary, function.entry).unwrap();
+            assert_eq!(native.machine_ir.function_id, function.id);
+            assert!(native.low_level_c.contains("HydirMachineState"));
+            assert!(native_instruction_count(&native) > 0);
+        }
+        let app = AnalystApp::new(&eframe::egui::Context::default());
+        assert!(app.native_decompilation.is_none());
+        assert!(matches!(app.native_view_mode, NativeViewMode::Summary));
+    }
+
+    #[test]
+    fn native_program_graph_actions_keep_stripped_function_identity() {
+        let binary =
+            include_bytes!("../../../fuzz/corpus/elf_import/unwind_discovery_stripped.elf");
+        let spec = import_elf(binary).unwrap();
+        let index = discover_functions(binary).unwrap();
+        let function = index.functions.first().unwrap();
+        match indexed_function_action(function, Some(&spec)) {
+            GraphNodeAction::Function {
+                label,
+                selector,
+                entry,
+                legacy_symbol,
+            } => {
+                assert!(label.starts_with("sub_"));
+                assert_eq!(selector, function.id);
+                assert_eq!(entry, function.entry);
+                assert!(!legacy_symbol);
+            }
+            GraphNodeAction::Address(_) => panic!("function graph action became an address action"),
+        }
+    }
+
+    #[test]
+    fn native_coverage_event_opens_the_coverage_dashboard() {
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf");
+        let spec = import_elf(binary).unwrap();
+        let report = measure_native_coverage(binary).unwrap();
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.events = receiver;
+        app.spec = Some(spec);
+        sender
+            .send(Event::NativeCoverageMeasured(Ok(report)))
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::Coverage));
+        assert!(app.native_coverage.is_some());
+        assert!(app.failure.is_none());
     }
 
     #[test]
