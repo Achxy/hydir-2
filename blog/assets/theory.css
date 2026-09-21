@@ -1,0 +1,34 @@
+/* Article components only: typography, page layout and both themes come from
+   the same stylesheets used by every other HydIR article. */
+.equation { position: relative; display: flex; align-items: center; gap: .65rem; margin: 1.5rem 0; }
+.equation-scroll { flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden; padding: .25rem; }
+.equation-scroll .katex-display { width: max-content; min-width: 100%; overflow: visible; margin: .5rem 0; }
+.equation-number { flex: none; font-size: .8rem; color: var(--site-muted); text-decoration: none; }
+.equation.is-scrollable { padding-bottom: 1.2rem; }
+.equation-hint { position: absolute; bottom: 0; left: 0; font: .7rem system-ui, sans-serif; color: var(--site-muted); }
+.equation-scroll:focus-visible, .lab :focus-visible, pre:focus-visible { outline: 2px solid var(--site-accent); outline-offset: 3px; }
+.diagram { overflow-x: auto; border: 1px solid var(--site-rule); padding: .75rem; }
+.diagram svg { display: block; width: 100%; min-width: 32rem; height: auto; }
+.diagram text { fill: var(--body-color); font-family: monospace; }
+.diagram .annotation { fill: var(--site-muted); }
+.diagram .nodes { fill: var(--site-panel); stroke: var(--site-rule); }
+.diagram .edges { stroke: var(--site-muted); }
+.diagram .arrow { fill: var(--site-muted); }
+.lab { margin: 2rem 0; padding: 1rem; background: var(--site-panel); border-left: 3px solid var(--site-accent); }
+.lab h3 { margin-top: 0; }
+.lab-controls, .lab-presets { display: flex; flex-wrap: wrap; gap: .6rem; margin: .9rem 0; }
+.lab label { display: flex; flex-direction: column; gap: .3rem; font-size: .9rem; }
+.lab input, .lab select, .lab button { min-height: 2.75rem; padding: .4rem .65rem; border: 1px solid var(--site-rule); border-radius: 0; background: var(--body-bg-color); color: var(--body-color); font: .85rem system-ui, sans-serif; }
+.lab input { width: 6rem; }
+.lab button { cursor: pointer; }
+.lab button:hover, .lab button[aria-pressed="true"] { background: var(--site-accent); color: var(--body-bg-color); }
+.lab-result, .copy-result { font: 1.2rem/1.5 monospace; overflow-wrap: anywhere; }
+.flag-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; padding-block: .75rem; border-block: 1px solid var(--site-rule); }
+.flag-row dt { font: .75rem/1.5 system-ui, sans-serif; color: var(--site-muted); }
+.flag-row dd { margin: .25rem 0 0; font-size: 1.2rem; }
+.lab[hidden] { display: none; }
+@media print {
+  .lab, .equation-hint { display: none; }
+  .equation, figure, pre { break-inside: avoid; }
+  .equation-scroll { overflow: visible; }
+}
