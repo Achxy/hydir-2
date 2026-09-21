@@ -298,8 +298,7 @@ cargo run --locked --bin hydirctl -- rebuild program.elf --trusted-fixture --out
 The patch output is a separate ELF and can be reverted using its matching
 bundle when the recorded byte and hash checks pass. Remote mutations require
 the current project revision and an idempotency key; the service does not
-execute the result. The [release gates](docs/RELEASE_GATES.md) record the
-remaining validation work.
+execute the result.
 
 ## HydIR interchange and region contracts
 
@@ -347,9 +346,10 @@ test-only submodule and is not linked into HydIR:
 git submodule update --init third_party/hydir-reference
 ```
 
-The current compatibility boundary and remaining gates are recorded in
-[ADR 0018](docs/adr/0018-native-compatibility-boundary.md) and
-[RELEASE_GATES.md](docs/RELEASE_GATES.md).
+The current compatibility boundary is recorded in
+[ADR 0018](docs/adr/0018-native-compatibility-boundary.md). The native
+decompiler's remaining gates are listed in the
+[implementation record](docs/NATIVE_DECOMPILER.md#remaining-gated-work).
 
 ## Symbolic exploration with Triton
 
