@@ -214,13 +214,26 @@ checked against their project revision and digest before presentation. Local
 and remote pass, rebuild, and scalar-patch controls use the same bounded
 contracts as the CLI and write new output paths.
 
-The disassembly view links each recovered instruction to its address and
-original bytes. The inspector separates file facts from ABI assertions and
-recovered CFG scope.
+### GUI screenshots
 
-[![egui disassembly cutout with decoded instruction addresses and bytes](assets/screenshots/egui-disassembly.webp)](assets/screenshots/egui-disassembly.webp)
+The full workbench screenshot at the top of this README shows the program tree,
+LLVM IR, inspector, diagnostics, and console together. The following captures
+show individual views of the desktop application.
 
-<p align="center"><img src="assets/screenshots/egui-inspector.webp" width="42%" alt="egui inspector cutout showing the selected function's ELF facts, ABI assertion, and CFG count"></p>
+**Disassembly.** Recovered instructions retain their addresses, original
+machine bytes, and decoded operations.
+
+[![HydIR GUI disassembly view showing addresses, machine bytes, and decoded instructions for hydir_max2](assets/screenshots/egui-disassembly.webp)](assets/screenshots/egui-disassembly.webp)
+
+**Function inspector.** The selected function's entry, byte extent, ELF symbol
+source, asserted ABI, and reachable CFG size appear beside the analysis views.
+
+[![HydIR GUI inspector showing the selected function's ELF facts, ABI assertion, and CFG size](assets/screenshots/egui-inspector.webp)](assets/screenshots/egui-inspector.webp)
+
+**C output and diagnostics.** The GUI reports an unsupported call explicitly
+while retaining the independently recovered CFG and LLVM lift.
+
+[![HydIR GUI C output view reporting an unsupported call without discarding the CFG or LLVM lift](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
 
 Remote projects do not reconnect automatically. Plaintext service connections
 remain loopback-only; non-loopback connections require TLS.
@@ -257,8 +270,6 @@ The scripts retain CFG, LLVM IR, C, and comparison reports. Their finite
 fixture results do not establish equivalence for arbitrary programs. A C
 generation refusal also does not discard an independently recovered CFG or
 LLVM lift; the workbench presents each stage's status separately.
-
-[![egui C output cutout refusing an unsupported call while retaining other analysis results](assets/screenshots/egui-refusal.webp)](assets/screenshots/egui-refusal.webp)
 
 ## Analysis, transformation, and rewrite contracts
 
