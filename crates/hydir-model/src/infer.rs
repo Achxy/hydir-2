@@ -4,8 +4,8 @@ use crate::{
 };
 use hydir_core::Location;
 use hydir_ir::{
-    FunctionIr, MachineControlEffect, MachineFunctionIr, MachineInstruction, MachineMemoryEffect,
-    MachineOperand, MachineOperation,
+    FunctionIr, MachineControlEffect, MachineEdgeKind, MachineFunctionIr, MachineInstruction,
+    MachineMemoryEffect, MachineOperand, MachineOperation,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -21,6 +21,7 @@ pub struct InferenceReport {
     pub analyzed_functions: usize,
     pub skipped_functions: usize,
     pub inferred_types: usize,
+    pub inferred_pointer_fields: usize,
     pub propagated_parameter_types: usize,
     pub conflicts: usize,
     pub model_revision: u64,
@@ -33,10 +34,19 @@ struct Origin {
     offset: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadedField {
+    parameter: String,
+    offset: u64,
+    site: Location,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct FlowState {
     regs: BTreeMap<String, Origin>,
     slots: BTreeMap<i64, Origin>,
+    loaded: BTreeMap<String, LoadedField>,
+    loaded_slots: BTreeMap<i64, LoadedField>,
 }
 
 impl FlowState {
@@ -46,6 +56,10 @@ impl FlowState {
             .retain(|key, value| other.regs.get(key) == Some(value));
         self.slots
             .retain(|key, value| other.slots.get(key) == Some(value));
+        self.loaded
+            .retain(|key, value| other.loaded.get(key) == Some(value));
+        self.loaded_slots
+            .retain(|key, value| other.loaded_slots.get(key) == Some(value));
         *self != old
     }
 }
@@ -64,6 +78,46 @@ struct CallBinding {
     caller_parameter: String,
     callee_register: String,
     site: Location,
+}
+
+#[derive(Clone)]
+struct FieldCallBinding {
+    caller: Location,
+    caller_parameter: String,
+    field_offset: u64,
+    field_site: Location,
+    callee: Location,
+    callee_register: String,
+    call_site: Location,
+}
+
+fn loaded_field(
+    operand: &MachineOperand,
+    state: &FlowState,
+    site: Location,
+) -> Option<LoadedField> {
+    let MachineOperand::Memory {
+        segment: None,
+        base: Some(base),
+        index: None,
+        displacement,
+        absolute: None,
+        width_bits: 64,
+        ..
+    } = operand
+    else {
+        return None;
+    };
+    let origin = state.regs.get(canonical_register(base))?;
+    let offset = origin.offset.checked_add(*displacement)?;
+    if !(0..=65_536).contains(&offset) {
+        return None;
+    }
+    Some(LoadedField {
+        parameter: origin.parameter.clone(),
+        offset: offset as u64,
+        site,
+    })
 }
 
 fn canonical_register(name: &str) -> &str {
@@ -111,6 +165,8 @@ fn stack_slot(operand: &MachineOperand) -> Option<i64> {
 fn transfer(instruction: &MachineInstruction, state: &mut FlowState) {
     let mut new_reg: Option<(String, Origin)> = None;
     let mut new_slot: Option<(i64, Origin)> = None;
+    let mut new_loaded: Option<(String, LoadedField)> = None;
+    let mut new_loaded_slot: Option<(i64, LoadedField)> = None;
     let mut written_slot = None;
     if let MachineOperation::Exact { family } = &instruction.operation {
         if family == "mov" && instruction.operands.len() == 2 {
@@ -130,6 +186,9 @@ fn transfer(instruction: &MachineInstruction, state: &mut FlowState) {
                     if let Some(origin) = state.regs.get(canonical_register(source)) {
                         new_reg = Some((canonical_register(name).to_owned(), origin.clone()));
                     }
+                    if let Some(field) = state.loaded.get(canonical_register(source)) {
+                        new_loaded = Some((canonical_register(name).to_owned(), field.clone()));
+                    }
                 }
                 (
                     MachineOperand::Register {
@@ -142,6 +201,11 @@ fn transfer(instruction: &MachineInstruction, state: &mut FlowState) {
                         if let Some(origin) = state.slots.get(&slot) {
                             new_reg = Some((canonical_register(name).to_owned(), origin.clone()));
                         }
+                        if let Some(field) = state.loaded_slots.get(&slot) {
+                            new_loaded = Some((canonical_register(name).to_owned(), field.clone()));
+                        }
+                    } else if let Some(field) = loaded_field(source, state, instruction.address) {
+                        new_loaded = Some((canonical_register(name).to_owned(), field));
                     }
                 }
                 (
@@ -155,6 +219,9 @@ fn transfer(instruction: &MachineInstruction, state: &mut FlowState) {
                         written_slot = Some(slot);
                         if let Some(origin) = state.regs.get(canonical_register(name)) {
                             new_slot = Some((slot, origin.clone()));
+                        }
+                        if let Some(field) = state.loaded.get(canonical_register(name)) {
+                            new_loaded_slot = Some((slot, field.clone()));
                         }
                     }
                 }
@@ -194,17 +261,22 @@ fn transfer(instruction: &MachineInstruction, state: &mut FlowState) {
     } else {
         state.regs.clear();
         state.slots.clear();
+        state.loaded.clear();
+        state.loaded_slots.clear();
         return;
     }
     for register in &instruction.effects.written_registers {
         let register = canonical_register(register);
         state.regs.remove(register);
+        state.loaded.remove(register);
         if register == "rbp" {
             state.slots.clear();
+            state.loaded_slots.clear();
         }
     }
     if let Some(slot) = written_slot {
         state.slots.remove(&slot);
+        state.loaded_slots.remove(&slot);
     }
     if matches!(
         instruction.effects.control,
@@ -212,14 +284,22 @@ fn transfer(instruction: &MachineInstruction, state: &mut FlowState) {
     ) {
         for register in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
             state.regs.remove(register);
+            state.loaded.remove(register);
         }
         state.slots.clear();
+        state.loaded_slots.clear();
     }
     if let Some((register, origin)) = new_reg {
         state.regs.insert(register, origin);
     }
     if let Some((slot, origin)) = new_slot {
         state.slots.insert(slot, origin);
+    }
+    if let Some((register, field)) = new_loaded {
+        state.loaded.insert(register, field);
+    }
+    if let Some((slot, field)) = new_loaded_slot {
+        state.loaded_slots.insert(slot, field);
     }
 }
 
@@ -263,6 +343,15 @@ fn flow_inputs(
             .instructions
             .iter()
             .flat_map(|instruction| &instruction.edges)
+            .filter(|edge| {
+                matches!(
+                    edge.kind,
+                    MachineEdgeKind::Fallthrough
+                        | MachineEdgeKind::Taken
+                        | MachineEdgeKind::Direct
+                        | MachineEdgeKind::IndirectTarget
+                )
+            })
             .filter_map(|edge| edge.target)
             .filter(|target| blocks.contains_key(target))
             .collect::<BTreeSet<_>>();
@@ -284,7 +373,14 @@ fn flow_inputs(
 fn collect(
     machine: &MachineFunctionIr,
     function: &FunctionIr,
-) -> Result<(BTreeMap<String, Vec<Access>>, Vec<CallBinding>), String> {
+) -> Result<
+    (
+        BTreeMap<String, Vec<Access>>,
+        Vec<CallBinding>,
+        Vec<FieldCallBinding>,
+    ),
+    String,
+> {
     let inputs = flow_inputs(machine, function)?;
     let call_targets = function
         .calls
@@ -293,6 +389,7 @@ fn collect(
         .collect::<BTreeMap<_, _>>();
     let mut accesses = BTreeMap::<String, Vec<Access>>::new();
     let mut calls = Vec::new();
+    let mut field_calls = Vec::new();
     for block in &machine.blocks {
         let Some(mut state) = inputs.get(&block.address).cloned() else {
             continue;
@@ -349,12 +446,23 @@ fn collect(
                             });
                         }
                     }
+                    if let Some(field) = state.loaded.get(reg) {
+                        field_calls.push(FieldCallBinding {
+                            caller: machine.entry,
+                            caller_parameter: field.parameter.clone(),
+                            field_offset: field.offset,
+                            field_site: field.site,
+                            callee: *callee,
+                            callee_register: reg.to_owned(),
+                            call_site: instruction.address,
+                        });
+                    }
                 }
             }
             transfer(instruction, &mut state);
         }
     }
-    Ok((accesses, calls))
+    Ok((accesses, calls, field_calls))
 }
 
 fn scalar(width: u64) -> TypeRef {
@@ -488,6 +596,142 @@ fn merge_inferred_callee_layout(
     Some(changed)
 }
 
+fn parameter_type(model: &AnalysisModel, entry: Location, register: &str) -> Option<TypeRef> {
+    let row = model.functions.iter().find(|row| row.entry == entry)?;
+    let explicit = ARG_REGS
+        .iter()
+        .position(|name| *name == register)
+        .and_then(|position| row.prototype.as_ref()?.parameters.get(position))
+        .map(|parameter| parameter.ty.clone());
+    explicit.or_else(|| row.inferred_parameters.get(register).cloned())
+}
+
+enum FieldResolution {
+    Unknown,
+    Compatible,
+    Changed,
+    Conflict,
+}
+
+fn resolve_loaded_pointer_field(
+    model: &mut AnalysisModel,
+    binding: &FieldCallBinding,
+) -> FieldResolution {
+    let Some(callee_ty) = parameter_type(model, binding.callee, &binding.callee_register) else {
+        return FieldResolution::Unknown;
+    };
+    if inferred_struct_id(&callee_ty).is_none() {
+        return FieldResolution::Unknown;
+    }
+    let Some(caller_ty) = parameter_type(model, binding.caller, &binding.caller_parameter) else {
+        return FieldResolution::Unknown;
+    };
+    let Some(caller_id) = inferred_struct_id(&caller_ty) else {
+        return FieldResolution::Unknown;
+    };
+    let Some(definition) = model.types.iter_mut().find(|ty| ty.id == caller_id) else {
+        return FieldResolution::Unknown;
+    };
+    let TypeDefinitionKind::Struct { fields } = &mut definition.kind else {
+        return FieldResolution::Unknown;
+    };
+    let Some(field) = fields
+        .iter_mut()
+        .find(|field| field.offset_bytes == binding.field_offset)
+    else {
+        return FieldResolution::Unknown;
+    };
+    let evidence = ModelEvidence {
+        source: ModelSource::NativeAnalysis,
+        detail: format!(
+            "64-bit field load passed to resolved callee {:x} in {}",
+            binding.callee.value.0, binding.callee_register
+        ),
+        site: Some(binding.field_site),
+    };
+    if field.ty == callee_ty {
+        if !field.evidence.contains(&evidence) && field.evidence.len() < 256 {
+            field.evidence.push(evidence);
+            return FieldResolution::Changed;
+        }
+        return FieldResolution::Compatible;
+    }
+    if definition.size_is_lower_bound
+        && field.ty
+            == (TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            })
+        && !field
+            .evidence
+            .iter()
+            .any(|evidence| evidence.source == ModelSource::AnalystAssertion)
+    {
+        field.ty = callee_ty;
+        if !field.evidence.contains(&evidence) && field.evidence.len() < 256 {
+            field.evidence.push(evidence);
+        }
+        return FieldResolution::Changed;
+    }
+    FieldResolution::Conflict
+}
+
+fn clear_ambiguous_inferred_field(
+    model: &mut AnalysisModel,
+    caller: Location,
+    parameter: &str,
+    offset: u64,
+) -> bool {
+    let Some(ty) = model
+        .functions
+        .iter()
+        .find(|row| row.entry == caller)
+        .and_then(|row| row.inferred_parameters.get(parameter))
+    else {
+        return false;
+    };
+    let Some(id) = inferred_struct_id(ty) else {
+        return false;
+    };
+    let Some(definition) = model
+        .types
+        .iter_mut()
+        .find(|definition| definition.id == id)
+    else {
+        return false;
+    };
+    if !definition.size_is_lower_bound {
+        return false;
+    }
+    let TypeDefinitionKind::Struct { fields } = &mut definition.kind else {
+        return false;
+    };
+    let Some(field) = fields.iter_mut().find(|field| field.offset_bytes == offset) else {
+        return false;
+    };
+    if !matches!(field.ty, TypeRef::Pointer { .. })
+        || field
+            .evidence
+            .iter()
+            .any(|evidence| evidence.source == ModelSource::AnalystAssertion)
+        || !field.evidence.iter().any(|evidence| {
+            evidence
+                .detail
+                .starts_with("64-bit field load passed to resolved callee")
+        })
+    {
+        return false;
+    }
+    field.ty = TypeRef::Primitive {
+        name: PrimitiveType::U64,
+    };
+    field.evidence.retain(|evidence| {
+        !evidence
+            .detail
+            .starts_with("64-bit field load passed to resolved callee")
+    });
+    true
+}
+
 fn conflict(model: &mut AnalysisModel, subject: String, detail: String, site: Option<Location>) {
     if model
         .conflicts
@@ -616,6 +860,7 @@ pub fn infer_model(
     validate_structure(model)?;
     let original = model.clone();
     let mut bindings = Vec::new();
+    let mut field_bindings = Vec::new();
     let mut analyzed = 0;
     let mut skipped = inputs.len().saturating_sub(MAX_FUNCTIONS);
     let mut inferred = 0;
@@ -628,7 +873,7 @@ pub fn infer_model(
             skipped += 1;
             continue;
         }
-        let (accesses, calls) = match collect(machine, function) {
+        let (accesses, calls, loaded_fields) = match collect(machine, function) {
             Ok(value) => value,
             Err(error) => {
                 conflict(
@@ -646,6 +891,7 @@ pub fn infer_model(
         };
         analyzed += 1;
         bindings.extend(calls);
+        field_bindings.extend(loaded_fields);
         if !model.functions.iter().any(|row| row.entry == machine.entry) {
             model.functions.push(ModelFunction {
                 entry: machine.entry,
@@ -800,6 +1046,68 @@ pub fn infer_model(
                 _ => {}
             }
         }
+        let mut field_candidates = BTreeMap::<(Location, String, u64), Vec<TypeRef>>::new();
+        for binding in &field_bindings {
+            let Some(ty) = parameter_type(model, binding.callee, &binding.callee_register) else {
+                continue;
+            };
+            if inferred_struct_id(&ty).is_none() {
+                continue;
+            }
+            let key = (
+                binding.caller,
+                binding.caller_parameter.clone(),
+                binding.field_offset,
+            );
+            let values = field_candidates.entry(key).or_default();
+            if !values.contains(&ty) {
+                values.push(ty)
+            }
+        }
+        let ambiguous = field_candidates
+            .iter()
+            .filter(|(_, values)| values.len() > 1)
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+        for (caller, parameter, offset) in &ambiguous {
+            changed |= clear_ambiguous_inferred_field(model, *caller, parameter, *offset);
+            conflict(
+                model,
+                format!("field_call:{:x}:{parameter}:{offset}", caller.value.0),
+                "loaded field reaches incompatible pointer parameter types; field left unresolved"
+                    .to_owned(),
+                field_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding.caller == *caller
+                            && binding.caller_parameter == *parameter
+                            && binding.field_offset == *offset
+                    })
+                    .map(|binding| binding.field_site),
+            );
+        }
+        for binding in &field_bindings {
+            if ambiguous.contains(&(
+                binding.caller,
+                binding.caller_parameter.clone(),
+                binding.field_offset,
+            )) {
+                continue;
+            }
+            match resolve_loaded_pointer_field(model, binding) {
+                FieldResolution::Changed => {
+                    changed = true;
+                }
+                FieldResolution::Conflict => conflict(
+                    model,
+                    format!("field_call:{:x}", binding.call_site.value.0),
+                    "loaded field pointer conflicts with an asserted or inferred field type"
+                        .to_owned(),
+                    Some(binding.field_site),
+                ),
+                FieldResolution::Unknown | FieldResolution::Compatible => {}
+            }
+        }
         if !changed {
             break;
         }
@@ -823,11 +1131,29 @@ pub fn infer_model(
         *model = original;
         return Err(error);
     }
+    let pointer_fields = model
+        .types
+        .iter()
+        .filter(|definition| definition.size_is_lower_bound)
+        .flat_map(|definition| match &definition.kind {
+            TypeDefinitionKind::Struct { fields } => fields.iter().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .filter(|field| {
+            matches!(field.ty, TypeRef::Pointer { .. })
+                && field.evidence.iter().any(|evidence| {
+                    evidence
+                        .detail
+                        .starts_with("64-bit field load passed to resolved callee")
+                })
+        })
+        .count();
     Ok(InferenceReport {
         schema_version: 1,
         analyzed_functions: analyzed,
         skipped_functions: skipped,
         inferred_types: inferred,
+        inferred_pointer_fields: pointer_fields,
         propagated_parameter_types: propagated,
         conflicts: model.conflicts.len(),
         model_revision: model.revision,

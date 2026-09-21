@@ -26,6 +26,10 @@ and unresolved type references remain unimported.
 Native inference follows unchanged pointer arguments through resolved direct
 calls. It merges compatible callee field constraints into the caller's partial
 aggregate to a bounded fixed point, including recursive call components.
+When a loaded 64-bit field is passed to a resolved callee whose argument is
+independently inferred as an aggregate pointer, inference can type that field
+as a pointer, including a recursive `next` field. Competing callee pointer
+types leave the field unresolved and record the conflict.
 Overlapping or incompatible constraints become visible conflicts. Indexed
 accesses do not establish array bounds without other evidence; bounded DWARF
 is the current source of proven array sizes.
