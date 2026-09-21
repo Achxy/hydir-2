@@ -1,0 +1,18 @@
+// HydIR native interchange service.
+syntax = "proto3";
+
+import "hydir_interchange/specification.proto";
+
+package hydir.interchange.server;
+
+message Codegen {
+  string json = 1;
+}
+
+message SpecChunk {
+  bytes chunk = 1;
+}
+
+service HydirInterchange {
+  rpc ProcessSpecification(stream SpecChunk) returns (Codegen) {}
+}

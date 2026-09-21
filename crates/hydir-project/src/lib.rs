@@ -107,6 +107,15 @@ pub struct LocalProject {
     pub binary_sha256: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct LocalAnnotationInput<'a> {
+    pub kind: AnnotationKind,
+    pub address: Option<Address>,
+    pub value: &'a str,
+    pub scope: &'a str,
+    pub idempotency_key: &'a str,
+}
+
 pub struct LocalProjectStore {
     conn: Connection,
 }
@@ -136,10 +145,10 @@ pub fn default_db_path() -> Result<PathBuf, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA")
+        std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .map(|base| base.join("HydIR/data/analyst.sqlite"))
-            .ok_or("Cannot determine the Windows user data directory".to_owned());
+            .ok_or("Cannot determine the Windows user data directory".to_owned())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     Err("Set HYDIR_LOCAL_DB to an absolute local project database path".to_owned())
@@ -382,12 +391,15 @@ impl LocalProjectStore {
         &mut self,
         project: &LocalProject,
         spec: &ProgramSpec,
-        kind: AnnotationKind,
-        address: Option<Address>,
-        value: &str,
-        scope: &str,
-        idempotency_key: &str,
+        input: LocalAnnotationInput<'_>,
     ) -> Result<LocalProject, String> {
+        let LocalAnnotationInput {
+            kind,
+            address,
+            value,
+            scope,
+            idempotency_key,
+        } = input;
         validate_analyst_annotation(kind, address, value, scope, idempotency_key)?;
         if spec.binary_sha256 != project.binary_sha256 {
             return Err("Annotation binary digest differs from open local project".to_owned());
@@ -395,10 +407,10 @@ impl LocalProjectStore {
         if binary_digest(&project.path)? != project.binary_sha256 {
             return Err("Local ELF changed after import; reopen it before editing".to_owned());
         }
-        if let Some(address) = address {
-            if !annotation_address_in_spec(spec, address) {
-                return Err("Annotation address is outside linked ELF load mappings".to_owned());
-            }
+        if let Some(address) = address
+            && !annotation_address_in_spec(spec, address)
+        {
+            return Err("Annotation address is outside linked ELF load mappings".to_owned());
         }
         let expected =
             i64::try_from(project.revision).map_err(|_| "Local project revision overflow")?;
@@ -541,14 +553,20 @@ mod tests {
 
     fn spec(bytes: &[u8]) -> ProgramSpec {
         ProgramSpec {
-            schema_version: 2,
+            schema_version: hydir_core::PROGRAM_SPEC_VERSION,
             binary_sha256: format!("{:x}", Sha256::digest(bytes)),
             target_triple: "x86_64-unknown-elf".to_owned(),
             abi: "System V AMD64".to_owned(),
             file_kind: "executable".to_owned(),
             image_base: None,
             entry_point: None,
+            entry_location: None,
             data_layout: None,
+            program_headers: Vec::new(),
+            dynamic_symbols: Vec::new(),
+            runtime_ranges: Vec::new(),
+            unwind_ranges: Vec::new(),
+            pointer_arrays: Vec::new(),
             address_spaces: Vec::new(),
             mapped_segments: vec![MappedSegmentSpec {
                 id: "load-0".to_owned(),
@@ -575,8 +593,28 @@ mod tests {
             call_recovery: RecoveryState::NotAttempted,
             reference_recovery: RecoveryState::NotAttempted,
             assumptions: Vec::new(),
+            typed_model: Default::default(),
+            memory_facts: Vec::new(),
+            uncertainties: Vec::new(),
+            provenance: Vec::new(),
             recovery_scope: "test".to_owned(),
             unresolved_control_flow: true,
+        }
+    }
+
+    fn annotation<'a>(
+        kind: AnnotationKind,
+        address: Option<Address>,
+        value: &'a str,
+        scope: &'a str,
+        idempotency_key: &'a str,
+    ) -> LocalAnnotationInput<'a> {
+        LocalAnnotationInput {
+            kind,
+            address,
+            value,
+            scope,
+            idempotency_key,
         }
     }
 
@@ -594,11 +632,13 @@ mod tests {
             .add_annotation(
                 &first,
                 &first_spec,
-                AnnotationKind::Assumption,
-                None,
-                "trusted caller contract",
-                "whole binary",
-                "local-key-1",
+                annotation(
+                    AnnotationKind::Assumption,
+                    None,
+                    "trusted caller contract",
+                    "whole binary",
+                    "local-key-1",
+                ),
             )
             .unwrap();
         assert_eq!(second.revision, 2);
@@ -606,11 +646,13 @@ mod tests {
             .add_annotation(
                 &first,
                 &first_spec,
-                AnnotationKind::Assumption,
-                None,
-                "trusted caller contract",
-                "whole binary",
-                "local-key-1",
+                annotation(
+                    AnnotationKind::Assumption,
+                    None,
+                    "trusted caller contract",
+                    "whole binary",
+                    "local-key-1",
+                ),
             )
             .unwrap();
         assert_eq!(replay.revision, 2);
@@ -619,11 +661,13 @@ mod tests {
                 .add_annotation(
                     &first,
                     &first_spec,
-                    AnnotationKind::Assumption,
-                    None,
-                    "changed statement",
-                    "whole binary",
-                    "local-key-1",
+                    annotation(
+                        AnnotationKind::Assumption,
+                        None,
+                        "changed statement",
+                        "whole binary",
+                        "local-key-1",
+                    ),
                 )
                 .unwrap_err()
                 .contains("different annotation request")
@@ -666,11 +710,13 @@ mod tests {
                 .add_annotation(
                     &reopened_project,
                     &first_spec,
-                    AnnotationKind::Comment,
-                    None,
-                    "stale",
-                    "whole binary",
-                    "local-key-2",
+                    annotation(
+                        AnnotationKind::Comment,
+                        None,
+                        "stale",
+                        "whole binary",
+                        "local-key-2",
+                    ),
                 )
                 .is_err()
         );
@@ -697,11 +743,13 @@ mod tests {
                 .add_annotation(
                     &project,
                     &spec,
-                    AnnotationKind::Name,
-                    Some(Address(0x402000)),
-                    "outside",
-                    "entry",
-                    "bad-address",
+                    annotation(
+                        AnnotationKind::Name,
+                        Some(Address(0x402000)),
+                        "outside",
+                        "entry",
+                        "bad-address",
+                    ),
                 )
                 .unwrap_err()
                 .contains("outside")
@@ -710,11 +758,13 @@ mod tests {
             .add_annotation(
                 &project,
                 &spec,
-                AnnotationKind::Name,
-                Some(Address(0x401000)),
-                "reviewed_entry",
-                "entry",
-                "valid-address",
+                annotation(
+                    AnnotationKind::Name,
+                    Some(Address(0x401000)),
+                    "reviewed_entry",
+                    "entry",
+                    "valid-address",
+                ),
             )
             .unwrap();
         let facts = store.list_annotations(&named).unwrap();

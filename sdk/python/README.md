@@ -1,11 +1,30 @@
-# HydIR Python SDK (API v1 subset)
+# HydIR Python SDK (compatible v1/v2 plus additive v3)
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
-`hydird`. It supports authenticated loopback discovery, project creation,
+`hydird`. It supports authenticated loopback or TLS discovery, project creation,
 explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
 durable lift jobs and event streams, a named allowlisted LLVM 14 pass
 experiment, restricted whole-executable rebuilding, and verified artifact
 download. There is no remote execution endpoint.
+
+`negotiate_api()` prefers `hydir.v3`, then falls back through v2 to v1 only
+when the newer endpoint reports `UNIMPLEMENTED`. v3 exposes isolated native
+whole-program jobs, replayable events, revision-checked analyst facts, and
+digest/media/schema/revision-checked ProgramSpec, FunctionIndex, coverage,
+MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
+artifacts. `get_program_artifact(...)` never executes the input and requires a
+FunctionIndex selector for function-scoped stages.
+
+v2 methods expose digest-checked
+`RegionSpec` v3, `PhysicalRegionIR` v1, and `DecompilationUnit` v1 JSON, compile scalar patch v1 into
+reversible `PatchBundle` v2, apply it with revision/idempotency protection, and
+request structural bundle verification. Behavioral verification remains false
+until a separate execution gate supplies evidence.
+
+`lift_region(...)` returns exact decoded operations, successors, physical
+register/flag/memory effects, boundary locations, and unresolved proof facts.
+Its `lowering_ready` field must be true before a caller treats it as patchable;
+successful decoding alone is not a C or replacement-safety claim.
 
 `decompile(project_id, revision, symbol, assume_u64x2=True)` returns C11
 from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
@@ -75,16 +94,23 @@ does not infer signatures. No sample is uploaded without a call to
 `upload_binary`. Artifact bytes are SHA-256 checked before being returned,
 and `export_artifact` refuses to overwrite an existing path. The client
 rejects plaintext non-loopback endpoints and non-private credential files.
+`https://host:port` endpoints use gRPC TLS with its default trust roots; callers
+using a private CA may pass its PEM bytes as `root_certificates`.
+Credential files may contain either a local 64-character static token or a
+bounded compact OIDC JWT; the server remains responsible for signature and
+claim validation.
 
-Generated `hydir_pb2.py` and `hydir_pb2_grpc.py` correspond to
-`crates/hydir-api/proto/hydir.proto`, produced with `grpcio-tools==1.84.0`.
+Generated `hydir*_pb2.py` and `hydir*_pb2_grpc.py` correspond to the v1, v2, and v3
+schemas in `crates/hydir-api/proto/`, produced with `grpcio-tools==1.84.0`.
 Regenerate after API changes with:
 
 ```sh
 python -m grpc_tools.protoc -I../../crates/hydir-api/proto \
   --python_out=hydir_sdk --grpc_python_out=hydir_sdk \
-  ../../crates/hydir-api/proto/hydir.proto
+  ../../crates/hydir-api/proto/hydir.proto \
+  ../../crates/hydir-api/proto/hydir_v2.proto \
+  ../../crates/hydir-api/proto/hydir_v3.proto
 ```
 
-After regeneration, change `import hydir_pb2` in the generated gRPC file to
-`from . import hydir_pb2` so the package imports correctly.
+After regeneration, change generated sibling imports to relative imports (for
+example, `from . import hydir_v2_pb2`) so the package imports correctly.

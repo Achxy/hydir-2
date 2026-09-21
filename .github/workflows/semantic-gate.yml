@@ -1,0 +1,42 @@
+name: semantic gate
+on:
+  push:
+  pull_request:
+jobs:
+  native-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native tools
+        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv
+      - name: Install Triton binary-analysis bindings
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install triton-library
+      - name: Rust tests
+        run: cargo test --locked --workspace
+      - name: Fuzz target build
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
+      - name: Native ELF decompiler artifacts and C11
+        run: bash scripts/demo-native-decompiler.sh
+      - name: Triton bridge protocol tests
+        env:
+          HYDIR_TRITON_PYTHON: .venv/bin/python
+        run: python3 tests/triton_bridge_test.py -q
+      - name: Semantic report protocol tests
+        run: python3 tests/semantic_gate_report_test.py -q
+      - name: Compiler-output semantic gate
+        env:
+          HYDIR_TRITON_PYTHON: .venv/bin/python
+        run: python3 scripts/semantic-gate.py --require-triton-witness --require-triton-conditions --require-assembly-coverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semantic-gate-report
+          path: |
+            target/semantic-gate/*/report.json
+            target/semantic-gate/*/*.solver-cases.json
+            target/semantic-gate/*/*.model.json

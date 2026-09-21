@@ -1,6 +1,13 @@
 //! Fail-closed, trusted-fixture whole-executable reconstruction for a tiny
 //! freestanding Linux/x86-64 subset. This does not copy executable code.
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+use hydir_semantics::{
+    Alu, Op as ScalarOp, Value as ScalarValue, Value32 as ScalarValue32,
+    classify as classify_scalar,
+};
+use iced_x86::{
+    Decoder, DecoderOptions, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
+    Register,
+};
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind,
 };
@@ -293,6 +300,7 @@ fn lift(bytes: &[u8]) -> R<(String, serde_json::Value)> {
     // Every decoded instruction in every symbol is checked, including unreachable code.
     // Reject unmodelled calls/branches before generating any executable.
     let entries: BTreeSet<u64> = functions.keys().copied().collect();
+    let clobbers = function_clobbers(&functions)?;
     let mut ir = format!(
         "; HydIR restricted decoded whole-program lift\n; source sha256 {:x}\n@hydir_memory = global [{} x i8] c\"{}\"\n@hydir_owned = constant [{} x i8] c\"{}\"\n@hydir_writable = constant [{} x i8] c\"{}\"\n@hydir_guest_base = constant i64 {}\n@hydir_memory_len = constant i64 {}\n",
         Sha256::digest(bytes),
@@ -310,7 +318,7 @@ fn lift(bytes: &[u8]) -> R<(String, serde_json::Value)> {
     }
     ir.push_str("@zf = global i1 false\ndeclare i64 @hydir_syscall(i64, i64, i64, i64)\ndeclare void @hydir_trap()\n");
     for function in functions.values() {
-        validate_initialized(function)?;
+        validate_initialized(function, &clobbers)?;
         validate_syscalls(function, base, span, &owned, &writable)?;
         ir.push_str(&format!("define void @f_{:x}() {{\n", function.start));
         for instruction in function.instructions.values() {
@@ -397,6 +405,14 @@ const RCX: u8 = 16;
 const ZF: u8 = 32;
 
 fn bit(register: Register) -> R<u8> {
+    match register {
+        Register::EAX => return Ok(RAX),
+        Register::EDI => return Ok(RDI),
+        Register::ESI => return Ok(RSI),
+        Register::EDX => return Ok(RDX),
+        Register::ECX => return Ok(RCX),
+        _ => {}
+    }
     Ok(match reg(register)? {
         "rax" => RAX,
         "rdi" => RDI,
@@ -408,6 +424,14 @@ fn bit(register: Register) -> R<u8> {
 }
 
 fn reg_index(register: Register) -> R<usize> {
+    match register {
+        Register::EAX => return Ok(0),
+        Register::EDI => return Ok(1),
+        Register::ESI => return Ok(2),
+        Register::EDX => return Ok(3),
+        Register::ECX => return Ok(4),
+        _ => {}
+    }
     Ok(match reg(register)? {
         "rax" => 0,
         "rdi" => 1,
@@ -440,13 +464,27 @@ fn validate_syscalls(
         match i.mnemonic() {
             Mnemonic::Mov if i.op0_kind() == OpKind::Register => {
                 let dst = reg_index(i.op0_register())?;
-                state[dst] = if i.op1_kind() == OpKind::Register {
+                let value = if i.op1_kind() == OpKind::Register {
                     state[reg_index(i.op1_register())?]
                 } else if i.op1_kind() == OpKind::Memory {
                     None
                 } else {
                     Some(immediate(i, 1)?)
                 };
+                state[dst] = value.map(|value| {
+                    if matches!(
+                        i.op0_register(),
+                        Register::EAX
+                            | Register::EDI
+                            | Register::ESI
+                            | Register::EDX
+                            | Register::ECX
+                    ) {
+                        value as u32 as u64
+                    } else {
+                        value
+                    }
+                });
             }
             Mnemonic::Lea if i.op0_kind() == OpKind::Register => {
                 state[reg_index(i.op0_register())?] = Some(i.ip_rel_memory_address());
@@ -546,10 +584,80 @@ fn validate_syscalls(
     Ok(())
 }
 
+/// Collect register and ZF writes, including transitively called functions.
+/// This is a may-write summary; it never promotes a callee return to a known
+/// value. Unsupported call targets fail before reconstruction.
+fn function_clobbers(functions: &BTreeMap<u64, Function>) -> R<BTreeMap<u64, u8>> {
+    let mut factory = InstructionInfoFactory::new();
+    let mut summaries = BTreeMap::new();
+    let mut calls = BTreeMap::<u64, Vec<u64>>::new();
+    for (entry, function) in functions {
+        let mut written = 0;
+        let mut targets = Vec::new();
+        for instruction in function.instructions.values() {
+            if instruction.mnemonic() == Mnemonic::Call {
+                if instruction.op0_kind() != OpKind::NearBranch64
+                    || !functions.contains_key(&instruction.near_branch_target())
+                {
+                    return Err(fail(format!(
+                        "unresolved direct call at 0x{:x}",
+                        instruction.ip()
+                    )));
+                }
+                targets.push(instruction.near_branch_target());
+                continue;
+            }
+            let info = factory.info(instruction);
+            for used in info.used_registers() {
+                if matches!(
+                    used.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                ) {
+                    written |= match used.register().full_register() {
+                        Register::RAX => RAX,
+                        Register::RDI => RDI,
+                        Register::RSI => RSI,
+                        Register::RDX => RDX,
+                        Register::RCX => RCX,
+                        _ => 0,
+                    };
+                }
+            }
+            if instruction.rflags_modified() != 0 {
+                written |= ZF;
+            }
+            if instruction.mnemonic() == Mnemonic::Syscall {
+                written |= RAX | RCX | ZF;
+            }
+        }
+        summaries.insert(*entry, written);
+        calls.insert(*entry, targets);
+    }
+    loop {
+        let mut changed = false;
+        for (entry, targets) in &calls {
+            let inherited = targets
+                .iter()
+                .fold(0, |mask, target| mask | summaries[target]);
+            let current = summaries[entry];
+            if current | inherited != current {
+                summaries.insert(*entry, current | inherited);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(summaries);
+        }
+    }
+}
+
 /// A conservative must-initialize analysis. Each function must be safe to
-/// enter with unknown registers; calls preserve knownness of already-defined
-/// registers, but never infer callee output. This is deliberately restrictive.
-fn validate_initialized(function: &Function) -> R<()> {
+/// enter with unknown registers. Calls preserve only locations absent from
+/// the transitive callee may-write summary.
+fn validate_initialized(function: &Function, clobbers: &BTreeMap<u64, u8>) -> R<()> {
     let mut input = BTreeMap::<u64, u8>::new();
     let mut pending = vec![function.start];
     input.insert(function.start, 0);
@@ -562,39 +670,48 @@ fn validate_initialized(function: &Function) -> R<()> {
         let mut reads = 0_u8;
         let mut defines = 0_u8;
         let mut clears = 0_u8;
-        match instruction.mnemonic() {
-            Mnemonic::Mov => {
-                if instruction.op0_kind() == OpKind::Register {
-                    defines = bit(instruction.op0_register())?;
-                    if instruction.op1_kind() == OpKind::Register {
+        if let Some((shared_reads, shared_writes)) = shared_initialization_effect(instruction) {
+            reads = shared_reads;
+            defines = shared_writes;
+        } else {
+            match instruction.mnemonic() {
+                Mnemonic::Mov => {
+                    if instruction.op0_kind() == OpKind::Register {
+                        defines = bit(instruction.op0_register())?;
+                        if instruction.op1_kind() == OpKind::Register {
+                            reads = bit(instruction.op1_register())?;
+                        }
+                    } else if instruction.op0_kind() == OpKind::Memory {
                         reads = bit(instruction.op1_register())?;
                     }
-                } else if instruction.op0_kind() == OpKind::Memory {
-                    reads = bit(instruction.op1_register())?;
                 }
-            }
-            Mnemonic::Movzx | Mnemonic::Lea => defines = bit(instruction.op0_register())?,
-            Mnemonic::Xor => defines = bit(instruction.op0_register())? | ZF,
-            Mnemonic::Add | Mnemonic::Sub => {
-                reads = bit(instruction.op0_register())?;
-                defines = reads | ZF;
-            }
-            Mnemonic::Cmp => {
-                reads = bit(instruction.op0_register())?;
-                defines = ZF;
-            }
-            Mnemonic::Je | Mnemonic::Jne => reads = ZF,
-            Mnemonic::Syscall => {
-                reads = RAX | RDI | RSI | RDX;
-                defines = RAX | RCX;
-                clears = ZF;
-            }
-            Mnemonic::Call => clears = ZF,
-            Mnemonic::Jmp | Mnemonic::Ret => {}
-            other => {
-                return Err(fail(format!(
-                    "unmodelled initialization effect {other:?} at 0x{ip:x}"
-                )));
+                Mnemonic::Movzx | Mnemonic::Lea => defines = bit(instruction.op0_register())?,
+                Mnemonic::Xor => defines = bit(instruction.op0_register())? | ZF,
+                Mnemonic::Add | Mnemonic::Sub => {
+                    reads = bit(instruction.op0_register())?;
+                    defines = reads | ZF;
+                }
+                Mnemonic::Cmp => {
+                    reads = bit(instruction.op0_register())?;
+                    defines = ZF;
+                }
+                Mnemonic::Je | Mnemonic::Jne => reads = ZF,
+                Mnemonic::Syscall => {
+                    reads = RAX | RDI | RSI | RDX;
+                    defines = RAX | RCX;
+                    clears = ZF;
+                }
+                Mnemonic::Call => {
+                    clears = *clobbers
+                        .get(&instruction.near_branch_target())
+                        .ok_or("call target has no clobber summary")?;
+                }
+                Mnemonic::Jmp | Mnemonic::Ret => {}
+                other => {
+                    return Err(fail(format!(
+                        "unmodelled initialization effect {other:?} at 0x{ip:x}"
+                    )));
+                }
             }
         }
         if state & reads != reads {
@@ -634,12 +751,122 @@ fn validate_initialized(function: &Function) -> R<()> {
     }
     Ok(())
 }
+
+fn shared_initialization_effect(instruction: &Instruction) -> Option<(u8, u8)> {
+    let op = classify_scalar(instruction).ok()?;
+    if matches!(
+        op,
+        ScalarOp::Ret
+            | ScalarOp::CallDirect { .. }
+            | ScalarOp::LoadStack64 { .. }
+            | ScalarOp::LoadStack32 { .. }
+            | ScalarOp::StoreStack64 { .. }
+            | ScalarOp::StoreStack32 { .. }
+            | ScalarOp::AluStack32 { .. }
+            | ScalarOp::CmpRegStack32 { .. }
+            | ScalarOp::CmpStack32 { .. }
+            | ScalarOp::SaveFramePointer
+            | ScalarOp::RestoreFramePointer
+            | ScalarOp::SetFramePointer
+            | ScalarOp::RestoreStackPointerFromFrame
+            | ScalarOp::AdjustStack { .. }
+            | ScalarOp::LeaveFrame
+    ) {
+        return None;
+    }
+    let effect = op.effects();
+    let supported_registers = hydir_semantics::RAX
+        | hydir_semantics::RDI
+        | hydir_semantics::RSI
+        | hydir_semantics::RDX
+        | hydir_semantics::RCX;
+    if (effect.read_registers | effect.write_registers) & !supported_registers != 0 {
+        return None;
+    }
+    if effect.read_flags & !hydir_semantics::ZF != 0 {
+        return None;
+    }
+    let reads = (effect.read_registers & 0x1f) as u8
+        | if effect.read_flags & hydir_semantics::ZF != 0 {
+            ZF
+        } else {
+            0
+        };
+    let writes = (effect.write_registers & 0x1f) as u8
+        | if effect.write_flags & hydir_semantics::ZF != 0 {
+            ZF
+        } else {
+            0
+        };
+    Some((reads, writes))
+}
 fn next(i: &Instruction, f: &Function) -> String {
     if f.instructions.contains_key(&i.next_ip()) {
         format!("  br label %b_{:x}\n", i.next_ip())
     } else {
         "  call void @hydir_trap()\n  unreachable\n".to_owned()
     }
+}
+
+fn emit_shared_scalar(i: &Instruction, function: &Function) -> R<Option<String>> {
+    let Ok(op) = classify_scalar(i) else {
+        return Ok(None);
+    };
+    let ip = i.ip();
+    let mut out = String::new();
+    match op {
+        ScalarOp::Mov { dst, src } => {
+            let dst = reg(dst)?;
+            match src {
+                ScalarValue::Register(source) => {
+                    let source = reg(source)?;
+                    out.push_str(&format!(
+                        "  %v_{ip:x} = load i64, i64* @{source}\n  store i64 %v_{ip:x}, i64* @{dst}\n"
+                    ));
+                }
+                ScalarValue::Immediate(value) => {
+                    out.push_str(&format!("  store i64 {}, i64* @{dst}\n", value as u64));
+                }
+            }
+        }
+        ScalarOp::Mov32 { dst, src } => {
+            let dst = reg(dst)?;
+            match src {
+                ScalarValue32::Register(source) => {
+                    let source = reg(source)?;
+                    out.push_str(&format!("  %v_{ip:x} = load i64, i64* @{source}\n  %low_{ip:x} = trunc i64 %v_{ip:x} to i32\n  %wide_{ip:x} = zext i32 %low_{ip:x} to i64\n  store i64 %wide_{ip:x}, i64* @{dst}\n"));
+                }
+                ScalarValue32::Immediate(value) => {
+                    out.push_str(&format!("  store i64 {value}, i64* @{dst}\n"));
+                }
+            }
+        }
+        ScalarOp::Alu {
+            kind,
+            dst,
+            src: ScalarValue::Immediate(value),
+        } => {
+            let dst = reg(dst)?;
+            let operation = match kind {
+                Alu::Add => "add",
+                Alu::Sub => "sub",
+                Alu::And => "and",
+                Alu::Or => "or",
+                Alu::Xor => "xor",
+            };
+            out.push_str(&format!("  %old_{ip:x} = load i64, i64* @{dst}\n  %v_{ip:x} = {operation} i64 %old_{ip:x}, {}\n  %z_{ip:x} = icmp eq i64 %v_{ip:x}, 0\n  store i1 %z_{ip:x}, i1* @zf\n  store i64 %v_{ip:x}, i64* @{dst}\n", value as u64));
+        }
+        ScalarOp::Cmp {
+            lhs,
+            rhs: ScalarValue::Immediate(value),
+        } => {
+            let lhs = reg(lhs)?;
+            out.push_str(&format!("  %old_{ip:x} = load i64, i64* @{lhs}\n  %v_{ip:x} = sub i64 %old_{ip:x}, {}\n  %z_{ip:x} = icmp eq i64 %v_{ip:x}, 0\n  store i1 %z_{ip:x}, i1* @zf\n", value as u64));
+        }
+        _ => return Ok(None),
+    }
+    out.push_str(&next(i, function));
+    Ok(Some(out))
 }
 fn emit(
     i: &Instruction,
@@ -650,17 +877,13 @@ fn emit(
     owned: &[bool],
     writable: &[bool],
 ) -> R<String> {
+    if let Some(out) = emit_shared_scalar(i, f)? {
+        return Ok(out);
+    }
     let ip = i.ip();
     let mut out = String::new();
     let at = format!("0x{ip:x}");
     match i.mnemonic() {
-        Mnemonic::Mov if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register => {
-            let dst = reg(i.op0_register())?;
-            let src = reg(i.op1_register())?;
-            out.push_str(&format!(
-                "  %v_{ip:x} = load i64, i64* @{src}\n  store i64 %v_{ip:x}, i64* @{dst}\n"
-            ));
-        }
         Mnemonic::Mov if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Memory => {
             let dst = reg(i.op0_register())?;
             let off = mapped(i, base, span, owned, 8)?;
@@ -673,11 +896,6 @@ fn emit(
                 return Err(fail(format!("write to read-only guest data at {at}")));
             }
             out.push_str(&format!("  %p_{ip:x} = getelementptr [{span} x i8], [{span} x i8]* @hydir_memory, i64 0, i64 {off}\n  %q_{ip:x} = bitcast i8* %p_{ip:x} to i64*\n  %v_{ip:x} = load i64, i64* @{src}\n  store i64 %v_{ip:x}, i64* %q_{ip:x}, align 1\n"));
-        }
-        Mnemonic::Mov if i.op0_kind() == OpKind::Register => {
-            let dst = reg(i.op0_register())?;
-            let value = immediate(i, 1)?;
-            out.push_str(&format!("  store i64 {value}, i64* @{dst}\n"));
         }
         Mnemonic::Movzx if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Memory => {
             let dst = reg(i.op0_register())?;
@@ -702,21 +920,10 @@ fn emit(
                 "  store i64 0, i64* @{dst}\n  store i1 true, i1* @zf\n"
             ));
         }
-        Mnemonic::Add | Mnemonic::Sub | Mnemonic::Cmp if i.op0_kind() == OpKind::Register => {
-            let dst = reg(i.op0_register())?;
-            let value = immediate(i, 1)?;
-            let operation = if i.mnemonic() == Mnemonic::Add {
-                "add"
-            } else {
-                "sub"
+        Mnemonic::Call if matches!(classify_scalar(i), Ok(ScalarOp::CallDirect { .. })) => {
+            let ScalarOp::CallDirect { target } = classify_scalar(i).map_err(fail)? else {
+                unreachable!("matched typed direct call")
             };
-            out.push_str(&format!("  %old_{ip:x} = load i64, i64* @{dst}\n  %v_{ip:x} = {operation} i64 %old_{ip:x}, {value}\n  %z_{ip:x} = icmp eq i64 %v_{ip:x}, 0\n  store i1 %z_{ip:x}, i1* @zf\n"));
-            if i.mnemonic() != Mnemonic::Cmp {
-                out.push_str(&format!("  store i64 %v_{ip:x}, i64* @{dst}\n"));
-            }
-        }
-        Mnemonic::Call if i.op0_kind() == OpKind::NearBranch64 => {
-            let target = i.near_branch_target();
             if !entries.contains(&target) {
                 return Err(fail(format!("unresolved call at {at}")));
             }
@@ -766,8 +973,136 @@ mod tests {
     fn llvm_byte_encoding_is_exact() {
         assert_eq!(llvm_bytes(&[0, 10, 255]), "\\00\\0A\\FF");
     }
+
+    #[test]
+    fn narrow_rebuilder_does_not_mask_extended_register_effects() {
+        let mut decoder = Decoder::with_ip(
+            64,
+            &[0x4d, 0x89, 0xca], // mov r10,r9
+            0x1000,
+            DecoderOptions::NONE,
+        );
+        assert!(shared_initialization_effect(&decoder.decode()).is_none());
+    }
     #[test]
     fn rejects_non_elf() {
         assert!(lift(b"not an elf").is_err());
+    }
+
+    #[test]
+    fn shared_scalar_emission_preserves_register_and_zero_flag_effects() {
+        let code = [
+            0x48, 0x89, 0xf8, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x83, 0xf8, 0x02, 0xc3,
+        ];
+        let mut decoder = Decoder::with_ip(64, &code, 0x1000, DecoderOptions::NONE);
+        let mut instructions = BTreeMap::new();
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            instructions.insert(instruction.ip(), instruction);
+        }
+        let function = Function {
+            name: "test".to_owned(),
+            start: 0x1000,
+            instructions,
+        };
+        let mov = emit_shared_scalar(&function.instructions[&0x1000], &function)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mov,
+            "  %v_1000 = load i64, i64* @rdi\n  store i64 %v_1000, i64* @rax\n  br label %b_1003\n"
+        );
+        let add = emit_shared_scalar(&function.instructions[&0x1003], &function)
+            .unwrap()
+            .unwrap();
+        assert!(add.contains("%v_1003 = add i64 %old_1003, 1"));
+        assert!(add.contains("store i64 %v_1003, i64* @rax"));
+        let cmp = emit_shared_scalar(&function.instructions[&0x1007], &function)
+            .unwrap()
+            .unwrap();
+        assert!(cmp.contains("%v_1007 = sub i64 %old_1007, 2"));
+        assert!(cmp.contains("store i1 %z_1007, i1* @zf"));
+        assert!(!cmp.contains("store i64 %v_1007"));
+    }
+
+    #[test]
+    fn mov32_zero_extends_in_rebuilder_and_initialization_analysis() {
+        let code = [0xbf, 0xff, 0xff, 0xff, 0xff, 0x89, 0xf8, 0xc3];
+        let mut decoder = Decoder::with_ip(64, &code, 0x2000, DecoderOptions::NONE);
+        let mut instructions = BTreeMap::new();
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            instructions.insert(instruction.ip(), instruction);
+        }
+        let function = Function {
+            name: "mov32".to_owned(),
+            start: 0x2000,
+            instructions,
+        };
+        validate_initialized(&function, &BTreeMap::new()).unwrap();
+        let immediate = emit_shared_scalar(&function.instructions[&0x2000], &function)
+            .unwrap()
+            .unwrap();
+        assert!(immediate.contains("store i64 4294967295, i64* @rdi"));
+        let copy = emit_shared_scalar(&function.instructions[&0x2005], &function)
+            .unwrap()
+            .unwrap();
+        assert!(copy.contains("trunc i64 %v_2005 to i32"));
+        assert!(copy.contains("zext i32 %low_2005 to i64"));
+    }
+
+    #[test]
+    fn call_invalidates_known_caller_saved_registers() {
+        // mov edi,1; call next; mov rax,rdi; ret. The call target is resolved
+        // by the whole-program pass, but no callee preservation proof exists.
+        let code = [0xbf, 1, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0x48, 0x89, 0xf8, 0xc3];
+        let mut decoder = Decoder::with_ip(64, &code, 0x3000, DecoderOptions::NONE);
+        let mut instructions = BTreeMap::new();
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            instructions.insert(instruction.ip(), instruction);
+        }
+        let function = Function {
+            name: "call_clobber".to_owned(),
+            start: 0x3000,
+            instructions,
+        };
+        assert!(
+            validate_initialized(&function, &BTreeMap::from([(0x300a, RDI)]))
+                .unwrap_err()
+                .to_string()
+                .contains("read before definite initialization")
+        );
+    }
+
+    #[test]
+    fn callee_write_summary_preserves_unmodified_rcx() {
+        let mut caller_code = vec![0x48, 0xc7, 0xc1, 3, 0, 0, 0, 0xe8];
+        caller_code.extend_from_slice(&(0x4000_i32 - 0x300c).to_le_bytes());
+        caller_code.extend_from_slice(&[0x48, 0x83, 0xe9, 1, 0xc3]);
+        let mut functions = BTreeMap::new();
+        for (name, start, code) in [
+            ("caller", 0x3000, caller_code.as_slice()),
+            ("callee", 0x4000, &[0xb8, 1, 0, 0, 0, 0xc3][..]),
+        ] {
+            let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::NONE);
+            let mut instructions = BTreeMap::new();
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                instructions.insert(instruction.ip(), instruction);
+            }
+            functions.insert(
+                start,
+                Function {
+                    name: name.to_owned(),
+                    start,
+                    instructions,
+                },
+            );
+        }
+        let summaries = function_clobbers(&functions).unwrap();
+        assert_eq!(summaries[&0x4000] & RCX, 0);
+        assert_eq!(summaries[&0x4000] & RAX, RAX);
+        validate_initialized(&functions[&0x3000], &summaries).unwrap();
     }
 }

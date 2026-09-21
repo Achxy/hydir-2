@@ -1,9 +1,25 @@
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
-    extract_symbol_code, import_elf, lift_at, lift_symbol, recover_at_cfg, recover_symbol_cfg,
-    MAX_BINARY_BYTES,
+    MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at,
+    lift_physical_region, lift_region_decision, lift_symbol, proven_stack_local_offsets,
+    recover_at_cfg, recover_region_cfg, recover_symbol_cfg, region_contract,
 };
-use hydir_c::emit_structured_c;
+use hydir_c::{
+    build_decision_decompilation_unit, build_decompilation_unit, emit_decision_region_c,
+    emit_decision_region_llvm, emit_structured_c,
+};
+use hydir_core::{
+    CallingConvention, Location, ScalarType, annotation_address_in_spec, parse_program_spec_json,
+};
+use hydir_decompile::{
+    NativeDecompilation, decompile_function_at, decompile_function_unit_at,
+    decompile_indexed_function_unit, decompile_symbol, decompile_symbol_unit,
+    discover_function_candidates, discover_functions, export_function_ir_llvm,
+    lift_machine_function, lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
+    measure_native_coverage,
+};
+use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
+use hydir_ir::MachineFunctionIr;
 mod local;
 mod passes;
 mod patch;
@@ -27,30 +43,49 @@ const HELP: &str = "HydIR native x86-64 ELF vertical slice
 Usage:
   hydirctl doctor
   hydirctl inspect <elf>
+  hydirctl disassemble <elf>
+  hydirctl discover <elf>
   hydirctl triton <elf> <function-symbol>
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl analyze-spec <linked-elf>
+  hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
+  hydirctl hydir-spec-region <hydir-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
+  hydirctl hydir-spec-lift <hydir-spec.pb> <linked-elf> <block-uid> [--output <physical-region-ir.json>]
+  hydirctl hydir-spec-decompile <hydir-spec.pb> <linked-elf> <block-uid> [--output <unit.json>]
+  hydirctl hydir-spec-report <hydir-spec.pb> <linked-elf>
   hydirctl cfg <elf> <function-symbol>
+  hydirctl region <elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|function|cir|llvm>
+  hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
+  hydirctl decompile <elf> --function <function-id-or-symbol> --view <low|structured|unit>
+  hydirctl decompile-all <elf> --output-dir <new-directory>
+  hydirctl explain <elf> --function <function-id-or-symbol> [--address <hex-address>]
+  hydirctl coverage <elf>
+  hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
   hydirctl transform <elf> <function-symbol> --assume-u64x2 --trusted-fixture --passes <comma-list> --output-dir <new-directory> [--opt <path>]
   hydirctl rebuild <linked-elf> --trusted-fixture --output-dir <new-directory> [--clang <path>]
-  hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl validate <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>] [--cases-file <json>] [--model <ProgramSpec.json>]
   hydirctl validate-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
-  hydirctl validate-c <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
+  hydirctl validate-c <elf> <function-symbol> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>] [--cases-file <json>] [--model <ProgramSpec.json>]
   hydirctl validate-c-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl local <project|inspect|analyze-spec|annotations> <elf> [--db <private-sqlite>]
   hydirctl local annotate <elf> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value> [--db <private-sqlite>]
   hydirctl remote <operation> ...
 
-Symbol mode requires a non-stripped function symbol. Address mode requires an
-analyst-supplied virtual entry and exact byte extent, and works on stripped
-linked ELF files. --assume-u64x2 explicitly
+Legacy symbol mode requires a non-stripped function symbol. Native --function
+mode also accepts a FunctionIndex ID discovered from ELF entry, dynamic symbol,
+unwind FDE, init/fini, or direct-call evidence; candidate extents remain partial. Legacy
+symbol-backed native lifting supports linked and relocatable ELF files;
+relocatable control targets come from ELF relocations, never placeholder bytes.
+address mode requires an analyst-supplied virtual entry and exact byte extent,
+and works on stripped linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
 Rebuild supports local and authenticated-loopback operations for a narrow
@@ -75,6 +110,67 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("disassemble") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&disassemble_elf(&bytes)?)?
+            );
+        }
+        Some("discover") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&discover_functions(&bytes)?)?
+            );
+        }
+        Some("coverage") if args.len() == 2 => {
+            let bytes = read_binary(&args[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&measure_native_coverage(&bytes)?)?
+            );
+        }
+        Some("explain") if (args.len() == 4 || args.len() == 6) && args[2] == "--function" => {
+            let requested_address = if args.len() == 6 {
+                if args[4] != "--address" {
+                    return Err(HELP.into());
+                }
+                Some(parse_u64_auto(&args[5], "instruction address")?)
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[1])?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let machine = lift_native_selection(&bytes, &selection)?;
+            let instructions = machine
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+                .filter(|instruction| {
+                    requested_address.is_none_or(|address| instruction.address.value.0 == address)
+                })
+                .collect::<Vec<_>>();
+            if requested_address.is_some() && instructions.is_empty() {
+                return Err(
+                    "requested address is not a recovered instruction in this function".into(),
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "function_id": machine.function_id,
+                    "name": machine.name,
+                    "entry": machine.entry,
+                    "structural_completeness": machine.structural_completeness,
+                    "semantic_fidelity": machine.semantic_fidelity,
+                    "verification": machine.verification,
+                    "instructions": instructions,
+                    "diagnostics": machine.diagnostics,
+                    "rewrite_ready": false,
+                }))?
+            );
+        }
         Some("doctor") if args.len() == 1 => {
             let clang = Command::new("clang").arg("--version").output();
             let clang_version = clang
@@ -137,6 +233,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                         triton_helper.display().to_string()
                     },
                     "native_elf_import": true,
+                    "native_decompiler": true,
+                    "native_decompiler_scope": "ProgramSpec v5 -> FunctionIndex v1 -> MachineIR -> StateIR -> FunctionIR -> CIR -> C11; symbol, unwind-FDE, entry, direct-call and init/fini seeds; partial results fail closed",
+                    "native_loader_metadata": "ELF64 program headers, GNU-versioned dynamic symbols, location-aware relocations, PLT/GOT/TLS ranges, linked .eh_frame FDEs, init/fini arrays, and symbol-backed ET_REL lifting",
                     "direct_cfg_scalar_llvm_lift": true,
                     "symbol_scoped_cfg_export": true,
                     "conservative_global_effect_analysis": true,
@@ -188,9 +287,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             let request: serde_json::Value = serde_json::from_slice(&input)
                 .map_err(|error| format!("invalid Triton console request: {error}"))?;
-            if request.get("operation").and_then(serde_json::Value::as_str)
-                != Some("console")
-            {
+            if request.get("operation").and_then(serde_json::Value::as_str) != Some("console") {
                 return Err("Triton console request must use operation=console".into());
             }
             let result = run_triton_bridge(&request)?;
@@ -206,16 +303,317 @@ fn run() -> Result<(), Box<dyn Error>> {
             let spec = analyze_spec_elf(&bytes)?;
             println!("{}", serde_json::to_string_pretty(&spec)?);
         }
+        Some("hydir-spec-inspect") if args.len() == 2 || args.len() == 4 => {
+            let output = if args.len() == 4 {
+                if args[2] != "--canonical-output" {
+                    return Err(HELP.into());
+                }
+                Some(args[3].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &document.canonical_bytes())?;
+            }
+            let inventory = document.inventory();
+            let mut exact_executable_blocks = 0usize;
+            let mut block_byte_errors = Vec::new();
+            let mut block_inventory = Vec::new();
+            for function in &document.specification().functions {
+                for uid in function.blocks.keys() {
+                    let block = &function.blocks[uid];
+                    block_inventory.push(json!({
+                        "uid": uid,
+                        "address": format!("0x{:016x}", block.address),
+                        "size": block.size,
+                        "name": block.name,
+                    }));
+                    match document.block_bytes(*uid) {
+                        Ok(_) => exact_executable_blocks += 1,
+                        Err(error) if block_byte_errors.len() < 32 => block_byte_errors.push(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema": "HydIR interchange specification protobuf",
+                    "reference_commit": hydir_interchange::EXTERNAL_REFERENCE_COMMIT,
+                    "interchange_schema_reference": hydir_interchange::INTERCHANGE_SCHEMA_REFERENCE,
+                    "source_sha256": document.source_sha256(),
+                    "source_bytes": document.original_bytes().len(),
+                    "canonical_bytes": document.canonical_bytes().len(),
+                    "stable_target": document.require_stable_target().is_ok(),
+                    "arch": document.specification().arch,
+                    "operating_system": document.specification().operating_system,
+                    "image_name": document.specification().image_name,
+                    "image_base": format!("0x{:016x}", document.specification().image_base),
+                    "functions": inventory.functions,
+                    "blocks": inventory.blocks,
+                    "exact_executable_blocks": exact_executable_blocks,
+                    "block_byte_errors": block_byte_errors,
+                    "block_inventory": block_inventory,
+                    "memory_ranges": inventory.memory_ranges,
+                    "globals": inventory.globals,
+                    "symbols": inventory.symbols,
+                    "callsites": inventory.callsites,
+                }))?
+            );
+        }
+        Some("hydir-spec-region") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let uid = parse_u64_auto(&args[3], "block UID")?;
+            let json = serde_json::to_vec_pretty(&document.region_spec_for_elf(&elf, uid)?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("hydir-spec-lift") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let uid = parse_u64_auto(&args[3], "block UID")?;
+            let region = document.region_spec_for_elf(&elf, uid)?;
+            let json = serde_json::to_vec_pretty(&lift_physical_region(&region)?)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("hydir-spec-decompile") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let uid = parse_u64_auto(&args[3], "block UID")?;
+            let region = document.region_spec_for_elf(&elf, uid)?;
+            let decision_ir = lift_region_decision(&region)?;
+            let unit = build_decision_decompilation_unit(
+                region,
+                decision_ir,
+                concat!("hydir/", env!("CARGO_PKG_VERSION")),
+            )?;
+            let json = serde_json::to_vec_pretty(&unit)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("hydir-spec-report") if args.len() == 3 => {
+            let metadata = fs::metadata(&args[1])?;
+            if metadata.len() == 0 || metadata.len() > MAX_SPECIFICATION_BYTES as u64 {
+                return Err(format!(
+                    "HydIR specification must be 1..={MAX_SPECIFICATION_BYTES} bytes"
+                )
+                .into());
+            }
+            let document = SpecificationDocument::decode(&fs::read(&args[1])?)?;
+            let elf = read_binary(&args[2])?;
+            let mut regions = Vec::new();
+            let mut bound = 0usize;
+            let mut cfg_recovered = 0usize;
+            let mut physical_ir_lifted = 0usize;
+            let mut structured_ir_lifted = 0usize;
+            let mut c_emitted = 0usize;
+            for function in &document.specification().functions {
+                for uid in function.blocks.keys() {
+                    let mut result = json!({
+                        "uid": uid,
+                        "bound": false,
+                        "cfg_recovered": false,
+                        "physical_ir_lifted": false,
+                        "structured_ir_lifted": false,
+                        "c_emitted": false,
+                    });
+                    match document.region_spec_for_elf(&elf, *uid) {
+                        Ok(region) => {
+                            bound += 1;
+                            result["bound"] = json!(true);
+                            result["entry"] = json!(format!("0x{:016x}", region.entry.0));
+                            result["bytes"] = json!(region.byte_length);
+                            match recover_region_cfg(&region) {
+                                Ok(cfg) => {
+                                    cfg_recovered += 1;
+                                    result["cfg_recovered"] = json!(true);
+                                    result["cfg_sha256"] = json!(format!(
+                                        "{:x}",
+                                        sha2::Sha256::digest(serde_json::to_vec(&cfg)?)
+                                    ));
+                                }
+                                Err(error) => result["cfg_diagnostic"] = json!(error.to_string()),
+                            }
+                            match lift_physical_region(&region) {
+                                Ok(physical_ir) => {
+                                    physical_ir_lifted += 1;
+                                    result["physical_ir_lifted"] = json!(true);
+                                    result["physical_ir_kind"] = json!("physical_v1");
+                                    result["physical_ir_instructions"] =
+                                        json!(physical_ir.instructions.len());
+                                    result["physical_ir_sha256"] = json!(format!(
+                                        "{:x}",
+                                        sha2::Sha256::digest(serde_json::to_vec(&physical_ir)?)
+                                    ));
+                                    result["lowering_ready"] = json!(physical_ir.lowering_ready);
+                                    result["unresolved_fact_count"] =
+                                        json!(physical_ir.unresolved_facts.len());
+                                }
+                                Err(error) => {
+                                    result["physical_ir_diagnostic"] = json!(error.to_string())
+                                }
+                            }
+                            match lift_region_decision(&region) {
+                                Ok(decision_ir) => {
+                                    let llvm = emit_decision_region_llvm(&decision_ir, &region)?;
+                                    structured_ir_lifted += 1;
+                                    result["structured_ir_lifted"] = json!(true);
+                                    result["structured_ir_kind"] = json!("decision_v1");
+                                    result["llvm_sha256"] =
+                                        json!(format!("{:x}", sha2::Sha256::digest(&llvm)));
+                                    match emit_decision_region_c(&decision_ir, &region) {
+                                        Ok(c) => {
+                                            c_emitted += 1;
+                                            result["c_emitted"] = json!(true);
+                                            result["c_sha256"] =
+                                                json!(format!("{:x}", sha2::Sha256::digest(&c)));
+                                        }
+                                        Err(error) => result["diagnostic"] = json!(error),
+                                    }
+                                }
+                                Err(error) => result["diagnostic"] = json!(error.to_string()),
+                            }
+                        }
+                        Err(error) => result["diagnostic"] = json!(error),
+                    }
+                    regions.push(result);
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": 2,
+                    "source_sha256": document.source_sha256(),
+                    "binary_sha256": format!("{:x}", sha2::Sha256::digest(&elf)),
+                    "total_regions": document.inventory().blocks,
+                    "bound_regions": bound,
+                    "cfg_recovered_regions": cfg_recovered,
+                    "physical_ir_regions": physical_ir_lifted,
+                    "structured_ir_regions": structured_ir_lifted,
+                    "c_regions": c_emitted,
+                    "regions": regions,
+                }))?
+            );
+        }
         Some("cfg") if args.len() == 3 => {
             let bytes = read_binary(&args[1])?;
             let cfg = recover_symbol_cfg(&bytes, &args[2])?;
             println!("{}", serde_json::to_string_pretty(&cfg)?);
+        }
+        Some("region") if args.len() == 3 => {
+            let bytes = read_binary(&args[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&region_contract(&bytes, &args[2])?)?
+            );
         }
         Some("cfg-at") if args.len() == 4 => {
             let bytes = read_binary(&args[1])?;
             let (address, size) = parse_address_extent(&args[2], &args[3])?;
             let cfg = recover_at_cfg(&bytes, address, size)?;
             println!("{}", serde_json::to_string_pretty(&cfg)?);
+        }
+        Some("lift") if args.len() == 6 && args[2] == "--function" && args[4] == "--ir" => {
+            let bytes = read_binary(&args[1])?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let machine = lift_native_selection(&bytes, &selection)?;
+            match args[5].as_str() {
+                "machine" => println!("{}", serde_json::to_string_pretty(&machine)?),
+                "state" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&lower_state_ir(&machine)?)?
+                ),
+                "function" => {
+                    let state = lower_state_ir(&machine)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&lower_function_ir(&machine, &state)?)?
+                    );
+                }
+                "cir" => {
+                    let state = lower_state_ir(&machine)?;
+                    let function = lower_function_ir(&machine, &state)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&lower_cir(&machine, &function)?)?
+                    );
+                }
+                "llvm" => {
+                    let state = lower_state_ir(&machine)?;
+                    let function = lower_function_ir(&machine, &state)?;
+                    print!("{}", export_function_ir_llvm(&function)?);
+                }
+                _ => {
+                    return Err("native --ir must be machine, state, function, cir, or llvm".into());
+                }
+            }
         }
         Some("lift") if args.len() == 4 || args.len() == 6 => {
             if args[3] != "--assume-u64x2" {
@@ -231,6 +629,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             let bytes = read_binary(&args[1])?;
             let ir = lift_symbol(&bytes, &args[2])?;
+            if let Some(path) = output {
+                write_new_or_identical(path, ir.as_bytes())?;
+            } else {
+                print!("{ir}");
+            }
+        }
+        Some("lift-model") if args.len() == 4 || args.len() == 6 => {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[1])?;
+            let (ir, _) = typed_model_lift(&bytes, &args[2], &args[3])?;
             if let Some(path) = output {
                 write_new_or_identical(path, ir.as_bytes())?;
             } else {
@@ -261,6 +676,177 @@ fn run() -> Result<(), Box<dyn Error>> {
                 print!("{ir}");
             }
         }
+        Some("decompile") if args.len() == 6 && args[2] == "--function" && args[4] == "--view" => {
+            let bytes = read_binary(&args[1])?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            match args[5].as_str() {
+                "low" => print!(
+                    "{}",
+                    decompile_native_selection(&bytes, &selection)?.low_level_c
+                ),
+                "structured" => {
+                    let native = decompile_native_selection(&bytes, &selection)?;
+                    let source = native.structured_c.ok_or(
+                        "structured C is unavailable for this function; request --view low or unit",
+                    )?;
+                    print!("{source}");
+                }
+                "unit" => match &selection {
+                    NativeFunctionSelection::Symbol(symbol) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decompile_symbol_unit(&bytes, symbol)?)?
+                    ),
+                    NativeFunctionSelection::Discovered(entry) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&decompile_function_unit_at(&bytes, *entry)?)?
+                    ),
+                },
+                _ => return Err("native --view must be low, structured, or unit".into()),
+            }
+        }
+        Some("decompile-all") if args.len() == 4 && args[2] == "--output-dir" => {
+            let bytes = read_binary(&args[1])?;
+            let index = discover_function_candidates(&bytes)?;
+            let output_dir = Path::new(&args[3]);
+            if output_dir.exists() {
+                return Err(format!(
+                    "output directory {} already exists; refusing to merge or overwrite",
+                    output_dir.display()
+                )
+                .into());
+            }
+            fs::create_dir(output_dir)?;
+            let mut results = Vec::new();
+            let mut attempted = std::collections::BTreeSet::new();
+            for function in &index.functions {
+                if !attempted.insert(function.id.clone()) {
+                    continue;
+                }
+                let display_name = function
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("sub_{:x}", function.entry.value.0));
+                let stem = format!(
+                    "{:05}-{}",
+                    results.len(),
+                    native_file_component(&display_name)
+                );
+                let symbol_backed = function
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == "elf_symbol");
+                if !symbol_backed {
+                    match decompile_indexed_function_unit(&bytes, &index, &function.id) {
+                        Ok(unit) => {
+                            let unit_path = output_dir.join(format!("{stem}.unit.json"));
+                            let low_path = output_dir.join(format!("{stem}.low.c"));
+                            write_new_or_identical(&unit_path, &serde_json::to_vec_pretty(&unit)?)?;
+                            write_new_or_identical(
+                                &low_path,
+                                unit.low_level_c
+                                    .as_deref()
+                                    .unwrap_or(&unit.c_source)
+                                    .as_bytes(),
+                            )?;
+                            let structured_path = if let Some(source) = unit.structured_c.as_deref()
+                            {
+                                let path = output_dir.join(format!("{stem}.structured.c"));
+                                write_new_or_identical(&path, source.as_bytes())?;
+                                Some(
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string(),
+                                )
+                            } else {
+                                None
+                            };
+                            results.push(json!({
+                                "function_id": function.id,
+                                "name": display_name,
+                                "status": "decompiled",
+                                "unit": unit_path.file_name().unwrap_or_default().to_string_lossy(),
+                                "low_level_c": low_path.file_name().unwrap_or_default().to_string_lossy(),
+                                "structured_c": structured_path,
+                                "structural_completeness": unit.structural_completeness,
+                                "semantic_fidelity": unit.semantic_fidelity,
+                                "rewrite_ready": unit.rewrite_ready,
+                            }));
+                        }
+                        Err(error) => results.push(json!({
+                            "function_id": function.id,
+                            "name": display_name,
+                            "status": "diagnostic",
+                            "diagnostic": error,
+                        })),
+                    }
+                    continue;
+                }
+                let Some(symbol) = function.name.as_deref() else {
+                    results.push(json!({
+                        "function_id": function.id,
+                        "name": display_name,
+                        "status": "diagnostic",
+                        "diagnostic": "ELF symbol evidence has no name",
+                    }));
+                    continue;
+                };
+                match decompile_symbol_unit(&bytes, symbol) {
+                    Ok(unit) => {
+                        let unit_path = output_dir.join(format!("{stem}.unit.json"));
+                        let low_path = output_dir.join(format!("{stem}.low.c"));
+                        write_new_or_identical(&unit_path, &serde_json::to_vec_pretty(&unit)?)?;
+                        write_new_or_identical(
+                            &low_path,
+                            unit.low_level_c
+                                .as_deref()
+                                .unwrap_or(&unit.c_source)
+                                .as_bytes(),
+                        )?;
+                        let structured_path = if let Some(source) = unit.structured_c.as_deref() {
+                            let path = output_dir.join(format!("{stem}.structured.c"));
+                            write_new_or_identical(&path, source.as_bytes())?;
+                            Some(
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        };
+                        results.push(json!({
+                            "function_id": function.id,
+                            "symbol": symbol,
+                            "status": "decompiled",
+                            "unit": unit_path.file_name().unwrap_or_default().to_string_lossy(),
+                            "low_level_c": low_path.file_name().unwrap_or_default().to_string_lossy(),
+                            "structured_c": structured_path,
+                            "structural_completeness": unit.structural_completeness,
+                            "semantic_fidelity": unit.semantic_fidelity,
+                            "rewrite_ready": unit.rewrite_ready,
+                        }));
+                    }
+                    Err(error) => results.push(json!({
+                        "function_id": function.id,
+                        "symbol": symbol,
+                        "status": "diagnostic",
+                        "diagnostic": error,
+                    })),
+                }
+            }
+            let manifest = json!({
+                "schema_version": 1,
+                "binary_sha256": index.binary_sha256,
+                "function_index_schema_version": index.schema_version,
+                "results": results,
+            });
+            write_new_or_identical(
+                output_dir.join("manifest.json"),
+                &serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
         Some("decompile") if args.len() == 4 || args.len() == 6 => {
             if args[3] != "--assume-u64x2" {
                 return Err(
@@ -281,6 +867,36 @@ fn run() -> Result<(), Box<dyn Error>> {
                 write_new_or_identical(path, c.as_bytes())?;
             } else {
                 print!("{c}");
+            }
+        }
+        Some("decompile-unit") if args.len() == 4 || args.len() == 6 => {
+            if args[3] != "--assume-u64x2" {
+                return Err(
+                    "decompile-unit requires explicit --assume-u64x2 prototype assertion".into(),
+                );
+            }
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[1])?;
+            let region = region_contract(&bytes, &args[2])?;
+            let raw_llvm = lift_symbol(&bytes, &args[2])?;
+            let unit = build_decompilation_unit(
+                region,
+                raw_llvm,
+                concat!("hydir/", env!("CARGO_PKG_VERSION")),
+            )?;
+            let json = serde_json::to_vec_pretty(&unit)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
             }
         }
         Some("decompile-at") if args.len() == 5 || args.len() == 7 => {
@@ -326,6 +942,82 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+enum NativeFunctionSelection {
+    Symbol(String),
+    Discovered(Location),
+}
+
+fn resolve_native_function(
+    bytes: &[u8],
+    selector: &str,
+) -> Result<NativeFunctionSelection, Box<dyn Error>> {
+    let index = discover_function_candidates(bytes)?;
+    let mut matches = index
+        .functions
+        .iter()
+        .filter(|function| function.id == selector || function.name.as_deref() == Some(selector));
+    let function = matches
+        .next()
+        .ok_or_else(|| format!("native function selector {selector:?} was not discovered"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "native function selector {selector:?} is ambiguous; use the FunctionIndex id"
+        )
+        .into());
+    }
+    if function
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "elf_symbol")
+    {
+        function
+            .name
+            .clone()
+            .map(NativeFunctionSelection::Symbol)
+            .ok_or_else(|| "ELF symbol evidence has no symbol name".into())
+    } else {
+        Ok(NativeFunctionSelection::Discovered(function.entry))
+    }
+}
+
+fn lift_native_selection(
+    bytes: &[u8],
+    selection: &NativeFunctionSelection,
+) -> Result<MachineFunctionIr, Box<dyn Error>> {
+    Ok(match selection {
+        NativeFunctionSelection::Symbol(symbol) => lift_machine_function(bytes, symbol)?,
+        NativeFunctionSelection::Discovered(entry) => lift_machine_function_at(bytes, *entry)?,
+    })
+}
+
+fn decompile_native_selection(
+    bytes: &[u8],
+    selection: &NativeFunctionSelection,
+) -> Result<NativeDecompilation, Box<dyn Error>> {
+    Ok(match selection {
+        NativeFunctionSelection::Symbol(symbol) => decompile_symbol(bytes, symbol)?,
+        NativeFunctionSelection::Discovered(entry) => decompile_function_at(bytes, *entry)?,
+    })
+}
+
+fn native_file_component(value: &str) -> String {
+    let mut component = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect::<String>();
+    if component.is_empty() || component == "." || component == ".." {
+        component = "function".to_owned();
+    }
+    component
+}
+
 fn parse_address_extent(address: &str, size: &str) -> Result<(u64, u64), Box<dyn Error>> {
     let digits = address
         .strip_prefix("0x")
@@ -341,6 +1033,89 @@ fn parse_address_extent(address: &str, size: &str) -> Result<(u64, u64), Box<dyn
     Ok((address, size))
 }
 
+fn parse_u64_auto(value: &str, label: &str) -> Result<u64, Box<dyn Error>> {
+    if let Some(digits) = value.strip_prefix("0x") {
+        if digits.is_empty() {
+            return Err(format!("{label} has no hexadecimal digits").into());
+        }
+        Ok(u64::from_str_radix(digits, 16)?)
+    } else {
+        Ok(value.parse::<u64>()?)
+    }
+}
+
+fn typed_model_lift(
+    bytes: &[u8],
+    symbol: &str,
+    model_path: &str,
+) -> Result<(String, serde_json::Value), Box<dyn Error>> {
+    let actual = import_elf(bytes)?;
+    if fs::metadata(model_path)?.len() > 2 * 1024 * 1024 {
+        return Err("typed ProgramSpec exceeds 2 MiB".into());
+    }
+    let model = parse_program_spec_json(&fs::read(model_path)?)?;
+    if model.binary_sha256 != actual.binary_sha256 {
+        return Err("typed ProgramSpec binary digest does not match ELF".into());
+    }
+    let function = actual
+        .functions
+        .iter()
+        .find(|function| function.name == symbol)
+        .ok_or("function symbol missing from binary inventory")?;
+    let prototype = model
+        .typed_model
+        .prototypes
+        .iter()
+        .find(|prototype| prototype.entry == function.address)
+        .ok_or("typed prototype assertion missing for function entry")?;
+    if !annotation_address_in_spec(&actual, prototype.entry)
+        || prototype.return_type != ScalarType::U64
+        || prototype.parameters != [ScalarType::U64, ScalarType::U64]
+        || prototype.calling_convention != CallingConvention::SysvAmd64
+    {
+        return Err("typed prototype is not the supported SysV u64(u64,u64) contract".into());
+    }
+    let model_json = serde_json::to_vec(&model.typed_model)?;
+    let model_sha256 = format!("{:x}", sha2::Sha256::digest(&model_json));
+    let body = lift_symbol(bytes, symbol)?;
+    let facts: Vec<_> = model
+        .typed_model
+        .stack_facts
+        .iter()
+        .filter(|fact| fact.function_entry == function.address)
+        .collect();
+    if !facts.is_empty() {
+        let offsets = proven_stack_local_offsets(bytes, symbol)?;
+        for fact in &facts {
+            if fact.width_bits != 64 || !offsets.contains(&fact.entry_rsp_offset) {
+                return Err(format!(
+                    "stack assertion {} is not a proven eight-byte local in this function",
+                    fact.id
+                )
+                .into());
+            }
+        }
+    }
+    let mut ir = format!(
+        "; HydIR binary sha256: {}\n; HydIR typed model sha256: {model_sha256}\n; prototype assertion: {}\n",
+        actual.binary_sha256, prototype.id
+    );
+    for fact in &facts {
+        ir.push_str(&format!(
+            "; stack assertion: {} offset {} width 64\n",
+            fact.id, fact.entry_rsp_offset
+        ));
+    }
+    ir.push_str(&body);
+    let evidence = json!({
+        "binary_sha256": actual.binary_sha256,
+        "typed_model_sha256": model_sha256,
+        "prototype_assertion": prototype.id,
+        "stack_assertions": facts.iter().map(|fact| fact.id.as_str()).collect::<Vec<_>>(),
+    });
+    Ok((ir, evidence))
+}
+
 fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Box<dyn Error>> {
     if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
         return Err(
@@ -351,6 +1126,8 @@ fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Bo
     let mut assume_u64x2 = false;
     let mut clang = "clang";
     let mut random_cases = 1000usize;
+    let mut cases_file = None;
+    let mut model_file = None;
     let mut index = if by_address { 3 } else { 2 };
     while index < args.len() {
         match args[index].as_str() {
@@ -363,6 +1140,14 @@ fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Bo
             "--random-cases" if index + 1 < args.len() => {
                 index += 1;
                 random_cases = args[index].parse()?;
+            }
+            "--cases-file" if cases_file.is_none() && index + 1 < args.len() => {
+                index += 1;
+                cases_file = Some(args[index].as_str());
+            }
+            "--model" if model_file.is_none() && index + 1 < args.len() => {
+                index += 1;
+                model_file = Some(args[index].as_str());
             }
             _ => {
                 return Err(
@@ -396,10 +1181,16 @@ fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Bo
         return Err("--random-cases is limited to 10000".into());
     }
     let bytes = read_binary(&binary)?;
-    let ir = if let Some((address, size)) = address_extent {
-        lift_at(&bytes, address, size)?
+    let (ir, model_evidence) = if let Some(model_path) = model_file {
+        if by_address {
+            return Err("typed model validation requires a named function symbol".into());
+        }
+        let (ir, evidence) = typed_model_lift(&bytes, &args[1], model_path)?;
+        (ir, Some(evidence))
+    } else if let Some((address, size)) = address_extent {
+        (lift_at(&bytes, address, size)?, None)
     } else {
-        lift_symbol(&bytes, &args[1])?
+        (lift_symbol(&bytes, &args[1])?, None)
     };
     let directory = tempfile::tempdir()?;
     let ir_path = directory.path().join("lifted.ll");
@@ -445,6 +1236,13 @@ fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Bo
         let b = next_random(&mut rng);
         cases.push((a, b));
     }
+    let external_cases = if let Some(path) = cases_file {
+        read_validation_cases(path)?
+    } else {
+        Vec::new()
+    };
+    let external_case_count = external_cases.len();
+    cases.extend(external_cases);
     let mut mismatches = Vec::new();
     let mut mismatch_count = 0usize;
     for (a, b) in &cases {
@@ -471,8 +1269,10 @@ fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Bo
         "binary": binary,
         "function": label,
         "entry_assumption": address_extent.map(|(address, size)| json!({"virtual_address": format!("0x{address:016x}"), "size_bytes": size, "provenance": "analyst-supplied"})),
+        "typed_model_evidence": model_evidence,
         "seed": format!("0x{seed:016x}"),
         "cases_attempted": cases.len(),
+        "external_cases_attempted": external_case_count,
         "cases_matched": matched,
         "cases_mismatched": mismatch_count,
         "mismatches": mismatches,
@@ -484,6 +1284,35 @@ fn validate(args: &[String], by_address: bool, c_backend: bool) -> Result<(), Bo
         return Err("differential validation failed".into());
     }
     Ok(())
+}
+
+fn read_validation_cases(path: &str) -> Result<Vec<(u64, u64)>, Box<dyn Error>> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > 64 * 1024 {
+        return Err("validation cases file exceeds 64 KiB".into());
+    }
+    let value: serde_json::Value = serde_json::from_reader(file)?;
+    let rows = value
+        .as_array()
+        .ok_or("validation cases must be a JSON array")?;
+    if rows.len() > 256 {
+        return Err("validation cases are limited to 256 pairs".into());
+    }
+    rows.iter()
+        .map(|row| {
+            let pair = row.as_array().ok_or("validation case must be a pair")?;
+            if pair.len() != 2 {
+                return Err("validation case must contain exactly two values".into());
+            }
+            let parse = |value: &serde_json::Value| -> Result<u64, Box<dyn Error>> {
+                value
+                    .as_str()
+                    .ok_or_else(|| "validation input must be a decimal u64 string".into())
+                    .and_then(|number| Ok(number.parse::<u64>()?))
+            };
+            Ok((parse(&pair[0])?, parse(&pair[1])?))
+        })
+        .collect()
 }
 
 fn read_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -527,15 +1356,15 @@ fn configured_triton_python() -> String {
     }
     let mut candidates = vec!["python".to_owned(), "python3".to_owned()];
     #[cfg(windows)]
-    if let Ok(output) = Command::new("py").args(["-0p"]).output() {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            candidates.extend(text.lines().filter_map(|line| {
-                line.split_whitespace()
-                    .find(|token| token.to_ascii_lowercase().ends_with(".exe"))
-                    .map(str::to_owned)
-            }));
-        }
+    if let Ok(output) = Command::new("py").args(["-0p"]).output()
+        && output.status.success()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        candidates.extend(text.lines().filter_map(|line| {
+            line.split_whitespace()
+                .find(|token| token.to_ascii_lowercase().ends_with(".exe"))
+                .map(str::to_owned)
+        }));
     }
     candidates
         .iter()
@@ -698,12 +1527,30 @@ const HARNESS: &str = r#"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-extern uint64_t hydir_lifted(uint64_t, uint64_t);
+extern uint64_t hydir_lifted(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 int main(int argc, char **argv) {
     if (argc != 3) return 64;
     uint64_t a = strtoull(argv[1], 0, 10);
     uint64_t b = strtoull(argv[2], 0, 10);
-    printf("%llu\n", (unsigned long long)hydir_lifted(a, b));
+    printf("%llu\n", (unsigned long long)hydir_lifted(a, b, 0, 0, 0, 0));
     return 0;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::read_validation_cases;
+
+    #[test]
+    fn external_cases_preserve_full_width_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cases.json");
+        std::fs::write(&path, r#"[["18446744073709551615","0"],["1","2"]]"#).unwrap();
+        assert_eq!(
+            read_validation_cases(path.to_str().unwrap()).unwrap(),
+            vec![(u64::MAX, 0), (1, 2)]
+        );
+        std::fs::write(&path, r#"[[18446744073709551615,"0"]]"#).unwrap();
+        assert!(read_validation_cases(path.to_str().unwrap()).is_err());
+    }
+}

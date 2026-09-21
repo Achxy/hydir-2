@@ -1,0 +1,11 @@
+{
+  "name": "hydir-blog-checks",
+  "private": true,
+  "scripts": {
+    "check:blog": "html-validate 'blog/**/*.html' && node scripts/check-blog.mjs",
+    "build:blog": "node scripts/build-blog-pages.mjs"
+  },
+  "devDependencies": {
+    "html-validate": "11.16.0"
+  }
+}

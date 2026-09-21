@@ -14,53 +14,90 @@ from uuid import uuid4
 import grpc
 
 from . import hydir_pb2 as proto
+from . import hydir_v2_pb2 as proto_v2
+from . import hydir_v3_pb2 as proto_v3
 from .hydir_pb2_grpc import HydirStub
+from .hydir_v2_pb2_grpc import HydirV2Stub
+from .hydir_v3_pb2_grpc import HydirV3Stub
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 
 
 class HydirClient:
-    """Authenticated loopback client; remote API version 1 only.
+    """Authenticated local-or-TLS client with additive v1/v2/v3 negotiation.
 
     Mutations accept explicit project revisions. Pass the same idempotency key
     when retrying create-project or lift-job requests after an uncertain reply.
     """
 
-    def __init__(self, endpoint: str, token_file: str | os.PathLike[str], timeout: float = 30.0):
+    def __init__(
+        self,
+        endpoint: str,
+        token_file: str | os.PathLike[str],
+        timeout: float = 30.0,
+        root_certificates: bytes | None = None,
+    ):
         parsed = urlsplit(endpoint)
         if (
-            parsed.scheme != "http"
+            parsed.scheme not in {"http", "https"}
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.path
+            or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
             or parsed.port is None
+            or not parsed.hostname
         ):
-            raise ValueError("Endpoint must be explicit http://loopback-address:port")
+            raise ValueError(
+                "Endpoint must be an explicit http/https host and port without "
+                "credentials, path, query, or fragment"
+            )
+        address = None
         try:
-            address = ipaddress.ip_address(parsed.hostname or "")
-        except ValueError as error:
-            raise ValueError("Endpoint must use a numeric loopback address") from error
-        if not address.is_loopback:
-            raise ValueError("Plaintext non-loopback connections are refused")
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            pass
+        if parsed.scheme == "http" and (address is None or not address.is_loopback):
+            raise ValueError("Plaintext connections require a numeric loopback address")
         token_path = Path(token_file)
         if os.name == "posix" and token_path.stat().st_mode & 0o077:
             raise ValueError("Credential file must be private (chmod 600)")
         token = token_path.read_text(encoding="ascii").strip()
-        if len(token) != 64 or any(character not in "0123456789abcdefABCDEF" for character in token):
-            raise ValueError("Credential file must contain a 64-character hex token")
+        is_static = len(token) == 64 and all(
+            character in "0123456789abcdefABCDEF" for character in token
+        )
+        segments = token.split(".")
+        is_compact_jwt = (
+            len(token) <= 16 * 1024
+            and len(segments) == 3
+            and all(
+                segment
+                and all(
+                    character.isascii()
+                    and (character.isalnum() or character in "-_")
+                    for character in segment
+                )
+                for segment in segments
+            )
+        )
+        if not (is_static or is_compact_jwt):
+            raise ValueError("Credential file must contain a bounded static token or compact JWT")
         self._metadata = (("authorization", "Bearer " + token),)
         self._timeout = timeout
-        target = f"[{address}]:{parsed.port}" if address.version == 6 else f"{address}:{parsed.port}"
-        self._channel = grpc.insecure_channel(
-            target,
-            options=(
-                ("grpc.max_receive_message_length", MAX_BINARY_BYTES + 1024),
-                ("grpc.max_send_message_length", MAX_BINARY_BYTES + 1024),
-            ),
+        host = parsed.hostname
+        target = f"[{host}]:{parsed.port}" if ":" in host else f"{host}:{parsed.port}"
+        options = (
+            ("grpc.max_receive_message_length", MAX_BINARY_BYTES + 1024),
+            ("grpc.max_send_message_length", MAX_BINARY_BYTES + 1024),
         )
+        if parsed.scheme == "https":
+            credentials = grpc.ssl_channel_credentials(root_certificates=root_certificates)
+            self._channel = grpc.secure_channel(target, credentials, options=options)
+        else:
+            self._channel = grpc.insecure_channel(target, options=options)
         self._stub = HydirStub(self._channel)
+        self._stub_v2 = HydirV2Stub(self._channel)
+        self._stub_v3 = HydirV3Stub(self._channel)
 
     def close(self) -> None:
         self._channel.close()
@@ -79,6 +116,336 @@ class HydirClient:
         if reply.api_version != 1:
             raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
         return reply
+
+    def discover_v2(self):
+        reply = self._call(self._stub_v2.Discover, proto_v2.DiscoverRequest())
+        if reply.api_version != 2:
+            raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
+        return reply
+
+    def discover_v3(self):
+        reply = self._call(self._stub_v3.Discover, proto_v3.DiscoverRequest())
+        if reply.api_version != 3:
+            raise RuntimeError(f"Unsupported HydIR API version {reply.api_version}")
+        return reply
+
+    def negotiate_api(self) -> tuple[int, object]:
+        """Prefer v3 while retaining transparent v2 and v1 compatibility paths."""
+        try:
+            return 3, self.discover_v3()
+        except grpc.RpcError as error:
+            if error.code() != grpc.StatusCode.UNIMPLEMENTED:
+                raise
+        try:
+            return 2, self.discover_v2()
+        except grpc.RpcError as error:
+            if error.code() != grpc.StatusCode.UNIMPLEMENTED:
+                raise
+        return 1, self.discover()
+
+    def get_program_artifact(
+        self, project_id: str, revision: int, stage: str,
+        function_selector: str | None = None,
+    ) -> dict | bytes:
+        """Fetch a digest-checked native artifact without executing the ELF."""
+        media_types = {
+            "program_spec": ("application/vnd.hydir.program-spec+json;version=5", 5),
+            "function_index": ("application/vnd.hydir.function-index+json;version=1", 1),
+            "coverage": ("application/vnd.hydir.coverage+json;version=1", 1),
+            "machine": ("application/vnd.hydir.machine-ir+json;version=1", 1),
+            "state": ("application/vnd.hydir.state-ir+json;version=1", 1),
+            "function": ("application/vnd.hydir.function-ir+json;version=1", 1),
+            "cir": ("application/vnd.hydir.cir+json;version=1", 1),
+            "llvm": ("text/x-llvm-ir", None),
+            "unit": ("application/vnd.hydir.decompilation-unit+json;version=2", 2),
+        }
+        if stage not in media_types:
+            raise ValueError("Unsupported native artifact stage")
+        function_scoped = stage in {"machine", "state", "function", "cir", "llvm", "unit"}
+        if function_scoped and not function_selector:
+            raise ValueError("Function-scoped native artifact requires a selector")
+        if not function_scoped and function_selector:
+            raise ValueError("Program-scoped native artifact cannot include a selector")
+        if function_selector and (
+            len(function_selector.encode("utf-8")) > 256
+            or any(ord(character) < 32 for character in function_selector)
+        ):
+            raise ValueError("Function selector exceeds the supported bounds")
+        reply = self._call(
+            self._stub_v3.GetProgramArtifact,
+            proto_v3.ProgramArtifactRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                stage=stage,
+                function_selector=function_selector or "",
+            ),
+        )
+        content = self._checked_artifact(reply, revision=revision)
+        expected_media_type, schema_version = media_types[stage]
+        if reply.media_type != expected_media_type:
+            raise RuntimeError("Native artifact media type verification failed")
+        if schema_version is None:
+            return content
+        value = json.loads(content)
+        if not isinstance(value, dict) or value.get("schema_version") != schema_version:
+            raise RuntimeError("Native artifact schema version verification failed")
+        return value
+
+    def start_program_analysis(
+        self, project_id: str, revision: int, *, idempotency_key: str | None = None,
+    ):
+        return self._call(
+            self._stub_v3.StartProgramAnalysis,
+            proto_v3.StartProgramAnalysisRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=idempotency_key or str(uuid4()),
+            ),
+        )
+
+    def get_analysis_job(self, project_id: str, job_id: str):
+        return self._call(
+            self._stub_v3.GetAnalysisJob,
+            proto_v3.JobRequest(project_id=project_id, job_id=job_id),
+        )
+
+    def cancel_analysis_job(self, project_id: str, job_id: str):
+        return self._call(
+            self._stub_v3.CancelAnalysisJob,
+            proto_v3.JobRequest(project_id=project_id, job_id=job_id),
+        )
+
+    def analysis_events(
+        self, project_id: str, job_id: str, after_sequence: int = 0,
+    ) -> Iterator:
+        if after_sequence < 0:
+            raise ValueError("Event sequence cannot be negative")
+        return self._call(
+            self._stub_v3.StreamAnalysisEvents,
+            proto_v3.JobEventRequest(
+                project_id=project_id,
+                job_id=job_id,
+                after_sequence=after_sequence,
+            ),
+        )
+
+    def update_analyst_fact_v3(
+        self, project_id: str, revision: int, *, kind: str, value: str,
+        scope: str, address: str | None = None, idempotency_key: str | None = None,
+    ):
+        """Append a revision-checked analyst fact through the native v3 API."""
+        if kind not in {"name", "comment", "assumption"}:
+            raise ValueError("Analyst fact kind must be name, comment, or assumption")
+        if kind == "name" and not address:
+            raise ValueError("Name facts require an address")
+        if not value.strip() or not scope.strip():
+            raise ValueError("Analyst fact value and scope are required")
+        max_value = {"name": 128, "comment": 2048, "assumption": 1024}[kind]
+        if (
+            len(value.encode("utf-8")) > max_value
+            or "\x00" in value
+            or (kind == "name" and any(character in "\r\n\t" for character in value))
+            or len(scope.encode("utf-8")) > 256
+            or any(ord(character) < 32 for character in scope)
+        ):
+            raise ValueError("Analyst fact value or scope exceeds the supported bounds")
+        if address is not None and (
+            not address.startswith("0x")
+            or not 1 <= len(address[2:]) <= 16
+            or any(character not in "0123456789abcdefABCDEF" for character in address[2:])
+        ):
+            raise ValueError("Address must be 0x plus 1..=16 hex digits")
+        reply = self._call(
+            self._stub_v3.UpdateAnalystFact,
+            proto_v3.AnalystFactRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=idempotency_key or str(uuid4()),
+                kind=kind,
+                address=address or "",
+                value=value,
+                scope=scope,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.revision != revision + 1
+            or len(reply.binary_sha256) != 64
+        ):
+            raise RuntimeError("Analyst fact revision or binary identity differs from request")
+        return reply
+
+    @staticmethod
+    def _checked_json_artifact(
+        reply, *, revision: int, media_type: str, schema_version: int,
+    ) -> dict:
+        content = HydirClient._checked_artifact(reply, revision=revision)
+        if reply.media_type != media_type:
+            raise RuntimeError("Artifact media type verification failed")
+        value = json.loads(content)
+        if not isinstance(value, dict) or value.get("schema_version") != schema_version:
+            raise RuntimeError("Artifact schema version verification failed")
+        return value
+
+    def get_region(
+        self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
+    ) -> dict:
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub_v2.GetRegion,
+            proto_v2.RegionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.region-spec+json;version=3",
+            schema_version=3,
+        )
+
+    def lift_region(
+        self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
+    ) -> dict:
+        """Return digest-checked PhysicalRegionIR without claiming C/patch readiness."""
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub_v2.LiftRegion,
+            proto_v2.RegionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.physical-region-ir+json;version=1",
+            schema_version=1,
+        )
+
+    def decompile_region(
+        self, project_id: str, revision: int, symbol: str, *, assume_u64x2: bool,
+    ) -> dict:
+        if not assume_u64x2:
+            raise ValueError("Explicit u64(u64,u64) prototype assertion is required")
+        reply = self._call(
+            self._stub_v2.DecompileRegion,
+            proto_v2.RegionRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                function_symbol=symbol,
+                assume_u64x2=True,
+            ),
+        )
+        unit = self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.decompilation-unit+json;version=1",
+            schema_version=1,
+        )
+        if unit.get("binary_sha256") != unit.get("region", {}).get("binary_sha256"):
+            raise RuntimeError("DecompilationUnit and RegionSpec binary identities differ")
+        return unit
+
+    def compile_patch_bundle(
+        self, project_id: str, revision: int, patch_json: bytes, *,
+        trusted_fixture: bool, assume_u64x2: bool, assume_entry_only: bool,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        request = self._v2_patch_request(
+            project_id,
+            revision,
+            patch_json,
+            trusted_fixture=trusted_fixture,
+            assume_u64x2=assume_u64x2,
+            assume_entry_only=assume_entry_only,
+            idempotency_key=idempotency_key,
+        )
+        reply = self._call(self._stub_v2.CompilePatch, request)
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.patch-bundle+json;version=2",
+            schema_version=2,
+        )
+
+    def apply_patch_v2(
+        self, project_id: str, revision: int, patch_json: bytes, *,
+        trusted_fixture: bool, assume_u64x2: bool, assume_entry_only: bool,
+        idempotency_key: str | None = None,
+    ) -> tuple[int, str, dict]:
+        request = self._v2_patch_request(
+            project_id,
+            revision,
+            patch_json,
+            trusted_fixture=trusted_fixture,
+            assume_u64x2=assume_u64x2,
+            assume_entry_only=assume_entry_only,
+            idempotency_key=idempotency_key,
+        )
+        reply = self._call(self._stub_v2.ApplyPatch, request)
+        if reply.project_id != project_id or reply.revision != revision + 1:
+            raise RuntimeError("Patch returned an unexpected project revision")
+        artifact = self._call(
+            self._stub.GetArtifact,
+            proto.ArtifactRequest(project_id=project_id, sha256=reply.patch_bundle_sha256),
+        )
+        bundle = self._checked_json_artifact(
+            artifact,
+            revision=revision,
+            media_type="application/vnd.hydir.patch-bundle+json;version=2",
+            schema_version=2,
+        )
+        if bundle.get("patched_sha256") != reply.binary_sha256:
+            raise RuntimeError("PatchBundle and patched revision binary identities differ")
+        return reply.revision, reply.binary_sha256, bundle
+
+    def verify_patch_bundle(
+        self, project_id: str, revision: int, patch_bundle_json: bytes,
+    ) -> dict:
+        if not patch_bundle_json or len(patch_bundle_json) > 2 * 1024 * 1024:
+            raise ValueError("PatchBundle must be 1..=2 MiB")
+        reply = self._call(
+            self._stub_v2.VerifyPatch,
+            proto_v2.VerifyPatchRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                patch_bundle_json=patch_bundle_json,
+            ),
+        )
+        report = json.loads(reply.report_json)
+        if not reply.structurally_valid or report.get("structurally_valid") is not True:
+            raise RuntimeError("PatchBundle structural verification failed")
+        if reply.behavior_verified != bool(report.get("behavior_verified")):
+            raise RuntimeError("PatchBundle behavior-verification status differs from report")
+        return report
+
+    @staticmethod
+    def _v2_patch_request(
+        project_id: str, revision: int, patch_json: bytes, *,
+        trusted_fixture: bool, assume_u64x2: bool, assume_entry_only: bool,
+        idempotency_key: str | None,
+    ):
+        if not (trusted_fixture and assume_u64x2 and assume_entry_only):
+            raise ValueError("Patch requires trusted-fixture, u64x2, and entry-only assertions")
+        if not patch_json or len(patch_json) > 4096:
+            raise ValueError("Patch document must be 1..=4096 bytes")
+        return proto_v2.PatchRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            idempotency_key=idempotency_key or str(uuid4()),
+            patch_json=patch_json,
+            trusted_fixture=True,
+            assume_u64x2=True,
+            assume_entry_only=True,
+        )
 
     def get_source(self) -> tuple[str, bytes]:
         """Retrieve and hash-check the exact source archive advertised by this build."""
