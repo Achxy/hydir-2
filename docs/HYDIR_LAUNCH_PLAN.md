@@ -442,7 +442,7 @@ After the beta and VM preview gates pass, expand in this order:
 2. Add a validated captured-state-to-Triton contract. Bind exact binary, input, snapshot, code version, registers, present memory pages, chosen byte origin, and analyst assumptions. An uncaptured register or memory read must return an explicit unsupported result.
 3. Solve a pure post-input validator from the captured state with bounded path and solver budgets. Return a function witness, candidate bytes, explored scope, and distinct SAT/UNSAT/unknown/timeout states. Do not infer original-channel provenance from a byte-equality probe.
 4. Write the proposed bytes into a new `InputSpec`, run a fresh original-binary replay, and emit a native-validated candidate only when the declared goal matches. Keep the internal witness and replay observation separately inspectable.
-5. Connect the selected branch to a conservative input-byte slice and then to a linked C/CFG/disassembly/trace view. Export a reproducible recipe and `InvestigationClaim` for the successful path.
+5. Link the failed captured decision to a bounded, trace-specific structural input-byte slice, then add static conservative dependencies and linked C/CFG/disassembly/trace navigation. Export a reproducible recipe and `InvestigationClaim` for the successful path.
 6. Expand typed-C widths, call effects, derived pointers, and targeted rediscovery against concrete failures in the flagship and held-out fixtures. Preserve the low-level fallback and record unresolved facts.
 7. Package and test the beta on clean Windows + WSL2 and Linux hosts; run held-out trials and fair baseline comparisons. Then complete the separately gated VM preview.
 

@@ -53,6 +53,7 @@ def main() -> None:
         probe_path = work / "probe.json"
         plan_path = work / "plan.json"
         candidate_path = work / "candidate.json"
+        slice_path = work / "slice.json"
         report_path = work / "solve-report.json"
         run(
             "clang", "-O1", "-fPIE", "-pie", "-fno-omit-frame-pointer",
@@ -84,13 +85,21 @@ def main() -> None:
             probe_path, plan_path)
         run(CTL, "solve", "snapshot-return", binary, spec_path, snapshot_path,
             probe_path, plan_path, "--candidate-output", candidate_path,
+            "--slice-output", slice_path,
             "--output", report_path)
         report = json.loads(report_path.read_text(encoding="utf-8"))
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        slice_report = json.loads(slice_path.read_text(encoding="utf-8"))
         assert report["bridge"]["status"] == "function_witness", report
         assert report["claim"] == "native_validated_candidate", report
         assert report["native_replay"]["status"] == "goal_matched", report
         assert candidate["stdin_hex"] == "41", candidate
+        assert slice_report == report["bridge"]["input_condition_slice"], slice_report
+        assert slice_report["relevant_origin_offsets"] == [0], slice_report
+        assert slice_report["binary_sha256"] == report["binary_sha256"], slice_report
+        assert slice_report["ast_walk_complete"], slice_report
+        assert any(decision["origin_offsets"] == [0]
+                   for decision in slice_report["decisions"]), slice_report
         again = json.loads(run(CTL, "replay", binary, candidate_path))
         assert again["status"] == "goal_matched", again
         print("snapshot solve and native replay gate passed")

@@ -94,7 +94,7 @@ Usage:
   hydirctl snapshot verify-origin <linked-elf> <input.json> <snapshot.json> <probe.json>
   hydirctl snapshot plan-return <linked-elf> <input.json> <snapshot.json> <probe.json> --code-bytes <n> --return <u64> [--output <plan.json>]
   hydirctl snapshot verify-plan <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json>
-  hydirctl solve snapshot-return <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json> [--candidate-output <input.json>] [--output <report.json>]
+  hydirctl solve snapshot-return <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json> [--candidate-output <input.json>] [--slice-output <slice.json>] [--output <report.json>]
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -405,14 +405,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("solve")
             if args.get(1).map(String::as_str) == Some("snapshot-return")
-                && matches!(args.len(), 7 | 9 | 11) =>
+                && matches!(args.len(), 7 | 9 | 11 | 13) =>
         {
             let mut candidate_output = None;
+            let mut slice_output = None;
             let mut report_output = None;
             for pair in args[7..].chunks_exact(2) {
                 match pair[0].as_str() {
                     "--candidate-output" if candidate_output.is_none() => {
                         candidate_output = Some(pair[1].as_str());
+                    }
+                    "--slice-output" if slice_output.is_none() => {
+                        slice_output = Some(pair[1].as_str());
                     }
                     "--output" if report_output.is_none() => {
                         report_output = Some(pair[1].as_str());
@@ -441,6 +445,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             let request = serde_json::to_value(&plan)?;
             let bridge = run_triton_bridge(&request)?;
             validate_snapshot_bridge_result(&plan, &bridge)?;
+            if let Some(path) = slice_output {
+                if bridge["input_condition_slice"].is_null() {
+                    return Err("no completed failing seed trace is available for a slice".into());
+                }
+                write_new_or_identical(
+                    path,
+                    &serde_json::to_vec_pretty(&bridge["input_condition_slice"])?,
+                )?;
+            }
             let mut claim = "no_function_witness";
             let mut candidate_spec = None;
             let mut native_replay = None;
@@ -2175,6 +2188,153 @@ fn validate_snapshot_bridge_result(
     {
         return Err("Triton snapshot diagnostic exceeds limit".into());
     }
+    validate_input_condition_slice(plan, &result["input_condition_slice"])?;
+    Ok(())
+}
+
+fn slice_indices(value: &serde_json::Value, limit: usize) -> Result<Vec<u64>, Box<dyn Error>> {
+    let values = value
+        .as_array()
+        .ok_or("Triton slice index list is missing")?;
+    if values.len() > limit {
+        return Err("Triton slice index list exceeds limit".into());
+    }
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let index = value.as_u64().ok_or("Triton slice index is invalid")?;
+        if result.last().is_some_and(|previous| *previous >= index) {
+            return Err("Triton slice indices must be strictly increasing".into());
+        }
+        result.push(index);
+    }
+    Ok(result)
+}
+
+fn validate_input_condition_slice(
+    plan: &hydir_execution::SnapshotResumePlan,
+    slice: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    if slice.is_null() {
+        return Ok(());
+    }
+    let code = hydir_execution::decode_hex(&plan.code_hex, 4096)?;
+    let code_end = plan
+        .code_address
+        .checked_add(code.len() as u64)
+        .ok_or("Triton slice code address overflows")?;
+    if slice["schema_version"] != 1
+        || slice["kind"] != "input_condition_slice"
+        || slice["scope"] != "captured_seed_trace_structural_dependencies"
+        || slice["binary_sha256"] != plan.binary_sha256
+        || slice["input_sha256"] != plan.input_sha256
+        || slice["snapshot_sha256"] != plan.snapshot_sha256
+        || slice["probe_sha256"] != plan.probe_sha256
+        || slice["code_sha256"] != format!("{:x}", sha2::Sha256::digest(&code))
+        || slice["code_address"] != plan.code_address
+        || slice["origin_id"] != plan.symbolic_origin.id
+        || slice["channel"] != serde_json::to_value(&plan.symbolic_origin.channel)?
+        || slice["channel_offset"] != plan.symbolic_origin.offset
+        || slice["seed_hex"] != plan.seed_hex
+        || slice["return_equals"] != plan.return_equals
+    {
+        return Err("Triton input-condition slice identity or scope mismatch".into());
+    }
+    let observed = slice["observed_return"]
+        .as_u64()
+        .ok_or("Triton slice observed return is missing")?;
+    if observed == plan.return_equals {
+        return Err("Triton slice does not describe a failed seed".into());
+    }
+    let complete = slice["ast_walk_complete"]
+        .as_bool()
+        .ok_or("Triton slice completeness flag is missing")?;
+    let unresolved = slice["unresolved_dependencies"]
+        .as_array()
+        .ok_or("Triton slice unresolved dependencies are missing")?;
+    if unresolved.len() < 3
+        || unresolved.len() > 5
+        || unresolved[0] != "origin_channel_provenance_unproven_byte_equality_only"
+        || unresolved[1] != "other_paths_and_environment_not_in_this_trace"
+        || unresolved[2] != "symbolic_memory_address_dependencies_not_analyzed"
+        || unresolved.iter().any(|item| item.as_str().is_none())
+        || (complete && unresolved.len() != 3)
+    {
+        return Err("Triton slice uncertainty statement is invalid".into());
+    }
+    let instructions = slice["instructions"]
+        .as_array()
+        .ok_or("Triton slice instructions are missing")?;
+    if instructions.is_empty() || instructions.len() > plan.max_instructions_per_seed as usize {
+        return Err("Triton slice instruction count exceeds path budget".into());
+    }
+    for (index, instruction) in instructions.iter().enumerate() {
+        let address = instruction["address"]
+            .as_u64()
+            .ok_or("Triton slice instruction address is invalid")?;
+        if instruction["index"] != index
+            || !(plan.code_address..code_end).contains(&address)
+            || instruction["code_offset"] != address - plan.code_address
+            || instruction["disassembly"]
+                .as_str()
+                .is_none_or(|text| text.is_empty() || text.len() > 256)
+        {
+            return Err("Triton slice instruction is outside captured code".into());
+        }
+    }
+    let decisions = slice["decisions"]
+        .as_array()
+        .ok_or("Triton slice decisions are missing")?;
+    if decisions.is_empty() || decisions.len() > 65 {
+        return Err("Triton slice decision count exceeds limit".into());
+    }
+    let mut all_offsets = std::collections::BTreeSet::new();
+    let mut all_sources = std::collections::BTreeSet::new();
+    for (position, decision) in decisions.iter().enumerate() {
+        let occurrence = decision["occurrence"]
+            .as_u64()
+            .ok_or("Triton slice decision occurrence is invalid")?
+            as usize;
+        if occurrence >= instructions.len()
+            || decision["address"] != instructions[occurrence]["address"]
+        {
+            return Err("Triton slice decision is outside captured trace".into());
+        }
+        let kind = decision["kind"]
+            .as_str()
+            .ok_or("Triton slice decision kind is missing")?;
+        if (position + 1 == decisions.len()) != (kind == "return") {
+            return Err("Triton slice must end with one return decision".into());
+        }
+        if kind == "return" {
+            if decision["observed_value"] != observed {
+                return Err("Triton slice return observation differs".into());
+            }
+        } else if kind != "branch" || decision["taken_target"].as_u64().is_none() {
+            return Err("Triton slice branch decision is invalid".into());
+        }
+        let offsets = slice_indices(&decision["origin_offsets"], plan.symbolic_origin.length)?;
+        let sources = slice_indices(&decision["source_occurrences"], instructions.len())?;
+        if offsets
+            .iter()
+            .any(|offset| *offset >= plan.symbolic_origin.length as u64)
+            || sources.iter().any(|source| *source > occurrence as u64)
+        {
+            return Err("Triton slice dependency is outside origin or trace".into());
+        }
+        if !offsets.is_empty() {
+            all_offsets.extend(offsets);
+            all_sources.extend(sources);
+        }
+    }
+    if slice_indices(
+        &slice["relevant_origin_offsets"],
+        plan.symbolic_origin.length,
+    )? != all_offsets.into_iter().collect::<Vec<_>>()
+        || slice_indices(&slice["source_occurrences"], instructions.len())?
+            != all_sources.into_iter().collect::<Vec<_>>()
+    {
+        return Err("Triton slice summary differs from decision dependencies".into());
+    }
     Ok(())
 }
 
@@ -2337,7 +2497,8 @@ int main(int argc, char **argv) {
 
 #[cfg(test)]
 mod tests {
-    use super::read_validation_cases;
+    use super::{read_validation_cases, validate_input_condition_slice};
+    use sha2::Digest;
 
     #[test]
     fn external_cases_preserve_full_width_inputs() {
@@ -2350,5 +2511,75 @@ mod tests {
         );
         std::fs::write(&path, r#"[[18446744073709551615,"0"]]"#).unwrap();
         assert!(read_validation_cases(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn input_condition_slice_rejects_changed_identity_and_origin_range() {
+        let plan = hydir_execution::SnapshotResumePlan {
+            schema_version: 1,
+            operation: "snapshot_return".into(),
+            binary_sha256: "0".repeat(64),
+            input_sha256: "1".repeat(64),
+            snapshot_sha256: "2".repeat(64),
+            probe_sha256: "3".repeat(64),
+            code_address: 0x1000,
+            code_hex: "c3".into(),
+            registers: Default::default(),
+            pages: vec![],
+            symbolic_origin: hydir_execution::InputOrigin {
+                id: "byte0".into(),
+                channel: hydir_execution::InputChannel::Stdin,
+                offset: 0,
+                length: 1,
+                encoding: hydir_execution::InputEncoding::Raw,
+                alphabet_hex: String::new(),
+            },
+            origin_address: 0x2000,
+            seed_hex: "42".into(),
+            origin_probe_evidence: hydir_execution::ProbeEvidence::ByteEqualityOnly,
+            assumptions: vec![],
+            return_equals: 1,
+            max_seeds: 4,
+            max_instructions_per_seed: 8,
+            max_solver_queries: 4,
+            wall_timeout_ms: 1000,
+            solver_timeout_ms: 100,
+        };
+        let mut slice = serde_json::json!({
+            "schema_version": 1,
+            "kind": "input_condition_slice",
+            "scope": "captured_seed_trace_structural_dependencies",
+            "binary_sha256": plan.binary_sha256,
+            "input_sha256": plan.input_sha256,
+            "snapshot_sha256": plan.snapshot_sha256,
+            "probe_sha256": plan.probe_sha256,
+            "code_sha256": format!("{:x}", sha2::Sha256::digest([0xc3])),
+            "code_address": 0x1000,
+            "origin_id": "byte0",
+            "channel": {"kind": "stdin"},
+            "channel_offset": 0,
+            "seed_hex": "42",
+            "observed_return": 0,
+            "return_equals": 1,
+            "ast_walk_complete": true,
+            "relevant_origin_offsets": [0],
+            "source_occurrences": [],
+            "instructions": [{"index": 0, "address": 0x1000,
+                              "code_offset": 0, "disassembly": "ret"}],
+            "decisions": [{"kind": "return", "occurrence": 0,
+                           "address": 0x1000, "observed_value": 0,
+                           "origin_offsets": [0], "source_occurrences": []}],
+            "unresolved_dependencies": [
+                "origin_channel_provenance_unproven_byte_equality_only",
+                "other_paths_and_environment_not_in_this_trace",
+                "symbolic_memory_address_dependencies_not_analyzed"
+            ]
+        });
+        validate_input_condition_slice(&plan, &slice).unwrap();
+        slice["decisions"][0]["origin_offsets"] = serde_json::json!([1]);
+        assert!(validate_input_condition_slice(&plan, &slice).is_err());
+        slice["decisions"][0]["origin_offsets"] = serde_json::json!([0]);
+        slice["code_sha256"] = serde_json::json!("4".repeat(64));
+        assert!(validate_input_condition_slice(&plan, &slice).is_err());
     }
 }
