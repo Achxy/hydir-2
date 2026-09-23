@@ -31,6 +31,7 @@ def main() -> None:
         specification = work / "input.json"
         matching = work / "matching.json"
         mismatching = work / "mismatching.json"
+        crashed = work / "crashed.json"
         run("clang", "-O1", ROOT / "tests" / "fixtures" / "replay_channels.c", "-o", binary)
         run("cargo", "build", "--locked", "-q", "-p", "hydir-cli")
         run(CTL, "replay", "init", binary, "--output", specification)
@@ -55,6 +56,14 @@ def main() -> None:
         specification.write_text(json.dumps(spec), encoding="utf-8")
         run(CTL, "replay", binary, specification, "--output", mismatching)
         expect_report(mismatching, "goal_mismatched", 1)
+        spec["argv_hex"] = [b"crash".hex()]
+        spec["goal"] = {"exit_code": 139, "stdout_contains_hex": None, "stderr_contains_hex": None}
+        specification.write_text(json.dumps(spec), encoding="utf-8")
+        run(CTL, "replay", binary, specification, "--output", crashed)
+        crash_report = json.loads(crashed.read_text(encoding="utf-8"))
+        assert crash_report["status"] == "runner_error", crash_report
+        assert crash_report["exit_code"] is None, crash_report
+        assert crash_report["diagnostic"], crash_report
 
 
 if __name__ == "__main__":

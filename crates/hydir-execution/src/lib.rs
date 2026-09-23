@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod gdb_mi;
+mod snapshot;
+pub use gdb_mi::{MiListEntry, MiRecord, MiValue, parse_mi_line};
+pub use snapshot::{
+    EXECUTION_SNAPSHOT_VERSION, ExecutionSnapshot, MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+    MemoryMapping, MemoryPage, MemoryPageState, MemoryReadError, RegisterObservation,
+    SnapshotStatus, StopPoint, parse_execution_snapshot, read_snapshot_memory,
+    validate_execution_snapshot,
+};
+
 #[cfg(target_os = "linux")]
 mod runner;
 #[cfg(target_os = "linux")]
@@ -324,10 +334,26 @@ pub fn validate_replay_report(
     {
         return Err("replay report metadata exceeds limit".into());
     }
+    if matches!(
+        report.status,
+        ReplayStatus::TimedOut
+            | ReplayStatus::OutputLimit
+            | ReplayStatus::RunnerError
+            | ReplayStatus::UnsupportedHost
+    ) && !report
+        .diagnostic
+        .as_ref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err("incomplete replay requires a diagnostic".into());
+    }
     let stdout = decode_hex(&report.stdout_hex, input.budget.output_bytes as usize)?;
     let stderr = decode_hex(&report.stderr_hex, input.budget.output_bytes as usize)?;
     if stdout.len() + stderr.len() > input.budget.output_bytes as usize {
         return Err("replay output exceeds budget".into());
+    }
+    if report.signal.is_some() {
+        return Err("ReplayReport v1 has no independent signal observation".into());
     }
     if matches!(report.status, ReplayStatus::UnsupportedHost)
         && (!stdout.is_empty() || !stderr.is_empty() || report.elapsed_ms != 0)
@@ -339,6 +365,9 @@ pub fn validate_replay_report(
         ReplayStatus::GoalMatched | ReplayStatus::GoalMismatched
     ) {
         let exit = report.exit_code.ok_or("observed replay has no exit code")?;
+        if !(0..128).contains(&exit) {
+            return Err("Bubblewrap cannot distinguish this exit value from a signal".into());
+        }
         let stdout_goal = input
             .goal
             .stdout_contains_hex
@@ -493,6 +522,15 @@ mod tests {
         report.status = ReplayStatus::GoalMismatched;
         validate_replay_report(&elf, &input, &report).unwrap();
         report.status = ReplayStatus::TimedOut;
+        assert!(validate_replay_report(&elf, &input, &report).is_err());
+        report.status = ReplayStatus::GoalMismatched;
+        report.exit_code = Some(139);
+        assert!(validate_replay_report(&elf, &input, &report).is_err());
+        report.status = ReplayStatus::RunnerError;
+        report.exit_code = None;
+        report.diagnostic = Some("exit status ambiguous".into());
+        validate_replay_report(&elf, &input, &report).unwrap();
+        report.signal = Some(11);
         assert!(validate_replay_report(&elf, &input, &report).is_err());
     }
 }

@@ -20,7 +20,10 @@ use hydir_decompile::{
     export_function_ir_llvm, lift_machine_function, lift_machine_function_at, lower_cir,
     lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
-use hydir_execution::{InputSpec, ReplayBudget, ReplayGoal, parse_input_spec, validate_input_spec};
+use hydir_execution::{
+    InputSpec, ReplayBudget, ReplayGoal, parse_execution_snapshot, parse_input_spec,
+    validate_execution_snapshot, validate_input_spec,
+};
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
@@ -83,6 +86,7 @@ Usage:
   hydirctl replay init <linked-elf> [--output <input.json>]
   hydirctl replay verify <linked-elf> <input.json>
   hydirctl replay <linked-elf> <input.json> [--output <report.json>]
+  hydirctl snapshot verify <linked-elf> <input.json> <snapshot.json>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -132,12 +136,44 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("verify") && args.len() == 5 =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            validate_execution_snapshot(&bytes, &spec, &snapshot)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": snapshot.schema_version,
+                    "valid": true,
+                    "status": snapshot.status,
+                    "binary_sha256": snapshot.binary_sha256,
+                    "input_sha256": snapshot.input_sha256,
+                    "thread_count": snapshot.thread_count,
+                    "mappings": snapshot.mappings.len(),
+                    "present_pages": snapshot.pages.iter().filter(|page| matches!(page.value, hydir_execution::MemoryPageState::Present { .. })).count(),
+                    "unavailable_pages": snapshot.pages.iter().filter(|page| matches!(page.value, hydir_execution::MemoryPageState::Unavailable { .. })).count(),
+                    "stop": snapshot.stop,
+                }))?
+            );
+        }
         Some("replay")
             if !matches!(args.get(1).map(String::as_str), Some("init" | "verify"))
                 && (args.len() == 3 || args.len() == 5 && args[3] == "--output") =>
         {
             let bytes = read_binary(&args[1])?;
-            let spec = parse_input_spec(&fs::read(&args[2])?)?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[2],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
             validate_input_spec(&bytes, &spec)?;
             #[cfg(target_os = "linux")]
             let report = hydir_execution::replay_local(&bytes, &spec)?;
@@ -206,7 +242,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("replay") if args.get(1).map(String::as_str) == Some("verify") && args.len() == 4 => {
             let bytes = read_binary(&args[2])?;
-            let spec = parse_input_spec(&fs::read(&args[3])?)?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
             validate_input_spec(&bytes, &spec)?;
             println!(
                 "{}",
@@ -485,6 +524,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "typed_cfg_v3": true,
                     "typed_c_local_cache": true,
                     "execution_snapshot_v1": false,
+                    "execution_snapshot_schema_v1": true,
+                    "gdb_mi_parser_v1": true,
+                    "gdb_mi_parser_scope": "bounded result, async, and stream records with nested tuples/lists and C-style escaped bytes; no session controller yet",
+                    "gdb_capture_v1": false,
                     "input_spec_v1": true,
                     "native_replay_v1": false,
                     "bubblewrap_installed": bwrap_version.is_some(),
@@ -1636,6 +1679,17 @@ fn read_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_BINARY_BYTES {
         return Err("binary changed during read and exceeds 64 MiB import limit".into());
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_json(path: impl AsRef<Path>, limit: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err("JSON artifact exceeds size limit".into());
     }
     Ok(bytes)
 }
