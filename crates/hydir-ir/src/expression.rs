@@ -38,6 +38,21 @@ pub enum Expression {
         value: u64,
         width_bits: u16,
     },
+    Extract {
+        value: Box<Expression>,
+        lsb_bits: u16,
+        width_bits: u16,
+    },
+    ZeroExtend {
+        value: Box<Expression>,
+        width_bits: u16,
+    },
+    InsertBits {
+        original: Box<Expression>,
+        value: Box<Expression>,
+        lsb_bits: u16,
+        width_bits: u16,
+    },
     Binary {
         operator: BinaryOperator,
         width_bits: u16,
@@ -51,6 +66,9 @@ impl Expression {
         match self {
             Self::Read { width_bits, .. }
             | Self::Constant { width_bits, .. }
+            | Self::Extract { width_bits, .. }
+            | Self::ZeroExtend { width_bits, .. }
+            | Self::InsertBits { width_bits, .. }
             | Self::Binary { width_bits, .. } => *width_bits,
         }
     }
@@ -130,6 +148,39 @@ fn validate_expression(
         }
         Expression::Read { source, .. } if !inputs.contains(source) => {
             Err("ExpressionIR reads a state version absent from its instruction".to_owned())
+        }
+        Expression::Extract {
+            value,
+            lsb_bits,
+            width_bits,
+        } => {
+            validate_expression(value, inputs, depth + 1)?;
+            if u32::from(*lsb_bits) + u32::from(*width_bits) > u32::from(value.width_bits()) {
+                return Err("ExpressionIR extract exceeds its source width".to_owned());
+            }
+            Ok(())
+        }
+        Expression::ZeroExtend { value, width_bits } => {
+            validate_expression(value, inputs, depth + 1)?;
+            if value.width_bits() >= *width_bits {
+                return Err("ExpressionIR zero extension does not widen its source".to_owned());
+            }
+            Ok(())
+        }
+        Expression::InsertBits {
+            original,
+            value,
+            lsb_bits,
+            width_bits,
+        } => {
+            validate_expression(original, inputs, depth + 1)?;
+            validate_expression(value, inputs, depth + 1)?;
+            if original.width_bits() != *width_bits
+                || u32::from(*lsb_bits) + u32::from(value.width_bits()) > u32::from(*width_bits)
+            {
+                return Err("ExpressionIR bit insertion exceeds its destination".to_owned());
+            }
+            Ok(())
         }
         Expression::Binary {
             width_bits,
