@@ -5,6 +5,9 @@
 //! unsupported instructions as explicit opaque effects and still returns a
 //! compilable low-level C artifact.
 
+mod expression;
+pub use expression::lower_expression_ir;
+
 use hydir_analysis::recover_pointer_table_targets;
 use hydir_backend::{
     disassemble_elf, extract_executable_window, extract_symbol_code, region_contract,
