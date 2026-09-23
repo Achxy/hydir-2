@@ -34,6 +34,35 @@ pub enum ComparisonOperator {
     UnsignedLess,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryByteOrder {
+    Little,
+}
+
+/// A 64-bit x86 effective address. Segment-relative addressing remains a
+/// residual until its segment base is represented as a state component.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AddressExpression {
+    pub base: Option<Box<Expression>>,
+    pub index: Option<Box<Expression>>,
+    pub scale: u32,
+    pub displacement: i64,
+    pub absolute: Option<u64>,
+}
+
+/// An exact byte-range write with every possibly affected abstract memory
+/// region. Consumers must preserve the whole input/output region set.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MemoryWrite {
+    pub address: AddressExpression,
+    pub value: Expression,
+    pub width_bits: u16,
+    pub byte_order: MemoryByteOrder,
+    pub memory_inputs: Vec<StateComponentVersion>,
+    pub memory_outputs: Vec<StateComponentVersion>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Expression {
@@ -75,6 +104,15 @@ pub enum Expression {
     ParityEven {
         value: Box<Expression>,
     },
+    MemoryRead {
+        address: AddressExpression,
+        width_bits: u16,
+        byte_order: MemoryByteOrder,
+        memory_inputs: Vec<StateComponentVersion>,
+    },
+    EffectiveAddress {
+        address: AddressExpression,
+    },
 }
 
 impl Expression {
@@ -85,8 +123,10 @@ impl Expression {
             | Self::Extract { width_bits, .. }
             | Self::ZeroExtend { width_bits, .. }
             | Self::InsertBits { width_bits, .. }
-            | Self::Binary { width_bits, .. } => *width_bits,
+            | Self::Binary { width_bits, .. }
+            | Self::MemoryRead { width_bits, .. } => *width_bits,
             Self::Compare { .. } | Self::ParityEven { .. } => 1,
+            Self::EffectiveAddress { .. } => 64,
         }
     }
 }
@@ -120,6 +160,8 @@ pub struct ExpressionInstruction {
     pub input_components: Vec<StateComponentVersion>,
     pub output_components: Vec<StateComponentVersion>,
     pub assignments: Vec<ExpressionAssignment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_writes: Vec<MemoryWrite>,
     /// Taken-edge predicate for a supported conditional branch. The control
     /// output remains in the residual until control lowering is implemented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +190,43 @@ pub struct ExpressionFunctionIr {
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
     pub diagnostics: Vec<IrDiagnostic>,
+}
+
+fn validate_memory_versions(
+    versions: &[StateComponentVersion],
+    available: &BTreeSet<StateComponentVersion>,
+) -> Result<(), String> {
+    if versions.is_empty()
+        || versions.len() > 16
+        || versions.iter().cloned().collect::<BTreeSet<_>>().len() != versions.len()
+        || versions.iter().any(|version| {
+            !version.component.starts_with("memory:") || !available.contains(version)
+        })
+    {
+        return Err("ExpressionIR memory versions are missing or invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_address(
+    address: &AddressExpression,
+    inputs: &BTreeSet<StateComponentVersion>,
+    depth: usize,
+) -> Result<(), String> {
+    if !matches!(address.scale, 1 | 2 | 4 | 8)
+        || (address.index.is_none() && address.scale != 1)
+        || (address.absolute.is_some()
+            && (address.base.is_some() || address.index.is_some() || address.displacement != 0))
+    {
+        return Err("ExpressionIR effective address is invalid".to_owned());
+    }
+    for part in [&address.base, &address.index].into_iter().flatten() {
+        validate_expression(part, inputs, depth + 1)?;
+        if part.width_bits() != 64 {
+            return Err("ExpressionIR effective address register is not 64-bit".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn validate_expression(
@@ -231,6 +310,29 @@ fn validate_expression(
             }
             Ok(())
         }
+        Expression::MemoryRead {
+            address,
+            width_bits,
+            memory_inputs,
+            ..
+        } => {
+            if !matches!(*width_bits, 8 | 16 | 32 | 64) {
+                return Err("ExpressionIR memory read width is unsupported".to_owned());
+            }
+            validate_address(address, inputs, depth + 1)?;
+            validate_memory_versions(memory_inputs, inputs)?;
+            if memory_inputs.iter().cloned().collect::<BTreeSet<_>>()
+                != inputs
+                    .iter()
+                    .filter(|version| version.component.starts_with("memory:"))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            {
+                return Err("ExpressionIR memory read omits an alias region".to_owned());
+            }
+            Ok(())
+        }
+        Expression::EffectiveAddress { address } => validate_address(address, inputs, depth + 1),
         _ => Ok(()),
     }
 }
@@ -328,6 +430,53 @@ pub fn validate_expression_function_ir(ir: &ExpressionFunctionIr) -> Result<(), 
                     return Err("ExpressionIR assignment does not define one output".to_owned());
                 }
                 validate_expression(&assignment.value, &inputs, 0)?;
+            }
+            if instruction.memory_writes.len() > 16 {
+                return Err("ExpressionIR has too many memory writes in one instruction".to_owned());
+            }
+            for write in &instruction.memory_writes {
+                if !matches!(write.width_bits, 8 | 16 | 32 | 64)
+                    || write.value.width_bits() != write.width_bits
+                {
+                    return Err("ExpressionIR memory write width is invalid".to_owned());
+                }
+                validate_address(&write.address, &inputs, 0)?;
+                validate_expression(&write.value, &inputs, 0)?;
+                validate_memory_versions(&write.memory_inputs, &inputs)?;
+                validate_memory_versions(&write.memory_outputs, &outputs)?;
+                if write.memory_inputs.iter().cloned().collect::<BTreeSet<_>>()
+                    != inputs
+                        .iter()
+                        .filter(|version| version.component.starts_with("memory:"))
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                    || write
+                        .memory_outputs
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        != outputs
+                            .iter()
+                            .filter(|version| version.component.starts_with("memory:"))
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                    || write
+                        .memory_inputs
+                        .iter()
+                        .map(|version| &version.component)
+                        .collect::<BTreeSet<_>>()
+                        != write
+                            .memory_outputs
+                            .iter()
+                            .map(|version| &version.component)
+                            .collect::<BTreeSet<_>>()
+                    || write
+                        .memory_outputs
+                        .iter()
+                        .any(|version| !assigned.insert(version.clone()))
+                {
+                    return Err("ExpressionIR memory write loses an alias region".to_owned());
+                }
             }
             if let Some(condition) = &instruction.condition {
                 validate_expression(condition, &inputs, 0)?;

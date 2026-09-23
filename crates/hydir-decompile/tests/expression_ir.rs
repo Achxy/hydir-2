@@ -205,6 +205,10 @@ fn evaluate(expression: &Expression, inputs: &BTreeMap<&str, u64>) -> u64 {
         Expression::ParityEven { value } => {
             u64::from(((evaluate(value, inputs) & 0xff) as u8).count_ones() % 2 == 0)
         }
+        Expression::MemoryRead { .. } => panic!("scalar flag oracle does not evaluate memory"),
+        Expression::EffectiveAddress { .. } => {
+            panic!("scalar flag oracle does not evaluate effective addresses")
+        }
     }
 }
 
@@ -511,4 +515,353 @@ fn expression_ir_flag_widths_cover_byte_word_and_qword() {
         assert!(sub.residual.is_none());
         validate_expression_function_ir(&expressions).unwrap();
     }
+}
+
+#[test]
+fn expression_ir_memory_accesses_keep_index_width_order_and_all_alias_regions() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/vm_vadd.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("vm_vadd.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("Clang is required for the VM memory fixture");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let native = decompile_symbol(&fs::read(object).unwrap(), "vm_vadd").unwrap();
+    let expressions = lower_expression_ir(&native.machine_ir, &native.state_ir).unwrap();
+    let instructions = expressions
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+
+    let indexed_load = instructions
+        .iter()
+        .find(|instruction| {
+            instruction.assignments.iter().any(|assignment| {
+                matches!(
+                    assignment.value,
+                    Expression::MemoryRead { ref address, .. } if address.index.is_some()
+                )
+            })
+        })
+        .unwrap();
+    let Expression::MemoryRead {
+        address,
+        width_bits,
+        byte_order,
+        memory_inputs,
+    } = &indexed_load.assignments[0].value
+    else {
+        panic!("indexed load must assign a memory read");
+    };
+    assert_eq!(*width_bits, 64);
+    assert_eq!(*byte_order, hydir_ir::expression::MemoryByteOrder::Little);
+    assert_eq!((address.scale, address.displacement), (8, 16));
+    assert_eq!(address.absolute, None);
+    assert!(
+        matches!(address.base.as_deref(), Some(Expression::Read { source, .. }) if source.component == "register:rdi")
+    );
+    assert!(
+        matches!(address.index.as_deref(), Some(Expression::Read { source, .. }) if source.component == "register:rcx")
+    );
+    assert_eq!(
+        memory_inputs
+            .iter()
+            .map(|version| version.component.as_str())
+            .collect::<Vec<_>>(),
+        ["memory:heap", "memory:unknown"]
+    );
+    assert!(indexed_load.residual.is_none());
+
+    let indexed_store = instructions
+        .iter()
+        .find(|instruction| {
+            instruction
+                .memory_writes
+                .iter()
+                .any(|write| write.address.index.is_some())
+        })
+        .unwrap();
+    let write = &indexed_store.memory_writes[0];
+    assert_eq!(
+        (
+            write.width_bits,
+            write.address.scale,
+            write.address.displacement
+        ),
+        (64, 8, 16)
+    );
+    assert_eq!(
+        write.byte_order,
+        hydir_ir::expression::MemoryByteOrder::Little
+    );
+    assert_eq!(
+        write
+            .memory_inputs
+            .iter()
+            .map(|version| version.component.as_str())
+            .collect::<Vec<_>>(),
+        ["memory:heap", "memory:unknown"]
+    );
+    assert_eq!(
+        write
+            .memory_outputs
+            .iter()
+            .map(|version| version.component.as_str())
+            .collect::<Vec<_>>(),
+        ["memory:heap", "memory:unknown"]
+    );
+    assert!(indexed_store.residual.is_none());
+    assert!(instructions.iter().any(|instruction| {
+        instruction.mnemonic == "add"
+            && instruction
+                .residual
+                .as_ref()
+                .is_some_and(|residual| residual.memory == hydir_ir::MachineMemoryEffect::Read)
+    }));
+    validate_expression_function_ir(&expressions).unwrap();
+
+    let mut missing_read_alias = expressions.clone();
+    let load = missing_read_alias
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| instruction.bytes_hex == indexed_load.bytes_hex)
+        .unwrap();
+    let Expression::MemoryRead { memory_inputs, .. } = &mut load.assignments[0].value else {
+        unreachable!()
+    };
+    memory_inputs.pop();
+    assert!(validate_expression_function_ir(&missing_read_alias).is_err());
+
+    let mut missing_write_alias = expressions.clone();
+    let store = missing_write_alias
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| instruction.bytes_hex == indexed_store.bytes_hex)
+        .unwrap();
+    store.memory_writes[0].memory_outputs.pop();
+    assert!(validate_expression_function_ir(&missing_write_alias).is_err());
+
+    let encoded = serde_json::to_vec(&expressions).unwrap();
+    let decoded: ExpressionFunctionIr = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, expressions);
+    validate_expression_function_ir(&decoded).unwrap();
+}
+
+#[test]
+fn expression_ir_tracks_byte_ranges_and_leaves_segment_base_unresolved() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/expression_memory.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("expression_memory.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("Clang is required for the byte-range fixture");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let native = decompile_symbol(&fs::read(object).unwrap(), "hydir_expression_memory").unwrap();
+    let expressions = lower_expression_ir(&native.machine_ir, &native.state_ir).unwrap();
+    let instructions = expressions
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+
+    let load32 = instructions
+        .iter()
+        .find(|instruction| instruction.bytes_hex.starts_with("8b07"))
+        .unwrap();
+    let Expression::ZeroExtend {
+        value,
+        width_bits: 64,
+    } = &load32.assignments[0].value
+    else {
+        panic!("32-bit memory load must clear upper register bits");
+    };
+    let Expression::MemoryRead {
+        width_bits: 32,
+        memory_inputs,
+        address,
+        ..
+    } = value.as_ref()
+    else {
+        panic!("32-bit load must read four bytes");
+    };
+    assert_eq!(address.displacement, 0);
+    assert_eq!(
+        memory_inputs
+            .iter()
+            .map(|version| version.component.as_str())
+            .collect::<Vec<_>>(),
+        ["memory:heap", "memory:unknown"]
+    );
+
+    let byte_store = instructions
+        .iter()
+        .find(|instruction| {
+            instruction
+                .memory_writes
+                .iter()
+                .any(|write| write.width_bits == 8)
+        })
+        .unwrap();
+    let write = &byte_store.memory_writes[0];
+    assert_eq!(write.address.displacement, 1);
+    assert_eq!(
+        write
+            .memory_outputs
+            .iter()
+            .map(|version| version.component.as_str())
+            .collect::<Vec<_>>(),
+        ["memory:heap", "memory:unknown"]
+    );
+    assert!(byte_store.residual.is_none());
+
+    let byte_load =
+        instructions
+            .iter()
+            .find(|instruction| {
+                instruction.assignments.iter().any(|assignment| matches!(
+                assignment.value,
+                Expression::InsertBits { ref value, .. }
+                    if matches!(value.as_ref(), Expression::MemoryRead { width_bits: 8, .. })
+            ))
+            })
+            .unwrap();
+    let Expression::InsertBits {
+        value, lsb_bits: 0, ..
+    } = &byte_load.assignments[0].value
+    else {
+        panic!("byte memory load must preserve the other parent register bits");
+    };
+    let Expression::MemoryRead { address, .. } = value.as_ref() else {
+        unreachable!()
+    };
+    assert_eq!(address.displacement, 2);
+    assert!(byte_load.residual.is_none());
+
+    let stack_accesses = instructions
+        .iter()
+        .flat_map(|instruction| &instruction.memory_writes)
+        .filter(|write| {
+            write
+                .memory_outputs
+                .iter()
+                .all(|version| version.component == "memory:stack")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stack_accesses.len(), 1);
+    assert_eq!(stack_accesses[0].address.displacement, -8);
+    assert_eq!(stack_accesses[0].width_bits, 64);
+
+    let narrow_address = instructions
+        .iter()
+        .find(|instruction| instruction.bytes_hex.starts_with("67"))
+        .unwrap();
+    assert!(narrow_address.assignments.is_empty());
+    assert!(
+        narrow_address
+            .residual
+            .as_ref()
+            .is_some_and(|residual| { residual.memory == hydir_ir::MachineMemoryEffect::Read })
+    );
+
+    let fs_load = instructions.iter().find(|instruction| instruction.residual.as_ref().is_some_and(|residual| {
+        residual.operands.iter().any(|operand| matches!(operand, hydir_ir::MachineOperand::Memory { segment: Some(segment), .. } if segment == "fs"))
+    })).unwrap();
+    assert!(fs_load.assignments.is_empty());
+    assert!(fs_load.residual.is_some());
+
+    let leas = instructions
+        .iter()
+        .filter(|instruction| instruction.mnemonic == "lea")
+        .collect::<Vec<_>>();
+    assert_eq!(leas.len(), 2);
+    let Expression::EffectiveAddress { address } = &leas[0].assignments[0].value else {
+        panic!("64-bit LEA must retain its effective address");
+    };
+    assert_eq!((address.scale, address.displacement), (8, 16));
+    assert!(address.base.is_some() && address.index.is_some());
+    assert!(leas[0].residual.is_none());
+    let Expression::ZeroExtend { value, .. } = &leas[1].assignments[0].value else {
+        panic!("32-bit LEA must clear upper register bits");
+    };
+    assert!(
+        matches!(value.as_ref(), Expression::Extract { value, width_bits: 32, .. }
+        if matches!(value.as_ref(), Expression::EffectiveAddress { .. }))
+    );
+    assert!(leas[1].residual.is_none());
+    validate_expression_function_ir(&expressions).unwrap();
+}
+
+#[test]
+fn expression_ir_does_not_assert_object_file_relocation_placeholders() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/global_effects.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("global_effects.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("Clang is required for the relocation fixture");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let native = decompile_symbol(&fs::read(object).unwrap(), "hydir_leaf").unwrap();
+    let expressions = lower_expression_ir(&native.machine_ir, &native.state_ir).unwrap();
+    let write = expressions
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| instruction.mnemonic == "mov")
+        .unwrap();
+    assert!(write.address.address_space != 0);
+    assert!(write.memory_writes.is_empty());
+    assert!(
+        write
+            .residual
+            .as_ref()
+            .is_some_and(|residual| residual.memory == hydir_ir::MachineMemoryEffect::Write)
+    );
+    validate_expression_function_ir(&expressions).unwrap();
+
+    let linked = decompile_symbol(&prism(), "hydir_stage_record").unwrap();
+    let linked_expressions = lower_expression_ir(&linked.machine_ir, &linked.state_ir).unwrap();
+    let linked_write = linked_expressions
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| {
+            instruction
+                .memory_writes
+                .iter()
+                .any(|write| write.address.absolute.is_some())
+        })
+        .unwrap();
+    assert_eq!(linked_write.address.address_space, 0);
+    assert!(linked_write.memory_writes[0].address.absolute.unwrap() > 0x1000);
+    assert!(linked_write.residual.is_none());
+    validate_expression_function_ir(&linked_expressions).unwrap();
 }
