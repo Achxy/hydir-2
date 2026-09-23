@@ -380,6 +380,7 @@ fn logical_result_compound_flags_match_signed_and_unsigned_oracles() {
         ("hydir_cfg_xor_signed_gt", "generated_xor_gt"),
         ("hydir_cfg_and_carry_clear", "generated_and_no_carry"),
         ("hydir_cfg_or_overflow_set", "generated_or_overflow"),
+        ("hydir_cfg_logical_join", "generated_logical_join"),
     ] {
         let native = decompile_symbol(&bytes, symbol).unwrap();
         let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
@@ -400,6 +401,9 @@ fn logical_result_compound_flags_match_signed_and_unsigned_oracles() {
       (xor_result != 0 && (xor_result & high_bit) == 0)) return 3;
   if (generated_and_no_carry(a,b) != 1) return 4;
   if (generated_or_overflow(a,b) != 0) return 5;
+  for (uint64_t select = 0; select < 2; ++select)
+    if (generated_logical_join(a,b,select) !=
+        (test_result != 0 && (test_result & high_bit) == 0)) return 6;
   return 0;
 }
 int main(void) {

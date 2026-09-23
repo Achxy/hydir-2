@@ -223,6 +223,26 @@ hydir_cfg_or_overflow_set:
     retq
 .size hydir_cfg_or_overflow_set, .-hydir_cfg_or_overflow_set
 
+.globl hydir_cfg_logical_join
+.type hydir_cfg_logical_join,@function
+hydir_cfg_logical_join:
+    testq %rdx, %rdx
+    jz .Llogical_join_test
+    movq %rdi, %rax
+    andq %rsi, %rax
+    jmp .Llogical_join_branch
+.Llogical_join_test:
+    testq %rsi, %rdi
+    movq %rdi, %rax
+.Llogical_join_branch:
+    jg .Llogical_join_positive
+    movq $0, %rax
+    retq
+.Llogical_join_positive:
+    movq $1, %rax
+    retq
+.size hydir_cfg_logical_join, .-hydir_cfg_logical_join
+
 .globl hydir_cfg_memory
 .type hydir_cfg_memory,@function
 hydir_cfg_memory:

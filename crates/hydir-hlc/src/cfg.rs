@@ -980,9 +980,8 @@ fn edge(instruction: &MachineInstruction, kind: MachineEdgeKind) -> Result<Locat
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlagSource {
     Compare,
-    Test,
+    Logical,
     Add,
-    ResultZero,
 }
 
 fn writes_flags(instruction: &MachineInstruction) -> bool {
@@ -1060,12 +1059,12 @@ fn flag_transfer(
     };
     match family.as_str() {
         "cmp" => Some(FlagSource::Compare),
-        "test" => Some(FlagSource::Test),
+        "test" => Some(FlagSource::Logical),
         // SUB and CMP set CF/SF/OF/ZF from the same ordered operands. The
         // destination write must not replace those operands before a branch.
         "sub" => Some(FlagSource::Compare),
         "add" => Some(FlagSource::Add),
-        "xor" | "and" | "or" => Some(FlagSource::ResultZero),
+        "xor" | "and" | "or" => Some(FlagSource::Logical),
         _ => incoming,
     }
 }
@@ -1137,14 +1136,8 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
     // Keep the direct two-operand form when the branch reads only ZF. The
     // structurer can then fold sole-reader snapshots back into readable C.
     let simple_zero = match (source, family) {
-        (Some(FlagSource::Test), "je" | "jz" | "jbe" | "jna") => Some(HighCfgCompareOp::TestZero),
-        (Some(FlagSource::Test), "jne" | "jnz" | "ja" | "jnbe") => {
-            Some(HighCfgCompareOp::TestNonzero)
-        }
-        (Some(FlagSource::ResultZero), "je" | "jz" | "jbe" | "jna") => {
-            Some(HighCfgCompareOp::Equal)
-        }
-        (Some(FlagSource::ResultZero), "jne" | "jnz" | "ja" | "jnbe") => {
+        (Some(FlagSource::Logical), "je" | "jz" | "jbe" | "jna") => Some(HighCfgCompareOp::Equal),
+        (Some(FlagSource::Logical), "jne" | "jnz" | "ja" | "jnbe") => {
             Some(HighCfgCompareOp::NotEqual)
         }
         _ => None,
@@ -1160,22 +1153,13 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
             },
         });
     }
-    if matches!(source, Some(FlagSource::Test | FlagSource::ResultZero)) {
-        let left = HighExpr::Variable {
-            name: FLAG_LEFT.to_owned(),
-        };
-        let result = if source == Some(FlagSource::Test) {
-            HighExpr::Binary {
-                op: BinaryOp::And,
-                left: Box::new(left),
-                right: Box::new(HighExpr::Variable {
-                    name: FLAG_RIGHT.to_owned(),
-                }),
-            }
-        } else {
-            left
-        };
-        return logical_flag_predicate(family, result);
+    if source == Some(FlagSource::Logical) {
+        return logical_flag_predicate(
+            family,
+            HighExpr::Variable {
+                name: FLAG_LEFT.to_owned(),
+            },
+        );
     }
     let op = match (source, family) {
         (Some(FlagSource::Compare), "je" | "jz") => HighCfgCompareOp::Equal,
@@ -1485,23 +1469,40 @@ fn lower_instruction(
                     site,
                 );
             }
-            *flag_source = Some(FlagSource::ResultZero);
+            *flag_source = Some(FlagSource::Logical);
             None
         }
-        ("cmp" | "test", [_left, _right])
-            if instruction.effects.control == MachineControlEffect::Next =>
-        {
+        ("cmp", [_left, _right]) if instruction.effects.control == MachineControlEffect::Next => {
             // Snapshot operands now: later register writes must not alter the flags.
             if snapshot_flags {
                 let (left, right) = normalized_flag_operands(semantic, family)?;
                 push_assignment(statements, FLAG_LEFT.to_owned(), left, site);
                 push_assignment(statements, FLAG_RIGHT.to_owned(), right, site);
             }
-            *flag_source = Some(if family == "cmp" {
-                FlagSource::Compare
-            } else {
-                FlagSource::Test
-            });
+            *flag_source = Some(FlagSource::Compare);
+            None
+        }
+        ("test", [_left, _right]) if instruction.effects.control == MachineControlEffect::Next => {
+            if snapshot_flags {
+                let (left, right) = normalized_flag_operands(semantic, family)?;
+                push_assignment(
+                    statements,
+                    FLAG_LEFT.to_owned(),
+                    HighExpr::Binary {
+                        op: BinaryOp::And,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    site,
+                );
+                push_assignment(
+                    statements,
+                    FLAG_RIGHT.to_owned(),
+                    HighExpr::Constant { value: 0 },
+                    site,
+                );
+            }
+            *flag_source = Some(FlagSource::Logical);
             None
         }
         ("nop" | "endbr64", []) if instruction.effects.control == MachineControlEffect::Next => {
