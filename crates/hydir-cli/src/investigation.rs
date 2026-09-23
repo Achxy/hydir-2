@@ -32,10 +32,14 @@ fn build_claim(
     plan: &SnapshotResumePlan,
     bridge: &Value,
     candidate: &InputSpec,
+    original_replay: &NativeReplayReport,
     replay: &NativeReplayReport,
 ) -> Result<InvestigationClaim, Box<dyn Error>> {
-    if bridge["status"] != "function_witness" || replay.status != ReplayStatus::GoalMatched {
-        return Err("a native-goal claim requires a function witness and matched replay".into());
+    if bridge["status"] != "function_witness"
+        || original_replay.status != ReplayStatus::GoalMismatched
+        || replay.status != ReplayStatus::GoalMatched
+    {
+        return Err("a repair claim requires an original mismatch and a candidate match".into());
     }
     let candidate_hex = bridge["candidate_hex"]
         .as_str()
@@ -90,6 +94,7 @@ fn build_claim(
     let plan_sha256 = digest_json(plan)?;
     let bridge_sha256 = digest_json(bridge)?;
     let slice_sha256 = digest_json(slice)?;
+    let original_replay_sha256 = digest_json(original_replay)?;
     let replay_sha256 = digest_json(replay)?;
     let invalidation_dependencies = vec![
         dependency("binary", plan.binary_sha256.clone()),
@@ -100,14 +105,14 @@ fn build_claim(
         dependency("resume_plan", plan_sha256.clone()),
         dependency("triton_result", bridge_sha256.clone()),
         dependency("failed_seed_slice", slice_sha256.clone()),
+        dependency("original_replay", original_replay_sha256.clone()),
         dependency("native_replay", replay_sha256.clone()),
     ];
     Ok(InvestigationClaim {
         schema_version: INVESTIGATION_CLAIM_VERSION,
-        kind: "candidate_reached_declared_goal".into(),
-        statement:
-            "One fresh execution of the original ELF met the candidate input's declared goal".into(),
-        evidence_kind: "native_replay_observation".into(),
+        kind: "candidate_repaired_declared_goal".into(),
+        statement: "One original-ELF replay missed the goal and one candidate replay met it".into(),
+        evidence_kind: "native_replay_contrast".into(),
         binary_sha256: plan.binary_sha256.clone(),
         original_input_sha256,
         candidate_input_sha256,
@@ -116,6 +121,7 @@ fn build_claim(
         plan_sha256,
         bridge_sha256,
         slice_sha256,
+        original_replay_sha256,
         replay_sha256,
         origin_id: plan.symbolic_origin.id.clone(),
         origin_channel: plan.symbolic_origin.channel.clone(),
@@ -135,8 +141,8 @@ fn build_claim(
         model_revision: None,
         assumptions: plan.assumptions.clone(),
         unresolved_dependencies,
-        coverage: "one_captured_seed_trace_and_one_fresh_native_replay".into(),
-        verification: "recorded_observation_requires_fresh_replay".into(),
+        coverage: "one_captured_seed_trace_and_two_native_replays".into(),
+        verification: "recorded_contrast_requires_fresh_replays".into(),
         invalidation_dependencies,
     })
 }
@@ -149,9 +155,10 @@ pub(super) fn build_recipe(
     plan: &SnapshotResumePlan,
     bridge: &Value,
     candidate: &InputSpec,
+    original_replay: &NativeReplayReport,
     replay: &NativeReplayReport,
 ) -> Result<AnalysisRecipe, Box<dyn Error>> {
-    let claim = build_claim(original, plan, bridge, candidate, replay)?;
+    let claim = build_claim(original, plan, bridge, candidate, original_replay, replay)?;
     let recipe = AnalysisRecipe {
         schema_version: ANALYSIS_RECIPE_VERSION,
         kind: "captured_pure_validator_return".into(),
@@ -162,6 +169,7 @@ pub(super) fn build_recipe(
         resume_plan: plan.clone(),
         bridge_result: bridge.clone(),
         candidate_input: candidate.clone(),
+        recorded_original_replay: original_replay.clone(),
         recorded_native_replay: replay.clone(),
         claim,
     };
@@ -207,6 +215,14 @@ pub(super) fn validate_recipe(elf: &[u8], recipe: &AnalysisRecipe) -> Result<(),
     if recipe.candidate_input != expected_candidate {
         return Err("AnalysisRecipe candidate changes bytes outside the declared origin".into());
     }
+    validate_replay_report(
+        elf,
+        &recipe.original_input,
+        &recipe.recorded_original_replay,
+    )?;
+    if recipe.recorded_original_replay.status != ReplayStatus::GoalMismatched {
+        return Err("AnalysisRecipe original input did not miss the goal".into());
+    }
     validate_replay_report(elf, &recipe.candidate_input, &recipe.recorded_native_replay)?;
     if recipe.recorded_native_replay.status != ReplayStatus::GoalMatched {
         return Err("AnalysisRecipe recorded replay did not meet the goal".into());
@@ -216,13 +232,14 @@ pub(super) fn validate_recipe(elf: &[u8], recipe: &AnalysisRecipe) -> Result<(),
         &recipe.resume_plan,
         &recipe.bridge_result,
         &recipe.candidate_input,
+        &recipe.recorded_original_replay,
         &recipe.recorded_native_replay,
     )?;
     if recipe.claim != expected_claim {
         return Err("InvestigationClaim differs from bound recipe evidence".into());
     }
     if serde_json::to_vec(recipe)?.len() > hydir_execution::MAX_ANALYSIS_RECIPE_JSON_BYTES {
-        return Err("AnalysisRecipe exceeds 16 MiB JSON limit".into());
+        return Err("AnalysisRecipe exceeds 24 MiB JSON limit".into());
     }
     Ok(())
 }

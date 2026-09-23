@@ -106,6 +106,8 @@ def main() -> None:
         assert any(decision["origin_offsets"] == [0]
                    for decision in slice_report["decisions"]), slice_report
         assert claim == recipe["claim"] == report["investigation_claim"], claim
+        assert report["original_replay"]["status"] == "goal_mismatched", report
+        assert recipe["recorded_original_replay"]["status"] == "goal_mismatched", recipe
         assert claim["changed_bytes"] == [{
             "origin_offset": 0, "channel_offset": 0,
             "before": 0x42, "after": 0x41,
@@ -115,7 +117,8 @@ def main() -> None:
         assert verified["verification_scope"] == "recorded_artifact_consistency_only", verified
         reproduced = json.loads(run(CTL, "recipe", "replay", binary, recipe_path))
         assert reproduced["claim_reproduced"], reproduced
-        assert reproduced["fresh_replay"]["status"] == "goal_matched", reproduced
+        assert reproduced["fresh_original_replay"]["status"] == "goal_mismatched", reproduced
+        assert reproduced["fresh_candidate_replay"]["status"] == "goal_matched", reproduced
 
         tampered = work / "tampered-recipe.json"
         recipe["candidate_input"]["stdin_hex"] = "43"

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const INVESTIGATION_CLAIM_VERSION: u32 = 1;
 pub const ANALYSIS_RECIPE_VERSION: u32 = 1;
-pub const MAX_ANALYSIS_RECIPE_JSON_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ANALYSIS_RECIPE_JSON_BYTES: usize = 24 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +41,7 @@ pub struct InvestigationClaim {
     pub plan_sha256: String,
     pub bridge_sha256: String,
     pub slice_sha256: String,
+    pub original_replay_sha256: String,
     pub replay_sha256: String,
     pub origin_id: String,
     pub origin_channel: InputChannel,
@@ -71,13 +72,14 @@ pub struct AnalysisRecipe {
     /// The validated Triton bridge result, including the failed-seed slice.
     pub bridge_result: serde_json::Value,
     pub candidate_input: InputSpec,
+    pub recorded_original_replay: NativeReplayReport,
     pub recorded_native_replay: NativeReplayReport,
     pub claim: InvestigationClaim,
 }
 
 pub fn parse_analysis_recipe(json: &[u8]) -> Result<AnalysisRecipe, String> {
     if json.len() > MAX_ANALYSIS_RECIPE_JSON_BYTES {
-        return Err("AnalysisRecipe exceeds 16 MiB JSON limit".into());
+        return Err("AnalysisRecipe exceeds 24 MiB JSON limit".into());
     }
     serde_json::from_slice(json).map_err(|error| format!("invalid AnalysisRecipe JSON: {error}"))
 }
