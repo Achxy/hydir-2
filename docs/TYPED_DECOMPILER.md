@@ -70,7 +70,12 @@ command and desktop view try v1 first,
 then v3; the local project caches v1 output and regenerates v3 output. Both
 artifacts retain instruction sites. The CFG subset emits bytewise little-endian
 C11 helpers for its 64-bit memory accesses and carries ExpressionIR alias-region
-versions on each load/store. It still rejects other memory operations, calls,
+versions on each load/store. A validated pointer-to-struct or pointer-to-union
+parameter can name a fixed 64-bit field across CFG branches and loops when its
+base register is unchanged throughout the function. The generated address uses
+`offsetof` and the model's layout assertions while the bytewise helper preserves
+unaligned and alias-safe access. A modified pointer, indexed address, ambiguous
+field, or unmatched width stays as a raw memory access. It still rejects other memory operations, calls,
 unsupported flag origins, opaque effects, and non-64-bit operands. The native
 `low` and `structured` views remain available for those
 functions. Typed C is marked semantically conservative and never rewrite
@@ -83,9 +88,9 @@ It also checks normalized zero-flag assignments and branch conditions, so
 `jz`/`jnz` after supported 64-bit arithmetic can be rendered and tested.
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
 still use the bounded compare/test interpretation; general flag SSA translation
-through joins remains future work. The raw memory helpers use integer-to-pointer
-conversion in the supported x86-64 execution environment; they do not yet
-turn modeled accesses into named fields or arrays. Absolute memory addresses
+through joins remains future work. The memory helpers use integer-to-pointer
+conversion in the supported x86-64 execution environment. Modeled arrays and
+derived pointer bases are not yet named in the CFG view. Absolute memory addresses
 remain unsupported until their ELF load bias is represented in the C view.
 
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,

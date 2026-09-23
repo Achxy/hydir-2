@@ -164,6 +164,45 @@ hydir_cfg_negative_offset:
     retq
 .size hydir_cfg_negative_offset, .-hydir_cfg_negative_offset
 
+.globl hydir_cfg_ctx_step
+.type hydir_cfg_ctx_step,@function
+hydir_cfg_ctx_step:
+    movq 8(%rdi), %rax
+    testq %rax, %rax
+    jz .Lctx_step_zero
+    movq 0(%rdi), %rdx
+    addq %rdx, %rax
+    movq %rax, 8(%rdi)
+    retq
+.Lctx_step_zero:
+    movq 0(%rdi), %rax
+    retq
+.size hydir_cfg_ctx_step, .-hydir_cfg_ctx_step
+
+.globl hydir_cfg_ctx_drain
+.type hydir_cfg_ctx_drain,@function
+hydir_cfg_ctx_drain:
+    xorq %rax, %rax
+.Lctx_drain_loop:
+    movq 8(%rdi), %rdx
+    testq %rdx, %rdx
+    jz .Lctx_drain_done
+    addq %rdx, %rax
+    subq $1, %rdx
+    movq %rdx, 8(%rdi)
+    jmp .Lctx_drain_loop
+.Lctx_drain_done:
+    retq
+.size hydir_cfg_ctx_drain, .-hydir_cfg_ctx_drain
+
+.globl hydir_cfg_ctx_shift
+.type hydir_cfg_ctx_shift,@function
+hydir_cfg_ctx_shift:
+    addq $8, %rdi
+    movq 0(%rdi), %rax
+    retq
+.size hydir_cfg_ctx_shift, .-hydir_cfg_ctx_shift
+
 .globl hydir_cfg_callee_saved
 .type hydir_cfg_callee_saved,@function
 hydir_cfg_callee_saved:

@@ -25,7 +25,10 @@ fn primitive_name(value: PrimitiveType) -> &'static str {
     }
 }
 
-fn named_prefix<'a>(model: &'a AnalysisModel, id: &str) -> Result<(&'static str, &'a str), String> {
+pub(crate) fn named_prefix<'a>(
+    model: &'a AnalysisModel,
+    id: &str,
+) -> Result<(&'static str, &'a str), String> {
     let def = model
         .types
         .iter()
@@ -39,7 +42,7 @@ fn named_prefix<'a>(model: &'a AnalysisModel, id: &str) -> Result<(&'static str,
     Ok((prefix, &def.name))
 }
 
-fn c_decl(ty: &TypeRef, name: &str, model: &AnalysisModel) -> Result<String, String> {
+pub(crate) fn c_decl(ty: &TypeRef, name: &str, model: &AnalysisModel) -> Result<String, String> {
     match ty {
         TypeRef::Primitive { name: primitive } => {
             Ok(format!("{} {name}", primitive_name(*primitive)))
@@ -71,7 +74,7 @@ fn by_value_deps(ty: &TypeRef, output: &mut BTreeSet<String>) {
     }
 }
 
-fn collect_used_types(
+pub(crate) fn collect_used_types(
     ty: &TypeRef,
     model: &AnalysisModel,
     used: &mut BTreeSet<String>,
@@ -258,6 +261,62 @@ fn collect_calls(
     Ok(())
 }
 
+pub(crate) fn emit_model_type_declarations(
+    model: &AnalysisModel,
+    used: &BTreeSet<String>,
+) -> Result<String, String> {
+    let definitions = model
+        .types
+        .iter()
+        .filter(|def| used.contains(&def.id))
+        .collect::<Vec<_>>();
+    let mut output = String::new();
+    for def in &definitions {
+        match def.kind {
+            TypeDefinitionKind::Struct { .. } => {
+                output.push_str(&format!("struct {};\n", def.name))
+            }
+            TypeDefinitionKind::Union { .. } => output.push_str(&format!("union {};\n", def.name)),
+            _ => {}
+        }
+    }
+    output.push_str("\n#pragma pack(push, 1)\n");
+    let mut emitted = BTreeSet::new();
+    let mut remaining = definitions.clone();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        remaining.retain(|def| {
+            let mut deps = BTreeSet::new();
+            match &def.kind {
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
+                    for field in fields {
+                        by_value_deps(&field.ty, &mut deps);
+                    }
+                }
+                TypeDefinitionKind::Alias { target } => by_value_deps(target, &mut deps),
+                TypeDefinitionKind::Enum { .. } => {}
+            }
+            if deps.iter().all(|id| emitted.contains(id)) {
+                false
+            } else {
+                true
+            }
+        });
+        if remaining.len() == before {
+            return Err("typed C type dependency cycle".to_owned());
+        }
+        for def in &definitions {
+            if emitted.contains(&def.id) || remaining.iter().any(|item| item.id == def.id) {
+                continue;
+            }
+            emit_definition(&mut output, def, model)?;
+            emitted.insert(def.id.clone());
+        }
+    }
+    output.push_str("#pragma pack(pop)\n\n");
+    Ok(output)
+}
+
 /// Emit C11 source for a HighLevelCIR artifact. Exact field offsets are
 /// checked in the emitted translation unit; partial types retain a comment.
 pub fn emit_typed_c(ir: &HighLevelCir, model: &AnalysisModel) -> Result<String, String> {
@@ -318,57 +377,8 @@ pub fn emit_typed_c(ir: &HighLevelCir, model: &AnalysisModel) -> Result<String, 
             collect_used_types(&parameter.ty, model, &mut used, 0)?;
         }
     }
-    let definitions = model
-        .types
-        .iter()
-        .filter(|def| used.contains(&def.id))
-        .collect::<Vec<_>>();
     let mut output = String::from("#include <stdint.h>\n#include <stddef.h>\n\n");
-    for def in &definitions {
-        match def.kind {
-            TypeDefinitionKind::Struct { .. } => {
-                output.push_str(&format!("struct {};\n", def.name))
-            }
-            TypeDefinitionKind::Union { .. } => output.push_str(&format!("union {};\n", def.name)),
-            _ => {}
-        }
-    }
-    output.push_str("\n#pragma pack(push, 1)\n");
-    let mut emitted = BTreeSet::new();
-    let mut remaining = definitions.clone();
-    while !remaining.is_empty() {
-        let before = remaining.len();
-        remaining.retain(|def| {
-            let mut deps = BTreeSet::new();
-            match &def.kind {
-                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
-                    for field in fields {
-                        by_value_deps(&field.ty, &mut deps);
-                    }
-                }
-                TypeDefinitionKind::Alias { target } => by_value_deps(target, &mut deps),
-                TypeDefinitionKind::Enum { .. } => {}
-            }
-            if deps.iter().all(|id| emitted.contains(id)) {
-                // Emission failures are handled in the second pass below.
-                false
-            } else {
-                true
-            }
-        });
-        if remaining.len() == before {
-            return Err("typed C type dependency cycle".to_owned());
-        }
-        // Resolve dependencies with a stable topological order.
-        for def in &definitions {
-            if emitted.contains(&def.id) || remaining.iter().any(|item| item.id == def.id) {
-                continue;
-            }
-            emit_definition(&mut output, def, model)?;
-            emitted.insert(def.id.clone());
-        }
-    }
-    output.push_str("#pragma pack(pop)\n\n");
+    output.push_str(&emit_model_type_declarations(model, &used)?);
     for (callee, (name, _)) in &calls {
         let row = model
             .functions
