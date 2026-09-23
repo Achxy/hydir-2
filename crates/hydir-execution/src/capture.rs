@@ -370,10 +370,7 @@ fn run_to_target(
             )?;
             let first_stop = session.wait_stop()?;
             let reason = stop_reason(&first_stop);
-            if !matches!(
-                reason,
-                "breakpoint-hit" | "end-stepping-range" | "location-reached"
-            ) {
+            if !is_first_instruction_stop(&first_stop) {
                 let signal = first_stop
                     .field("signal-name")
                     .and_then(MiValue::as_text)
@@ -396,6 +393,20 @@ fn run_to_target(
                 .into());
             }
             let mappings = read_mappings(session)?;
+            let first_pc = first_stop
+                .field("frame")
+                .and_then(|value| match value {
+                    MiValue::Tuple(fields) => tuple_field(fields, "addr"),
+                    _ => None,
+                })
+                .and_then(MiValue::as_text)
+                .and_then(parse_hex_u64)
+                .ok_or("GDB first-instruction stop has no program counter")?;
+            if !mappings.iter().any(|mapping| {
+                mapping.executable && mapping.start <= first_pc && first_pc < mapping.end
+            }) {
+                return Err("GDB first-instruction stop is not in executable memory".into());
+            }
             let bias = elf_load_bias(elf, &mappings)
                 .ok_or("cannot resolve the staged ELF load bias at process start")?;
             let runtime = address
@@ -404,15 +415,7 @@ fn run_to_target(
             if !in_staged_executable_mapping(&mappings, runtime) {
                 return Err("requested ELF address is not executable in the staged process".into());
             }
-            let first_pc = first_stop
-                .field("frame")
-                .and_then(|value| match value {
-                    MiValue::Tuple(fields) => tuple_field(fields, "addr"),
-                    _ => None,
-                })
-                .and_then(MiValue::as_text)
-                .and_then(parse_hex_u64);
-            if first_pc != Some(runtime) {
+            if first_pc != runtime {
                 session.required(&format!("-break-insert *0x{runtime:x}"))?;
                 run_command(session, "-exec-continue")?;
                 require_breakpoint_hit(session.wait_stop()?)?;
@@ -436,6 +439,16 @@ fn stop_reason(record: &MiRecord) -> &str {
         .field("reason")
         .and_then(MiValue::as_text)
         .unwrap_or("unknown")
+}
+
+fn is_first_instruction_stop(record: &MiRecord) -> bool {
+    // GDB can report `starti`'s synthetic "Program stopped" event as a
+    // signal-received record with signal-name 0. Real signals stay fatal here.
+    matches!(
+        stop_reason(record),
+        "breakpoint-hit" | "end-stepping-range" | "location-reached"
+    ) || (stop_reason(record) == "signal-received"
+        && record.field("signal-name").and_then(MiValue::as_text) == Some("0"))
 }
 
 fn require_breakpoint_hit(record: MiRecord) -> Result<(), CaptureFailure> {
@@ -961,6 +974,22 @@ mod tests {
             registers.get("fs_base"),
             Some(RegisterObservation::Unavailable { .. })
         ));
+    }
+
+    #[test]
+    fn first_instruction_accepts_only_gdb_zero_signal() {
+        let zero = parse_mi_line(
+            br#"*stopped,reason="signal-received",signal-name="0",signal-meaning="Signal 0""#,
+        )
+        .unwrap();
+        let fault = parse_mi_line(
+            br#"*stopped,reason="signal-received",signal-name="SIGSEGV",signal-meaning="Segmentation fault""#,
+        )
+        .unwrap();
+        let breakpoint = parse_mi_line(br#"*stopped,reason="breakpoint-hit""#).unwrap();
+        assert!(is_first_instruction_stop(&zero));
+        assert!(is_first_instruction_stop(&breakpoint));
+        assert!(!is_first_instruction_stop(&fault));
     }
 
     #[test]
