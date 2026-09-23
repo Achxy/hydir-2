@@ -7,11 +7,11 @@ license.workspace = true
 
 [dependencies]
 hydir-core = { path = "../hydir-core" }
+hydir-decompile = { path = "../hydir-decompile" }
 hydir-ir = { path = "../hydir-ir" }
 hydir-model = { path = "../hydir-model" }
 serde.workspace = true
 
 [dev-dependencies]
-hydir-decompile = { path = "../hydir-decompile" }
 serde_json.workspace = true
 tempfile = "3.23"

@@ -83,3 +83,11 @@ hydir_cfg_signed_count:
 .Lsigned_done:
     retq
 .size hydir_cfg_signed_count, .-hydir_cfg_signed_count
+
+.globl hydir_cfg_zeroing
+.type hydir_cfg_zeroing,@function
+hydir_cfg_zeroing:
+    xorq %rax, %rax
+    addq %rdi, %rax
+    retq
+.size hydir_cfg_zeroing, .-hydir_cfg_zeroing
