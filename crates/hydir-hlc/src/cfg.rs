@@ -68,10 +68,20 @@ pub struct HighCfgFieldView {
     pub field: String,
     pub base: HighExpr,
     pub offset_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_base: Option<HighCfgDerivedBase>,
     /// An array subscript is a layout annotation, not a proof that the
     /// runtime index is within the modeled array's bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_index: Option<HighExpr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HighCfgDerivedBase {
+    /// Raw register used by the memory instruction; `base` is the stable
+    /// origin parameter whose type supplies the field interpretation.
+    pub register: String,
+    pub origin_offset_bytes: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -189,6 +199,7 @@ fn scalar_expression(expression: &Expression) -> Result<HighExpr, String> {
             value,
             width_bits: 64,
         } => Ok(HighExpr::Constant { value: *value }),
+        Expression::EffectiveAddress { address } => address_expression(address),
         Expression::Binary {
             operator: ExpressionBinaryOperator::Xor,
             width_bits: 64,
@@ -297,18 +308,55 @@ fn aggregate_fields(definition: &TypeDefinition) -> Option<(HighCfgAggregateKind
     }
 }
 
+#[derive(Clone, Debug)]
+struct FieldRoot {
+    type_id: String,
+    origin_register: String,
+    origin_offset_bytes: i64,
+}
+
+fn register_read(expression: &Expression) -> Option<&str> {
+    let Expression::Read {
+        source,
+        width_bits: 64,
+    } = expression
+    else {
+        return None;
+    };
+    source.component.strip_prefix("register:")
+}
+
+fn derived_pointer_origin(expression: &Expression) -> Option<(&str, i64)> {
+    if let Some(register) = register_read(expression) {
+        return Some((register, 0));
+    }
+    let Expression::EffectiveAddress { address } = expression else {
+        return None;
+    };
+    if address.absolute.is_some() || address.index.is_some() {
+        return None;
+    }
+    Some((
+        register_read(address.base.as_deref()?)?,
+        address.displacement,
+    ))
+}
+
 fn stable_field_roots(
     parameters: &[HighParameter],
     expression: &ExpressionFunctionIr,
-) -> BTreeMap<String, String> {
-    let writes = expression
+) -> BTreeMap<String, FieldRoot> {
+    let mut writes = BTreeMap::<&str, usize>::new();
+    for component in expression
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
         .flat_map(|instruction| &instruction.output_components)
         .map(|output| output.component.as_str())
-        .collect::<BTreeSet<_>>();
-    parameters
+    {
+        *writes.entry(component).or_default() += 1;
+    }
+    let mut roots = parameters
         .iter()
         .filter_map(|parameter| {
             let TypeRef::Pointer { to } = &parameter.ty else {
@@ -317,21 +365,74 @@ fn stable_field_roots(
             let TypeRef::Named { id } = to.as_ref() else {
                 return None;
             };
-            (!writes.contains(format!("register:{}", parameter.location).as_str()))
-                .then(|| (parameter.location.clone(), id.clone()))
+            (!writes.contains_key(format!("register:{}", parameter.location).as_str())).then(|| {
+                (
+                    parameter.location.clone(),
+                    FieldRoot {
+                        type_id: id.clone(),
+                        origin_register: parameter.location.clone(),
+                        origin_offset_bytes: 0,
+                    },
+                )
+            })
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    // Entry-block, single-write copies and LEAs dominate every later block.
+    // Do not derive from a parameter register: it is initialized on entry, so
+    // a skipped assignment could otherwise appear valid at a join.
+    if let Some(entry_block) = expression
+        .blocks
+        .iter()
+        .find(|block| block.address == expression.entry)
+    {
+        for instruction in &entry_block.instructions {
+            if instruction.residual.is_some() || !instruction.memory_writes.is_empty() {
+                continue;
+            }
+            for assignment in &instruction.assignments {
+                let Some(target) = assignment.target.component.strip_prefix("register:") else {
+                    continue;
+                };
+                if roots.contains_key(target)
+                    || parameters
+                        .iter()
+                        .any(|parameter| parameter.location == target)
+                    || writes.get(assignment.target.component.as_str()) != Some(&1)
+                {
+                    continue;
+                }
+                let Some((origin, offset)) = derived_pointer_origin(&assignment.value) else {
+                    continue;
+                };
+                let Some(root) = roots.get(origin) else {
+                    continue;
+                };
+                if root.origin_register != origin {
+                    continue;
+                }
+                let Some(total_offset) = root.origin_offset_bytes.checked_add(offset) else {
+                    continue;
+                };
+                let new_root = FieldRoot {
+                    type_id: root.type_id.clone(),
+                    origin_register: root.origin_register.clone(),
+                    origin_offset_bytes: total_offset,
+                };
+                roots.insert(target.to_owned(), new_root);
+            }
+        }
+    }
+    roots
 }
 
 fn field_view_from_address(
     address: &AddressExpression,
-    roots: &BTreeMap<String, String>,
+    roots: &BTreeMap<String, FieldRoot>,
     model: &AnalysisModel,
 ) -> Option<HighCfgFieldView> {
     if address.absolute.is_some() || (address.index.is_some() && address.scale != 8) {
         return None;
     }
-    let offset_bytes = u64::try_from(address.displacement).ok()?;
     let Expression::Read {
         source,
         width_bits: 64,
@@ -340,7 +441,10 @@ fn field_view_from_address(
         return None;
     };
     let register_name = source.component.strip_prefix("register:")?;
-    let type_id = roots.get(register_name)?;
+    let root = roots.get(register_name)?;
+    let offset_bytes =
+        u64::try_from(root.origin_offset_bytes.checked_add(address.displacement)?).ok()?;
+    let type_id = &root.type_id;
     let definition = model
         .types
         .iter()
@@ -364,21 +468,41 @@ fn field_view_from_address(
     if matching.next().is_some() {
         return None;
     }
+    let derived_base = if root.origin_register != register_name {
+        Some(HighCfgDerivedBase {
+            register: local(register_name).ok()?,
+            origin_offset_bytes: root.origin_offset_bytes,
+        })
+    } else {
+        None
+    };
     Some(HighCfgFieldView {
         type_id: type_id.clone(),
         type_name: definition.name.clone(),
         aggregate_kind,
         field: field.name.clone(),
         base: HighExpr::Variable {
-            name: local(register_name).ok()?,
+            name: local(&root.origin_register).ok()?,
         },
         offset_bytes,
+        derived_base,
         array_index,
     })
 }
 
-fn field_view_address(view: &HighCfgFieldView) -> HighExpr {
-    let mut address = view.base.clone();
+fn field_view_address(view: &HighCfgFieldView) -> Option<HighExpr> {
+    let (mut address, displacement) = if let Some(derived) = &view.derived_base {
+        (
+            HighExpr::Variable {
+                name: derived.register.clone(),
+            },
+            i64::try_from(view.offset_bytes)
+                .ok()?
+                .checked_sub(derived.origin_offset_bytes)?,
+        )
+    } else {
+        (view.base.clone(), i64::try_from(view.offset_bytes).ok()?)
+    };
     if let Some(index) = &view.array_index {
         address = HighExpr::Binary {
             op: BinaryOp::Add,
@@ -390,22 +514,26 @@ fn field_view_address(view: &HighCfgFieldView) -> HighExpr {
             }),
         };
     }
-    if view.offset_bytes != 0 {
+    if displacement != 0 {
         address = HighExpr::Binary {
-            op: BinaryOp::Add,
+            op: if displacement < 0 {
+                BinaryOp::Sub
+            } else {
+                BinaryOp::Add
+            },
             left: Box::new(address),
             right: Box::new(HighExpr::Constant {
-                value: view.offset_bytes,
+                value: displacement.unsigned_abs(),
             }),
         };
     }
-    address
+    Some(address)
 }
 
 fn normalized_memory_load(
     semantic: &ExpressionInstruction,
     register_name: &str,
-    roots: &BTreeMap<String, String>,
+    roots: &BTreeMap<String, FieldRoot>,
     model: &AnalysisModel,
 ) -> Result<
     (
@@ -447,7 +575,7 @@ fn normalized_memory_load(
 
 fn normalized_memory_store(
     semantic: &ExpressionInstruction,
-    roots: &BTreeMap<String, String>,
+    roots: &BTreeMap<String, FieldRoot>,
     model: &AnalysisModel,
 ) -> Result<
     (
@@ -809,7 +937,7 @@ fn push_assignment(
 fn lower_instruction(
     instruction: &MachineInstruction,
     semantic: &ExpressionInstruction,
-    field_roots: &BTreeMap<String, String>,
+    field_roots: &BTreeMap<String, FieldRoot>,
     model: &AnalysisModel,
     flag_source: &mut Option<FlagSource>,
     snapshot_flags: bool,
@@ -886,6 +1014,25 @@ fn lower_instruction(
         {
             let target = register(destination)?;
             let register_name = target.strip_prefix("hydir_").unwrap();
+            let expression = normalized_register_value(semantic, register_name)?;
+            push_assignment(statements, target, expression, site);
+            None
+        }
+        ("lea", [destination, MachineOperand::Memory { .. }])
+            if instruction.effects.control == MachineControlEffect::Next
+                && instruction.effects.memory == MachineMemoryEffect::None =>
+        {
+            let target = register(destination)?;
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            if semantic.residual.is_some()
+                || semantic.assignments.len() != 1
+                || !matches!(
+                    &semantic.assignments[0].value,
+                    Expression::EffectiveAddress { .. }
+                )
+            {
+                return Err("typed CFG LEA lacks normalized effective-address semantics".to_owned());
+            }
             let expression = normalized_register_value(semantic, register_name)?;
             push_assignment(statements, target, expression, site);
             None
@@ -1213,7 +1360,14 @@ fn validate_field_view(view: &HighCfgFieldView, address: &HighExpr) -> Result<()
         || !valid_ident(&view.type_name)
         || !valid_ident(&view.field)
         || !matches!(&view.base, HighExpr::Variable { name } if valid_local(name))
-        || field_view_address(view) != *address
+        || view.derived_base.as_ref().is_some_and(|derived| {
+            !derived
+                .register
+                .strip_prefix("hydir_")
+                .is_some_and(|register| REGISTERS.contains(&register))
+                || matches!(&view.base, HighExpr::Variable { name } if name == &derived.register)
+        })
+        || field_view_address(view).as_ref() != Some(address)
     {
         return Err("typed CFG field annotation differs from its address".to_owned());
     }
@@ -1513,11 +1667,23 @@ fn c_memory_address(address: &HighExpr, field_view: &Option<HighCfgFieldView>) -
         HighCfgAggregateKind::Struct => "struct",
         HighCfgAggregateKind::Union => "union",
     };
-    let base = c_expr(&view.base);
     let offset = format!(
         "(uint64_t)offsetof({kind} {}, {})",
         view.type_name, view.field
     );
+    let (base, offset) = if let Some(derived) = &view.derived_base {
+        let correction = if derived.origin_offset_bytes < 0 {
+            format!(
+                "({offset} + UINT64_C({}))",
+                derived.origin_offset_bytes.unsigned_abs()
+            )
+        } else {
+            format!("({offset} - UINT64_C({}))", derived.origin_offset_bytes)
+        };
+        (derived.register.clone(), correction)
+    } else {
+        (c_expr(&view.base), offset)
+    };
     match &view.array_index {
         None => format!("({base} + {offset})"),
         Some(index) => format!(
@@ -1608,17 +1774,26 @@ fn c_label(address: Location) -> String {
 
 fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<(), String> {
     let model_row = model.functions.iter().find(|row| row.entry == ir.entry);
-    let written = ir
-        .blocks
-        .iter()
-        .flat_map(|block| &block.statements)
-        .filter_map(|statement| match statement {
-            HighCfgStatement::Assign { target, .. } | HighCfgStatement::Load { target, .. } => {
-                Some(target.as_str())
+    let mut writes = BTreeMap::<&str, Vec<(Location, Option<&HighExpr>)>>::new();
+    for block in &ir.blocks {
+        for statement in &block.statements {
+            match statement {
+                HighCfgStatement::Assign { target, value, .. } => {
+                    writes
+                        .entry(target)
+                        .or_default()
+                        .push((block.address, Some(value)));
+                }
+                HighCfgStatement::Load { target, .. } => {
+                    writes
+                        .entry(target)
+                        .or_default()
+                        .push((block.address, None));
+                }
+                HighCfgStatement::Store { .. } => {}
             }
-            HighCfgStatement::Store { .. } => None,
-        })
-        .collect::<BTreeSet<_>>();
+        }
+    }
     for block in &ir.blocks {
         for statement in &block.statements {
             let view = match statement {
@@ -1653,7 +1828,7 @@ fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Re
             let HighExpr::Variable { name: base } = &view.base else {
                 return Err("typed CFG field base is not an invariant parameter".to_owned());
             };
-            if written.contains(base.as_str()) {
+            if writes.contains_key(base.as_str()) {
                 return Err("typed CFG modeled field base is modified".to_owned());
             }
             let (index, parameter) = ir
@@ -1674,6 +1849,36 @@ fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Re
                 .or_else(|| row.inferred_parameters.get(&parameter.location));
             if modeled_type != Some(&parameter.ty) {
                 return Err("typed CFG field parameter differs from current model".to_owned());
+            }
+            if let Some(derived) = &view.derived_base {
+                if ir.parameters.iter().any(|parameter| {
+                    local(&parameter.location).ok().as_deref() == Some(derived.register.as_str())
+                }) {
+                    return Err("typed CFG derived field register is an input parameter".to_owned());
+                }
+                let Some(assignments) = writes.get(derived.register.as_str()) else {
+                    return Err("typed CFG derived field register has no assignment".to_owned());
+                };
+                let expected = if derived.origin_offset_bytes == 0 {
+                    view.base.clone()
+                } else {
+                    HighExpr::Binary {
+                        op: if derived.origin_offset_bytes < 0 {
+                            BinaryOp::Sub
+                        } else {
+                            BinaryOp::Add
+                        },
+                        left: Box::new(view.base.clone()),
+                        right: Box::new(HighExpr::Constant {
+                            value: derived.origin_offset_bytes.unsigned_abs(),
+                        }),
+                    }
+                };
+                if assignments.as_slice() != [(ir.entry, Some(&expected))] {
+                    return Err(
+                        "typed CFG derived field base lacks one dominating assignment".to_owned(),
+                    );
+                }
             }
         }
     }

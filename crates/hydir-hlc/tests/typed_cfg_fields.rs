@@ -111,6 +111,11 @@ fn typed_model(bytes: &[u8]) -> hydir_model::AnalysisModel {
         ("hydir_cfg_ctx_step", "hydir_ctx_type"),
         ("hydir_cfg_ctx_drain", "hydir_ctx_type"),
         ("hydir_cfg_ctx_shift", "hydir_ctx_type"),
+        ("hydir_cfg_ctx_derived_count", "hydir_ctx_type"),
+        ("hydir_cfg_ctx_derived_seed", "hydir_ctx_type"),
+        ("hydir_cfg_ctx_copy_count", "hydir_ctx_type"),
+        ("hydir_cfg_ctx_derived_mutated", "hydir_ctx_type"),
+        ("hydir_cfg_ctx_derived_loop", "hydir_ctx_type"),
         ("hydir_cfg_ctx_slot_add", "hydir_array_ctx_type"),
         ("hydir_cfg_ctx_bad_stride", "hydir_array_ctx_type"),
         ("hydir_cfg_memory", "hydir_ambiguous_type"),
@@ -128,7 +133,10 @@ fn typed_model(bytes: &[u8]) -> hydir_model::AnalysisModel {
                 }),
             },
         }];
-        if symbol == "hydir_cfg_ctx_slot_add" || symbol == "hydir_cfg_ctx_bad_stride" {
+        if symbol == "hydir_cfg_ctx_slot_add"
+            || symbol == "hydir_cfg_ctx_bad_stride"
+            || symbol == "hydir_cfg_ctx_derived_loop"
+        {
             parameters.push(ModelParameter {
                 name: "index".to_owned(),
                 ty: u64_type.clone(),
@@ -393,4 +401,182 @@ fn mismatched_array_stride_keeps_raw_address() {
     ));
     let c = emit_typed_cfg_c(&ir, &model).unwrap();
     assert!(c.contains("hydir_load_u64(((hydir_rdi + (hydir_rsi * UINT64_C(4))) + UINT64_C(8)))"));
+}
+
+#[test]
+fn entry_block_derived_pointers_render_fields_and_match_oracles() {
+    let (temp, bytes) = fixture();
+    let model = typed_model(&bytes);
+    for (symbol, field, offset, want_count) in [
+        ("hydir_cfg_ctx_derived_count", "count", 8, true),
+        ("hydir_cfg_ctx_derived_seed", "seed", 8, false),
+        ("hydir_cfg_ctx_copy_count", "count", 0, true),
+    ] {
+        let native = decompile_symbol(&bytes, symbol).unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+            .unwrap_or_else(|error| panic!("{symbol}: {error}"));
+        let views = ir
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .filter_map(|statement| match statement {
+                HighCfgStatement::Load { field_view, .. }
+                | HighCfgStatement::Store { field_view, .. } => field_view.as_ref(),
+                HighCfgStatement::Assign { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(views.len(), 1, "{symbol}");
+        assert_eq!(views[0].field, field);
+        let derived = views[0].derived_base.as_ref().unwrap();
+        assert_eq!(derived.register, "hydir_rcx");
+        assert_eq!(derived.origin_offset_bytes, offset);
+        let json = serde_json::to_vec(&ir).unwrap();
+        let round_trip: HighLevelCfgCir = serde_json::from_slice(&json).unwrap();
+        assert_eq!(ir, round_trip);
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        assert!(c.contains(&format!("offsetof(struct hydir_ctx, {field})")));
+        let expected = if want_count { "ctx.count" } else { "ctx.seed" };
+        let source = format!(
+            "{c}\nint main(void) {{ for (uint64_t seed=0; seed<100; ++seed) for (uint64_t n=0; n<100; ++n) {{ struct hydir_ctx ctx={{seed,n}}; if ({symbol}(&ctx)!={expected}) return 1; }} return 0; }}\n"
+        );
+        let path = temp.path().join(format!("{symbol}.c"));
+        fs::write(&path, source).unwrap();
+        for compiler in ["clang", "gcc"] {
+            if Command::new(compiler).arg("--version").output().is_err() {
+                continue;
+            }
+            let executable = temp.path().join(format!("{symbol}_{compiler}.exe"));
+            let output = Command::new(compiler)
+                .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .arg(&path)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{symbol} {compiler}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                Command::new(executable).status().unwrap().success(),
+                "{symbol} {compiler} oracle failed"
+            );
+        }
+        if symbol == "hydir_cfg_ctx_derived_count" {
+            let mut forged = ir.clone();
+            for statement in forged
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.statements)
+            {
+                if let HighCfgStatement::Assign { target, value, .. } = statement {
+                    if target == "hydir_rcx" {
+                        *value = hydir_hlc::HighExpr::Variable {
+                            name: "hydir_rdi".to_owned(),
+                        };
+                        break;
+                    }
+                }
+            }
+            assert!(validate_high_level_cfg_cir(&forged).is_ok());
+            assert!(emit_typed_cfg_c(&forged, &model).is_err());
+        }
+    }
+}
+
+#[test]
+fn modified_derived_register_keeps_raw_memory_address() {
+    let (_temp, bytes) = fixture();
+    let model = typed_model(&bytes);
+    let native = decompile_symbol(&bytes, "hydir_cfg_ctx_derived_mutated").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    assert!(ir.blocks.iter().flat_map(|block| &block.statements).all(
+        |statement| match statement {
+            HighCfgStatement::Load { field_view, .. }
+            | HighCfgStatement::Store { field_view, .. } => field_view.is_none(),
+            HighCfgStatement::Assign { .. } => true,
+        }
+    ));
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(c.contains("hydir_load_u64(hydir_rcx)"));
+}
+
+#[test]
+fn entry_block_derived_pointer_survives_a_loop() {
+    let (temp, bytes) = fixture();
+    let model = typed_model(&bytes);
+    let native = decompile_symbol(&bytes, "hydir_cfg_ctx_derived_loop").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    assert!(ir.blocks.len() > 2);
+    let views = ir
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            HighCfgStatement::Load { field_view, .. }
+            | HighCfgStatement::Store { field_view, .. } => field_view.as_ref(),
+            HighCfgStatement::Assign { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].field, "count");
+    assert!(views[0].derived_base.is_some());
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(c.contains("offsetof(struct hydir_ctx, count)"));
+    let source = format!(
+        "{c}\nint main(void) {{ for (uint64_t n=0;n<100;++n) for (uint64_t times=0;times<100;++times) {{ struct hydir_ctx ctx={{7,n}}; if (hydir_cfg_ctx_derived_loop(&ctx,times)!=n*times) return 1; }} return 0; }}\n"
+    );
+    let path = temp.path().join("derived_loop.c");
+    fs::write(&path, source).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let executable = temp.path().join(format!("derived_loop_{compiler}.exe"));
+        let output = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            Command::new(executable).status().unwrap().success(),
+            "{compiler} derived loop oracle failed"
+        );
+    }
+}
+
+#[test]
+fn lea_index_arithmetic_matches_modular_oracle_without_a_model() {
+    let (temp, bytes) = fixture();
+    let model = init_model(&bytes).unwrap();
+    let native = decompile_symbol(&bytes, "hydir_cfg_lea_index").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    let source = format!(
+        "{c}\nint main(void) {{ uint64_t v[]={{0,1,2,UINT64_MAX,UINT64_C(0x8000000000000000)}}; for(unsigned i=0;i<5;++i) for(unsigned j=0;j<5;++j) if(hydir_cfg_lea_index(v[i],v[j]) != v[i]+v[j]*UINT64_C(8)) return 1; return 0; }}\n"
+    );
+    let path = temp.path().join("lea_index.c");
+    fs::write(&path, source).unwrap();
+    let executable = temp.path().join("lea_index.exe");
+    let output = Command::new("clang")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(Command::new(executable).status().unwrap().success());
 }

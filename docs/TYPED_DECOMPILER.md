@@ -93,8 +93,14 @@ It also checks normalized zero-flag assignments and branch conditions, so
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
 still use the bounded compare/test interpretation; general flag SSA translation
 through joins remains future work. The memory helpers use integer-to-pointer
-conversion in the supported x86-64 execution environment. Arrays of structures
-and derived pointer bases are not yet named in the CFG view. Absolute memory addresses
+conversion in the supported x86-64 execution environment. The CFG lowerer also
+handles normalized 64-bit `lea` expressions. A single-write register derived
+in the entry block from an unchanged pointer parameter by a copy or constant
+offset can carry that parameter's modeled field names through branches and
+loops. The field annotation records the derived register and offset; emission
+checks its dominating assignment and keeps the register in the C address.
+Derived pointers from later blocks, changing bases, and arrays of structures
+are not yet named in the CFG view. Absolute memory addresses
 remain unsupported until their ELF load bias is represented in the C view.
 
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,

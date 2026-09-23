@@ -224,6 +224,62 @@ hydir_cfg_ctx_bad_stride:
     retq
 .size hydir_cfg_ctx_bad_stride, .-hydir_cfg_ctx_bad_stride
 
+.globl hydir_cfg_ctx_derived_count
+.type hydir_cfg_ctx_derived_count,@function
+hydir_cfg_ctx_derived_count:
+    leaq 8(%rdi), %rcx
+    movq (%rcx), %rax
+    retq
+.size hydir_cfg_ctx_derived_count, .-hydir_cfg_ctx_derived_count
+
+.globl hydir_cfg_ctx_derived_seed
+.type hydir_cfg_ctx_derived_seed,@function
+hydir_cfg_ctx_derived_seed:
+    leaq 8(%rdi), %rcx
+    movq -8(%rcx), %rax
+    retq
+.size hydir_cfg_ctx_derived_seed, .-hydir_cfg_ctx_derived_seed
+
+.globl hydir_cfg_ctx_copy_count
+.type hydir_cfg_ctx_copy_count,@function
+hydir_cfg_ctx_copy_count:
+    movq %rdi, %rcx
+    movq 8(%rcx), %rax
+    retq
+.size hydir_cfg_ctx_copy_count, .-hydir_cfg_ctx_copy_count
+
+.globl hydir_cfg_ctx_derived_mutated
+.type hydir_cfg_ctx_derived_mutated,@function
+hydir_cfg_ctx_derived_mutated:
+    leaq 8(%rdi), %rcx
+    subq $8, %rcx
+    movq (%rcx), %rax
+    retq
+.size hydir_cfg_ctx_derived_mutated, .-hydir_cfg_ctx_derived_mutated
+
+.globl hydir_cfg_ctx_derived_loop
+.type hydir_cfg_ctx_derived_loop,@function
+hydir_cfg_ctx_derived_loop:
+    leaq 8(%rdi), %rcx
+    xorq %rax, %rax
+    testq %rsi, %rsi
+    jz .Lctx_derived_loop_done
+.Lctx_derived_loop_next:
+    movq (%rcx), %rdx
+    addq %rdx, %rax
+    subq $1, %rsi
+    jnz .Lctx_derived_loop_next
+.Lctx_derived_loop_done:
+    retq
+.size hydir_cfg_ctx_derived_loop, .-hydir_cfg_ctx_derived_loop
+
+.globl hydir_cfg_lea_index
+.type hydir_cfg_lea_index,@function
+hydir_cfg_lea_index:
+    leaq (%rdi,%rsi,8), %rax
+    retq
+.size hydir_cfg_lea_index, .-hydir_cfg_lea_index
+
 .globl hydir_cfg_callee_saved
 .type hydir_cfg_callee_saved,@function
 hydir_cfg_callee_saved:
