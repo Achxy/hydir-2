@@ -91,6 +91,71 @@ hydir_cfg_add_double_carry:
     retq
 .size hydir_cfg_add_double_carry, .-hydir_cfg_add_double_carry
 
+.globl hydir_cfg_add_below_equal
+.type hydir_cfg_add_below_equal,@function
+hydir_cfg_add_below_equal:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    jbe .Ladd_below_equal_yes
+    retq
+.Ladd_below_equal_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_below_equal, .-hydir_cfg_add_below_equal
+
+.globl hydir_cfg_add_above
+.type hydir_cfg_add_above,@function
+hydir_cfg_add_above:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    ja .Ladd_above_yes
+    retq
+.Ladd_above_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_above, .-hydir_cfg_add_above
+
+.globl hydir_cfg_add_signed_less
+.type hydir_cfg_add_signed_less,@function
+hydir_cfg_add_signed_less:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    jl .Ladd_signed_less_yes
+    retq
+.Ladd_signed_less_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_signed_less, .-hydir_cfg_add_signed_less
+
+.globl hydir_cfg_add_signed_less_equal
+.type hydir_cfg_add_signed_less_equal,@function
+hydir_cfg_add_signed_less_equal:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    jle .Ladd_signed_less_equal_yes
+    retq
+.Ladd_signed_less_equal_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_signed_less_equal, .-hydir_cfg_add_signed_less_equal
+
+.globl hydir_cfg_add_signed_greater
+.type hydir_cfg_add_signed_greater,@function
+hydir_cfg_add_signed_greater:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    jg .Ladd_signed_greater_yes
+    retq
+.Ladd_signed_greater_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_signed_greater, .-hydir_cfg_add_signed_greater
+
 .globl hydir_cfg_sub_flags
 .type hydir_cfg_sub_flags,@function
 hydir_cfg_sub_flags:

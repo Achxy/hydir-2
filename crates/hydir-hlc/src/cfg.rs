@@ -1225,33 +1225,65 @@ fn logical_flag_predicate(family: &str, result: HighExpr) -> Result<HighCfgPredi
 }
 
 fn addition_predicate(family: &str) -> Result<HighCfgPredicate, String> {
+    let binary = |op, left, right| HighExpr::Binary {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
     let left = HighExpr::Variable {
         name: FLAG_LEFT.to_owned(),
     };
     let right = HighExpr::Variable {
         name: FLAG_RIGHT.to_owned(),
     };
-    let sum = HighExpr::Binary {
-        op: BinaryOp::Add,
-        left: Box::new(left.clone()),
-        right: Box::new(right.clone()),
-    };
+    let sum = binary(BinaryOp::Add, left.clone(), right.clone());
     let high_bit = HighExpr::Constant {
         value: 0x8000_0000_0000_0000,
     };
-    let overflow_bits = HighExpr::Binary {
-        op: BinaryOp::And,
-        left: Box::new(HighExpr::Binary {
-            op: BinaryOp::Xor,
-            left: Box::new(left.clone()),
-            right: Box::new(sum.clone()),
-        }),
-        right: Box::new(HighExpr::Binary {
-            op: BinaryOp::Xor,
-            left: Box::new(right),
-            right: Box::new(sum.clone()),
-        }),
-    };
+    let overflow_bits = binary(
+        BinaryOp::And,
+        binary(
+            BinaryOp::And,
+            binary(BinaryOp::Xor, left.clone(), sum.clone()),
+            binary(BinaryOp::Xor, right.clone(), sum.clone()),
+        ),
+        high_bit.clone(),
+    );
+    // The high bit of the carry-generation formula is CF after wrapping ADD.
+    let carry_bit = binary(
+        BinaryOp::And,
+        binary(
+            BinaryOp::Or,
+            binary(BinaryOp::And, left.clone(), right.clone()),
+            binary(
+                BinaryOp::And,
+                binary(BinaryOp::Or, left.clone(), right.clone()),
+                binary(
+                    BinaryOp::Xor,
+                    sum.clone(),
+                    HighExpr::Constant { value: u64::MAX },
+                ),
+            ),
+        ),
+        high_bit.clone(),
+    );
+    let sign_bit = binary(BinaryOp::And, sum.clone(), high_bit.clone());
+    // For nonzero x, either x or -x has its high bit set. Invert that single
+    // bit to obtain a mask for ZF without introducing a Boolean IR variant.
+    let zero_bit = binary(
+        BinaryOp::Xor,
+        binary(
+            BinaryOp::And,
+            binary(
+                BinaryOp::Or,
+                sum.clone(),
+                binary(BinaryOp::Sub, HighExpr::Constant { value: 0 }, sum.clone()),
+            ),
+            high_bit.clone(),
+        ),
+        high_bit.clone(),
+    );
+    let signed_less_bit = binary(BinaryOp::Xor, sign_bit, overflow_bits.clone());
     let (op, left, right) = match family {
         "je" | "jz" => (
             HighCfgCompareOp::Equal,
@@ -1269,6 +1301,28 @@ fn addition_predicate(family: &str) -> Result<HighCfgPredicate, String> {
         "jno" => (HighCfgCompareOp::TestZero, overflow_bits, high_bit),
         "js" => (HighCfgCompareOp::TestNonzero, sum, high_bit),
         "jns" => (HighCfgCompareOp::TestZero, sum, high_bit),
+        "jbe" | "jna" => (
+            HighCfgCompareOp::TestNonzero,
+            binary(BinaryOp::Or, carry_bit, zero_bit),
+            high_bit,
+        ),
+        "ja" | "jnbe" => (
+            HighCfgCompareOp::TestZero,
+            binary(BinaryOp::Or, carry_bit, zero_bit),
+            high_bit,
+        ),
+        "jl" | "jnge" => (HighCfgCompareOp::TestNonzero, signed_less_bit, high_bit),
+        "jge" | "jnl" => (HighCfgCompareOp::TestZero, signed_less_bit, high_bit),
+        "jle" | "jng" => (
+            HighCfgCompareOp::TestNonzero,
+            binary(BinaryOp::Or, zero_bit, signed_less_bit),
+            high_bit,
+        ),
+        "jg" | "jnle" => (
+            HighCfgCompareOp::TestZero,
+            binary(BinaryOp::Or, zero_bit, signed_less_bit),
+            high_bit,
+        ),
         _ => {
             return Err(format!(
                 "typed CFG has no supported addition flag proof for {family}"
