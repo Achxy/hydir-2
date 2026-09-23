@@ -1,7 +1,7 @@
 use hydir_decompile::decompile_symbol;
 use hydir_hlc::{
-    HighCfgTerminator, HighLevelCfgCir, emit_typed_cfg_c, lower_high_level_cfg_cir,
-    validate_high_level_cfg_cir,
+    HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, emit_typed_cfg_c,
+    lower_high_level_cfg_cir, validate_high_level_cfg_cir,
 };
 use hydir_model::init_model;
 use std::{fs, path::PathBuf, process::Command};
@@ -81,9 +81,13 @@ fn scalar_cfg_branches_and_loops_compile_and_match_oracles() {
         }
         assert!(validate_high_level_cfg_cir(&missing_edge).is_err());
         let mut uninitialized = ir.clone();
-        uninitialized.blocks[0].statements[0].value = hydir_hlc::HighExpr::Variable {
-            name: "hydir_r10".to_owned(),
-        };
+        if let HighCfgStatement::Assign { value, .. } = &mut uninitialized.blocks[0].statements[0] {
+            *value = hydir_hlc::HighExpr::Variable {
+                name: "hydir_r10".to_owned(),
+            };
+        } else {
+            panic!("expected an initial scalar assignment");
+        }
         assert!(validate_high_level_cfg_cir(&uninitialized).is_err());
         sources.push(c);
     }
@@ -110,7 +114,7 @@ fn scalar_cfg_branches_and_loops_compile_and_match_oracles() {
 }
 
 #[test]
-fn scalar_cfg_rejects_memory_and_callee_saved_writes() {
+fn scalar_cfg_rejects_unmodeled_widths_and_callee_saved_writes() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
     let temp = tempfile::tempdir().unwrap();
@@ -129,12 +133,147 @@ fn scalar_cfg_rejects_memory_and_callee_saved_writes() {
     );
     let bytes = fs::read(&object).unwrap();
     let model = init_model(&bytes).unwrap();
-    for symbol in ["hydir_cfg_memory", "hydir_cfg_callee_saved"] {
+    for symbol in ["hydir_cfg_memory_byte", "hydir_cfg_callee_saved"] {
         let native = decompile_symbol(&bytes, symbol).unwrap();
         assert!(
             lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).is_err(),
             "{symbol} was admitted"
         );
+    }
+}
+
+#[test]
+fn memory_flow_through_branches_and_loops_compiles_and_matches_oracles() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let mut source = String::from("#include <stdint.h>\n");
+    for (symbol, renamed) in [
+        ("hydir_cfg_memory", "generated_load"),
+        ("hydir_cfg_array_sum", "generated_sum"),
+        ("hydir_cfg_array_fill", "generated_fill"),
+        ("hydir_cfg_indexed_sum", "generated_indexed"),
+        ("hydir_cfg_overlap", "generated_overlap"),
+        ("hydir_cfg_negative_offset", "generated_negative"),
+    ] {
+        let native = decompile_symbol(&bytes, symbol).unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+            .unwrap_or_else(|error| panic!("{symbol}: {error}"));
+        let json = serde_json::to_vec(&ir).unwrap();
+        let round_trip: HighLevelCfgCir = serde_json::from_slice(&json).unwrap();
+        validate_high_level_cfg_cir(&round_trip).unwrap();
+        let mut invalid = ir.clone();
+        if let Some(statement) = invalid
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.statements)
+            .find(|statement| {
+                matches!(
+                    statement,
+                    HighCfgStatement::Load { .. } | HighCfgStatement::Store { .. }
+                )
+            })
+        {
+            match statement {
+                HighCfgStatement::Load { memory_inputs, .. }
+                | HighCfgStatement::Store { memory_inputs, .. } => memory_inputs.clear(),
+                HighCfgStatement::Assign { .. } => unreachable!(),
+            }
+            assert!(validate_high_level_cfg_cir(&invalid).is_err());
+        } else {
+            panic!("{symbol} has no recovered memory action");
+        }
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        assert!(c.contains("hydir_load_u64") || c.contains("hydir_store_u64"));
+        if symbol == "hydir_cfg_indexed_sum" {
+            assert!(c.contains("* UINT64_C(8)"));
+        }
+        if symbol == "hydir_cfg_negative_offset" {
+            assert!(c.contains("- UINT64_C(8)"));
+        }
+        source.push_str(&format!(
+            "#define {symbol} {renamed}\n{c}\n#undef {symbol}\n"
+        ));
+    }
+    source.push_str(concat!(
+        "static int overlap_check(void) {\n",
+        "  unsigned char bytes[16], oracle[16];\n",
+        "  uint64_t edge[] = {0, 1, UINT64_MAX, UINT64_C(0x8000000000000000), UINT64_C(0x0102030405060708)};\n",
+        "  for (unsigned j = 0; j < 5; ++j) {\n",
+        "    for (unsigned i = 0; i < 16; ++i) bytes[i] = oracle[i] = (unsigned char)(i + 31u);\n",
+        "    uint64_t value = edge[j];\n",
+        "    for (unsigned i = 0; i < 8; ++i) oracle[i] = (unsigned char)(value >> (8u * i));\n",
+        "    uint64_t expected = 0;\n",
+        "    for (unsigned i = 0; i < 8; ++i) expected |= ((uint64_t)oracle[i + 1]) << (8u * i);\n",
+        "    if (generated_overlap((uint64_t)(uintptr_t)bytes,value) != expected) return 1;\n",
+        "    for (unsigned i = 0; i < 16; ++i) if (bytes[i] != oracle[i]) return 2;\n",
+        "  }\n",
+        "  return 0;\n",
+        "}\n"
+    ));
+    source.push_str("int main(void) {\n");
+    source.push_str(
+        "  uint64_t values[8] = {UINT64_MAX, 1, 7, 9, 0, 3, UINT64_C(0x8000000000000000), 4};\n",
+    );
+    source.push_str("  for (uint64_t n = 0; n <= 8; ++n) {\n");
+    source.push_str(
+        "    uint64_t expected = 0; for (uint64_t i = 0; i < n; ++i) expected += values[i];\n",
+    );
+    source
+        .push_str("    if (generated_sum((uint64_t)(uintptr_t)values,n) != expected) return 1;\n");
+    source.push_str(
+        "    if (generated_indexed((uint64_t)(uintptr_t)values,n) != expected) return 2;\n",
+    );
+    source.push_str("  }\n");
+    source.push_str(
+        "  if (generated_load((uint64_t)(uintptr_t)&values[3]) != values[3]) return 3;\n",
+    );
+    source.push_str(
+        "  if (generated_negative((uint64_t)(uintptr_t)&values[4]) != values[3]) return 7;\n",
+    );
+    source.push_str("  uint64_t filled[8] = {0};\n");
+    source.push_str("  for (uint64_t n = 0; n <= 8; ++n) {\n");
+    source.push_str("    for (unsigned i = 0; i < 8; ++i) filled[i] = 0;\n");
+    source.push_str(
+        "    if (generated_fill((uint64_t)(uintptr_t)filled, UINT64_MAX, n) != 0) return 4;\n",
+    );
+    source.push_str("    for (uint64_t i = 0; i < 8; ++i) if (filled[i] != (i < n ? UINT64_MAX : 0)) return 5;\n");
+    source.push_str("  }\n  if (overlap_check() != 0) return 6;\n  return 0;\n}\n");
+    let path = temp.path().join("memory_cfg.c");
+    fs::write(&path, source).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let exe = temp.path().join(format!("memory_cfg_{compiler}.exe"));
+        let result = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(Command::new(exe).status().unwrap().success());
     }
 }
 

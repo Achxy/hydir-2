@@ -36,6 +36,7 @@ pub struct HighParameter {
 pub enum BinaryOp {
     Add,
     Sub,
+    Mul,
     Xor,
     And,
     Or,

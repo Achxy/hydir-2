@@ -95,6 +95,75 @@ hydir_cfg_memory:
     retq
 .size hydir_cfg_memory, .-hydir_cfg_memory
 
+.globl hydir_cfg_memory_byte
+.type hydir_cfg_memory_byte,@function
+hydir_cfg_memory_byte:
+    movzbq (%rdi), %rax
+    retq
+.size hydir_cfg_memory_byte, .-hydir_cfg_memory_byte
+
+.globl hydir_cfg_array_sum
+.type hydir_cfg_array_sum,@function
+hydir_cfg_array_sum:
+    xorq %rax, %rax
+    testq %rsi, %rsi
+    jz .Larray_sum_done
+.Larray_sum_loop:
+    movq (%rdi), %rdx
+    addq %rdx, %rax
+    addq $8, %rdi
+    subq $1, %rsi
+    jnz .Larray_sum_loop
+.Larray_sum_done:
+    retq
+.size hydir_cfg_array_sum, .-hydir_cfg_array_sum
+
+.globl hydir_cfg_array_fill
+.type hydir_cfg_array_fill,@function
+hydir_cfg_array_fill:
+    xorq %rax, %rax
+    testq %rdx, %rdx
+    jz .Larray_fill_done
+.Larray_fill_loop:
+    movq %rsi, (%rdi)
+    addq $8, %rdi
+    subq $1, %rdx
+    jnz .Larray_fill_loop
+.Larray_fill_done:
+    retq
+.size hydir_cfg_array_fill, .-hydir_cfg_array_fill
+
+.globl hydir_cfg_indexed_sum
+.type hydir_cfg_indexed_sum,@function
+hydir_cfg_indexed_sum:
+    xorq %rax, %rax
+    xorq %rdx, %rdx
+.Lindexed_sum_loop:
+    cmpq %rsi, %rdx
+    jae .Lindexed_sum_done
+    movq (%rdi,%rdx,8), %rcx
+    addq %rcx, %rax
+    addq $1, %rdx
+    jmp .Lindexed_sum_loop
+.Lindexed_sum_done:
+    retq
+.size hydir_cfg_indexed_sum, .-hydir_cfg_indexed_sum
+
+.globl hydir_cfg_overlap
+.type hydir_cfg_overlap,@function
+hydir_cfg_overlap:
+    movq %rsi, (%rdi)
+    movq 1(%rdi), %rax
+    retq
+.size hydir_cfg_overlap, .-hydir_cfg_overlap
+
+.globl hydir_cfg_negative_offset
+.type hydir_cfg_negative_offset,@function
+hydir_cfg_negative_offset:
+    movq -8(%rdi), %rax
+    retq
+.size hydir_cfg_negative_offset, .-hydir_cfg_negative_offset
+
 .globl hydir_cfg_callee_saved
 .type hydir_cfg_callee_saved,@function
 hydir_cfg_callee_saved:

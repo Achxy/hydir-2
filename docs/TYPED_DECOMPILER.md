@@ -59,18 +59,20 @@ Resolved direct calls with a fixed, explicit SysV prototype become C call
 expressions; their caller-saved registers are invalidated. The scalar pair
 and direct-call fixtures emit typed C at both `-O0` and `-O2`. It carries
 instruction-address provenance and produces a C11 typed view with checked
-field offsets. `HighLevelCfgCir v2` covers a separate exact, memory-free
-64-bit scalar subset with direct branches, joins, and loops. It snapshots
+field offsets. `HighLevelCfgCir v3` covers a separate bounded 64-bit subset
+with direct branches, joins, loops, and normalized `mov` loads/stores. It snapshots
 live comparison operands and arithmetic results from normalized ExpressionIR
 zero-flag assignments. The C11 renderer folds
 single-entry chains, private diamonds, and simple pre-test loops into readable
 statements. Other control flow retains explicit gotos. A flag snapshot is
 inlined into a condition only when that branch is its sole reader. The typed
 command and desktop view try v1 first,
-then v2; the local project caches v1 output and regenerates v2 output. Both
-artifacts retain instruction sites. The CFG subset currently rejects memory
-accesses, calls, unsupported flag origins, opaque effects, and non-64-bit
-operands. The native `low` and `structured` views remain available for those
+then v3; the local project caches v1 output and regenerates v3 output. Both
+artifacts retain instruction sites. The CFG subset emits bytewise little-endian
+C11 helpers for its 64-bit memory accesses and carries ExpressionIR alias-region
+versions on each load/store. It still rejects other memory operations, calls,
+unsupported flag origins, opaque effects, and non-64-bit operands. The native
+`low` and `structured` views remain available for those
 functions. Typed C is marked semantically conservative and never rewrite
 ready; the source-level view does not model all machine fault and environment
 behavior.
@@ -81,7 +83,10 @@ It also checks normalized zero-flag assignments and branch conditions, so
 `jz`/`jnz` after supported 64-bit arithmetic can be rendered and tested.
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
 still use the bounded compare/test interpretation; general flag SSA translation
-through joins remains future work.
+through joins remains future work. The raw memory helpers use integer-to-pointer
+conversion in the supported x86-64 execution environment; they do not yet
+turn modeled accesses into named fields or arrays. Absolute memory addresses
+remain unsupported until their ELF load bias is represented in the C view.
 
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,
 `high_level_cfg_cir`, and `typed_c` read artifacts. Each artifact uses the same bounded automatic model

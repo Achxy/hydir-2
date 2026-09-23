@@ -6,19 +6,19 @@ use crate::{BinaryOp, HighExpr, HighParameter, parameters, u64_type, valid_ident
 use hydir_core::Location;
 use hydir_decompile::{lower_expression_ir, lower_state_ir};
 use hydir_ir::expression::{
-    BinaryOperator as ExpressionBinaryOperator, ComparisonOperator, Expression,
-    ExpressionFunctionIr, ExpressionInstruction, validate_expression_function_ir,
+    AddressExpression, BinaryOperator as ExpressionBinaryOperator, ComparisonOperator, Expression,
+    ExpressionFunctionIr, ExpressionInstruction, MemoryByteOrder, validate_expression_function_ir,
 };
 use hydir_ir::{
     FunctionIr, MachineControlEffect, MachineEdgeKind, MachineFunctionIr, MachineInstruction,
-    MachineMemoryEffect, MachineOperand, MachineOperation, SemanticFidelity,
+    MachineMemoryEffect, MachineOperand, MachineOperation, SemanticFidelity, StateComponentVersion,
     StructuralCompleteness, validate_function_ir, validate_machine_function_ir,
 };
 use hydir_model::{AnalysisModel, TypeRef, validate_structure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-pub const HIGH_LEVEL_CFG_CIR_VERSION: u32 = 2;
+pub const HIGH_LEVEL_CFG_CIR_VERSION: u32 = 3;
 // Caller-saved GPRs only. Callee-saved state and the stack need separate ABI
 // proofs before this C view can claim to preserve them.
 const REGISTERS: [&str; 9] = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"];
@@ -51,10 +51,38 @@ pub struct HighCfgPredicate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HighCfgStatement {
-    pub target: String,
-    pub value: HighExpr,
-    pub site: Location,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HighCfgStatement {
+    Assign {
+        target: String,
+        value: HighExpr,
+        site: Location,
+    },
+    Load {
+        target: String,
+        address: HighExpr,
+        width_bits: u16,
+        byte_order: MemoryByteOrder,
+        memory_inputs: Vec<StateComponentVersion>,
+        site: Location,
+    },
+    Store {
+        address: HighExpr,
+        value: HighExpr,
+        width_bits: u16,
+        byte_order: MemoryByteOrder,
+        memory_inputs: Vec<StateComponentVersion>,
+        memory_outputs: Vec<StateComponentVersion>,
+        site: Location,
+    },
+}
+
+impl HighCfgStatement {
+    fn site(&self) -> Location {
+        match self {
+            Self::Assign { site, .. } | Self::Load { site, .. } | Self::Store { site, .. } => *site,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -167,6 +195,113 @@ fn scalar_expression(expression: &Expression) -> Result<HighExpr, String> {
             Err("typed CFG requires a normalized 64-bit scalar ExpressionIR assignment".to_owned())
         }
     }
+}
+
+fn address_expression(address: &AddressExpression) -> Result<HighExpr, String> {
+    if address.absolute.is_some() {
+        return Err("typed CFG absolute memory address requires load-bias proof".to_owned());
+    }
+    let mut parts = Vec::new();
+    if let Some(base) = &address.base {
+        parts.push(scalar_expression(base)?);
+    }
+    if let Some(index) = &address.index {
+        let mut index = scalar_expression(index)?;
+        if address.scale != 1 {
+            index = HighExpr::Binary {
+                op: BinaryOp::Mul,
+                left: Box::new(index),
+                right: Box::new(HighExpr::Constant {
+                    value: u64::from(address.scale),
+                }),
+            };
+        }
+        parts.push(index);
+    }
+    let mut parts = parts.into_iter();
+    let mut result = parts
+        .next()
+        .ok_or("typed CFG memory address has no register base or index")?;
+    for part in parts {
+        result = HighExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(result),
+            right: Box::new(part),
+        };
+    }
+    if address.displacement != 0 {
+        result = HighExpr::Binary {
+            op: if address.displacement < 0 {
+                BinaryOp::Sub
+            } else {
+                BinaryOp::Add
+            },
+            left: Box::new(result),
+            right: Box::new(HighExpr::Constant {
+                value: address.displacement.unsigned_abs(),
+            }),
+        };
+    }
+    Ok(result)
+}
+
+fn normalized_memory_load(
+    semantic: &ExpressionInstruction,
+    register_name: &str,
+) -> Result<(HighExpr, Vec<StateComponentVersion>), String> {
+    let component = format!("register:{register_name}");
+    let mut assignments = semantic
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.target.component == component);
+    let assignment = assignments
+        .next()
+        .ok_or("typed CFG memory load lacks normalized ExpressionIR semantics")?;
+    if assignments.next().is_some()
+        || semantic.assignments.len() != 1
+        || semantic.residual.is_some()
+        || !semantic.memory_writes.is_empty()
+    {
+        return Err("typed CFG memory load has residual or ambiguous effects".to_owned());
+    }
+    match &assignment.value {
+        Expression::MemoryRead {
+            address,
+            width_bits: 64,
+            byte_order: MemoryByteOrder::Little,
+            memory_inputs,
+        } => Ok((address_expression(address)?, memory_inputs.clone())),
+        _ => Err("typed CFG requires a normalized 64-bit memory load".to_owned()),
+    }
+}
+
+fn normalized_memory_store(
+    semantic: &ExpressionInstruction,
+) -> Result<
+    (
+        HighExpr,
+        HighExpr,
+        Vec<StateComponentVersion>,
+        Vec<StateComponentVersion>,
+    ),
+    String,
+> {
+    let [write] = semantic.memory_writes.as_slice() else {
+        return Err("typed CFG memory store lacks one normalized ExpressionIR write".to_owned());
+    };
+    if write.width_bits != 64
+        || write.byte_order != MemoryByteOrder::Little
+        || semantic.residual.is_some()
+        || !semantic.assignments.is_empty()
+    {
+        return Err("typed CFG memory store has residual or unsupported effects".to_owned());
+    }
+    Ok((
+        address_expression(&write.address)?,
+        scalar_expression(&write.value)?,
+        write.memory_inputs.clone(),
+        write.memory_outputs.clone(),
+    ))
 }
 
 fn normalized_register_value(
@@ -484,6 +619,19 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
     })
 }
 
+fn push_assignment(
+    statements: &mut Vec<HighCfgStatement>,
+    target: String,
+    value: HighExpr,
+    site: Location,
+) {
+    statements.push(HighCfgStatement::Assign {
+        target,
+        value,
+        site,
+    });
+}
+
 fn lower_instruction(
     instruction: &MachineInstruction,
     semantic: &ExpressionInstruction,
@@ -504,7 +652,12 @@ fn lower_instruction(
     if instruction.effects.conservative
         || instruction.decorators != Default::default()
         || (instruction.effects.memory != MachineMemoryEffect::None
-            && !(family == "ret" && instruction.effects.memory == MachineMemoryEffect::Read))
+            && !(family == "ret" && instruction.effects.memory == MachineMemoryEffect::Read)
+            && !(family == "mov"
+                && matches!(
+                    instruction.effects.memory,
+                    MachineMemoryEffect::Read | MachineMemoryEffect::Write
+                )))
     {
         return Err(format!(
             "typed CFG effect at 0x{:x} is unsupported",
@@ -513,21 +666,49 @@ fn lower_instruction(
     }
     let site = instruction.address;
     let operands = instruction.operands.as_slice();
-    let mut assign = |target: String, value: HighExpr| {
-        statements.push(HighCfgStatement {
-            target,
-            value,
-            site,
-        });
-    };
     let terminator = match (family.as_str(), operands) {
+        ("mov", [destination, MachineOperand::Memory { width_bits: 64, .. }])
+            if instruction.effects.control == MachineControlEffect::Next
+                && instruction.effects.memory == MachineMemoryEffect::Read =>
+        {
+            let target = register(destination)?;
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            let (address, memory_inputs) = normalized_memory_load(semantic, register_name)?;
+            statements.push(HighCfgStatement::Load {
+                target,
+                address,
+                width_bits: 64,
+                byte_order: MemoryByteOrder::Little,
+                memory_inputs,
+                site,
+            });
+            None
+        }
+        ("mov", [MachineOperand::Memory { width_bits: 64, .. }, _source])
+            if instruction.effects.control == MachineControlEffect::Next
+                && instruction.effects.memory == MachineMemoryEffect::Write =>
+        {
+            let (address, value, memory_inputs, memory_outputs) =
+                normalized_memory_store(semantic)?;
+            statements.push(HighCfgStatement::Store {
+                address,
+                value,
+                width_bits: 64,
+                byte_order: MemoryByteOrder::Little,
+                memory_inputs,
+                memory_outputs,
+                site,
+            });
+            None
+        }
         ("mov", [destination, _source])
-            if instruction.effects.control == MachineControlEffect::Next =>
+            if instruction.effects.control == MachineControlEffect::Next
+                && instruction.effects.memory == MachineMemoryEffect::None =>
         {
             let target = register(destination)?;
             let register_name = target.strip_prefix("hydir_").unwrap();
             let expression = normalized_register_value(semantic, register_name)?;
-            assign(target, expression);
+            push_assignment(statements, target, expression, site);
             None
         }
         ("add" | "sub" | "xor" | "and" | "or", [destination, _source])
@@ -539,10 +720,20 @@ fn lower_instruction(
             if snapshot_flags && normalized_result_zero(semantic, family)? != expression {
                 return Err("typed CFG arithmetic result and zero flag disagree".to_owned());
             }
-            assign(target.clone(), expression);
+            push_assignment(statements, target.clone(), expression, site);
             if snapshot_flags {
-                assign(FLAG_LEFT.to_owned(), HighExpr::Variable { name: target });
-                assign(FLAG_RIGHT.to_owned(), HighExpr::Constant { value: 0 });
+                push_assignment(
+                    statements,
+                    FLAG_LEFT.to_owned(),
+                    HighExpr::Variable { name: target },
+                    site,
+                );
+                push_assignment(
+                    statements,
+                    FLAG_RIGHT.to_owned(),
+                    HighExpr::Constant { value: 0 },
+                    site,
+                );
             }
             *flag_source = Some(FlagSource::ResultZero);
             None
@@ -553,8 +744,8 @@ fn lower_instruction(
             // Snapshot operands now: later register writes must not alter the flags.
             if snapshot_flags {
                 let (left, right) = normalized_flag_operands(semantic, family)?;
-                assign(FLAG_LEFT.to_owned(), left);
-                assign(FLAG_RIGHT.to_owned(), right);
+                push_assignment(statements, FLAG_LEFT.to_owned(), left, site);
+                push_assignment(statements, FLAG_RIGHT.to_owned(), right, site);
             }
             *flag_source = Some(if family == "cmp" {
                 FlagSource::Compare
@@ -617,8 +808,9 @@ fn lower_instruction(
     Ok(terminator)
 }
 
-/// Lower exact, memory-free 64-bit SysV scalar flow. Unsupported operations
-/// reject the typed CFG view; the existing low-level view remains available.
+/// Lower the supported 64-bit SysV CFG, including normalized MOV memory
+/// effects. Unsupported operations reject this view; low-level C remains
+/// available.
 pub fn lower_high_level_cfg_cir(
     machine: &MachineFunctionIr,
     function: &FunctionIr,
@@ -825,6 +1017,15 @@ fn expression_is_initialized(
     Ok(())
 }
 
+fn valid_memory_versions(versions: &[StateComponentVersion]) -> bool {
+    !versions.is_empty()
+        && versions.len() <= 16
+        && versions
+            .iter()
+            .all(|version| version.component.starts_with("memory:"))
+        && versions.iter().collect::<BTreeSet<_>>().len() == versions.len()
+}
+
 pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
     if ir.schema_version != HIGH_LEVEL_CFG_CIR_VERSION
         || ir.binary_sha256.len() != 64
@@ -872,15 +1073,59 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
             return Err("typed CFG statement limit exceeded".to_owned());
         }
         for statement in &block.statements {
-            if statement.site.address_space != ir.entry.address_space
-                || statement.site.value.0 < block.address.value.0
+            if statement.site().address_space != ir.entry.address_space
+                || statement.site().value.0 < block.address.value.0
             {
                 return Err("typed CFG assignment site differs from its block".to_owned());
             }
-            if !valid_local(&statement.target) {
-                return Err("typed CFG has an invalid assignment target".to_owned());
+            match statement {
+                HighCfgStatement::Assign { target, value, .. } => {
+                    if !valid_local(target) {
+                        return Err("typed CFG has an invalid assignment target".to_owned());
+                    }
+                    scalar_reads(value, &mut BTreeSet::new(), 0)?;
+                }
+                HighCfgStatement::Load {
+                    target,
+                    address,
+                    width_bits,
+                    memory_inputs,
+                    ..
+                } => {
+                    if !valid_local(target)
+                        || *width_bits != 64
+                        || !valid_memory_versions(memory_inputs)
+                    {
+                        return Err("typed CFG has an invalid memory load".to_owned());
+                    }
+                    scalar_reads(address, &mut BTreeSet::new(), 0)?;
+                }
+                HighCfgStatement::Store {
+                    address,
+                    value,
+                    width_bits,
+                    memory_inputs,
+                    memory_outputs,
+                    ..
+                } => {
+                    if *width_bits != 64
+                        || !valid_memory_versions(memory_inputs)
+                        || !valid_memory_versions(memory_outputs)
+                        || memory_inputs
+                            .iter()
+                            .map(|version| &version.component)
+                            .collect::<BTreeSet<_>>()
+                            != memory_outputs
+                                .iter()
+                                .map(|version| &version.component)
+                                .collect::<BTreeSet<_>>()
+                    {
+                        return Err("typed CFG has an invalid memory store".to_owned());
+                    }
+                    scalar_reads(address, &mut BTreeSet::new(), 0)?;
+                    scalar_reads(value, &mut BTreeSet::new(), 0)?;
+                }
             }
-            scalar_reads(&statement.value, &mut BTreeSet::new(), 0)?;
         }
         match &block.terminator {
             HighCfgTerminator::Branch {
@@ -982,7 +1227,11 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
                 block
                     .statements
                     .iter()
-                    .map(|statement| statement.target.clone()),
+                    .filter_map(|statement| match statement {
+                        HighCfgStatement::Assign { target, .. }
+                        | HighCfgStatement::Load { target, .. } => Some(target.clone()),
+                        HighCfgStatement::Store { .. } => None,
+                    }),
             );
             changed |= inputs.insert(block.address, incoming.clone()) != Some(incoming);
             changed |= outputs.insert(block.address, outgoing.clone()) != Some(outgoing);
@@ -998,8 +1247,22 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
     for block in &ir.blocks {
         let mut initialized = inputs[&block.address].clone();
         for statement in &block.statements {
-            expression_is_initialized(&statement.value, &initialized)?;
-            initialized.insert(statement.target.clone());
+            match statement {
+                HighCfgStatement::Assign { target, value, .. } => {
+                    expression_is_initialized(value, &initialized)?;
+                    initialized.insert(target.clone());
+                }
+                HighCfgStatement::Load {
+                    target, address, ..
+                } => {
+                    expression_is_initialized(address, &initialized)?;
+                    initialized.insert(target.clone());
+                }
+                HighCfgStatement::Store { address, value, .. } => {
+                    expression_is_initialized(address, &initialized)?;
+                    expression_is_initialized(value, &initialized)?;
+                }
+            }
         }
         match &block.terminator {
             HighCfgTerminator::Branch { predicate, .. } => {
@@ -1023,6 +1286,7 @@ fn c_expr(expr: &HighExpr) -> String {
             let op = match op {
                 BinaryOp::Add => "+",
                 BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
                 BinaryOp::Xor => "^",
                 BinaryOp::And => "&",
                 BinaryOp::Or => "|",
@@ -1031,6 +1295,20 @@ fn c_expr(expr: &HighExpr) -> String {
         }
         HighExpr::Field { .. } | HighExpr::Call { .. } => {
             unreachable!("validated scalar expression")
+        }
+    }
+}
+
+fn c_statement(statement: &HighCfgStatement) -> String {
+    match statement {
+        HighCfgStatement::Assign { target, value, .. } => {
+            format!("{target} = {};", c_expr(value))
+        }
+        HighCfgStatement::Load {
+            target, address, ..
+        } => format!("{target} = hydir_load_u64({});", c_expr(address)),
+        HighCfgStatement::Store { address, value, .. } => {
+            format!("hydir_store_u64({}, {});", c_expr(address), c_expr(value))
         }
     }
 }
@@ -1083,7 +1361,7 @@ fn c_label(address: Location) -> String {
     format!("hydir_bb_{}_{:x}", address.address_space, address.value.0)
 }
 
-/// Emit strict C11 for the bounded scalar CFG. Gotos preserve loops and joins
+/// Emit strict C11 for the bounded CFG. Gotos preserve loops and joins
 /// exactly; a later structuring pass may replace them when it can prove shape.
 pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<String, String> {
     validate_structure(model)?;
@@ -1093,6 +1371,32 @@ pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<S
     }
     let body = structure::emit_body(ir);
     let mut output = String::from("#include <stdint.h>\n\n");
+    if ir.blocks.iter().any(|block| {
+        block.statements.iter().any(|statement| {
+            matches!(
+                statement,
+                HighCfgStatement::Load { .. } | HighCfgStatement::Store { .. }
+            )
+        })
+    }) {
+        output.push_str(
+            r#"#ifndef HYDIR_MEMORY_HELPERS_V1
+#define HYDIR_MEMORY_HELPERS_V1
+static inline uint64_t hydir_load_u64(uint64_t address) {
+  const unsigned char *bytes = (const unsigned char *)(uintptr_t)address;
+  uint64_t value = UINT64_C(0);
+  for (unsigned i = 0; i < 8; ++i) value |= ((uint64_t)bytes[i]) << (i * 8u);
+  return value;
+}
+static inline void hydir_store_u64(uint64_t address, uint64_t value) {
+  unsigned char *bytes = (unsigned char *)(uintptr_t)address;
+  for (unsigned i = 0; i < 8; ++i) bytes[i] = (unsigned char)(value >> (i * 8u));
+}
+#endif
+
+"#,
+        );
+    }
     output.push_str(&format!("uint64_t {}(", ir.name));
     if ir.parameters.is_empty() {
         output.push_str("void");
@@ -1111,8 +1415,22 @@ pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<S
     let mut reads = BTreeSet::new();
     for block in &ir.blocks {
         for statement in &block.statements {
-            used.insert(statement.target.clone());
-            scalar_reads(&statement.value, &mut reads, 0)?;
+            match statement {
+                HighCfgStatement::Assign { target, value, .. } => {
+                    used.insert(target.clone());
+                    scalar_reads(value, &mut reads, 0)?;
+                }
+                HighCfgStatement::Load {
+                    target, address, ..
+                } => {
+                    used.insert(target.clone());
+                    scalar_reads(address, &mut reads, 0)?;
+                }
+                HighCfgStatement::Store { address, value, .. } => {
+                    scalar_reads(address, &mut reads, 0)?;
+                    scalar_reads(value, &mut reads, 0)?;
+                }
+            }
         }
         match &block.terminator {
             HighCfgTerminator::Branch { predicate, .. } => {

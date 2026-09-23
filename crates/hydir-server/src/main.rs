@@ -2048,7 +2048,7 @@ fn native_artifact_media_type(stage: &str) -> Option<&'static str> {
         "unit" => Some("application/vnd.hydir.decompilation-unit+json;version=2"),
         "analysis_model" => Some("application/vnd.hydir.analysis-model+json;version=1"),
         "high_level_cir" => Some("application/vnd.hydir.high-level-cir+json;version=1"),
-        "high_level_cfg_cir" => Some("application/vnd.hydir.high-level-cfg-cir+json;version=2"),
+        "high_level_cfg_cir" => Some("application/vnd.hydir.high-level-cfg-cir+json;version=3"),
         "typed_c" => Some("text/x-c;view=typed"),
         _ => None,
     }
@@ -5193,7 +5193,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_cfg_artifact_and_typed_c_cover_bounded_scalar_loop() {
+    fn v3_cfg_artifact_and_typed_c_cover_scalar_and_memory_loops() {
         use std::process::Command;
         let directory = tempfile::tempdir().unwrap();
         let fixture =
@@ -5219,11 +5219,11 @@ mod tests {
         .unwrap();
         let content = native_artifact(&binary, &json).unwrap();
         let artifact: serde_json::Value = serde_json::from_slice(&content).unwrap();
-        assert_eq!(artifact["schema_version"], 2);
+        assert_eq!(artifact["schema_version"], 3);
         assert!(artifact["blocks"].as_array().unwrap().len() > 2);
         assert_eq!(
             native_artifact_media_type("high_level_cfg_cir"),
-            Some("application/vnd.hydir.high-level-cfg-cir+json;version=2")
+            Some("application/vnd.hydir.high-level-cfg-cir+json;version=3")
         );
         let json = serde_json::to_string(&NativeArtifactSelector {
             stage: "typed_c".to_owned(),
@@ -5232,6 +5232,28 @@ mod tests {
         .unwrap();
         let c = String::from_utf8(native_artifact(&binary, &json).unwrap()).unwrap();
         assert!(!c.contains("goto hydir_bb_") && c.contains("while ("));
+        let json = serde_json::to_string(&NativeArtifactSelector {
+            stage: "high_level_cfg_cir".to_owned(),
+            function: "hydir_cfg_array_sum".to_owned(),
+        })
+        .unwrap();
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&native_artifact(&binary, &json).unwrap()).unwrap();
+        assert_eq!(artifact["schema_version"], 3);
+        assert!(artifact["blocks"].as_array().unwrap().iter().any(|block| {
+            block["statements"].as_array().is_some_and(|statements| {
+                statements
+                    .iter()
+                    .any(|statement| statement["kind"] == "load")
+            })
+        }));
+        let json = serde_json::to_string(&NativeArtifactSelector {
+            stage: "typed_c".to_owned(),
+            function: "hydir_cfg_array_sum".to_owned(),
+        })
+        .unwrap();
+        let c = String::from_utf8(native_artifact(&binary, &json).unwrap()).unwrap();
+        assert!(c.contains("hydir_load_u64") && c.contains("return hydir_rax"));
     }
 
     #[cfg(unix)]
