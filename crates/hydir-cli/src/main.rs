@@ -21,8 +21,9 @@ use hydir_decompile::{
     lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
 use hydir_execution::{
-    InputSpec, ReplayBudget, ReplayGoal, parse_execution_snapshot, parse_input_spec,
-    validate_execution_snapshot, validate_input_spec,
+    InputSpec, ProbeLocation, ReplayBudget, ReplayGoal, parse_execution_snapshot, parse_input_spec,
+    parse_origin_probe, probe_origin, validate_execution_snapshot, validate_input_spec,
+    validate_origin_probe,
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
@@ -88,6 +89,8 @@ Usage:
   hydirctl replay <linked-elf> <input.json> [--output <report.json>]
   hydirctl capture <linked-elf> <input.json> (--function <symbol> | --address <elf-vaddr>) [--output <snapshot.json>]
   hydirctl snapshot verify <linked-elf> <input.json> <snapshot.json>
+  hydirctl snapshot probe-origin <linked-elf> <input.json> <snapshot.json> <origin-id> --register <name> [--output <probe.json>]
+  hydirctl snapshot verify-origin <linked-elf> <input.json> <snapshot.json> <probe.json>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -118,6 +121,8 @@ an unsupported-host report. See docs/REPLAY_PROTOCOL.md for its current scope.
 Capture uses GDB/MI in the same Linux isolation and stops at a simple C symbol
 or a file-backed executable ELF virtual address, including stripped PIE code.
 It currently supports one thread and emits a sparse snapshot.
+An origin probe checks bytes at an analyst-selected register location against
+one InputSpec origin. A match is byte equality, not channel provenance.
 Rebuild supports local and authenticated-loopback operations for a narrow
 freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
@@ -188,6 +193,67 @@ fn run() -> Result<(), Box<dyn Error>> {
                 std::io::stdout().write_all(&json)?;
                 println!();
             }
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("probe-origin")
+                && (args.len() == 8 || args.len() == 10 && args[8] == "--output")
+                && args[6] == "--register" =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let report = probe_origin(
+                &bytes,
+                &spec,
+                &snapshot,
+                &args[5],
+                ProbeLocation::Register {
+                    name: args[7].clone(),
+                    offset: 0,
+                },
+            )?;
+            let json = serde_json::to_vec_pretty(&report)?;
+            if args.len() == 10 {
+                write_new_or_identical(&args[9], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("verify-origin") && args.len() == 6 =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let report = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            validate_origin_probe(&bytes, &spec, &snapshot, &report)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": report.schema_version,
+                    "valid": true,
+                    "origin_id": report.origin_id,
+                    "status": report.status,
+                    "evidence": report.evidence,
+                    "runtime_address": report.runtime_address,
+                }))?
+            );
         }
         Some("snapshot")
             if args.get(1).map(String::as_str) == Some("verify") && args.len() == 5 =>
@@ -586,9 +652,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "execution_snapshot_v1": false,
                     "execution_snapshot_schema_v1": true,
                     "gdb_mi_parser_v1": true,
-                    "gdb_mi_parser_scope": "bounded result, async, and stream records with nested tuples/lists and C-style escaped bytes; no session controller yet",
+                    "gdb_mi_parser_scope": "bounded result, async, and stream records with nested tuples/lists and C-style escaped bytes; experimental session controller awaits Linux gate",
                     "gdb_capture_v1": false,
                     "input_spec_v1": true,
+                    "origin_probe_v1": true,
+                    "origin_probe_scope": "analyst-selected captured register versus input-origin bytes; exact snapshot-bound byte equality only, not channel provenance",
                     "native_replay_v1": false,
                     "bubblewrap_installed": bwrap_version.is_some(),
                     "bubblewrap_version": bwrap_version,

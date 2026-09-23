@@ -38,21 +38,6 @@ def symbol_address(binary: Path, symbol: str) -> int:
     return matches[0]
 
 
-def captured_bytes(snapshot: dict, address: int, length: int) -> bytes:
-    result = bytearray()
-    while len(result) < length:
-        page_address = address & ~4095
-        pages = [page for page in snapshot["pages"] if page["address"] == page_address]
-        assert len(pages) == 1 and pages[0]["value"]["state"] == "present", pages
-        page = bytes.fromhex(pages[0]["value"]["bytes_hex"])
-        offset = address - page_address
-        chunk = page[offset:offset + length - len(result)]
-        assert chunk, (address, length)
-        result.extend(chunk)
-        address += len(chunk)
-    return bytes(result)
-
-
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hydir-replay-smoke-") as directory:
         work = Path(directory)
@@ -65,6 +50,7 @@ def main() -> None:
         stripped = work / "replay_channels.stripped.elf"
         stripped_specification = work / "stripped-input.json"
         stripped_snapshot_path = work / "stripped-snapshot.json"
+        stripped_probe_path = work / "stripped-origin-probe.json"
         run("clang", "-O1", "-fPIE", "-pie", ROOT / "tests" / "fixtures" / "replay_channels.c", "-o", binary)
         validator_address = symbol_address(binary, "check_line")
         run("strip", "--strip-all", "-o", stripped, binary)
@@ -115,7 +101,15 @@ def main() -> None:
         expected = source[origin["offset"]:origin["offset"] + origin["length"]]
         argument = stripped_snapshot["registers"]["rdi"]
         assert argument["state"] == "present", stripped_snapshot
-        assert captured_bytes(stripped_snapshot, argument["value"], len(expected)) == expected
+        run(CTL, "snapshot", "probe-origin", stripped, stripped_specification,
+            stripped_snapshot_path, origin["id"], "--register", "rdi", "--output", stripped_probe_path)
+        run(CTL, "snapshot", "verify-origin", stripped, stripped_specification,
+            stripped_snapshot_path, stripped_probe_path)
+        probe = json.loads(stripped_probe_path.read_text(encoding="utf-8"))
+        assert probe["status"] == "matched", probe
+        assert probe["evidence"] == "byte_equality_only", probe
+        assert probe["runtime_address"] == argument["value"], probe
+        assert probe["observed_hex"] == expected.hex(), probe
         spec["stdin_hex"] = b"wrong\n".hex()
         specification.write_text(json.dumps(spec), encoding="utf-8")
         run(CTL, "replay", binary, specification, "--output", mismatching)

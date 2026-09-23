@@ -6,8 +6,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 mod gdb_mi;
+mod origin_probe;
 mod snapshot;
 pub use gdb_mi::{MiListEntry, MiRecord, MiValue, parse_mi_line};
+pub use origin_probe::{
+    MAX_ORIGIN_PROBE_JSON_BYTES, ORIGIN_PROBE_VERSION, OriginProbe, ProbeEvidence, ProbeLocation,
+    ProbeStatus, parse_origin_probe, probe_origin, validate_origin_probe,
+};
 pub use snapshot::{
     EXECUTION_SNAPSHOT_VERSION, ExecutionSnapshot, MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
     MemoryMapping, MemoryPage, MemoryPageState, MemoryReadError, RegisterObservation,
