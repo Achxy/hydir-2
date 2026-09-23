@@ -72,6 +72,8 @@ For 64-bit `test`, `and`, `or`, and `xor`, the CFG lowerer also derives signed
 and unsigned compound predicates from the result's sign and zero bits. These
 operations clear carry and overflow, so branches reading only those flags have
 a constant outcome. Simple zero tests keep a direct form for C structuring.
+The flag snapshot is the logical result at the instruction site; branches can
+therefore use it after paths from `test` and `and` rejoin.
 The flag rules follow the [AMD64 architecture manual](https://docs.amd.com/v/u/en-US/24592_3.24).
 The C11 renderer folds
 single-entry chains, private diamonds, and simple pre-test loops into readable
