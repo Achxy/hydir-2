@@ -1060,7 +1060,10 @@ fn flag_transfer(
     match family.as_str() {
         "cmp" => Some(FlagSource::Compare),
         "test" => Some(FlagSource::Test),
-        "add" | "sub" | "xor" | "and" | "or" => Some(FlagSource::ResultZero),
+        // SUB and CMP set CF/SF/OF/ZF from the same ordered operands. The
+        // destination write must not replace those operands before a branch.
+        "sub" => Some(FlagSource::Compare),
+        "add" | "xor" | "and" | "or" => Some(FlagSource::ResultZero),
         _ => incoming,
     }
 }
@@ -1277,7 +1280,32 @@ fn lower_instruction(
             push_assignment(statements, target, expression, site);
             None
         }
-        ("add" | "sub" | "xor" | "and" | "or", [destination, _source])
+        ("sub", [destination, _source])
+            if instruction.effects.control == MachineControlEffect::Next =>
+        {
+            let target = register(destination)?;
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            let expression = normalized_register_value(semantic, register_name)?;
+            if snapshot_flags {
+                if normalized_result_zero(semantic, family)? != expression {
+                    return Err("typed CFG subtraction result and flags disagree".to_owned());
+                }
+                let HighExpr::Binary {
+                    op: BinaryOp::Sub,
+                    left,
+                    right,
+                } = &expression
+                else {
+                    return Err("typed CFG subtraction lacks ordered operands".to_owned());
+                };
+                push_assignment(statements, FLAG_LEFT.to_owned(), *left.clone(), site);
+                push_assignment(statements, FLAG_RIGHT.to_owned(), *right.clone(), site);
+            }
+            push_assignment(statements, target, expression, site);
+            *flag_source = Some(FlagSource::Compare);
+            None
+        }
+        ("add" | "xor" | "and" | "or", [destination, _source])
             if instruction.effects.control == MachineControlEffect::Next =>
         {
             let target = register(destination)?;

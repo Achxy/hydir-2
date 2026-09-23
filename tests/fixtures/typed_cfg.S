@@ -64,6 +64,39 @@ hydir_cfg_sub_flags:
     retq
 .size hydir_cfg_sub_flags, .-hydir_cfg_sub_flags
 
+.globl hydir_cfg_sub_unsigned_join
+.type hydir_cfg_sub_unsigned_join,@function
+hydir_cfg_sub_unsigned_join:
+    testq %rdx, %rdx
+    jz .Lsub_join_cmp
+    movq %rdi, %rax
+    subq %rsi, %rax
+    jmp .Lsub_join_branch
+.Lsub_join_cmp:
+    cmpq %rsi, %rdi
+    movq %rdi, %rax
+.Lsub_join_branch:
+    jb .Lsub_join_less
+    movq $0, %rax
+    retq
+.Lsub_join_less:
+    movq $1, %rax
+    retq
+.size hydir_cfg_sub_unsigned_join, .-hydir_cfg_sub_unsigned_join
+
+.globl hydir_cfg_sub_signed_snapshot
+.type hydir_cfg_sub_signed_snapshot,@function
+hydir_cfg_sub_signed_snapshot:
+    movq %rdi, %rax
+    subq %rsi, %rax
+    movq $0, %rax
+    jl .Lsub_signed_less
+    retq
+.Lsub_signed_less:
+    movq $1, %rax
+    retq
+.size hydir_cfg_sub_signed_snapshot, .-hydir_cfg_sub_signed_snapshot
+
 .globl hydir_cfg_and_flags
 .type hydir_cfg_and_flags,@function
 hydir_cfg_and_flags:
