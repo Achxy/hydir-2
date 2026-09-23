@@ -1,35 +1,38 @@
-# Hydir master plan: understand binaries, solve challenges, verify results
+# Hydir product plan: understand binaries, solve challenges, verify results
 
-Status: active implementation roadmap. Updated 2026-09-23. This is the single source of truth for launch scope, order, gates, and claims.
+Status: active implementation roadmap. Updated 2026-09-23. This is the single source of truth for product scope, implementation order, launch gates, and claims.
 
 This document consolidates the typed-decompiler milestone, CTF workflow, VM roadmap, competitor research, desktop workbench, and launch requirements. It replaces the earlier fragmented proposals. The status below distinguishes implemented capabilities from proposed launch gates. No competitive benchmark or end-to-end launch workflow has passed yet.
 
-## 0. The launch decision
+## 0. The product decision
 
-Hydir should win a **specific investigation**, not a feature-count contest: an analyst opens an unfamiliar stripped x86-64 ELF, finds the check that rejects an input, understands the relevant code and data, produces a changed input, and sees that input succeed in a fresh run of the original binary. The project must retain enough evidence to reproduce and challenge that answer. A second, bounded demo explains a virtualized check through a guest graph and checked expression simplification. General decompiler parity, broad architectures, and commercial VM support are later goals.
+Hydir should win a **specific investigation**: an analyst opens an unfamiliar stripped x86-64 ELF, finds the check that rejects an input, understands the relevant code and data, produces a changed input, and sees that input succeed in a fresh run of the original binary. The project retains the evidence, assumptions, and recipe needed to reproduce or challenge that answer. This is a focused competitive promise against existing reverse-engineering workflows, not a claim of Ghidra-scale format coverage or angr-scale engine breadth.
 
-| Order | User-visible result | Engineering gate | Status on launch branch |
+The first public beta is the **evidence-linked CTF solve workbench**. A separate VM demonstration becomes public when its guest graph, effect slice, and scoped equivalence check pass M7; it does not hold the core solve beta hostage. A polished general-purpose decompiler and commercial VM support are later expansion targets.
+
+| Priority | User-visible result | Required gate | Current state on `codex/hydir-launch` |
 | --- | --- | --- | --- |
-| 1. Trust the base | Open a binary and retain low-level views when recovery fails | M0 compatibility, deterministic fixtures, truthful capability report | Partly integrated; full GUI/package gate open |
-| 2. Understand the check | Navigate from a condition to typed C, field evidence, calls, and machine instructions | M1 expressions, M2 typed flow and type constraints, M3 dependency invalidation | Model and typed subsets implemented; widths, calls, indirect flow, and targeted rediscovery open |
-| 3. Observe the original | Run a controlled input, stop at a useful boundary, inspect real state, and replay | M4 capture, origin mapping, runner, PIE/missing-memory gates | Replay and snapshot contracts exist; named-symbol and stripped-address capture are experimental and await live Linux gate |
-| 4. Solve and explain | Show the bytes behind failure, generate a candidate, and validate it natively | M5 guided solving plus M6 slices, trace indexing, and result states | Function-level Triton bridge exists; guided input solve is open |
-| 5. Explain a VM | Map host activity to a bounded guest CFG and check one scoped simplification | M7 guest graph, effects, multiple-input comparison, equivalence query | VM profile and bounded VPC explorer exist; guest CFG/checks open |
-| 6. Ship and compare | Complete the investigation in the installed app and reproduce it by CLI | M8 usability, package, independent challenges, fair baselines | Not yet gated |
+| P0a. Trust and understand | Open a stripped ELF; follow a rejection through typed or low-level C, calls, types, CFG, and instructions | M0–M3 bounded correctness and linked navigation | Model, ExpressionIR, and typed subsets exist; widths, calls, indirect flow, remote edits, and broader fixtures remain |
+| P0b. Observe and solve | Run a failing input, capture a useful state, identify candidate input bytes, solve a bounded goal, and replay against the original ELF | M4–M6 end-to-end solve gate | Replay/snapshot/probe contracts and experimental capture exist; live Linux gate, captured-state solving, slices, and native-validated candidate workflow remain |
+| P0c. Ship the beta | Install, complete the investigation without a custom script, export/reproduce the recipe, and compare fairly | M8 beta usability, packaging, and held-out challenges | Not yet gated |
+| P1. Explain a VM | Show a bounded guest CFG, host/guest evidence, and one checked simplification | M7 VM gate | VM profile and bounded VPC explorer exist; guest CFG and checks remain |
+| P2. Broaden coverage | Expand formats, architectures, language idioms, and harder protection families based on measured failures | GA and post-launch gates | Deliberately deferred |
 
-The order expresses dependencies, not six isolated projects. Build UI affordances and regression fixtures with the feature they expose. Prioritize a failed end-to-end workflow over adding another disconnected analysis pass.
+This is one dependency chain. Build UI affordances and regression fixtures with the feature they expose. A failing end-to-end solve takes priority over an isolated new analysis pass. Work is accepted only when it changes a supported analyst action and has a fixture or independent challenge that proves that action.
 
-**Launch rule:** a result card must distinguish an observation, a static inference, an analyst assertion, a solver result under assumptions, and a native-validated candidate. A timeout, incomplete CFG, missing page, or unknown alias must remain visible at the point where it affects the answer. Never use C compilation, one successful replay, or an SMT equivalence of a small expression as a broader correctness claim.
+**Claim rule:** a result card distinguishes an observation, a static inference, an analyst assertion, a solver result under assumptions, and a native-validated candidate. A timeout, incomplete CFG, missing page, unknown alias, or failed replay stays visible at the point where it affects the answer. C compilation proves that emitted text is valid C for its helper contract; it does not prove equivalence. One replay proves one run under one recorded environment.
 
 ## 1. Product objective and positioning
 
 Build a reverse-engineering workbench in which an analyst can open a stripped binary, understand its data and control flow, identify why an input fails, generate a candidate input, and verify the result against the original executable. The same project should explain a virtualized validation routine and retain the evidence behind every important conclusion.
 
-The three required launch workflows are:
+The three core beta workflows are:
 
 1. **Understand:** recover useful types and readable C, inspect evidence, edit interpretations, and navigate all related views.
 2. **Solve:** choose an input and a goal, follow its dependencies, run bounded exploration, and replay a generated input against the original program.
-3. **Explain obfuscation:** recover a bounded guest CFG, separate interpreter activity from relevant guest effects, and check a proposed simplification.
+3. **Reproduce:** export the input, model edits, solver assumptions, tool versions, and native validation as a portable investigation recipe.
+
+The follow-on VM workflow recovers a bounded guest CFG, separates interpreter activity from relevant guest effects, and checks a proposed simplification. It ships as a distinct, clearly scoped preview after its M7 gate passes.
 
 The competitive objective is lower analyst effort and shorter time to a verified answer on these workflows. Measure this against Ghidra, angr with angr-management, rev.ng, and Miasm where each supports the task. General architecture coverage and ecosystem parity remain longer-term work.
 
@@ -54,15 +57,15 @@ These are product differentiation hypotheses. GUI symbolic execution, SSA, snaps
 
 This table defines experiments, not claims that Hydir already exceeds these tools. Compare the same binary, goal, hardware, budgets, and analyst guidance; count preparation time and failed runs.
 
-### Critical path to the first public demo
+### Critical path to the first public beta
 
 1. **Make the existing spine trustworthy:** finish M0 integration and the bounded M1 expression/semantics gates. Preserve low-level output whenever a typed view is unsupported.
 2. **Make the binary understandable:** finish M2 typed flow, aggregate recovery, and model editing, then M3 targeted discovery and artifact invalidation. Demo a type edit changing C and xrefs without reprocessing unrelated functions.
 3. **Make a result verifiable:** implement M4 capture and fresh replay, then M5 goal solving and M6 input-to-condition slices. Demo a failing input, a generated candidate, and a native-confirmed success from the same project.
-4. **Explain the virtualized check:** complete the bounded M7 guest graph and checked simplification on the first-party VM fixture. Show unexplored edges and assumptions alongside the recovered logic.
-5. **Ship and measure:** complete M8 navigation, recipes, packaging, installation, external trials, and fair comparisons. Publish failures and unsupported cases with the successful demo.
+4. **Ship and measure:** complete M8 navigation, recipes, packaging, installation, external trials, and fair comparisons. Publish failures and unsupported cases with the successful demo.
+5. **Extend to a VM preview:** complete the bounded M7 guest graph and checked simplification on the first-party VM fixture. Show unexplored edges and assumptions alongside the recovered logic.
 
-The first public demo requires all five steps. An earlier typed-C or solver preview can be shown with its narrower verified scope.
+The first public beta requires steps 1–4. Step 5 is a second demonstration and a product expansion, with its own gate. An earlier typed-C or solver preview can be shown with its narrower verified scope.
 
 ## 2. Current baseline
 
@@ -135,6 +138,11 @@ The proposed product contribution is the **evidence-linked repair loop**: from o
 
 Add a small versioned `InvestigationClaim v1` artifact once the first solve works. It should bind a single user-facing statement (for example, “bytes 4–7 caused this branch” or “this candidate reaches success”) to binary/input hashes, address and trace references, model revision, assumptions, evidence kind, coverage, and invalidation dependencies. Exporting a claim must reproduce its check or state why that check is unavailable. This gives both the UI and CLI one honest contract for explaining results, without building a general theorem prover or claiming whole-program correctness.
 
+Two follow-on experiments could make this more than a convenient wrapper around existing engines:
+
+1. **Conflict-driven investigation:** when a type inference, static edge, or expression disagrees with an observation, present the precise conflicting facts and propose the cheapest bounded next measurement (another input, a breakpoint, or targeted rediscovery). Keep the recommendation and its outcome as evidence; never silently vote one source into truth.
+2. **Distinguishing input for competing interpretations:** branch two analyst models or two supported pure expressions, search for an input on which they differ, then run that input through the original binary. This is a scoped hypothesis test, with unknown/unsupported outcomes preserved. Build it after the core repair loop, and retain it only if external testers use it to resolve real ambiguity faster.
+
 ## 5. Milestone M0 — Integrate and establish the baseline
 
 **Deliverables**
@@ -162,6 +170,8 @@ Add a small versioned `InvestigationClaim v1` artifact once the first solve work
 
 ## 7. Milestone M2 — Deliver typed decompilation and usable type recovery
 
+**Beta slice:** make the flagship validator and held-out checks readable with typed conditions, fixed direct calls, 8-bit input accesses, 64-bit arithmetic, aggregate fields, and honest goto/low-level fallbacks. Expand the full width and call matrix below against measured failures rather than blocking the first solve on every pattern.
+
 **Typed C**
 
 - Add `HighLevelCIR v2` with typed expressions, locals, blocks, conditions, loops, switch, labels/gotos, memory operations, calls, returns, and source mappings.
@@ -187,6 +197,8 @@ This work draws on [Retypd](https://arxiv.org/abs/1603.05495), [Symless](https:/
 
 ## 8. Milestone M3 — Make discovery, edits, and artifacts incremental
 
+**Beta slice:** local model edits must invalidate affected C, field xrefs, and callers, and a newly observed indirect target must trigger bounded rediscovery. Remote editing and general server-side cache coherence belong to GA unless the beta workflow depends on them.
+
 **Deliverables**
 
 - Replace repeated whole-function indirect-target recovery with a bounded changed-address worklist. Revisit affected blocks, functions, call sites, and summaries; record frontier and stop reason.
@@ -202,6 +214,8 @@ This work draws on [Retypd](https://arxiv.org/abs/1603.05495), [Symless](https:/
 ## 9. Milestone M4 — Capture useful execution state and replay inputs
 
 This is the first execution deliverable. It can proceed alongside M1–M3 once M0 establishes common artifact and identity contracts.
+
+**Beta slice:** establish live Linux capture of a stripped PIE after stdin or file input, prove the selected input bytes are present or label the mapping as an analyst assumption, and replay a generated candidate in a fresh process. Keep argv and broader process-state capture as explicit capability gates.
 
 **Deliverables**
 
@@ -219,6 +233,8 @@ The architecture follows the capture-and-focus principle demonstrated by [Symbio
 **Gate:** stdin, argv, and file fixtures can be captured, resumed in the supported Triton scope, and replayed reproducibly. PIE addresses resolve correctly. Missing memory, code changes, cancellation, and unsupported thread behavior produce explicit results.
 
 ## 10. Milestone M5 — Turn Triton into a guided CTF workflow
+
+**Beta slice:** start with a captured pure validator and byte constraints, one selected reach/branch/return goal, bounded path search, and fresh native replay. Add libc/syscall summaries and larger state merging only when a frozen challenge demonstrates the need and the summary can be checked.
 
 **Deliverables**
 
@@ -245,6 +261,8 @@ Total session time and memory cap every profile. Persist remaining frontiers for
 **Gate:** users can solve supported checks from the GUI without writing a solver script, export the full recipe, and reproduce the input and validation using the CLI. All analyst-supplied addresses, summaries, constraints, and guidance appear in that recipe.
 
 ## 11. Milestone M6 — Help analysts find the interesting logic
+
+**Beta slice:** one failed condition must link to its relevant input byte range, source instructions, and a captured occurrence with unresolved dependencies displayed. Large trace indexing and broad behavioral hint catalogs follow after the core route is reliable.
 
 **Deliverables**
 
@@ -294,12 +312,12 @@ Implement UI work alongside each milestone, then use this stage for end-to-end i
 
 1. **Explain this rejection:** connect a failed condition to field values, input byte ranges, relevant instructions, and recorded assumptions.
 2. **Repair this input:** preserve locked bytes, propose a satisfying change, show the changed bytes, and replay the result. A minimum-change claim requires a completed optimization check; otherwise show the best candidate found.
-3. **Explain this simplification:** connect a small recovered expression to its host/guest slice and the check supporting it.
-4. **Export this investigation:** retain model edits, inputs, goals, guidance, tool versions, budgets, evidence, and replay results in a portable bundle.
+3. **Export this investigation:** retain model edits, inputs, goals, guidance, tool versions, budgets, evidence, and replay results in a portable bundle.
+4. **Explain this simplification (VM preview):** connect a small recovered expression to its host/guest slice and the check supporting it.
 
-**Bounded follow-up experiment:** branch a model interpretation, compare artifacts, and seek an input distinguishing two supported pure expressions. Verify the observation against the original function when possible. General hypothesis solving remains experimental until it passes dedicated gates.
+The conflict-driven and distinguishing-input experiments in section 4 follow the beta repair loop. General hypothesis solving remains experimental until it passes dedicated gates.
 
-**Gate:** a new user can complete each documented launch workflow without the author intervening or opening an undocumented console.
+**Gate:** a new user can complete each documented core beta workflow without the author intervening or opening an undocumented console. Apply the same gate to the later VM preview before calling it user-ready.
 
 ## 14. Interfaces, compatibility, and repository ownership
 
@@ -324,9 +342,9 @@ Static cache identity includes binary digest, model revision/dependency content,
 
 ## 15. Flagship demo and external validation
 
-### One complete ten-minute investigation
+### One complete ten-minute CTF investigation
 
-Build a distributable stripped ELF challenge containing a cross-function parser, encoded messages, a typed context, and a small virtualized validator. It accepts a binary input file. Publish source and deterministic build instructions after the challenge presentation; use varied build seeds and layouts during development.
+Build a distributable stripped ELF challenge containing a cross-function parser, encoded messages, a typed context, and a bounded validator. It accepts a binary input file. Publish source and deterministic build instructions after the challenge presentation; use varied build seeds and layouts during development. A virtualized variant provides the later M7 preview.
 
 | Approximate segment | Visible outcome |
 | --- | --- |
@@ -334,11 +352,11 @@ Build a distributable stripped ELF challenge containing a cross-function parser,
 | 1–2 minutes | Recover an encoded message and navigate to the validator |
 | 2–3 minutes | Recover/edit an object layout and see C and field xrefs update |
 | 3–5 minutes | Capture at an input boundary; explain which bytes influence rejection |
-| 5–7 minutes | Show a guest branch/loop and check a simplified expression |
-| 7–8 minutes | Generate a candidate and demonstrate success in a fresh original execution |
+| 5–7 minutes | Generate a candidate and show the changed bytes and assumptions |
+| 7–8 minutes | Demonstrate success in a fresh original execution |
 | 8–10 minutes | Export the investigation and reproduce it through the CLI |
 
-PRISM and the plaintext password fixtures remain tutorials and regression tests. They do not serve as evidence of solving unfamiliar obfuscated programs. Record cold-analysis and cached-demo timings separately. All required live actions must work from the shipped package.
+The VM preview is a separate five-minute route through guest CFG recovery, host/guest links, effect slicing, multiple-input comparison, and one scoped equivalence check. PRISM and plaintext password fixtures remain tutorials and regression tests. They do not serve as evidence of solving unfamiliar obfuscated programs. Record cold-analysis and cached-demo timings separately. All required live actions must work from the shipped package.
 
 ### Independent challenges
 
@@ -346,7 +364,24 @@ Evaluate Google CTF Unbreakable as an external demo candidate, Defcamp r100 as a
 
 Do not copy reference scripts' handpicked branch addresses into an allegedly automatic workflow. Record manual guidance and time spent preparing each recipe. Use provenance/hash manifests and upstream retrieval where redistribution rights are not established.
 
-## 16. Release acceptance and competitive evaluation
+## 16. Public beta, VM preview, and GA acceptance
+
+### First public beta gate
+
+- The ten-minute CTF investigation completes from a clean Windows + WSL2 install and a clean Linux install, with no custom solver script and a matching CLI recipe. Record both a cold run and the prepared presentation run.
+- Three independently built stripped x86-64 ELF challenges are frozen before final tuning. At least two must produce native-validated candidate inputs within a 30-minute analysis session after documented setup; publish every failure and all analyst hints used. This is a launch target, not a current result.
+- The same fixtures exercise typed/low-level fallbacks, model round-trips, missing pages, unsupported effects, solver timeout/unknown, stale artifacts, and native replay mismatch. Strict-compile supported typed C with Clang and GCC; differential tests gate only functions advertised as exact under their model.
+- Five people outside the implementation work attempt the documented core workflows; at least four finish each without author intervention. Report times and blockers. Navigation remains responsive under the M8 performance profile.
+- Capability status in the app, CLI, and docs agrees with the test evidence. In particular, Linux capture, replay, and solve flags remain experimental until their live gates pass.
+
+### VM preview gate
+
+- On a first-party fixture with a loop, conditional path, and external memory effect, recover the declared guest scope and show every unexplored frontier. Compare observable effects across multiple inputs and loop counts.
+- Check one pure guest expression against its original under explicit widths and assumptions. Report counterexample, unknown, and timeout distinctly; do not label the surrounding binary rewrite-ready.
+
+### GA expansion gate
+
+The larger matrix below is the quality target for a general release. It should not be treated as already achieved or as a prerequisite for the focused public beta.
 
 ### Correctness and compatibility
 
@@ -359,7 +394,7 @@ Do not copy reference scripts' handpicked branch addresses into an allegedly aut
 
 ### Real usefulness
 
-- All three launch workflows pass end to end from a clean installation.
+- All three core beta workflows and the separately gated VM preview pass end to end from a clean installation.
 - Twelve development challenges produce verified outcomes; six additional external challenges are frozen before tuning, with at least four producing native-confirmed solutions within the declared ten-minute deep-analysis budget after recipe setup. Report setup effort and failures separately.
 - Evaluate selected functions from at least five real utility/program codebases, recording discovery, type accuracy, C compilation, fidelity, and analysis failures even where solver goals do not apply.
 - Six external testers attempt each documented workflow; at least five complete each without author intervention. Record time, confusing actions, setup failures, and exported-result reproducibility.
@@ -383,16 +418,17 @@ Publish supported comparisons and reproducible recipes. Any claim that Hydir is 
 
 | Sequence | Work | Required predecessor |
 | --- | --- | --- |
-| 1 | M0 integration and baseline | Current repository |
-| 2 | M1 shared expressions; begin M4 runner/capture contracts | M0 |
-| 3 | M2 typed flow/types; M3 targeted discovery/cache; finish M4 capture/replay | M1 for semantic consumers; M0 for runner |
-| 4 | M5 guided solving; M6 strings/slices/trace navigation | M1 + M4; model/UI foundations as needed |
-| 5 | M7 guest CFG/effects/checks | M1 + M2 + execution/slice foundations |
-| 6 | M8 complete investigations, packaging, external trials, release gates | Required workflows integrated |
+| 1 | M0 integration and baseline | Current repository; partly complete on launch branch |
+| 2 | M1 shared expressions and M4 runner/capture contracts | M0; bounded subsets exist |
+| 3 | Complete the minimum M2/M3 typed navigation and M4 live capture/replay gates needed for the CTF investigation | M1 for semantic consumers; M0 for runner |
+| 4 | M5 guided solving and M6 input/condition explanations, with linked UI | M1 + M4 and relevant model facts |
+| 5 | M8 beta investigation, recipe export, packaging, held-out trials, and fair comparison | Core solve workflow integrated |
+| 6 | M7 guest CFG/effects/checks and VM preview | M1 + M2 + execution/slice foundations |
+| 7 | GA coverage and broader targets | Beta and VM evidence plus measured failures |
 
 Carry UI and compatibility work with its owning milestone. End each stage with a demonstrable user action, a regression fixture, a capability update, and a documented remaining limitation. Prioritize the next demonstrated blocker to a required workflow.
 
-After launch gates pass, expand in this order:
+After the beta and VM preview gates pass, expand in this order:
 
 1. Improve coverage on failed external ELF cases: indirect control flow, dynamic linking, supported library summaries, and richer ABI/type recovery.
 2. Add PE64 and the Windows ABI/runner, then specific commercial VM profiles with independent fixtures and evidence scopes.
@@ -400,7 +436,17 @@ After launch gates pass, expand in this order:
 4. Extend the checked region-patching path with explicit ABI, memory, exit, and environmental contracts; preserve original binaries and scoped verification artifacts.
 5. Add deeper hypothesis comparison, reusable analysis extensions, additional architectures/formats, and collaboration when demand and correctness coverage justify them.
 
-**Next implementation action:** run the experimental replay and both capture smoke paths on Linux; fix any GDB/MI, namespace, and PIE failures. Then move capture to an input-consumption boundary and connect captured bytes to `InputSpec` origins before Triton resumption. In parallel, extend struct-array and pointer annotations beyond entry-block derivations and add bounded call effects and the remaining supported widths. **First new execution payoff:** explain a failed condition from captured input bytes and replay a working input against the original binary.
+**Immediate execution queue (in order):**
+
+1. Run the experimental replay, named capture, stripped PIE address capture, and origin-probe smoke paths on Linux CI. Fix actual namespace, GDB/MI, PIE, and sparse-memory failures before changing capability flags.
+2. Add a validated captured-state-to-Triton contract. Bind exact binary, input, snapshot, code version, registers, present memory pages, chosen byte origin, and analyst assumptions. An uncaptured register or memory read must return an explicit unsupported result.
+3. Solve a pure post-input validator from the captured state with bounded path and solver budgets. Return a function witness, candidate bytes, explored scope, and distinct SAT/UNSAT/unknown/timeout states. Do not infer original-channel provenance from a byte-equality probe.
+4. Write the proposed bytes into a new `InputSpec`, run a fresh original-binary replay, and emit a native-validated candidate only when the declared goal matches. Keep the internal witness and replay observation separately inspectable.
+5. Connect the selected branch to a conservative input-byte slice and then to a linked C/CFG/disassembly/trace view. Export a reproducible recipe and `InvestigationClaim` for the successful path.
+6. Expand typed-C widths, call effects, derived pointers, and targeted rediscovery against concrete failures in the flagship and held-out fixtures. Preserve the low-level fallback and record unresolved facts.
+7. Package and test the beta on clean Windows + WSL2 and Linux hosts; run held-out trials and fair baseline comparisons. Then complete the separately gated VM preview.
+
+**First new execution payoff:** explain a failed condition from captured input bytes and replay a working input against the original binary. A feature that does not move this workflow or a stated correctness gate should wait.
 
 **M4 progress (2026-09-23):** `InputSpec v1` and `NativeReplayReport v1` have binary/input digest binding, bounded stdin/argv/file bytes, origin ranges, goals, and validation. The CLI can initialize and verify input specs. An experimental Linux Bubblewrap runner emits explicit matched, mismatched, timeout, output-limit, and runner-error reports. Windows emits an unsupported-host report. Named-symbol and stripped-address GDB/MI snapshot producers compile for the Linux target; live Linux replay/capture, input-boundary origin mapping, and the full M4 gate remain open. See [the replay protocol](REPLAY_PROTOCOL.md).
 
