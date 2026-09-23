@@ -11,7 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Read, Write},
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt, process::CommandExt},
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -140,7 +140,7 @@ fn capture_inner(
                     "capture argv currently supports ASCII letters, digits, _, -, ., and /".into(),
                 );
             }
-            Ok(std::ffi::OsString::from_vec(bytes))
+            String::from_utf8(bytes).map_err(|_| "capture argv must be ASCII".into())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let scratch =
@@ -223,7 +223,7 @@ fn capture_inner(
         "--args",
         "/work/.hydir-program",
     ]);
-    for arg in argv {
+    for arg in &argv {
         command.arg(arg);
     }
     command
@@ -260,7 +260,7 @@ fn capture_inner(
     session.required("-gdb-set pagination off")?;
     session.required("-gdb-set confirm off")?;
     session.required("-gdb-set disable-randomization off")?;
-    run_to_target(&mut session, elf, target)?;
+    run_to_target(&mut session, elf, target, &argv)?;
     let thread = session.required("-thread-info")?;
     let (thread_count, thread_id) = parse_threads(&thread.record)?;
     if thread_count != 1 {
@@ -353,21 +353,16 @@ fn run_to_target(
     session: &mut MiSession,
     elf: &[u8],
     target: CaptureTarget<'_>,
+    argv: &[String],
 ) -> Result<(), CaptureFailure> {
     match target {
         CaptureTarget::Symbol(symbol) => {
             session.required(&format!("-break-insert {symbol}"))?;
-            run_command(
-                session,
-                "-interpreter-exec console \"run < /work/.hydir-stdin > /dev/null 2>&1\"",
-            )?;
+            run_command(session, &launch_command("run", argv))?;
             require_breakpoint_hit(session.wait_stop()?)?;
         }
         CaptureTarget::ElfVaddr(address) => {
-            run_command(
-                session,
-                "-interpreter-exec console \"starti < /work/.hydir-stdin > /dev/null 2>&1\"",
-            )?;
+            run_command(session, &launch_command("starti", argv))?;
             let first_stop = session.wait_stop()?;
             let reason = stop_reason(&first_stop);
             if !is_first_instruction_stop(&first_stop) {
@@ -434,6 +429,17 @@ fn run_to_target(
         }
     }
     Ok(())
+}
+
+fn launch_command(verb: &str, argv: &[String]) -> String {
+    // GDB treats a launch command containing redirections as new arguments;
+    // include the validated argv rather than relying on --args defaults.
+    let arguments = if argv.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", argv.join(" "))
+    };
+    format!("-interpreter-exec console \"{verb}{arguments} < /work/.hydir-stdin > /dev/null 2>&1\"")
 }
 
 fn run_command(session: &mut MiSession, command: &str) -> Result<(), CaptureFailure> {
@@ -1004,6 +1010,18 @@ mod tests {
         assert!(is_first_instruction_stop(&zero));
         assert!(is_first_instruction_stop(&breakpoint));
         assert!(!is_first_instruction_stop(&fault));
+    }
+
+    #[test]
+    fn gdb_launch_retains_program_argv_with_input_redirection() {
+        assert_eq!(
+            launch_command("starti", &["open".into()]),
+            "-interpreter-exec console \"starti open < /work/.hydir-stdin > /dev/null 2>&1\""
+        );
+        assert_eq!(
+            launch_command("run", &[]),
+            "-interpreter-exec console \"run < /work/.hydir-stdin > /dev/null 2>&1\""
+        );
     }
 
     #[test]
