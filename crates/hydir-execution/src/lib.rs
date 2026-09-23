@@ -5,16 +5,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod bridge_result;
 mod gdb_mi;
 mod investigation;
+mod investigation_logic;
 mod origin_probe;
 mod snapshot;
 mod snapshot_resume;
+pub use bridge_result::{validate_input_condition_slice, validate_snapshot_bridge_result};
 pub use gdb_mi::{MiListEntry, MiRecord, MiValue, parse_mi_line};
 pub use investigation::{
     ANALYSIS_RECIPE_VERSION, AnalysisRecipe, ChangedOriginByte, ClaimDependency,
     INVESTIGATION_CLAIM_VERSION, InvestigationClaim, MAX_ANALYSIS_RECIPE_JSON_BYTES,
     parse_analysis_recipe,
+};
+pub use investigation_logic::{
+    build_analysis_recipe, candidate_links_failed_trace, validate_analysis_recipe,
 };
 pub use origin_probe::{
     MAX_ORIGIN_PROBE_JSON_BYTES, ORIGIN_PROBE_VERSION, OriginProbe, ProbeEvidence, ProbeLocation,

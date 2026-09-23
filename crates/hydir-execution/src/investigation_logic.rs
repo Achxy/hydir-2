@@ -1,7 +1,7 @@
 //! A reproducible bounded solve recipe and a claim scoped to one native replay.
 
-use super::validate_snapshot_bridge_result;
-use hydir_execution::{
+use crate::validate_snapshot_bridge_result;
+use crate::{
     ANALYSIS_RECIPE_VERSION, AnalysisRecipe, ChangedOriginByte, ClaimDependency, ExecutionSnapshot,
     INVESTIGATION_CLAIM_VERSION, InputSpec, InvestigationClaim, NativeReplayReport, OriginProbe,
     ReplayStatus, SnapshotResumePlan, decode_hex, input_sha256, input_with_origin_candidate,
@@ -27,7 +27,7 @@ fn dependency(kind: &str, sha256: String) -> ClaimDependency {
     }
 }
 
-pub(super) fn candidate_links_failed_trace(plan: &SnapshotResumePlan, bridge: &Value) -> bool {
+pub fn candidate_links_failed_trace(plan: &SnapshotResumePlan, bridge: &Value) -> bool {
     let Some(candidate_hex) = bridge["candidate_hex"].as_str() else {
         return false;
     };
@@ -181,7 +181,7 @@ fn build_claim(
     })
 }
 
-pub(super) fn build_recipe(
+pub fn build_analysis_recipe(
     elf: &[u8],
     original: &InputSpec,
     snapshot: &ExecutionSnapshot,
@@ -207,11 +207,11 @@ pub(super) fn build_recipe(
         recorded_native_replay: replay.clone(),
         claim,
     };
-    validate_recipe(elf, &recipe)?;
+    validate_analysis_recipe(elf, &recipe)?;
     Ok(recipe)
 }
 
-pub(super) fn validate_recipe(elf: &[u8], recipe: &AnalysisRecipe) -> Result<(), Box<dyn Error>> {
+pub fn validate_analysis_recipe(elf: &[u8], recipe: &AnalysisRecipe) -> Result<(), Box<dyn Error>> {
     if recipe.schema_version != ANALYSIS_RECIPE_VERSION
         || recipe.kind != "captured_pure_validator_return"
         || recipe.hydir_version.is_empty()
@@ -272,7 +272,7 @@ pub(super) fn validate_recipe(elf: &[u8], recipe: &AnalysisRecipe) -> Result<(),
     if recipe.claim != expected_claim {
         return Err("InvestigationClaim differs from bound recipe evidence".into());
     }
-    if serde_json::to_vec(recipe)?.len() > hydir_execution::MAX_ANALYSIS_RECIPE_JSON_BYTES {
+    if serde_json::to_vec(recipe)?.len() > crate::MAX_ANALYSIS_RECIPE_JSON_BYTES {
         return Err("AnalysisRecipe exceeds 24 MiB JSON limit".into());
     }
     Ok(())
