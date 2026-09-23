@@ -28,6 +28,10 @@ jobs:
         env:
           HYDIR_TRITON_PYTHON: .venv/bin/python
         run: python3 tests/triton_bridge_test.py -q
+      - name: Captured-state solve and native replay smoke
+        env:
+          HYDIR_TRITON_PYTHON: .venv/bin/python
+        run: python3 scripts/snapshot-solve-smoke.py
       - name: Semantic report protocol tests
         run: python3 tests/semantic_gate_report_test.py -q
       - name: Compiler-output semantic gate

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Bounded, non-executing Triton semantics bridge for HydIR.
+"""Bounded Triton semantics and captured-state bridge for HydIR.
 
-The bridge explores only direct control flow inside one bounded symbol. Each
-path gets a fresh Triton context; final register values are merged as textual
-ITE expressions so a conditional function is not mistaken for a straight-line
-trace.
+The original operation explores direct flow in one symbol without running the
+ELF. The snapshot operation starts from explicitly captured state and returns
+only a function witness; original-program validation belongs to native replay.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
+import time
 
 
 MAX_REQUEST_BYTES = 128 * 1024
@@ -20,6 +20,14 @@ MAX_PATHS = 64
 MAX_PATH_INSTRUCTIONS = 1024
 MAX_CONSOLE_COMMANDS = 64
 MAX_CONSOLE_COMMAND_BYTES = 4096
+SNAPSHOT_REGISTERS = (
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9",
+    "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags",
+)
+SNAPSHOT_FLAG_BITS = {
+    "cf", "pf", "af", "zf", "sf", "tf", "if", "df", "of", "nt",
+    "rf", "vm", "ac", "vif", "vip", "id", "rflags",
+}
 
 
 def fail(message: str) -> None:
@@ -63,6 +71,405 @@ def validate_request(request: dict) -> tuple[str, str, int, bytes]:
     if len(code) > MAX_CODE_BYTES:
         fail("function exceeds 4096-byte limit")
     return symbol, digest.lower(), address, code
+
+
+class UnsupportedSnapshot(Exception):
+    """A captured state cannot support this bounded symbolic execution."""
+
+
+class SnapshotBudgetExhausted(Exception):
+    """The bounded solver session has reached its declared budget."""
+
+
+def _u64(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 1 << 64:
+        fail(f"{name} must be an unsigned 64-bit integer")
+    return value
+
+
+def _digest(value: object, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        fail(f"{name} must be a 64-character hex digest")
+    try:
+        bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be hexadecimal") from error
+    return value
+
+
+def _hex_bytes(value: object, limit: int, name: str) -> bytes:
+    if not isinstance(value, str) or not value or len(value) % 2 or len(value) > limit * 2:
+        fail(f"{name} must contain 1..={limit} bytes of even-length hex")
+    try:
+        return bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(f"{name} is not valid hexadecimal") from error
+
+
+def validate_snapshot_request(request: dict) -> dict:
+    if request.get("operation") != "snapshot_return":
+        fail("unsupported snapshot operation")
+    for name in ("binary_sha256", "input_sha256", "snapshot_sha256", "probe_sha256"):
+        _digest(request.get(name), name)
+    code_address = _u64(request.get("code_address"), "code_address")
+    code = _hex_bytes(request.get("code_hex"), MAX_CODE_BYTES, "code_hex")
+    registers = request.get("registers")
+    if not isinstance(registers, dict) or set(registers) != set(SNAPSHOT_REGISTERS):
+        fail("snapshot registers must contain the captured integer register set")
+    for name, value in registers.items():
+        _u64(value, f"register {name}")
+    if registers["rip"] != code_address:
+        fail("captured RIP differs from code_address")
+    pages = request.get("pages")
+    if not isinstance(pages, list) or not 1 <= len(pages) <= 8:
+        fail("snapshot request must include 1..=8 present pages")
+    page_bytes = {}
+    writable_pages = set()
+    executable_pages = set()
+    previous = -1
+    for page in pages:
+        if not isinstance(page, dict) or set(page) != {
+            "address", "bytes_hex", "writable", "executable"
+        }:
+            fail("snapshot page has invalid fields")
+        address = _u64(page["address"], "page address")
+        if address % 4096 or address <= previous:
+            fail("snapshot pages must be aligned and strictly increasing")
+        data = _hex_bytes(page["bytes_hex"], 4096, "page bytes_hex")
+        if len(data) != 4096:
+            fail("snapshot present page must contain exactly 4096 bytes")
+        if not isinstance(page["writable"], bool) or not isinstance(page["executable"], bool):
+            fail("snapshot page permissions must be booleans")
+        page_bytes[address] = data
+        if page["writable"]:
+            writable_pages.add(address)
+        if page["executable"]:
+            executable_pages.add(address)
+        previous = address
+
+    def captured_bytes(address: int, length: int) -> bytes:
+        result = bytearray()
+        for location in range(address, address + length):
+            page = page_bytes.get(location & ~4095)
+            if page is None:
+                fail(f"snapshot did not capture byte 0x{location:x}")
+            result.append(page[location & 4095])
+        return bytes(result)
+
+    if captured_bytes(code_address, len(code)) != code:
+        fail("code_hex disagrees with captured memory")
+    if any((location & ~4095) not in executable_pages
+           for location in range(code_address, code_address + len(code))):
+        fail("captured code is outside executable pages")
+    origin = request.get("symbolic_origin")
+    if not isinstance(origin, dict) or not isinstance(origin.get("id"), str) or not origin["id"]:
+        fail("symbolic_origin must name an input origin")
+    origin_address = _u64(request.get("origin_address"), "origin_address")
+    seed = _hex_bytes(request.get("seed_hex"), 32, "seed_hex")
+    if origin_address < code_address + len(code) and origin_address + len(seed) > code_address:
+        fail("symbolic origin overlaps captured code")
+    if origin.get("length") != len(seed) or captured_bytes(origin_address, len(seed)) != seed:
+        fail("symbolic origin differs from captured seed bytes")
+    if request.get("origin_probe_evidence") != "byte_equality_only":
+        fail("snapshot origin requires explicit byte-equality evidence")
+    assumptions = [
+        "analyst_selected_origin_address_has_input_channel_bytes",
+        "selected_code_extent_and_captured_pages_cover_this_function_path",
+    ]
+    if request.get("assumptions") != assumptions:
+        fail("snapshot solver assumptions are missing or altered")
+    encoding = origin.get("encoding")
+    if encoding not in ("raw", "ascii"):
+        fail("snapshot solver currently supports raw and ASCII origin encodings")
+    alphabet_hex = origin.get("alphabet_hex", "")
+    if not isinstance(alphabet_hex, str) or len(alphabet_hex) % 2 or len(alphabet_hex) > 512:
+        fail("symbolic origin alphabet is invalid")
+    try:
+        alphabet = bytes.fromhex(alphabet_hex)
+    except ValueError as error:
+        raise ValueError("symbolic origin alphabet is not hexadecimal") from error
+    if alphabet_hex and not alphabet:
+        fail("symbolic origin alphabet is empty")
+    channel = origin.get("channel")
+    if not isinstance(channel, dict) or channel.get("kind") not in ("stdin", "argv", "file"):
+        fail("symbolic origin channel is invalid")
+    allowed = set(alphabet) if alphabet else set(range(256))
+    if encoding == "ascii":
+        allowed.intersection_update(range(128))
+    if channel["kind"] == "argv":
+        allowed.discard(0)
+    if not allowed or any(byte not in allowed for byte in seed):
+        fail("captured seed violates symbolic origin constraints")
+    expected = _u64(request.get("return_equals"), "return_equals")
+    for name, maximum in (("max_seeds", 16), ("max_instructions_per_seed", 1024),
+                          ("max_solver_queries", 32), ("wall_timeout_ms", 20000),
+                          ("solver_timeout_ms", 2000)):
+        value = request.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
+            fail(f"{name} must be within 1..={maximum}")
+    return {
+        "code_address": code_address,
+        "code": code,
+        "registers": registers,
+        "pages": page_bytes,
+        "writable_pages": writable_pages,
+        "origin": origin,
+        "origin_address": origin_address,
+        "seed": seed,
+        "allowed": allowed,
+        "return_equals": expected,
+        "max_seeds": request["max_seeds"],
+        "max_instructions": request["max_instructions_per_seed"],
+        "max_solver_queries": request["max_solver_queries"],
+        "wall_timeout_ms": request["wall_timeout_ms"],
+        "solver_timeout_ms": request["solver_timeout_ms"],
+    }
+
+
+def _snapshot_context(plan: dict, seed: bytes):
+    from triton import ARCH, CALLBACK, CPUSIZE, MemoryAccess, TritonContext
+
+    context = TritonContext(ARCH.X86_64)
+    context.setSolverTimeout(plan["solver_timeout_ms"])
+    for address, data in plan["pages"].items():
+        context.setConcreteMemoryAreaValue(address, data, callbacks=False)
+    context.setConcreteMemoryAreaValue(plan["origin_address"], seed, callbacks=False)
+    known_registers = set()
+    for name, value in plan["registers"].items():
+        register = getattr(context.registers, name)
+        context.setConcreteRegisterValue(register, value, callbacks=False)
+        known_registers.add(context.getParentRegister(register).getName())
+    known_registers.update(SNAPSHOT_FLAG_BITS)
+    known_pages = set(plan["pages"])
+    writable_pages = plan["writable_pages"]
+    code_start = plan["code_address"]
+    code_end = code_start + len(plan["code"])
+
+    def check_memory(_, memory):
+        address = memory.getAddress()
+        size = memory.getSize()
+        if size <= 0 or any((byte & ~4095) not in known_pages
+                            for byte in range(address, address + size)):
+            raise UnsupportedSnapshot(f"uncaptured memory at 0x{address:x}")
+
+    def check_write(_, memory, _value):
+        check_memory(_, memory)
+        address = memory.getAddress()
+        if any((byte & ~4095) not in writable_pages
+               for byte in range(address, address + memory.getSize())):
+            raise UnsupportedSnapshot(f"write to non-writable captured page at 0x{address:x}")
+        if address < code_end and address + memory.getSize() > code_start:
+            raise UnsupportedSnapshot("self-modifying code is outside snapshot solver scope")
+
+    def check_register(ctx, register):
+        parent = ctx.getParentRegister(register).getName()
+        if parent not in known_registers:
+            raise UnsupportedSnapshot(f"uncaptured register {parent}")
+
+    context.addCallback(CALLBACK.GET_CONCRETE_MEMORY_VALUE, check_memory)
+    context.addCallback(CALLBACK.SET_CONCRETE_MEMORY_VALUE, check_write)
+    context.addCallback(CALLBACK.GET_CONCRETE_REGISTER_VALUE, check_register)
+    variables = []
+    for index in range(len(seed)):
+        variable = context.symbolizeMemory(
+            MemoryAccess(plan["origin_address"] + index, CPUSIZE.BYTE), f"origin_{index}"
+        )
+        variables.append(variable)
+    return context, variables
+
+
+def _allowed_constraints(context, variables, allowed: set[int]):
+    ast_context = context.getAstContext()
+    if len(allowed) == 256:
+        return []
+    values = sorted(allowed)
+    result = []
+    for variable in variables:
+        node = ast_context.variable(variable)
+        if values == list(range(128)):
+            result.append(ast_context.bvult(node, ast_context.bv(128, 8)))
+            continue
+        if values == list(range(1, 256)):
+            result.append(node != ast_context.bv(0, 8))
+            continue
+        alternatives = [node == ast_context.bv(value, 8) for value in values]
+        result.append(alternatives[0] if len(alternatives) == 1
+                      else ast_context.lor(alternatives))
+    return result
+
+
+def _solve_snapshot_query(context, clauses, variables, seed, timeout, budget):
+    from triton import SOLVER_STATE
+
+    remaining_ms = int((budget["deadline"] - time.monotonic()) * 1000)
+    if budget["queries"] >= budget["max_queries"] or remaining_ms <= 0:
+        raise SnapshotBudgetExhausted("snapshot solver query or wall budget exhausted")
+    budget["queries"] += 1
+    predicate = clauses[0] if len(clauses) == 1 else context.getAstContext().land(clauses)
+    model, status, _ = context.getModel(
+        predicate, status=True, timeout=min(timeout, remaining_ms)
+    )
+    if status == SOLVER_STATE.UNSAT:
+        return None, "unsat"
+    if status != SOLVER_STATE.SAT:
+        for label in ("TIMEOUT", "UNKNOWN", "OUTOFMEM"):
+            if status == getattr(SOLVER_STATE, label, None):
+                return None, label.lower()
+        return None, "unknown"
+    candidate = bytearray(seed)
+    for index, variable in enumerate(variables):
+        value = model.get(variable.getId())
+        if value is not None:
+            candidate[index] = int(value.getValue())
+    return bytes(candidate), "sat"
+
+
+def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict):
+    from triton import EXCEPTION, Instruction
+
+    context, variables = _snapshot_context(plan, seed)
+    allowed = _allowed_constraints(context, variables, plan["allowed"])
+    prefix = []
+    alternatives = []
+    seen_constraints = 0
+    instructions = 0
+    while instructions < plan["max_instructions"]:
+        if time.monotonic() >= budget["deadline"]:
+            raise SnapshotBudgetExhausted("snapshot solver wall budget exhausted")
+        pc = context.getConcreteRegisterValue(context.registers.rip, callbacks=False)
+        offset = pc - plan["code_address"]
+        if offset < 0 or offset >= len(plan["code"]):
+            raise UnsupportedSnapshot(f"control flow leaves captured code at 0x{pc:x}")
+        instruction = Instruction(plan["code"][offset:offset + 15])
+        instruction.setAddress(pc)
+        context.disassembly(instruction)
+        size = instruction.getSize()
+        if size <= 0 or offset + size > len(plan["code"]):
+            raise UnsupportedSnapshot(f"instruction at 0x{pc:x} exceeds captured code")
+        text = instruction.getDisassembly() or ""
+        mnemonic = text.split(None, 1)[0].lower() if text else "unknown"
+        if mnemonic.startswith(("call", "syscall", "sysenter", "int", "iret", "hlt", "ud2")):
+            raise UnsupportedSnapshot(f"unsupported instruction at 0x{pc:x}: {mnemonic}")
+        outcome = context.processing(instruction)
+        if outcome != EXCEPTION.NO_FAULT:
+            raise UnsupportedSnapshot(f"Triton cannot process 0x{pc:x}: {outcome}")
+        instructions += 1
+        budget["processed_instructions"] += 1
+        if explore:
+            constraints = context.getPathConstraints()
+            for constraint in constraints[seen_constraints:]:
+                if not constraint.isMultipleBranches():
+                    continue
+                options = constraint.getBranchConstraints()
+                taken = [branch for branch in options if branch["isTaken"]]
+                if len(taken) != 1:
+                    raise UnsupportedSnapshot(f"ambiguous branch at 0x{pc:x}")
+                for branch in options:
+                    if branch["isTaken"]:
+                        continue
+                    candidate, state = _solve_snapshot_query(
+                        context, prefix + [branch["constraint"]] + allowed,
+                        variables, seed, plan["solver_timeout_ms"], budget
+                    )
+                    alternatives.append((candidate, state))
+                prefix.append(taken[0]["constraint"])
+            seen_constraints = len(constraints)
+        if mnemonic.startswith("ret"):
+            value = context.getConcreteRegisterValue(context.registers.rax, callbacks=False)
+            if not explore:
+                return value, None, "not_run", [], instructions
+            goal = context.getRegisterAst(context.registers.rax) == context.getAstContext().bv(
+                plan["return_equals"], 64
+            )
+            candidate, state = _solve_snapshot_query(
+                context, [context.getPathPredicate(), goal] + allowed,
+                variables, seed, plan["solver_timeout_ms"], budget
+            )
+            return value, candidate, state, alternatives, instructions
+    raise UnsupportedSnapshot("snapshot path exceeds instruction budget")
+
+
+def run_snapshot_return(request: dict) -> dict:
+    plan = validate_snapshot_request(request)
+    budget = {
+        "deadline": time.monotonic() + plan["wall_timeout_ms"] / 1000,
+        "queries": 0,
+        "max_queries": plan["max_solver_queries"],
+        "processed_instructions": 0,
+    }
+    queued = [plan["seed"]]
+    seen = set()
+    explored = 0
+    uncertainty = set()
+    unsupported = []
+    budget_hit = None
+    while queued and explored < plan["max_seeds"]:
+        seed = queued.pop(0)
+        if seed in seen:
+            continue
+        seen.add(seed)
+        explored += 1
+        try:
+            value, candidate, state, alternatives, _ = _execute_snapshot_seed(
+                plan, seed, True, budget
+            )
+            if state == "sat" and candidate is not None:
+                if any(byte not in plan["allowed"] for byte in candidate):
+                    raise UnsupportedSnapshot("solver candidate violates origin constraints")
+                checked, _, _, _, _ = _execute_snapshot_seed(
+                    plan, candidate, False, budget
+                )
+                if checked != plan["return_equals"]:
+                    raise UnsupportedSnapshot("candidate does not satisfy concrete Triton replay")
+                status = "function_witness"
+                witness = candidate.hex()
+                break
+            uncertainty.add(state)
+            for alternative, alternative_state in alternatives:
+                if alternative_state != "sat":
+                    uncertainty.add(alternative_state)
+                elif alternative is not None and alternative not in seen and alternative not in queued:
+                    queued.append(alternative)
+        except UnsupportedSnapshot as error:
+            unsupported.append(str(error))
+        except SnapshotBudgetExhausted as error:
+            budget_hit = str(error)
+            break
+    else:
+        witness = None
+        if queued or budget_hit:
+            status = "budget_exhausted"
+        elif unsupported:
+            status = "unsupported_effect"
+        elif "timeout" in uncertainty:
+            status = "solver_timeout"
+        elif "unknown" in uncertainty or "outofmem" in uncertainty:
+            status = "solver_unknown"
+        else:
+            status = "search_exhausted"
+    if budget_hit:
+        witness = None
+        status = "budget_exhausted"
+    return {
+        "schema_version": 1,
+        "operation": "snapshot_return",
+        "backend": "triton",
+        "binary_sha256": request["binary_sha256"],
+        "input_sha256": request["input_sha256"],
+        "snapshot_sha256": request["snapshot_sha256"],
+        "probe_sha256": request["probe_sha256"],
+        "origin_id": plan["origin"]["id"],
+        "origin_probe_evidence": "byte_equality_only",
+        "assumptions": request["assumptions"],
+        "return_equals": plan["return_equals"],
+        "status": status,
+        "candidate_hex": witness,
+        "explored_seeds": explored,
+        "processed_instructions": budget["processed_instructions"],
+        "solver_queries": budget["queries"],
+        "unsupported_paths": len(unsupported),
+        "diagnostic": budget_hit or (unsupported[0] if unsupported else None),
+    }
 
 
 def new_context():
@@ -317,6 +724,10 @@ def main() -> None:
         request = read_request()
         if request.get("operation") == "console":
             json.dump(run_console(request), sys.stdout, sort_keys=True)
+            sys.stdout.write("\n")
+            return
+        if request.get("operation") == "snapshot_return":
+            json.dump(run_snapshot_return(request), sys.stdout, sort_keys=True)
             sys.stdout.write("\n")
             return
         symbol, digest, address, code = validate_request(request)
