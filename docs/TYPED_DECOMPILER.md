@@ -67,7 +67,9 @@ the destination write, so subsequent signed and unsigned comparisons can use
 the same predicate as `cmp`, including when both paths join before a branch.
 Addition also snapshots its original operands: a later `jc`/`jnc` compares the
 wrapped sum with the first operand, and `jo`/`jno` checks the sign-bit overflow
-formula. Zero and sign checks after addition use the same modular sum.
+formula. Zero and sign checks after addition use the same modular sum. Compound
+unsigned and signed branches use bit masks for CF, ZF, SF, and OF; the mask
+identities preserve the 64-bit modular result without signed C overflow.
 For 64-bit `test`, `and`, `or`, and `xor`, the CFG lowerer also derives signed
 and unsigned compound predicates from the result's sign and zero bits. These
 operations clear carry and overflow, so branches reading only those flags have
@@ -111,8 +113,8 @@ It also checks normalized zero-flag assignments and branch conditions, so
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
 use the bounded compare/test/subtract interpretation; logical operations cover
 their defined zero, sign, carry, and overflow combinations. Addition supports
-direct zero, sign, carry, and overflow checks. Compound conditions after
-addition, arbitrary flag SSA, and other arithmetic carry/overflow sources remain future
+direct and compound checks over those flags. Arbitrary flag SSA and other
+arithmetic carry/overflow sources remain future
 work. The memory helpers use integer-to-pointer
 conversion in the supported x86-64 execution environment. The CFG lowerer also
 handles normalized 64-bit `lea` expressions. A single-write register derived
