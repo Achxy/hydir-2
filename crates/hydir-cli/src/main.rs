@@ -376,7 +376,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "analysis_model_v1": true,
                     "analysis_model_scope": "ELF SHA-256-bound JSON with bounded DWARF import, aggregate inference, visible conflicts, and revision-checked local analyst edits",
                     "expression_ir_v1": true,
-                    "expression_ir_scope": "supported scalar register writes, defined flags for supported register CMP/TEST/arithmetic operations, conditional branch predicates, and component SSA joins; remaining effects retain explicit residuals",
+                    "expression_ir_scope": "supported scalar writes, condition flags/predicates, little-endian MOV loads/stores with complete alias-region dependencies, 64/32-bit LEA, and component SSA joins; unsupported effects remain residual",
                     "typed_c_v1": true,
                     "typed_c_scope": "complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; other functions retain low-level C",
                     "typed_c_local_cache": true,
