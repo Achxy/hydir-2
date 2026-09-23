@@ -11,13 +11,15 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Install native tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv
+        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv bubblewrap
       - name: Install Triton binary-analysis bindings
         run: |
           python3 -m venv .venv
           .venv/bin/python -m pip install triton-library
       - name: Rust tests
         run: cargo test --locked --workspace
+      - name: Native replay smoke
+        run: python3 scripts/replay-smoke.py
       - name: Fuzz target build
         run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
       - name: Native ELF decompiler artifacts and C11
