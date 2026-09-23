@@ -77,6 +77,8 @@ def new_context():
 
 def path_witness(context, choices: tuple[int, ...]) -> list[int] | None:
     """Solve the selected branch at each replayed conditional instruction."""
+    from triton import SOLVER_STATE
+
     branches = [constraint.getBranchConstraints()
                 for constraint in context.getPathConstraints()
                 if constraint.isMultipleBranches()]
@@ -90,9 +92,14 @@ def path_witness(context, choices: tuple[int, ...]) -> list[int] | None:
     if not selected:
         return [0, 0]
     predicate = selected[0] if len(selected) == 1 else context.getAstContext().land(selected)
-    if not context.isSat(predicate):
+    model, status, _ = context.getModel(predicate, status=True, timeout=2000)
+    if status == SOLVER_STATE.UNSAT:
         return None
-    model = context.getModel(predicate)
+    if status != SOLVER_STATE.SAT:
+        for label in ("TIMEOUT", "UNKNOWN", "OUTOFMEM"):
+            if status == getattr(SOLVER_STATE, label):
+                fail(f"Triton solver returned {label.lower()} for a path witness")
+        fail(f"Triton solver returned unrecognized status {status!r} for a path witness")
     values = []
     for alias in ("arg0", "arg1"):
         variable = context.getSymbolicVariable(alias)

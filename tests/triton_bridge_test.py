@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +71,37 @@ class TritonBridgeTests(unittest.TestCase):
         result = self.run_bridge({"schema_version": 999})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsupported request schema", result.stderr)
+
+    def test_solver_uncertainty_does_not_discard_a_path_as_unsat(self) -> None:
+        specification = importlib.util.spec_from_file_location("hydir_triton_bridge", BRIDGE)
+        assert specification is not None and specification.loader is not None
+        bridge = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(bridge)
+
+        solver_state = types.SimpleNamespace(
+            SAT=1, UNSAT=2, TIMEOUT=3, UNKNOWN=4, OUTOFMEM=5
+        )
+        branch = types.SimpleNamespace(
+            isMultipleBranches=lambda: True,
+            getBranchConstraints=lambda: [{"constraint": "selected_path"}],
+        )
+        for status, label in ((3, "timeout"), (4, "unknown"), (5, "outofmem")):
+            context = types.SimpleNamespace(
+                getPathConstraints=lambda: [branch],
+                getModel=lambda predicate, **options: ({}, status, 2000),
+            )
+            with self.subTest(status=label), patch.dict(
+                sys.modules, {"triton": types.SimpleNamespace(SOLVER_STATE=solver_state)}
+            ):
+                with self.assertRaisesRegex(ValueError, label):
+                    bridge.path_witness(context, (0,))
+
+        context = types.SimpleNamespace(
+            getPathConstraints=lambda: [branch],
+            getModel=lambda predicate, **options: ({}, solver_state.UNSAT, 2),
+        )
+        with patch.dict(sys.modules, {"triton": types.SimpleNamespace(SOLVER_STATE=solver_state)}):
+            self.assertIsNone(bridge.path_witness(context, (0,)))
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_symbolic_add2(self) -> None:
