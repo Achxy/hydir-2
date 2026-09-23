@@ -107,6 +107,53 @@ fn typed_model(bytes: &[u8]) -> hydir_model::AnalysisModel {
         },
         evidence: evidence.clone(),
     });
+    model.types.push(TypeDefinition {
+        id: "hydir_record_type".to_owned(),
+        name: "hydir_record".to_owned(),
+        size_bytes: 16,
+        size_is_lower_bound: false,
+        kind: TypeDefinitionKind::Struct {
+            fields: ["key", "value"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| ModelField {
+                    name: name.to_owned(),
+                    offset_bytes: (index as u64) * 8,
+                    ty: u64_type.clone(),
+                    evidence: evidence.clone(),
+                })
+                .collect(),
+        },
+        evidence: evidence.clone(),
+    });
+    model.types.push(TypeDefinition {
+        id: "hydir_record_ctx_type".to_owned(),
+        name: "hydir_record_ctx".to_owned(),
+        size_bytes: 72,
+        size_is_lower_bound: false,
+        kind: TypeDefinitionKind::Struct {
+            fields: vec![
+                ModelField {
+                    name: "header".to_owned(),
+                    offset_bytes: 0,
+                    ty: u64_type.clone(),
+                    evidence: evidence.clone(),
+                },
+                ModelField {
+                    name: "records".to_owned(),
+                    offset_bytes: 8,
+                    ty: TypeRef::Array {
+                        of: Box::new(TypeRef::Named {
+                            id: "hydir_record_type".to_owned(),
+                        }),
+                        count: 4,
+                    },
+                    evidence: evidence.clone(),
+                },
+            ],
+        },
+        evidence: evidence.clone(),
+    });
     for (symbol, type_id) in [
         ("hydir_cfg_ctx_step", "hydir_ctx_type"),
         ("hydir_cfg_ctx_drain", "hydir_ctx_type"),
@@ -118,6 +165,9 @@ fn typed_model(bytes: &[u8]) -> hydir_model::AnalysisModel {
         ("hydir_cfg_ctx_derived_loop", "hydir_ctx_type"),
         ("hydir_cfg_ctx_slot_add", "hydir_array_ctx_type"),
         ("hydir_cfg_ctx_bad_stride", "hydir_array_ctx_type"),
+        ("hydir_cfg_record_add", "hydir_record_ctx_type"),
+        ("hydir_cfg_record_mutated_index", "hydir_record_ctx_type"),
+        ("hydir_cfg_record_mutated_origin", "hydir_record_ctx_type"),
         ("hydir_cfg_memory", "hydir_ambiguous_type"),
     ] {
         let row = model
@@ -136,13 +186,16 @@ fn typed_model(bytes: &[u8]) -> hydir_model::AnalysisModel {
         if symbol == "hydir_cfg_ctx_slot_add"
             || symbol == "hydir_cfg_ctx_bad_stride"
             || symbol == "hydir_cfg_ctx_derived_loop"
+            || symbol == "hydir_cfg_record_add"
+            || symbol == "hydir_cfg_record_mutated_index"
+            || symbol == "hydir_cfg_record_mutated_origin"
         {
             parameters.push(ModelParameter {
                 name: "index".to_owned(),
                 ty: u64_type.clone(),
             });
         }
-        if symbol == "hydir_cfg_ctx_slot_add" {
+        if symbol == "hydir_cfg_ctx_slot_add" || symbol == "hydir_cfg_record_add" {
             parameters.push(ModelParameter {
                 name: "delta".to_owned(),
                 ty: u64_type.clone(),
@@ -579,4 +632,200 @@ fn lea_index_arithmetic_matches_modular_oracle_without_a_model() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(Command::new(executable).status().unwrap().success());
+}
+
+#[test]
+fn modeled_array_of_structs_links_nested_field_to_scaled_index() {
+    let (temp, bytes) = fixture();
+    let model = typed_model(&bytes);
+    let native = decompile_symbol(&bytes, "hydir_cfg_record_add").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    let views = ir
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            HighCfgStatement::Load { field_view, .. }
+            | HighCfgStatement::Store { field_view, .. } => field_view.as_ref(),
+            HighCfgStatement::Assign { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(views.len(), 2);
+    for view in views {
+        assert_eq!(view.field, "records");
+        assert_eq!(view.offset_bytes, 8);
+        assert_eq!(
+            view.array_index,
+            Some(hydir_hlc::HighExpr::Variable {
+                name: "hydir_rsi".to_owned()
+            })
+        );
+        let element = view.array_element.as_ref().unwrap();
+        assert_eq!(element.element_type_name, "hydir_record");
+        assert_eq!(element.field, "value");
+        assert_eq!(element.field_offset_bytes, 8);
+        assert_eq!(element.raw_index, "hydir_rcx");
+        assert_eq!(element.raw_scale, 8);
+        assert_eq!(element.index_multiplier, 2);
+    }
+    let json = serde_json::to_vec(&ir).unwrap();
+    let round_trip: HighLevelCfgCir = serde_json::from_slice(&json).unwrap();
+    assert_eq!(round_trip, ir);
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(c.contains("offsetof(struct hydir_record_ctx, records)"));
+    assert!(c.contains("sizeof(struct hydir_record) / UINT64_C(2)"));
+    assert!(c.contains("offsetof(struct hydir_record, value)"));
+    let source = format!(
+        r#"{c}
+int main(void) {{
+  uint64_t deltas[] = {{0, 1, UINT64_MAX}};
+  for (uint64_t i=0;i<6;++i) for (unsigned d=0;d<3;++d) {{
+    struct hydir_record_ctx ctx = {{7, {{{{11,10}},{{22,20}},{{33,30}},{{44,40}}}}}};
+    uint64_t before[] = {{10,20,30,40}};
+    uint64_t got = hydir_cfg_record_add(&ctx,i,deltas[d]);
+    uint64_t want = i<4 ? before[i]+deltas[d] : 0;
+    if (got!=want) return 1;
+    for (unsigned j=0;j<4;++j)
+      if (ctx.records[j].value != (i==j ? want : before[j])) return 2;
+  }}
+  return 0;
+}}
+"#
+    );
+    let path = temp.path().join("record_array.c");
+    fs::write(&path, source).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let executable = temp.path().join(format!("record_array_{compiler}.exe"));
+        let output = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            Command::new(executable).status().unwrap().success(),
+            "{compiler} record oracle failed"
+        );
+    }
+    let mut forged = ir.clone();
+    for statement in forged
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+    {
+        if let HighCfgStatement::Load {
+            field_view: Some(view),
+            ..
+        } = statement
+        {
+            view.array_element.as_mut().unwrap().index_multiplier = 3;
+            break;
+        }
+    }
+    assert!(emit_typed_cfg_c(&forged, &model).is_err());
+}
+
+#[test]
+fn changed_scaled_index_does_not_assert_an_array_of_structs() {
+    let (_temp, bytes) = fixture();
+    let model = typed_model(&bytes);
+    for symbol in [
+        "hydir_cfg_record_mutated_index",
+        "hydir_cfg_record_mutated_origin",
+    ] {
+        let native = decompile_symbol(&bytes, symbol).unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+        assert!(ir.blocks.iter().flat_map(|block| &block.statements).all(
+            |statement| match statement {
+                HighCfgStatement::Load { field_view, .. }
+                | HighCfgStatement::Store { field_view, .. } => field_view.is_none(),
+                HighCfgStatement::Assign { .. } => true,
+            }
+        ));
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        assert!(
+            c.contains("hydir_load_u64(((hydir_rdi + (hydir_rcx * UINT64_C(8))) + UINT64_C(16)))")
+        );
+    }
+}
+
+#[test]
+fn changed_element_layout_invalidates_nested_field_presentation() {
+    let (temp, bytes) = fixture();
+    let model = typed_model(&bytes);
+    let native = decompile_symbol(&bytes, "hydir_cfg_record_add").unwrap();
+    let old_ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    assert!(
+        old_ir
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .any(|statement| match statement {
+                HighCfgStatement::Load {
+                    field_view: Some(view),
+                    ..
+                } => view.array_element.is_some(),
+                _ => false,
+            })
+    );
+    let mut changed = model.clone();
+    let record = changed
+        .types
+        .iter_mut()
+        .find(|item| item.id == "hydir_record_type")
+        .unwrap();
+    record.size_bytes = 24;
+    let evidence = record.evidence.clone();
+    let TypeDefinitionKind::Struct { fields } = &mut record.kind else {
+        panic!("record must be a struct")
+    };
+    fields.push(ModelField {
+        name: "extra".to_owned(),
+        offset_bytes: 16,
+        ty: TypeRef::Primitive {
+            name: PrimitiveType::U64,
+        },
+        evidence,
+    });
+    changed
+        .types
+        .iter_mut()
+        .find(|item| item.id == "hydir_record_ctx_type")
+        .unwrap()
+        .size_bytes = 104;
+    changed.revision += 1;
+    validate_structure(&changed).unwrap();
+    assert!(emit_typed_cfg_c(&old_ir, &changed).is_err());
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &changed).unwrap();
+    assert!(ir.blocks.iter().flat_map(|block| &block.statements).all(
+        |statement| match statement {
+            HighCfgStatement::Load { field_view, .. }
+            | HighCfgStatement::Store { field_view, .. } => field_view.is_none(),
+            HighCfgStatement::Assign { .. } => true,
+        }
+    ));
+    let c = emit_typed_cfg_c(&ir, &changed).unwrap();
+    let path = temp.path().join("changed_record_layout.c");
+    fs::write(&path, c).unwrap();
+    let output = Command::new("clang")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-c"])
+        .arg(&path)
+        .arg("-o")
+        .arg(temp.path().join("changed_record_layout.o"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

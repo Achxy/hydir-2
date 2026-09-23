@@ -77,7 +77,12 @@ base register is unchanged throughout the function. The generated address uses
 unaligned and alias-safe access. A modeled fixed-size array field with eight-byte
 elements can also name indexed loads and stores; the address retains the exact
 index arithmetic and uses `sizeof` for the modeled element. This annotation does
-not establish that a runtime index is in bounds. A modified pointer, unsupported
+not establish that a runtime index is in bounds. An array of named structs can
+identify one eight-byte element field when the element has an exact modeled
+size and a stable integer parameter or a single entry-block assignment proves
+the effective index stride. The emitted C names the parent array and nested
+field through `offsetof` and ties the stride to `sizeof` the element type.
+A modified pointer or index, unsupported
 stride, overlapping union interpretation, or unmatched width stays as a raw
 memory access. It still rejects other memory operations, calls,
 unsupported flag origins, opaque effects, and non-64-bit operands. The native
@@ -99,8 +104,8 @@ in the entry block from an unchanged pointer parameter by a copy or constant
 offset can carry that parameter's modeled field names through branches and
 loops. The field annotation records the derived register and offset; emission
 checks its dominating assignment and keeps the register in the C address.
-Derived pointers from later blocks, changing bases, and arrays of structures
-are not yet named in the CFG view. Absolute memory addresses
+Derived pointers from later blocks, changing bases, and struct arrays without
+a proven index multiplier remain raw in the CFG view. Absolute memory addresses
 remain unsupported until their ELF load bias is represented in the C view.
 
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,
