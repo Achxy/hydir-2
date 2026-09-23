@@ -225,11 +225,13 @@ pub fn replay_local(elf: &[u8], input: &InputSpec) -> Result<NativeReplayReport,
         report.diagnostic = Some("Bubblewrap did not confirm child execution and exit".into());
         return Ok(report);
     };
-    report.exit_code = Some(exit_code);
-    if exit_code >= 128 {
-        report.diagnostic =
-            Some("exit value may encode a signal; Bubblewrap does not distinguish it".into());
+    if !(0..128).contains(&exit_code) {
+        report.diagnostic = Some(format!(
+            "Bubblewrap exit value {exit_code} may be an exact exit code or a signal; exact termination is unverified"
+        ));
+        return Ok(report);
     }
+    report.exit_code = Some(exit_code);
     let stdout_goal = input
         .goal
         .stdout_contains_hex
