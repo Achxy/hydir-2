@@ -54,6 +54,8 @@ def main() -> None:
         plan_path = work / "plan.json"
         candidate_path = work / "candidate.json"
         slice_path = work / "slice.json"
+        claim_path = work / "claim.json"
+        recipe_path = work / "recipe.json"
         report_path = work / "solve-report.json"
         run(
             "clang", "-O1", "-fPIE", "-pie", "-fno-omit-frame-pointer",
@@ -85,11 +87,14 @@ def main() -> None:
             probe_path, plan_path)
         run(CTL, "solve", "snapshot-return", binary, spec_path, snapshot_path,
             probe_path, plan_path, "--candidate-output", candidate_path,
-            "--slice-output", slice_path,
+            "--slice-output", slice_path, "--claim-output", claim_path,
+            "--recipe-output", recipe_path,
             "--output", report_path)
         report = json.loads(report_path.read_text(encoding="utf-8"))
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
         slice_report = json.loads(slice_path.read_text(encoding="utf-8"))
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
         assert report["bridge"]["status"] == "function_witness", report
         assert report["claim"] == "native_validated_candidate", report
         assert report["native_replay"]["status"] == "goal_matched", report
@@ -100,6 +105,34 @@ def main() -> None:
         assert slice_report["ast_walk_complete"], slice_report
         assert any(decision["origin_offsets"] == [0]
                    for decision in slice_report["decisions"]), slice_report
+        assert claim == recipe["claim"] == report["investigation_claim"], claim
+        assert claim["changed_bytes"] == [{
+            "origin_offset": 0, "channel_offset": 0,
+            "before": 0x42, "after": 0x41,
+        }], claim
+        verified = json.loads(run(CTL, "recipe", "verify", binary, recipe_path))
+        assert verified["valid"], verified
+        assert verified["verification_scope"] == "recorded_artifact_consistency_only", verified
+        reproduced = json.loads(run(CTL, "recipe", "replay", binary, recipe_path))
+        assert reproduced["claim_reproduced"], reproduced
+        assert reproduced["fresh_replay"]["status"] == "goal_matched", reproduced
+
+        tampered = work / "tampered-recipe.json"
+        recipe["candidate_input"]["stdin_hex"] = "43"
+        tampered.write_text(json.dumps(recipe), encoding="utf-8")
+        rejected = subprocess.run(
+            [str(CTL), "recipe", "verify", str(binary), str(tampered)],
+            text=True, capture_output=True, check=False,
+        )
+        assert rejected.returncode != 0, rejected.stdout
+        recipe["candidate_input"]["stdin_hex"] = "41"
+        recipe["claim"]["replay_sha256"] = "0" * 64
+        tampered.write_text(json.dumps(recipe), encoding="utf-8")
+        rejected_claim = subprocess.run(
+            [str(CTL), "recipe", "verify", str(binary), str(tampered)],
+            text=True, capture_output=True, check=False,
+        )
+        assert rejected_claim.returncode != 0, rejected_claim.stdout
         again = json.loads(run(CTL, "replay", binary, candidate_path))
         assert again["status"] == "goal_matched", again
         print("snapshot solve and native replay gate passed")

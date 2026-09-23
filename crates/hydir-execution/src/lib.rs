@@ -6,10 +6,16 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 mod gdb_mi;
+mod investigation;
 mod origin_probe;
 mod snapshot;
 mod snapshot_resume;
 pub use gdb_mi::{MiListEntry, MiRecord, MiValue, parse_mi_line};
+pub use investigation::{
+    ANALYSIS_RECIPE_VERSION, AnalysisRecipe, ChangedOriginByte, ClaimDependency,
+    INVESTIGATION_CLAIM_VERSION, InvestigationClaim, MAX_ANALYSIS_RECIPE_JSON_BYTES,
+    parse_analysis_recipe,
+};
 pub use origin_probe::{
     MAX_ORIGIN_PROBE_JSON_BYTES, ORIGIN_PROBE_VERSION, OriginProbe, ProbeEvidence, ProbeLocation,
     ProbeStatus, parse_origin_probe, probe_origin, validate_origin_probe,

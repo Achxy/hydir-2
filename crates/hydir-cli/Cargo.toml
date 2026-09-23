@@ -29,6 +29,7 @@ hydir-project = { path = "../hydir-project" }
 object.workspace = true
 iced-x86.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
 tonic.workspace = true
 tokio.workspace = true

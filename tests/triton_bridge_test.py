@@ -188,6 +188,7 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertEqual(report["candidate_hex"], "41")
         self.assertEqual(report["origin_probe_evidence"], "byte_equality_only")
         self.assertEqual(report["return_equals"], 1)
+        self.assertRegex(report["backend_version"], r"^\d+\.\d+\.\d+$")
         trace = report["input_condition_slice"]
         self.assertEqual(trace["scope"], "captured_seed_trace_structural_dependencies")
         self.assertEqual(trace["relevant_origin_offsets"], [0])

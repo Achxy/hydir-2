@@ -31,6 +31,7 @@ use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod investigation;
 mod local;
 mod passes;
 mod patch;
@@ -94,7 +95,9 @@ Usage:
   hydirctl snapshot verify-origin <linked-elf> <input.json> <snapshot.json> <probe.json>
   hydirctl snapshot plan-return <linked-elf> <input.json> <snapshot.json> <probe.json> --code-bytes <n> --return <u64> [--output <plan.json>]
   hydirctl snapshot verify-plan <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json>
-  hydirctl solve snapshot-return <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json> [--candidate-output <input.json>] [--slice-output <slice.json>] [--output <report.json>]
+  hydirctl solve snapshot-return <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json> [--candidate-output <input.json>] [--slice-output <slice.json>] [--claim-output <claim.json>] [--recipe-output <recipe.json>] [--output <report.json>]
+  hydirctl recipe verify <linked-elf> <recipe.json> [--output <verification.json>]
+  hydirctl recipe replay <linked-elf> <recipe.json> [--output <replay.json>]
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -405,10 +408,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("solve")
             if args.get(1).map(String::as_str) == Some("snapshot-return")
-                && matches!(args.len(), 7 | 9 | 11 | 13) =>
+                && (7..=17).contains(&args.len())
+                && args.len() % 2 == 1 =>
         {
             let mut candidate_output = None;
             let mut slice_output = None;
+            let mut claim_output = None;
+            let mut recipe_output = None;
             let mut report_output = None;
             for pair in args[7..].chunks_exact(2) {
                 match pair[0].as_str() {
@@ -417,6 +423,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
                     "--slice-output" if slice_output.is_none() => {
                         slice_output = Some(pair[1].as_str());
+                    }
+                    "--claim-output" if claim_output.is_none() => {
+                        claim_output = Some(pair[1].as_str());
+                    }
+                    "--recipe-output" if recipe_output.is_none() => {
+                        recipe_output = Some(pair[1].as_str());
                     }
                     "--output" if report_output.is_none() => {
                         report_output = Some(pair[1].as_str());
@@ -492,6 +504,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                 candidate_spec = Some(candidate);
                 native_replay = Some(replay);
             }
+            let recipe = match (&candidate_spec, &native_replay) {
+                (Some(candidate), Some(replay))
+                    if replay.status == hydir_execution::ReplayStatus::GoalMatched
+                        && !bridge["input_condition_slice"].is_null() =>
+                {
+                    Some(investigation::build_recipe(
+                        &bytes, &spec, &snapshot, &probe, &plan, &bridge, candidate, replay,
+                    )?)
+                }
+                _ => None,
+            };
+            if let Some(path) = claim_output {
+                let claim = &recipe
+                    .as_ref()
+                    .ok_or("no native-validated failing-seed claim is available")?
+                    .claim;
+                write_new_or_identical(path, &serde_json::to_vec_pretty(claim)?)?;
+            }
+            if let Some(path) = recipe_output {
+                let recipe = recipe
+                    .as_ref()
+                    .ok_or("no native-validated failing-seed recipe is available")?;
+                write_new_or_identical(path, &serde_json::to_vec_pretty(recipe)?)?;
+            }
             let report = json!({
                 "schema_version": 1,
                 "operation": "snapshot_return",
@@ -505,12 +541,67 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "bridge": bridge,
                 "candidate_input": candidate_spec,
                 "native_replay": native_replay,
+                "investigation_claim": recipe.as_ref().map(|recipe| &recipe.claim),
             });
             let json = serde_json::to_vec_pretty(&report)?;
             if let Some(path) = report_output {
                 write_new_or_identical(path, &json)?;
             } else {
                 std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("recipe")
+            if matches!(args.get(1).map(String::as_str), Some("verify" | "replay"))
+                && (args.len() == 4 || args.len() == 6 && args[4] == "--output") =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let recipe = hydir_execution::parse_analysis_recipe(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_ANALYSIS_RECIPE_JSON_BYTES,
+            )?)?;
+            investigation::validate_recipe(&bytes, &recipe)?;
+            let result = if args[1] == "verify" {
+                json!({
+                    "schema_version": 1,
+                    "operation": "recipe_verify",
+                    "valid": true,
+                    "claim": recipe.claim,
+                    "verification_scope": "recorded_artifact_consistency_only",
+                    "fresh_replay": null,
+                })
+            } else {
+                #[cfg(target_os = "linux")]
+                let replay = hydir_execution::replay_local(&bytes, &recipe.candidate_input)?;
+                #[cfg(not(target_os = "linux"))]
+                let replay = hydir_execution::NativeReplayReport {
+                    schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                    binary_sha256: recipe.candidate_input.binary_sha256.clone(),
+                    input_sha256: hydir_execution::input_sha256(&recipe.candidate_input)?,
+                    status: hydir_execution::ReplayStatus::UnsupportedHost,
+                    exit_code: None,
+                    signal: None,
+                    stdout_hex: String::new(),
+                    stderr_hex: String::new(),
+                    elapsed_ms: 0,
+                    runner: "unavailable".into(),
+                    diagnostic: Some("recipe replay requires Linux with Bubblewrap".into()),
+                };
+                hydir_execution::validate_replay_report(&bytes, &recipe.candidate_input, &replay)?;
+                json!({
+                    "schema_version": 1,
+                    "operation": "recipe_replay",
+                    "claim_reproduced": replay.status == hydir_execution::ReplayStatus::GoalMatched,
+                    "recorded_replay": recipe.recorded_native_replay,
+                    "fresh_replay": replay,
+                    "claim": recipe.claim,
+                })
+            };
+            let output = serde_json::to_vec_pretty(&result)?;
+            if args.len() == 6 {
+                write_new_or_identical(&args[5], &output)?;
+            } else {
+                std::io::stdout().write_all(&output)?;
                 println!();
             }
         }
@@ -2142,6 +2233,12 @@ fn validate_snapshot_bridge_result(
     let status = result["status"]
         .as_str()
         .ok_or("Triton snapshot result status is missing")?;
+    if result["backend_version"]
+        .as_str()
+        .is_none_or(|version| version.is_empty() || version.len() > 64)
+    {
+        return Err("Triton snapshot backend version is missing".into());
+    }
     if !matches!(
         status,
         "function_witness"

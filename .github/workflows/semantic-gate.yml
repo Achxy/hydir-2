@@ -20,7 +20,7 @@ jobs:
       - name: Install Triton binary-analysis bindings
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install triton-library
+          .venv/bin/python -m pip install triton-library==1.0.0rc4
       - name: Rust tests
         run: cargo test --locked --workspace
       - name: Native replay smoke
