@@ -86,6 +86,7 @@ Usage:
   hydirctl replay init <linked-elf> [--output <input.json>]
   hydirctl replay verify <linked-elf> <input.json>
   hydirctl replay <linked-elf> <input.json> [--output <report.json>]
+  hydirctl capture <linked-elf> <input.json> --function <symbol> [--output <snapshot.json>]
   hydirctl snapshot verify <linked-elf> <input.json> <snapshot.json>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
@@ -114,6 +115,8 @@ asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
 Replay uses an experimental local Linux Bubblewrap runner. Other hosts return
 an unsupported-host report. See docs/REPLAY_PROTOCOL.md for its current scope.
+Capture uses GDB/MI in the same Linux isolation and currently stops at a simple
+C symbol entry in a single-threaded process. It emits a sparse snapshot.
 Rebuild supports local and authenticated-loopback operations for a narrow
 freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
@@ -136,6 +139,44 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("capture")
+            if (args.len() == 5 || args.len() == 7 && args[5] == "--output")
+                && args[3] == "--function" =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[2],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            validate_input_spec(&bytes, &spec)?;
+            #[cfg(target_os = "linux")]
+            let snapshot = hydir_execution::capture_function_entry(&bytes, &spec, &args[4])?;
+            #[cfg(not(target_os = "linux"))]
+            let snapshot = hydir_execution::ExecutionSnapshot {
+                schema_version: hydir_execution::EXECUTION_SNAPSHOT_VERSION,
+                binary_sha256: spec.binary_sha256.clone(),
+                input_sha256: hydir_execution::input_sha256(&spec)?,
+                status: hydir_execution::SnapshotStatus::UnsupportedHost,
+                stop: None,
+                thread_id: None,
+                thread_count: 0,
+                registers: Default::default(),
+                mappings: Vec::new(),
+                pages: Vec::new(),
+                runner: "unavailable".into(),
+                diagnostics: vec![
+                    "native capture currently requires Linux, Bubblewrap, and GDB".into(),
+                ],
+            };
+            validate_execution_snapshot(&bytes, &spec, &snapshot)?;
+            let json = serde_json::to_vec_pretty(&snapshot)?;
+            if args.len() == 7 {
+                write_new_or_identical(&args[6], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
         Some("snapshot")
             if args.get(1).map(String::as_str) == Some("verify") && args.len() == 5 =>
         {
@@ -444,6 +485,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Some("doctor") if args.len() == 1 => {
+            let gdb_version = Command::new("gdb")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.lines().next().map(str::to_owned));
             let bwrap_version = Command::new("bwrap")
                 .arg("--version")
                 .output()
@@ -532,6 +580,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_replay_v1": false,
                     "bubblewrap_installed": bwrap_version.is_some(),
                     "bubblewrap_version": bwrap_version,
+                    "gdb_installed": gdb_version.is_some(),
+                    "gdb_version": gdb_version,
                     "vm_profile_v1": true,
                     "vm_explorer_scope": "bounded host/VPC exploration; guest CFG and rewrite readiness are not established",
                     "native_loader_metadata": "ELF64 program headers, GNU-versioned dynamic symbols, location-aware relocations, PLT/GOT/TLS ranges, linked .eh_frame FDEs, init/fini arrays, and symbol-backed ET_REL lifting",

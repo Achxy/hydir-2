@@ -71,7 +71,7 @@ pub fn parse_mi_line(line: &[u8]) -> Result<MiRecord, String> {
     }
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    if line == b"(gdb)" {
+    if line == b"(gdb)" || line == b"(gdb) " {
         return Ok(MiRecord::Prompt);
     }
     let mut parser = Parser {

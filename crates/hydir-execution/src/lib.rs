@@ -19,6 +19,10 @@ pub use snapshot::{
 mod runner;
 #[cfg(target_os = "linux")]
 pub use runner::replay_local;
+#[cfg(target_os = "linux")]
+mod capture;
+#[cfg(target_os = "linux")]
+pub use capture::capture_function_entry;
 
 pub const INPUT_SPEC_VERSION: u32 = 1;
 pub const NATIVE_REPLAY_REPORT_VERSION: u32 = 1;
@@ -280,7 +284,7 @@ fn validate_relative_path(path: &str) -> Result<(), String> {
         || path
             .split('/')
             .next()
-            .is_some_and(|part| part == ".hydir-program")
+            .is_some_and(|part| part.starts_with(".hydir-"))
     {
         return Err("input file path must be a normalized relative path".into());
     }
@@ -464,6 +468,9 @@ mod tests {
         let elf = elf_header();
         let mut input = sample_spec(&elf);
         input.files[0].path = "../escape".into();
+        assert!(validate_input_spec(&elf, &input).is_err());
+        input = sample_spec(&elf);
+        input.files[0].path = ".hydir-stdin".into();
         assert!(validate_input_spec(&elf, &input).is_err());
         input = sample_spec(&elf);
         input.files.push(InputFile {

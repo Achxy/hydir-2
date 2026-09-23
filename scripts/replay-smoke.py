@@ -32,6 +32,7 @@ def main() -> None:
         matching = work / "matching.json"
         mismatching = work / "mismatching.json"
         crashed = work / "crashed.json"
+        snapshot_path = work / "snapshot.json"
         run("clang", "-O1", ROOT / "tests" / "fixtures" / "replay_channels.c", "-o", binary)
         run("cargo", "build", "--locked", "-q", "-p", "hydir-cli")
         run(CTL, "replay", "init", binary, "--output", specification)
@@ -52,6 +53,13 @@ def main() -> None:
         run(CTL, "replay", "verify", binary, specification)
         run(CTL, "replay", binary, specification, "--output", matching)
         expect_report(matching, "goal_matched", 0)
+        run(CTL, "capture", binary, specification, "--function", "main", "--output", snapshot_path)
+        run(CTL, "snapshot", "verify", binary, specification, snapshot_path)
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        assert snapshot["status"] == "stopped", snapshot
+        assert snapshot["thread_count"] == 1, snapshot
+        assert snapshot["stop"]["runtime_pc"] == snapshot["stop"]["elf_vaddr"] + snapshot["stop"]["load_bias"], snapshot
+        assert any(page["value"]["state"] == "present" for page in snapshot["pages"]), snapshot
         spec["stdin_hex"] = b"wrong\n".hex()
         specification.write_text(json.dumps(spec), encoding="utf-8")
         run(CTL, "replay", binary, specification, "--output", mismatching)
