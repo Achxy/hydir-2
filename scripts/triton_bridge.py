@@ -386,7 +386,7 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict)
                 variables, seed, plan["solver_timeout_ms"], budget
             )
             return value, candidate, state, alternatives, instructions
-    raise UnsupportedSnapshot("snapshot path exceeds instruction budget")
+    raise SnapshotBudgetExhausted("snapshot path exceeds instruction budget")
 
 
 def run_snapshot_return(request: dict) -> dict:

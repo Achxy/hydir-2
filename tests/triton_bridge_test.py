@@ -217,6 +217,19 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertEqual(report["solver_queries"], 1)
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_return_reports_instruction_budget_on_loop(self) -> None:
+        request = self.snapshot_request()
+        request["code_hex"] = "ebfe"
+        request["pages"][0]["bytes_hex"] = (bytes.fromhex("ebfe") + bytes(4094)).hex()
+        request["max_instructions_per_seed"] = 8
+        result = self.run_bridge(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "budget_exhausted")
+        self.assertIsNone(report["candidate_hex"])
+        self.assertEqual(report["processed_instructions"], 8)
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_snapshot_return_marks_uncaptured_runtime_read_unsupported(self) -> None:
         request = self.snapshot_request()
         request["registers"]["rdi"] = 0x5000
