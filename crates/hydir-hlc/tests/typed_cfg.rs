@@ -354,6 +354,90 @@ fn arithmetic_zero_flags_compile_and_match_boundary_oracles() {
 }
 
 #[test]
+fn addition_carry_and_overflow_use_prewrite_operands() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let mut source = String::from("#include <stdint.h>\n");
+    for (symbol, renamed) in [
+        ("hydir_cfg_add_carry", "generated_carry"),
+        ("hydir_cfg_add_overflow", "generated_overflow"),
+        ("hydir_cfg_add_double_carry", "generated_double_carry"),
+    ] {
+        let native = decompile_symbol(&bytes, symbol).unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+            .unwrap_or_else(|error| panic!("{symbol}: {error}"));
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        assert!(c.contains("hydir_flag_left") && c.contains("hydir_flag_right"));
+        source.push_str(&format!(
+            "#define {symbol} {renamed}\n{c}\n#undef {symbol}\n"
+        ));
+    }
+    source.push_str(
+        r#"int main(void) {
+  const uint64_t edge[] = {0, 1, 2, UINT64_C(0x7fffffffffffffff),
+                           UINT64_C(0x8000000000000000), UINT64_MAX};
+  for (unsigned i = 0; i < 6; ++i) for (unsigned j = 0; j < 6; ++j) {
+    uint64_t a = edge[i], b = edge[j], sum = a + b;
+    if (generated_carry(a,b) != (sum < a)) return 1;
+    if (generated_overflow(a,b) !=
+        ((((a ^ sum) & (b ^ sum)) & UINT64_C(0x8000000000000000)) != 0)) return 2;
+    if (generated_double_carry(a) != ((a + a) < a)) return 3;
+  }
+  uint64_t state = UINT64_C(0xa0761d6478bd642f);
+  for (unsigned i = 0; i < 10000; ++i) {
+    state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+    uint64_t a = state;
+    state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+    uint64_t b = state, sum = a + b;
+    if (generated_carry(a,b) != (sum < a)) return 4;
+    if (generated_overflow(a,b) !=
+        ((((a ^ sum) & (b ^ sum)) & UINT64_C(0x8000000000000000)) != 0)) return 5;
+    if (generated_double_carry(a) != ((a + a) < a)) return 6;
+  }
+  return 0;
+}
+"#,
+    );
+    let path = temp.path().join("addition_flags.c");
+    fs::write(&path, source).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let exe = temp.path().join(format!("addition_flags_{compiler}.exe"));
+        let result = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(Command::new(exe).status().unwrap().success());
+    }
+}
+
+#[test]
 fn subtraction_comparison_flags_survive_joins_and_register_writes() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");

@@ -65,6 +65,9 @@ live comparison operands and arithmetic results from normalized ExpressionIR
 zero-flag assignments. A 64-bit `sub` snapshots its ordered operands before
 the destination write, so subsequent signed and unsigned comparisons can use
 the same predicate as `cmp`, including when both paths join before a branch.
+Addition also snapshots its original operands: a later `jc`/`jnc` compares the
+wrapped sum with the first operand, and `jo`/`jno` checks the sign-bit overflow
+formula. Zero and sign checks after addition use the same modular sum.
 The C11 renderer folds
 single-entry chains, private diamonds, and simple pre-test loops into readable
 statements. Other control flow retains explicit gotos. A flag snapshot is
@@ -99,8 +102,10 @@ supported scalar register writes, including the `xor reg, reg` zeroing idiom.
 It also checks normalized zero-flag assignments and branch conditions, so
 `jz`/`jnz` after supported 64-bit arithmetic can be rendered and tested.
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
-use the bounded compare/test/subtract interpretation; arbitrary flag SSA and
-other arithmetic carry/overflow sources remain future work. The memory helpers use integer-to-pointer
+use the bounded compare/test/subtract interpretation; addition supports direct
+zero, sign, carry, and overflow checks. Compound conditions after addition,
+arbitrary flag SSA, and other arithmetic carry/overflow sources remain future
+work. The memory helpers use integer-to-pointer
 conversion in the supported x86-64 execution environment. The CFG lowerer also
 handles normalized 64-bit `lea` expressions. A single-write register derived
 in the entry block from an unchanged pointer parameter by a copy or constant

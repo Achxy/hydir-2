@@ -52,6 +52,45 @@ hydir_cfg_add_snapshot:
     retq
 .size hydir_cfg_add_snapshot, .-hydir_cfg_add_snapshot
 
+.globl hydir_cfg_add_carry
+.type hydir_cfg_add_carry,@function
+hydir_cfg_add_carry:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    jc .Ladd_carry_yes
+    retq
+.Ladd_carry_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_carry, .-hydir_cfg_add_carry
+
+.globl hydir_cfg_add_overflow
+.type hydir_cfg_add_overflow,@function
+hydir_cfg_add_overflow:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $0, %rax
+    jo .Ladd_overflow_yes
+    retq
+.Ladd_overflow_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_overflow, .-hydir_cfg_add_overflow
+
+.globl hydir_cfg_add_double_carry
+.type hydir_cfg_add_double_carry,@function
+hydir_cfg_add_double_carry:
+    movq %rdi, %rax
+    addq %rax, %rax
+    movq $0, %rax
+    jc .Ladd_double_carry_yes
+    retq
+.Ladd_double_carry_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_add_double_carry, .-hydir_cfg_add_double_carry
+
 .globl hydir_cfg_sub_flags
 .type hydir_cfg_sub_flags,@function
 hydir_cfg_sub_flags:

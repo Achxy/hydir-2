@@ -981,6 +981,7 @@ fn edge(instruction: &MachineInstruction, kind: MachineEdgeKind) -> Result<Locat
 enum FlagSource {
     Compare,
     Test,
+    Add,
     ResultZero,
 }
 
@@ -1063,7 +1064,8 @@ fn flag_transfer(
         // SUB and CMP set CF/SF/OF/ZF from the same ordered operands. The
         // destination write must not replace those operands before a branch.
         "sub" => Some(FlagSource::Compare),
-        "add" | "xor" | "and" | "or" => Some(FlagSource::ResultZero),
+        "add" => Some(FlagSource::Add),
+        "xor" | "and" | "or" => Some(FlagSource::ResultZero),
         _ => incoming,
     }
 }
@@ -1129,6 +1131,9 @@ fn flag_inputs(
 }
 
 fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicate, String> {
+    if source == Some(FlagSource::Add) {
+        return addition_predicate(family);
+    }
     let op = match (source, family) {
         (Some(FlagSource::Compare), "je" | "jz") => HighCfgCompareOp::Equal,
         (Some(FlagSource::Compare), "jne" | "jnz") => HighCfgCompareOp::NotEqual,
@@ -1161,6 +1166,60 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
             name: FLAG_RIGHT.to_owned(),
         },
     })
+}
+
+fn addition_predicate(family: &str) -> Result<HighCfgPredicate, String> {
+    let left = HighExpr::Variable {
+        name: FLAG_LEFT.to_owned(),
+    };
+    let right = HighExpr::Variable {
+        name: FLAG_RIGHT.to_owned(),
+    };
+    let sum = HighExpr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(left.clone()),
+        right: Box::new(right.clone()),
+    };
+    let high_bit = HighExpr::Constant {
+        value: 0x8000_0000_0000_0000,
+    };
+    let overflow_bits = HighExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(HighExpr::Binary {
+            op: BinaryOp::Xor,
+            left: Box::new(left.clone()),
+            right: Box::new(sum.clone()),
+        }),
+        right: Box::new(HighExpr::Binary {
+            op: BinaryOp::Xor,
+            left: Box::new(right),
+            right: Box::new(sum.clone()),
+        }),
+    };
+    let (op, left, right) = match family {
+        "je" | "jz" => (
+            HighCfgCompareOp::Equal,
+            sum,
+            HighExpr::Constant { value: 0 },
+        ),
+        "jne" | "jnz" => (
+            HighCfgCompareOp::NotEqual,
+            sum,
+            HighExpr::Constant { value: 0 },
+        ),
+        "jb" | "jc" | "jnae" => (HighCfgCompareOp::UnsignedLess, sum, left),
+        "jae" | "jnb" | "jnc" => (HighCfgCompareOp::UnsignedGreaterEqual, sum, left),
+        "jo" => (HighCfgCompareOp::TestNonzero, overflow_bits, high_bit),
+        "jno" => (HighCfgCompareOp::TestZero, overflow_bits, high_bit),
+        "js" => (HighCfgCompareOp::TestNonzero, sum, high_bit),
+        "jns" => (HighCfgCompareOp::TestZero, sum, high_bit),
+        _ => {
+            return Err(format!(
+                "typed CFG has no supported addition flag proof for {family}"
+            ));
+        }
+    };
+    Ok(HighCfgPredicate { op, left, right })
 }
 
 fn push_assignment(
@@ -1305,7 +1364,32 @@ fn lower_instruction(
             *flag_source = Some(FlagSource::Compare);
             None
         }
-        ("add" | "xor" | "and" | "or", [destination, _source])
+        ("add", [destination, _source])
+            if instruction.effects.control == MachineControlEffect::Next =>
+        {
+            let target = register(destination)?;
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            let expression = normalized_register_value(semantic, register_name)?;
+            if snapshot_flags {
+                if normalized_result_zero(semantic, family)? != expression {
+                    return Err("typed CFG addition result and flags disagree".to_owned());
+                }
+                let HighExpr::Binary {
+                    op: BinaryOp::Add,
+                    left,
+                    right,
+                } = &expression
+                else {
+                    return Err("typed CFG addition lacks ordered operands".to_owned());
+                };
+                push_assignment(statements, FLAG_LEFT.to_owned(), *left.clone(), site);
+                push_assignment(statements, FLAG_RIGHT.to_owned(), *right.clone(), site);
+            }
+            push_assignment(statements, target, expression, site);
+            *flag_source = Some(FlagSource::Add);
+            None
+        }
+        ("xor" | "and" | "or", [destination, _source])
             if instruction.effects.control == MachineControlEffect::Next =>
         {
             let target = register(destination)?;
