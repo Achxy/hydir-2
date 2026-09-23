@@ -2254,6 +2254,7 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-execution",
  "hydir-hlc",
  "hydir-ir",
  "hydir-model",

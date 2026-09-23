@@ -31,6 +31,10 @@ use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, decompile_function_at, decompile_symbol,
     discover_functions, measure_native_coverage,
 };
+use hydir_execution::{
+    AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
+    validate_analysis_recipe,
+};
 use hydir_hlc::{
     HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
@@ -83,6 +87,7 @@ enum Task {
     LoadWorkbench,
     SaveWorkbench(WorkbenchSettings),
     Open(PathBuf),
+    OpenRecipe(PathBuf),
     OpenGhidraGraph(PathBuf),
     OpenRemote {
         endpoint: String,
@@ -183,6 +188,7 @@ enum Event {
         spec: ProgramSpec,
         function_index: Result<FunctionIndex, String>,
     },
+    RecipeLoaded(Result<AnalysisRecipe, String>),
     GhidraGraphLoaded(Result<GhidraGraph, String>),
     RemoteProjectCreated(String),
     Selected {
@@ -1622,6 +1628,45 @@ fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn bounded_read_recipe(path: &Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| format!("Cannot open investigation recipe: {error}"))?
+        .take((MAX_ANALYSIS_RECIPE_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Cannot read investigation recipe: {error}"))?;
+    if bytes.len() > MAX_ANALYSIS_RECIPE_JSON_BYTES {
+        return Err("Investigation recipe exceeds the 24 MiB limit".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn recipe_elf_address(recipe: &AnalysisRecipe, runtime_address: u64) -> Option<u64> {
+    let stop = recipe.snapshot.stop.as_ref()?;
+    let code_length = recipe.resume_plan.code_hex.len() / 2;
+    captured_code_elf_address(
+        stop,
+        recipe.resume_plan.code_address,
+        code_length,
+        runtime_address,
+    )
+}
+
+fn captured_code_elf_address(
+    stop: &StopPoint,
+    code_address: u64,
+    code_length: usize,
+    runtime_address: u64,
+) -> Option<u64> {
+    let code_end = code_address.checked_add(code_length as u64)?;
+    if stop.runtime_pc != code_address || !(code_address..code_end).contains(&runtime_address) {
+        return None;
+    }
+    let offset = runtime_address.checked_sub(stop.runtime_pc)?;
+    let translated = runtime_address.checked_sub(stop.load_bias?)?;
+    (translated == stop.elf_vaddr?.checked_add(offset)?).then_some(translated)
+}
+
 fn hydirctl_path() -> PathBuf {
     if let Ok(executable) = std::env::current_exe() {
         let sibling = executable.with_file_name(if cfg!(windows) {
@@ -1769,6 +1814,18 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 }
                 Err(error) => Event::Failed(error),
             },
+            Task::OpenRecipe(path) => {
+                let result = match &source {
+                    Source::Local(elf) => bounded_read_recipe(&path).and_then(|json| {
+                        let recipe = parse_analysis_recipe(&json)?;
+                        validate_analysis_recipe(elf, &recipe)
+                            .map_err(|error| format!("Recipe verification failed: {error}"))?;
+                        Ok(recipe)
+                    }),
+                    _ => Err("Open the matching local ELF before loading a recipe".to_owned()),
+                };
+                Event::RecipeLoaded(result)
+            }
             Task::OpenGhidraGraph(path) => match fs::read_to_string(&path)
                 .map_err(|error| format!("Could not read Ghidra graph: {error}"))
                 .and_then(|text| {
@@ -2281,6 +2338,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
     Overview,
+    Investigation,
     RegionStudio,
     Native,
     Bytes,
@@ -2391,7 +2449,11 @@ fn local_typed_view(
     })
 }
 
-fn typed_source_sites(ui: &mut egui::Ui, ir: &HighLevelCir) -> Option<u64> {
+fn typed_source_sites(
+    ui: &mut egui::Ui,
+    ir: &HighLevelCir,
+    selected_address: Option<u64>,
+) -> Option<u64> {
     let mut selected = None;
     for statement in &ir.statements {
         let (label, site) = match statement {
@@ -2400,7 +2462,10 @@ fn typed_source_sites(ui: &mut egui::Ui, ir: &HighLevelCir) -> Option<u64> {
             HighStatement::Return { site, .. } => ("return".to_owned(), site),
         };
         if ui
-            .small_button(format!("0x{:x} · {label}", site.value.0))
+            .selectable_label(
+                selected_address == Some(site.value.0),
+                format!("0x{:x} · {label}", site.value.0),
+            )
             .clicked()
         {
             selected = Some(site.value.0);
@@ -2409,7 +2474,11 @@ fn typed_source_sites(ui: &mut egui::Ui, ir: &HighLevelCir) -> Option<u64> {
     selected
 }
 
-fn typed_cfg_source_sites(ui: &mut egui::Ui, ir: &HighLevelCfgCir) -> Option<u64> {
+fn typed_cfg_source_sites(
+    ui: &mut egui::Ui,
+    ir: &HighLevelCfgCir,
+    selected_address: Option<u64>,
+) -> Option<u64> {
     let mut selected = None;
     for block in &ir.blocks {
         for statement in &block.statements {
@@ -2419,7 +2488,10 @@ fn typed_cfg_source_sites(ui: &mut egui::Ui, ir: &HighLevelCfgCir) -> Option<u64
                 HighCfgStatement::Store { site, .. } => ("store", site),
             };
             if ui
-                .small_button(format!("0x{:x} · {label}", site.value.0))
+                .selectable_label(
+                    selected_address == Some(site.value.0),
+                    format!("0x{:x} · {label}", site.value.0),
+                )
                 .clicked()
             {
                 selected = Some(site.value.0);
@@ -2431,7 +2503,10 @@ fn typed_cfg_source_sites(ui: &mut egui::Ui, ir: &HighLevelCfgCir) -> Option<u64
             HighCfgTerminator::Return { site, .. } => ("return", site),
         };
         if ui
-            .small_button(format!("0x{:x} · {label}", site.value.0))
+            .selectable_label(
+                selected_address == Some(site.value.0),
+                format!("0x{:x} · {label}", site.value.0),
+            )
             .clicked()
         {
             selected = Some(site.value.0);
@@ -2537,10 +2612,12 @@ struct AnalystApp {
     tasks: SyncSender<Task>,
     events: Receiver<Event>,
     path_input: String,
+    recipe_path_input: String,
     ghidra_graph_path: String,
     workbench: WorkbenchSettings,
     workbench_loaded: bool,
     startup_open_local: Option<PathBuf>,
+    startup_recipe_path: Option<PathBuf>,
     current_local_path: Option<PathBuf>,
     remote_endpoint: String,
     remote_token_file: String,
@@ -2597,6 +2674,7 @@ struct AnalystApp {
     native_coverage_error: Option<String>,
     analysis: Option<AnalysisReport>,
     disassembly_report: Option<DisassemblyReport>,
+    investigation_recipe: Option<AnalysisRecipe>,
     triton_result: Option<serde_json::Value>,
     triton_console_result: Option<serde_json::Value>,
     triton_console_commands: Vec<String>,
@@ -2614,6 +2692,8 @@ struct AnalystApp {
     job_symbol: Option<String>,
     last_job_poll: std::time::Instant,
     selected_address: Option<u64>,
+    pending_recipe_address: Option<u64>,
+    pending_disassembly_scroll: Option<u64>,
     selection_target_tab: Option<Tab>,
     tab: Tab,
     region_studio_mode: RegionStudioMode,
@@ -2648,10 +2728,12 @@ impl AnalystApp {
             tasks: task_sender,
             events: event_receiver,
             path_input: String::new(),
+            recipe_path_input: String::new(),
             ghidra_graph_path: String::new(),
             workbench: WorkbenchSettings::default(),
             workbench_loaded: false,
             startup_open_local: None,
+            startup_recipe_path: None,
             current_local_path: None,
             remote_endpoint: "http://127.0.0.1:50051".to_owned(),
             remote_token_file: String::new(),
@@ -2708,6 +2790,7 @@ impl AnalystApp {
             native_coverage_error: None,
             analysis: None,
             disassembly_report: None,
+            investigation_recipe: None,
             triton_result: None,
             triton_console_result: None,
             triton_console_commands: Vec::new(),
@@ -2725,6 +2808,8 @@ impl AnalystApp {
             job_symbol: None,
             last_job_poll: std::time::Instant::now(),
             selected_address: None,
+            pending_recipe_address: None,
+            pending_disassembly_scroll: None,
             selection_target_tab: None,
             tab: Tab::Overview,
             region_studio_mode: RegionStudioMode::Contract,
@@ -2829,12 +2914,15 @@ impl AnalystApp {
                     self.native_coverage = None;
                     self.native_coverage_error = None;
                     self.disassembly_report = None;
+                    self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
                     self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
+                    self.pending_recipe_address = None;
+                    self.pending_disassembly_scroll = None;
                     self.transform_before = None;
                     self.transform_after = None;
                     self.transform_report = None;
@@ -2857,7 +2945,37 @@ impl AnalystApp {
                         Task::RefreshAnnotations { binary_sha256 },
                         "Loading revisioned analyst annotations…",
                     );
+                    if !remote && let Some(path) = self.startup_recipe_path.take() {
+                        self.recipe_path_input = path.display().to_string();
+                        self.enqueue(Task::OpenRecipe(path), "Verifying investigation recipe…");
+                    }
                 }
+                Event::RecipeLoaded(result) => match result {
+                    Ok(recipe) => {
+                        if self
+                            .spec
+                            .as_ref()
+                            .is_none_or(|spec| spec.binary_sha256 != recipe.claim.binary_sha256)
+                        {
+                            self.failure =
+                                Some("Recipe binary digest differs from the open ELF".to_owned());
+                            self.status = "Investigation recipe discarded".to_owned();
+                        } else {
+                            self.selected_address =
+                                recipe_elf_address(&recipe, recipe.claim.failed_decision_address);
+                            self.status = "Verified investigation recipe loaded".to_owned();
+                            self.history.push(self.status.clone());
+                            self.investigation_recipe = Some(recipe);
+                            self.tab = Tab::Investigation;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.status = "Investigation recipe rejected".to_owned();
+                        self.history.push(error.clone());
+                        self.failure = Some(error);
+                    }
+                },
                 Event::GhidraGraphLoaded(result) => match result {
                     Ok(graph) => {
                         if graph.schema_version != 1 || graph.source != "ghidra" {
@@ -2979,6 +3097,9 @@ impl AnalystApp {
                         format!("{symbol} is outside the current recovery contract")
                     };
                     self.history.push(self.status.clone());
+                    if let Some(address) = self.pending_recipe_address.take() {
+                        self.selected_address = Some(address);
+                    }
                     self.tab = self
                         .selection_target_tab
                         .take()
@@ -3018,6 +3139,9 @@ impl AnalystApp {
                         }
                     }
                     self.history.push(self.status.clone());
+                    if let Some(address) = self.pending_recipe_address.take() {
+                        self.selected_address = Some(address);
+                    }
                     self.tab = self.selection_target_tab.take().unwrap_or(Tab::Native);
                 }
                 Event::Disassembled(result) => match result {
@@ -3040,6 +3164,9 @@ impl AnalystApp {
                             );
                             self.history.push(self.status.clone());
                             self.disassembly_report = Some(report);
+                            if let Some(address) = self.pending_recipe_address.take() {
+                                self.selected_address = Some(address);
+                            }
                             self.console_json = false;
                             self.tab = Tab::Bytes;
                             self.failure = None;
@@ -3613,6 +3740,82 @@ impl AnalystApp {
         );
     }
 
+    fn open_recipe_site(&mut self, runtime_address: u64, target: Tab) {
+        let Some(recipe) = &self.investigation_recipe else {
+            return;
+        };
+        let Some(address) = recipe_elf_address(recipe, runtime_address) else {
+            self.failure = Some("Captured address has no verified ELF translation".to_owned());
+            return;
+        };
+        let entry = recipe_elf_address(recipe, recipe.resume_plan.code_address);
+        let already_selected = entry.is_some_and(|entry| {
+            self.native_decompilation
+                .as_ref()
+                .is_some_and(|native| native.machine_ir.entry.value.0 == entry)
+        });
+        self.selected_address = Some(address);
+        self.pending_disassembly_scroll = Some(address);
+        if target == Tab::Bytes {
+            if self.disassembly_report.is_some() {
+                self.tab = Tab::Bytes;
+            } else {
+                self.pending_recipe_address = Some(address);
+                self.enqueue(
+                    Task::Disassemble,
+                    "Locating recipe site in ELF disassembly…",
+                );
+            }
+            return;
+        }
+        if already_selected {
+            self.tab = target;
+            if target == Tab::Native {
+                self.native_view_mode = NativeViewMode::TypedC;
+            } else if target == Tab::Graph {
+                self.graph_mode = GraphMode::Function;
+            }
+            return;
+        }
+        let action = self.function_index.as_ref().and_then(|index| {
+            index
+                .functions
+                .iter()
+                .find(|function| Some(function.entry.value.0) == entry)
+                .map(|function| indexed_function_action(function, self.spec.as_ref()))
+        });
+        if let Some(GraphNodeAction::Function {
+            label,
+            selector,
+            entry,
+            legacy_symbol,
+        }) = action
+        {
+            if legacy_symbol {
+                self.select(label);
+            } else {
+                self.select_native(label, selector, entry);
+            }
+            self.pending_recipe_address = Some(address);
+            self.pending_disassembly_scroll = Some(address);
+            self.selection_target_tab = Some(target);
+            if target == Tab::Native {
+                self.native_view_mode = NativeViewMode::TypedC;
+            } else if target == Tab::Graph {
+                self.graph_mode = GraphMode::Function;
+            }
+        } else if self.disassembly_report.is_some() {
+            self.tab = Tab::Bytes;
+            self.status = "No exact recovered function entry; showing ELF disassembly".to_owned();
+        } else {
+            self.pending_recipe_address = Some(address);
+            self.enqueue(
+                Task::Disassemble,
+                "Locating recipe site in ELF disassembly…",
+            );
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
             .fill(PANEL)
@@ -3718,6 +3921,27 @@ impl AnalystApp {
         disassemble.on_disabled_hover_text(
             "Open a local ELF first. Whole-ELF disassembly is currently local-only.",
         );
+        ui.separator();
+        ui.label(RichText::new("Investigation recipe").strong().color(ACCENT));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.recipe_path_input)
+                .hint_text("/absolute/path/to/recipe.json")
+                .desired_width(f32::INFINITY),
+        );
+        let load_recipe = ui.add_enabled(
+            !self.busy
+                && !self.remote
+                && self.spec.is_some()
+                && !self.recipe_path_input.trim().is_empty(),
+            egui::Button::new("Verify and open recipe"),
+        );
+        if load_recipe.clicked() {
+            self.enqueue(
+                Task::OpenRecipe(PathBuf::from(self.recipe_path_input.trim())),
+                "Verifying investigation recipe…",
+            );
+        }
+        load_recipe.on_disabled_hover_text("Open the matching local ELF first.");
         let triton = ui.add_enabled(
             !self.busy
                 && !self.remote
@@ -4704,6 +4928,7 @@ impl AnalystApp {
         ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
+                (Tab::Investigation, "Investigation"),
                 (Tab::RegionStudio, "Region Studio"),
                 (Tab::Native, "Native decompiler"),
                 (Tab::Bytes, "Disassembly"),
@@ -4724,6 +4949,7 @@ impl AnalystApp {
         ui.separator();
         match self.tab {
             Tab::Overview => self.overview_view(ui),
+            Tab::Investigation => self.investigation_view(ui),
             Tab::RegionStudio => self.region_studio(ui),
             Tab::Native => self.native_explorer_view(ui),
             Tab::Bytes => self.disassembly(ui),
@@ -4734,6 +4960,177 @@ impl AnalystApp {
             Tab::Passes => self.passes_view(ui),
             Tab::Analysis => self.analysis_view(ui),
             Tab::C => self.c_view(ui),
+        }
+    }
+
+    fn investigation_view(&mut self, ui: &mut egui::Ui) {
+        let Some(recipe) = self.investigation_recipe.as_ref() else {
+            ui.heading("Investigation");
+            ui.label(RichText::new(
+                "Open a matching local ELF, then verify an exported recipe in the Program pane.",
+            ).color(MUTED));
+            return;
+        };
+        let claim = &recipe.claim;
+        let static_decision = recipe_elf_address(recipe, claim.failed_decision_address);
+        let mut jump = None;
+        ui.heading(RichText::new("Verified investigation record").color(ACCENT));
+        ui.label(RichText::new(&claim.statement).strong());
+        ui.label(
+            RichText::new("Recorded artifact checks passed. Native outcomes shown here are observations from the recipe; use recipe replay for fresh runs.")
+                .size(11.0)
+                .color(MUTED),
+        );
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            metric_readout(ui, "ORIGINAL", "GOAL MISSED", BAD);
+            metric_readout(ui, "CANDIDATE", "GOAL MET", GOOD);
+            metric_readout(
+                ui,
+                "CHANGED BYTES",
+                &claim.changed_bytes.len().to_string(),
+                ACCENT,
+            );
+            metric_readout(ui, "TRACE SCOPE", "ONE CAPTURED SEED", INFO);
+        });
+        ui.add_space(8.0);
+        field(ui, "ORIGIN", &claim.origin_id);
+        field(
+            ui,
+            "FAILED DECISION",
+            &format!(
+                "{} · occurrence {} · runtime 0x{:x}",
+                claim.failed_decision_kind,
+                claim.failed_decision_occurrence,
+                claim.failed_decision_address
+            ),
+        );
+        if let Some(address) = static_decision {
+            field(ui, "ELF ADDRESS", &format!("0x{address:x}"));
+        } else {
+            ui.colored_label(
+                ACCENT,
+                "No verified runtime-to-ELF address mapping; static navigation is unavailable.",
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy && static_decision.is_some(),
+                    egui::Button::new("Open C source sites"),
+                )
+                .clicked()
+            {
+                jump = Some((claim.failed_decision_address, Tab::Native));
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && static_decision.is_some(),
+                    egui::Button::new("Open CFG graph"),
+                )
+                .clicked()
+            {
+                jump = Some((claim.failed_decision_address, Tab::Graph));
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && static_decision.is_some(),
+                    egui::Button::new("Open disassembly"),
+                )
+                .clicked()
+            {
+                jump = Some((claim.failed_decision_address, Tab::Bytes));
+            }
+        });
+        ui.separator();
+        ui.heading(RichText::new("Input byte changes").size(16.0));
+        for change in &claim.changed_bytes {
+            let linked = claim
+                .relevant_origin_offsets
+                .contains(&change.origin_offset);
+            ui.label(
+                RichText::new(format!(
+                    "{} +{} (channel +{}): {:02x} → {:02x}{}",
+                    claim.origin_id,
+                    change.origin_offset,
+                    change.channel_offset,
+                    change.before,
+                    change.after,
+                    if linked {
+                        " · in failed trace slice"
+                    } else {
+                        ""
+                    }
+                ))
+                .monospace()
+                .color(if linked { GOOD } else { ACCENT }),
+            );
+        }
+        ui.add_space(6.0);
+        ui.heading(RichText::new("Source instructions").size(16.0));
+        let slice = &recipe.bridge_result["input_condition_slice"];
+        let instructions = slice["instructions"].as_array();
+        let source_indices = slice["source_occurrences"].as_array();
+        let sources = source_indices
+            .into_iter()
+            .flat_map(|indices| indices.iter())
+            .filter_map(|value| {
+                let index = value.as_u64()? as usize;
+                let instruction = instructions?.get(index)?;
+                let runtime = instruction["address"].as_u64()?;
+                let disassembly = instruction["disassembly"].as_str()?.to_owned();
+                Some((
+                    index,
+                    runtime,
+                    disassembly,
+                    recipe_elf_address(recipe, runtime),
+                ))
+            })
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical()
+            .id_salt("investigation_source_instructions")
+            .max_height(250.0)
+            .show_rows(ui, 24.0, sources.len(), |ui, range| {
+                for index in range {
+                    let (occurrence, runtime, disassembly, elf_address) = &sources[index];
+                    let label = if let Some(address) = elf_address {
+                        format!("#{occurrence} · ELF 0x{address:x} · {disassembly}")
+                    } else {
+                        format!("#{occurrence} · runtime 0x{runtime:x} · {disassembly}")
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.busy && elf_address.is_some(),
+                            egui::Button::new(RichText::new(label).monospace().size(11.0)),
+                        )
+                        .clicked()
+                    {
+                        jump = Some((*runtime, Tab::Bytes));
+                    }
+                }
+            });
+        ui.separator();
+        ui.label(
+            RichText::new("Unresolved dependencies and assumptions")
+                .strong()
+                .color(ACCENT),
+        );
+        for assumption in &claim.assumptions {
+            ui.label(
+                RichText::new(format!("Assumption: {assumption}"))
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        }
+        for unresolved in &claim.unresolved_dependencies {
+            ui.label(
+                RichText::new(format!("Unresolved: {unresolved}"))
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        }
+        if let Some((runtime, target)) = jump {
+            self.open_recipe_site(runtime, target);
         }
     }
 
@@ -5648,40 +6045,46 @@ impl AnalystApp {
                 .color(MUTED),
             );
             let mut clicked = None;
-            egui::ScrollArea::vertical()
-                .id_salt("native_bytes_view")
-                .show_rows(ui, 26.0, instructions.len(), |ui, range| {
-                    for position in range {
-                        let instruction = instructions[position];
-                        let opaque =
-                            matches!(instruction.operation, MachineOperation::OpaqueEffect { .. });
-                        let line = format!(
-                            "{}:0x{:016x}  {:<20} {:<10} {:?}",
-                            instruction.address.address_space,
-                            instruction.address.value.0,
-                            instruction.bytes_hex,
-                            instruction.mnemonic,
-                            instruction.operands
-                        );
-                        if ui
-                            .selectable_label(
-                                self.selected_address == Some(instruction.address.value.0),
-                                RichText::new(line).monospace().size(11.0).color(if opaque {
-                                    BAD
-                                } else {
-                                    TEXT
-                                }),
-                            )
-                            .on_hover_text(format!(
-                                "Operation: {:?}\nEffects: {:?}\nEdges: {:?}",
-                                instruction.operation, instruction.effects, instruction.edges
-                            ))
-                            .clicked()
-                        {
-                            clicked = Some(instruction.address.value.0);
-                        }
+            let mut scroll = egui::ScrollArea::vertical().id_salt("native_bytes_view");
+            if let Some(address) = self.pending_disassembly_scroll.take()
+                && let Some(position) = instructions
+                    .iter()
+                    .position(|instruction| instruction.address.value.0 == address)
+            {
+                scroll = scroll.vertical_scroll_offset(position as f32 * 26.0);
+            }
+            scroll.show_rows(ui, 26.0, instructions.len(), |ui, range| {
+                for position in range {
+                    let instruction = instructions[position];
+                    let opaque =
+                        matches!(instruction.operation, MachineOperation::OpaqueEffect { .. });
+                    let line = format!(
+                        "{}:0x{:016x}  {:<20} {:<10} {:?}",
+                        instruction.address.address_space,
+                        instruction.address.value.0,
+                        instruction.bytes_hex,
+                        instruction.mnemonic,
+                        instruction.operands
+                    );
+                    if ui
+                        .selectable_label(
+                            self.selected_address == Some(instruction.address.value.0),
+                            RichText::new(line).monospace().size(11.0).color(if opaque {
+                                BAD
+                            } else {
+                                TEXT
+                            }),
+                        )
+                        .on_hover_text(format!(
+                            "Operation: {:?}\nEffects: {:?}\nEdges: {:?}",
+                            instruction.operation, instruction.effects, instruction.edges
+                        ))
+                        .clicked()
+                    {
+                        clicked = Some(instruction.address.value.0);
                     }
-                });
+                }
+            });
             if let Some(address) = clicked {
                 self.selected_address = Some(address);
             }
@@ -5753,31 +6156,37 @@ impl AnalystApp {
         });
         let instructions = report.instructions;
         let mut clicked = None;
-        egui::ScrollArea::vertical()
-            .id_salt("whole_elf_disassembly")
-            .show_rows(ui, 25.0, instructions.len(), |ui, range| {
-                for index in range {
-                    let instruction = &instructions[index];
-                    let selected = self.selected_address == Some(instruction.address.0);
-                    let target = instruction
-                        .branch_target
-                        .map_or_else(String::new, |address| format!(" → 0x{:x}", address.0));
-                    let line = format!(
-                        "0x{:016x}  {:<18} {:<26} {:?}{}",
-                        instruction.address.0,
-                        instruction.bytes_hex,
-                        format!("{} {}", instruction.mnemonic, instruction.operands),
-                        instruction.flow,
-                        target,
-                    );
-                    if ui
-                        .selectable_label(selected, RichText::new(line).monospace().size(11.0))
-                        .clicked()
-                    {
-                        clicked = Some(instruction.address.0);
-                    }
+        let mut scroll = egui::ScrollArea::vertical().id_salt("whole_elf_disassembly");
+        if let Some(address) = self.pending_disassembly_scroll.take()
+            && let Some(position) = instructions
+                .iter()
+                .position(|instruction| instruction.address.0 == address)
+        {
+            scroll = scroll.vertical_scroll_offset(position as f32 * 25.0);
+        }
+        scroll.show_rows(ui, 25.0, instructions.len(), |ui, range| {
+            for index in range {
+                let instruction = &instructions[index];
+                let selected = self.selected_address == Some(instruction.address.0);
+                let target = instruction
+                    .branch_target
+                    .map_or_else(String::new, |address| format!(" → 0x{:x}", address.0));
+                let line = format!(
+                    "0x{:016x}  {:<18} {:<26} {:?}{}",
+                    instruction.address.0,
+                    instruction.bytes_hex,
+                    format!("{} {}", instruction.mnemonic, instruction.operands),
+                    instruction.flow,
+                    target,
+                );
+                if ui
+                    .selectable_label(selected, RichText::new(line).monospace().size(11.0))
+                    .clicked()
+                {
+                    clicked = Some(instruction.address.0);
                 }
-            });
+            }
+        });
         if let Some(address) = clicked {
             self.selected_address = Some(address);
         }
@@ -7183,12 +7592,11 @@ impl AnalystApp {
                     typed
                         .ir
                         .as_ref()
-                        .and_then(|ir| typed_source_sites(ui, ir))
+                        .and_then(|ir| typed_source_sites(ui, ir, self.selected_address))
                         .or_else(|| {
-                            typed
-                                .cfg_ir
-                                .as_ref()
-                                .and_then(|ir| typed_cfg_source_sites(ui, ir))
+                            typed.cfg_ir.as_ref().and_then(|ir| {
+                                typed_cfg_source_sites(ui, ir, self.selected_address)
+                            })
                         })
                 } else {
                     ui.colored_label(
@@ -8812,6 +9220,13 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    let open_recipe = if let [flag, _, recipe] = arguments.as_slice()
+        && flag == "--open-recipe"
+    {
+        Some(PathBuf::from(recipe))
+    } else {
+        None
+    };
     let open_local = if let [flag, path] = arguments.as_slice()
         && flag == "--open-local"
     {
@@ -8820,11 +9235,15 @@ fn main() -> eframe::Result<()> {
         && flag == "--open-local"
     {
         Some((PathBuf::from(path), Some(symbol.clone())))
+    } else if let [flag, path, _] = arguments.as_slice()
+        && flag == "--open-recipe"
+    {
+        Some((PathBuf::from(path), None))
     } else if arguments.is_empty() {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -8845,6 +9264,7 @@ fn main() -> eframe::Result<()> {
                 app.initial_symbol = symbol;
                 app.startup_open_local = Some(path);
             }
+            app.startup_recipe_path = open_recipe;
             Ok(Box::new(app))
         }),
     )
@@ -8854,8 +9274,8 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
-        WorkbenchGraphEdge, WorkbenchGraphNode, indexed_function_action, ir_slice,
-        local_region_artifacts, native_function_excerpt, native_instruction_count,
+        WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address, indexed_function_action,
+        ir_slice, local_region_artifacts, native_function_excerpt, native_instruction_count,
         native_opaque_instruction_count, preview_patch_local, resized_console_height,
         valid_bearer_token, validate_endpoint, workbench_graph_layout,
     };
@@ -8867,7 +9287,38 @@ mod tests {
     use hydir_decompile::{
         decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
     };
+    use hydir_execution::StopPoint;
     use std::sync::mpsc;
+
+    #[test]
+    fn recipe_navigation_translates_only_verified_captured_pie_code() {
+        let stop = StopPoint {
+            runtime_pc: 0x7f00_1000,
+            elf_vaddr: Some(0x1000),
+            load_bias: Some(0x7f00_0000),
+            symbol: None,
+        };
+        assert_eq!(
+            captured_code_elf_address(&stop, 0x7f00_1000, 0x20, 0x7f00_101f),
+            Some(0x101f)
+        );
+        assert_eq!(
+            captured_code_elf_address(&stop, 0x7f00_1000, 0x20, 0x7f00_1020),
+            None
+        );
+        assert_eq!(
+            captured_code_elf_address(&stop, 0x7f00_1001, 0x20, 0x7f00_101f),
+            None
+        );
+        let wrong_bias = StopPoint {
+            load_bias: Some(0x7f00_0001),
+            ..stop
+        };
+        assert_eq!(
+            captured_code_elf_address(&wrong_bias, 0x7f00_1000, 0x20, 0x7f00_101f),
+            None
+        );
+    }
 
     #[test]
     fn graph_layout_leaves_label_space_and_routes_long_edges_around_nodes() {
