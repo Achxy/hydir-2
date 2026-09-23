@@ -22,7 +22,7 @@ pub use runner::replay_local;
 #[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
-pub use capture::capture_function_entry;
+pub use capture::{capture_elf_address, capture_function_entry};
 
 pub const INPUT_SPEC_VERSION: u32 = 1;
 pub const NATIVE_REPLAY_REPORT_VERSION: u32 = 1;

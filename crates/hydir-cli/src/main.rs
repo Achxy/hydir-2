@@ -86,7 +86,7 @@ Usage:
   hydirctl replay init <linked-elf> [--output <input.json>]
   hydirctl replay verify <linked-elf> <input.json>
   hydirctl replay <linked-elf> <input.json> [--output <report.json>]
-  hydirctl capture <linked-elf> <input.json> --function <symbol> [--output <snapshot.json>]
+  hydirctl capture <linked-elf> <input.json> (--function <symbol> | --address <elf-vaddr>) [--output <snapshot.json>]
   hydirctl snapshot verify <linked-elf> <input.json> <snapshot.json>
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
@@ -115,8 +115,9 @@ asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
 Replay uses an experimental local Linux Bubblewrap runner. Other hosts return
 an unsupported-host report. See docs/REPLAY_PROTOCOL.md for its current scope.
-Capture uses GDB/MI in the same Linux isolation and currently stops at a simple
-C symbol entry in a single-threaded process. It emits a sparse snapshot.
+Capture uses GDB/MI in the same Linux isolation and stops at a simple C symbol
+or a file-backed executable ELF virtual address, including stripped PIE code.
+It currently supports one thread and emits a sparse snapshot.
 Rebuild supports local and authenticated-loopback operations for a narrow
 freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
@@ -141,7 +142,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match args.first().map(String::as_str) {
         Some("capture")
             if (args.len() == 5 || args.len() == 7 && args[5] == "--output")
-                && args[3] == "--function" =>
+                && matches!(args[3].as_str(), "--function" | "--address") =>
         {
             let bytes = read_binary(&args[1])?;
             let spec = parse_input_spec(&read_bounded_json(
@@ -149,8 +150,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 hydir_execution::MAX_INPUT_SPEC_BYTES,
             )?)?;
             validate_input_spec(&bytes, &spec)?;
+            let address = if args[3] == "--address" {
+                Some(parse_u64_auto(&args[4], "ELF virtual address")?)
+            } else {
+                None
+            };
             #[cfg(target_os = "linux")]
-            let snapshot = hydir_execution::capture_function_entry(&bytes, &spec, &args[4])?;
+            let snapshot = if let Some(address) = address {
+                hydir_execution::capture_elf_address(&bytes, &spec, address)?
+            } else {
+                hydir_execution::capture_function_entry(&bytes, &spec, &args[4])?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let _ = address;
             #[cfg(not(target_os = "linux"))]
             let snapshot = hydir_execution::ExecutionSnapshot {
                 schema_version: hydir_execution::EXECUTION_SNAPSHOT_VERSION,
