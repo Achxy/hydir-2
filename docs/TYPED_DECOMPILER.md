@@ -61,8 +61,11 @@ and direct-call fixtures emit typed C at both `-O0` and `-O2`. It carries
 instruction-address provenance and produces a C11 typed view with checked
 field offsets. `HighLevelCfgCir v2` covers a separate exact, memory-free
 64-bit scalar subset with direct branches, joins, and loops. It snapshots
-comparison operands at the flag-setting instruction and emits C11 labels and
-gotos that preserve the CFG. The typed command and desktop view try v1 first,
+comparison operands at the flag-setting instruction. The C11 renderer folds
+single-entry chains, private diamonds, and simple pre-test loops into readable
+statements. Other control flow retains explicit gotos. A flag snapshot is
+inlined into a condition only when that branch is its sole reader. The typed
+command and desktop view try v1 first,
 then v2; the local project caches v1 output and regenerates v2 output. Both
 artifacts retain instruction sites. The CFG subset currently rejects memory
 accesses, calls, unsupported flag origins, opaque effects, and non-64-bit

@@ -19,6 +19,7 @@ pub const HIGH_LEVEL_CFG_CIR_VERSION: u32 = 2;
 const REGISTERS: [&str; 9] = ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"];
 const FLAG_LEFT: &str = "hydir_flag_left";
 const FLAG_RIGHT: &str = "hydir_flag_right";
+mod structure;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -680,6 +681,7 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
         .collect::<BTreeMap<_, _>>();
     let mut outputs = inputs.clone();
     inputs.insert(ir.entry, initial.clone());
+    let mut converged = false;
     for _ in 0..(blocks.len() * universe.len() + 1) {
         let mut changed = false;
         for block in &ir.blocks {
@@ -707,8 +709,12 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
             changed |= outputs.insert(block.address, outgoing.clone()) != Some(outgoing);
         }
         if !changed {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        return Err("typed CFG definite-assignment analysis did not converge".to_owned());
     }
     for block in &ir.blocks {
         let mut initialized = inputs[&block.address].clone();
@@ -806,6 +812,7 @@ pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<S
     if ir.binary_sha256 != model.binary_sha256 || ir.model_revision != model.revision {
         return Err("typed CFG model identity/revision differs".to_owned());
     }
+    let body = structure::emit_body(ir);
     let mut output = String::from("#include <stdint.h>\n\n");
     output.push_str(&format!("uint64_t {}(", ir.name));
     if ir.parameters.is_empty() {
@@ -822,20 +829,23 @@ pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<S
     for parameter in &ir.parameters {
         used.insert(local(&parameter.location)?);
     }
+    let mut reads = BTreeSet::new();
     for block in &ir.blocks {
         for statement in &block.statements {
             used.insert(statement.target.clone());
-            scalar_reads(&statement.value, &mut used, 0)?;
+            scalar_reads(&statement.value, &mut reads, 0)?;
         }
         match &block.terminator {
             HighCfgTerminator::Branch { predicate, .. } => {
-                scalar_reads(&predicate.left, &mut used, 0)?;
-                scalar_reads(&predicate.right, &mut used, 0)?;
+                scalar_reads(&predicate.left, &mut reads, 0)?;
+                scalar_reads(&predicate.right, &mut reads, 0)?;
             }
-            HighCfgTerminator::Return { value, .. } => scalar_reads(value, &mut used, 0)?,
+            HighCfgTerminator::Return { value, .. } => scalar_reads(value, &mut reads, 0)?,
             HighCfgTerminator::Goto { .. } => {}
         }
     }
+    used.extend(reads.iter().cloned());
+    used.retain(|name| (name != FLAG_LEFT && name != FLAG_RIGHT) || body.contains(name));
     for name in &used {
         let initializer = ir
             .parameters
@@ -847,40 +857,11 @@ pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<S
                 .map(|parameter| parameter.name.as_str())
                 .unwrap_or("UINT64_C(0)")
         ));
-        output.push_str(&format!("  (void){name};\n"));
-    }
-    output.push_str(&format!("  goto {};\n", c_label(ir.entry)));
-    for block in &ir.blocks {
-        output.push_str(&format!("{}:\n", c_label(block.address)));
-        for statement in &block.statements {
-            output.push_str(&format!(
-                "  {} = {};\n",
-                statement.target,
-                c_expr(&statement.value)
-            ));
-        }
-        match &block.terminator {
-            HighCfgTerminator::Goto { target, .. } => {
-                output.push_str(&format!("  goto {};\n", c_label(*target)));
-            }
-            HighCfgTerminator::Branch {
-                predicate,
-                taken,
-                fallthrough,
-                ..
-            } => {
-                output.push_str(&format!(
-                    "  if ({}) goto {};\n  goto {};\n",
-                    c_predicate(predicate),
-                    c_label(*taken),
-                    c_label(*fallthrough)
-                ));
-            }
-            HighCfgTerminator::Return { value, .. } => {
-                output.push_str(&format!("  return {};\n", c_expr(value)));
-            }
+        if !reads.contains(name) {
+            output.push_str(&format!("  (void){name};\n"));
         }
     }
+    output.push_str(&body);
     output.push_str("}\n");
     Ok(output)
 }

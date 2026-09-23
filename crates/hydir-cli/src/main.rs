@@ -378,7 +378,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "expression_ir_v1": true,
                     "expression_ir_scope": "supported scalar writes, condition flags/predicates, little-endian MOV loads/stores with complete alias-region dependencies, 64/32-bit LEA, and component SSA joins; unsupported effects remain residual",
                     "typed_c_v1": true,
-                    "typed_c_scope": "v1: complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; v2 CFG: exact memory-free 64-bit scalar branches and loops with gotos; other functions retain low-level C",
+                    "typed_c_scope": "v1: complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; v2 CFG: exact memory-free 64-bit scalar branches with private diamonds, simple pre-test loops, and goto fallback; other functions retain low-level C",
                     "typed_cfg_v2": true,
                     "typed_c_local_cache": true,
                     "vm_profile_v1": true,

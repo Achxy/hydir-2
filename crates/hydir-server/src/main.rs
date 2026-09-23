@@ -5231,7 +5231,7 @@ mod tests {
         })
         .unwrap();
         let c = String::from_utf8(native_artifact(&binary, &json).unwrap()).unwrap();
-        assert!(c.contains("goto hydir_bb_") && c.contains("if ("));
+        assert!(!c.contains("goto hydir_bb_") && c.contains("while ("));
     }
 
     #[cfg(unix)]
