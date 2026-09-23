@@ -42,7 +42,12 @@ fn scalar_cfg_branches_and_loops_compile_and_match_oracles() {
         assert_eq!(round_trip, ir);
         validate_high_level_cfg_cir(&round_trip).unwrap();
         let c = emit_typed_cfg_c(&ir, &model).unwrap();
-        assert!(c.contains("goto hydir_bb_") && c.contains("if ("));
+        assert!(!c.contains("goto hydir_bb_") && !c.contains("hydir_flag_left"));
+        if symbol == "hydir_cfg_min" {
+            assert!(c.contains("if (") && c.contains("} else {"));
+        } else {
+            assert!(c.contains("while (") && !c.contains("for (;;)"));
+        }
         let path = temp.path().join(format!("{symbol}.c"));
         fs::write(&path, &c).unwrap();
         for compiler in ["clang", "gcc"] {
@@ -135,4 +140,94 @@ fn scalar_cfg_rejects_unmodeled_flags_memory_and_callee_saved_writes() {
             "{symbol} was admitted"
         );
     }
+}
+
+#[test]
+fn nested_branch_keeps_goto_fallback_and_matches_oracle() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let native = decompile_symbol(&bytes, "hydir_cfg_nested").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(c.contains("goto hydir_bb_") && c.contains("if (") && c.contains("} else {"));
+    let harness = format!(
+        "#include <stdint.h>\n#define hydir_cfg_nested generated_nested\n{c}\n#undef hydir_cfg_nested\nstatic uint64_t oracle(uint64_t a, uint64_t b) {{ if (a < b) return 7; if (a == 0) return b; return a; }}\nint main(void) {{ for (uint64_t a = 0; a < 100; ++a) for (uint64_t b = 0; b < 100; ++b) if (generated_nested(a,b) != oracle(a,b)) return 1; return 0; }}\n"
+    );
+    let path = temp.path().join("nested.c");
+    fs::write(&path, harness).unwrap();
+    let exe = temp.path().join("nested.exe");
+    let compile = Command::new("clang")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(path)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(Command::new(exe).status().unwrap().success());
+}
+
+#[test]
+fn signed_loop_condition_preserves_boundary_order() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let native = decompile_symbol(&bytes, "hydir_cfg_signed_count").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(c.contains("while (") && c.contains("0x8000000000000000"));
+    let harness = format!(
+        "#include <stdint.h>\n#define hydir_cfg_signed_count generated_signed_count\n{c}\n#undef hydir_cfg_signed_count\nstatic uint64_t oracle(int64_t a, int64_t b) {{ uint64_t n=0; for (; a < b; ++a) ++n; return n; }}\nint main(void) {{ int64_t x[] = {{INT64_MIN, INT64_MIN+1, -3, -2, -1, 0, 1, 2, 3, INT64_MAX-1, INT64_MAX}}; for (unsigned i=0;i<11;++i) for (unsigned j=0;j<11;++j) {{ if (x[j] < x[i] || (uint64_t)x[j]-(uint64_t)x[i] > 3) continue; if (generated_signed_count((uint64_t)x[i],(uint64_t)x[j]) != oracle(x[i],x[j])) return 1; }} return 0; }}\n"
+    );
+    let path = temp.path().join("signed.c");
+    fs::write(&path, harness).unwrap();
+    let exe = temp.path().join("signed.exe");
+    let compile = Command::new("clang")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(path)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(Command::new(exe).status().unwrap().success());
 }
