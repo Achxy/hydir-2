@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 mod gdb_mi;
 mod origin_probe;
 mod snapshot;
+mod snapshot_resume;
 pub use gdb_mi::{MiListEntry, MiRecord, MiValue, parse_mi_line};
 pub use origin_probe::{
     MAX_ORIGIN_PROBE_JSON_BYTES, ORIGIN_PROBE_VERSION, OriginProbe, ProbeEvidence, ProbeLocation,
@@ -18,6 +19,11 @@ pub use snapshot::{
     MemoryMapping, MemoryPage, MemoryPageState, MemoryReadError, RegisterObservation,
     SnapshotStatus, StopPoint, parse_execution_snapshot, read_snapshot_memory,
     validate_execution_snapshot,
+};
+pub use snapshot_resume::{
+    MAX_SNAPSHOT_RESUME_JSON_BYTES, SNAPSHOT_RESUME_VERSION, SnapshotResumePage,
+    SnapshotResumePlan, build_snapshot_resume_plan, input_with_origin_candidate,
+    parse_snapshot_resume_plan, validate_snapshot_resume_plan,
 };
 
 #[cfg(target_os = "linux")]

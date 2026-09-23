@@ -21,9 +21,10 @@ use hydir_decompile::{
     lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
 use hydir_execution::{
-    InputSpec, ProbeLocation, ReplayBudget, ReplayGoal, parse_execution_snapshot, parse_input_spec,
-    parse_origin_probe, probe_origin, validate_execution_snapshot, validate_input_spec,
-    validate_origin_probe,
+    InputSpec, ProbeLocation, ReplayBudget, ReplayGoal, build_snapshot_resume_plan,
+    input_with_origin_candidate, parse_execution_snapshot, parse_input_spec, parse_origin_probe,
+    parse_snapshot_resume_plan, probe_origin, validate_execution_snapshot, validate_input_spec,
+    validate_origin_probe, validate_snapshot_resume_plan,
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
@@ -91,6 +92,9 @@ Usage:
   hydirctl snapshot verify <linked-elf> <input.json> <snapshot.json>
   hydirctl snapshot probe-origin <linked-elf> <input.json> <snapshot.json> <origin-id> --register <name> [--output <probe.json>]
   hydirctl snapshot verify-origin <linked-elf> <input.json> <snapshot.json> <probe.json>
+  hydirctl snapshot plan-return <linked-elf> <input.json> <snapshot.json> <probe.json> --code-bytes <n> --return <u64> [--output <plan.json>]
+  hydirctl snapshot verify-plan <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json>
+  hydirctl solve snapshot-return <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json> [--candidate-output <input.json>] [--output <report.json>]
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -123,6 +127,9 @@ or a file-backed executable ELF virtual address, including stripped PIE code.
 It currently supports one thread and emits a sparse snapshot.
 An origin probe checks bytes at an analyst-selected register location against
 one InputSpec origin. A match is byte equality, not channel provenance.
+Snapshot return solving is experimental and limited to a captured pure code
+extent. A Triton function witness becomes native-validated only after fresh
+original-ELF replay meets the InputSpec goal.
 Rebuild supports local and authenticated-loopback operations for a narrow
 freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
@@ -256,6 +263,78 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("plan-return")
+                && (args.len() == 10 || args.len() == 12 && args[10] == "--output")
+                && args[6] == "--code-bytes"
+                && args[8] == "--return" =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let probe = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            let code_bytes = args[7].parse::<usize>()?;
+            let return_equals = parse_u64_auto(&args[9], "return value")?;
+            let plan = build_snapshot_resume_plan(
+                &bytes,
+                &spec,
+                &snapshot,
+                &probe,
+                code_bytes,
+                return_equals,
+            )?;
+            let json = serde_json::to_vec_pretty(&plan)?;
+            if args.len() == 12 {
+                write_new_or_identical(&args[11], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("verify-plan") && args.len() == 7 =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let probe = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            let plan = parse_snapshot_resume_plan(&read_bounded_json(
+                &args[6],
+                hydir_execution::MAX_SNAPSHOT_RESUME_JSON_BYTES,
+            )?)?;
+            validate_snapshot_resume_plan(&bytes, &spec, &snapshot, &probe, &plan)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": plan.schema_version,
+                    "valid": true,
+                    "operation": plan.operation,
+                    "binary_sha256": plan.binary_sha256,
+                    "snapshot_sha256": plan.snapshot_sha256,
+                    "origin_id": plan.symbolic_origin.id,
+                    "code_bytes": plan.code_hex.len() / 2,
+                    "present_pages": plan.pages.len(),
+                }))?
+            );
+        }
+        Some("snapshot")
             if args.get(1).map(String::as_str) == Some("verify") && args.len() == 5 =>
         {
             let bytes = read_binary(&args[2])?;
@@ -283,6 +362,104 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "stop": snapshot.stop,
                 }))?
             );
+        }
+        Some("solve")
+            if args.get(1).map(String::as_str) == Some("snapshot-return")
+                && matches!(args.len(), 7 | 9 | 11) =>
+        {
+            let mut candidate_output = None;
+            let mut report_output = None;
+            for pair in args[7..].chunks_exact(2) {
+                match pair[0].as_str() {
+                    "--candidate-output" if candidate_output.is_none() => {
+                        candidate_output = Some(pair[1].as_str());
+                    }
+                    "--output" if report_output.is_none() => {
+                        report_output = Some(pair[1].as_str());
+                    }
+                    _ => return Err(HELP.into()),
+                }
+            }
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let probe = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            let plan = parse_snapshot_resume_plan(&read_bounded_json(
+                &args[6],
+                hydir_execution::MAX_SNAPSHOT_RESUME_JSON_BYTES,
+            )?)?;
+            validate_snapshot_resume_plan(&bytes, &spec, &snapshot, &probe, &plan)?;
+            let request = serde_json::to_value(&plan)?;
+            let bridge = run_triton_bridge(&request)?;
+            validate_snapshot_bridge_result(&plan, &bridge)?;
+            let mut claim = "no_function_witness";
+            let mut candidate_spec = None;
+            let mut native_replay = None;
+            if let Some(candidate_hex) = bridge["candidate_hex"].as_str() {
+                let candidate = input_with_origin_candidate(
+                    &bytes,
+                    &spec,
+                    &plan.symbolic_origin.id,
+                    candidate_hex,
+                )?;
+                if let Some(path) = candidate_output {
+                    write_new_or_identical(path, &serde_json::to_vec_pretty(&candidate)?)?;
+                }
+                #[cfg(target_os = "linux")]
+                let replay = hydir_execution::replay_local(&bytes, &candidate)?;
+                #[cfg(not(target_os = "linux"))]
+                let replay = hydir_execution::NativeReplayReport {
+                    schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                    binary_sha256: candidate.binary_sha256.clone(),
+                    input_sha256: hydir_execution::input_sha256(&candidate)?,
+                    status: hydir_execution::ReplayStatus::UnsupportedHost,
+                    exit_code: None,
+                    signal: None,
+                    stdout_hex: String::new(),
+                    stderr_hex: String::new(),
+                    elapsed_ms: 0,
+                    runner: "unavailable".into(),
+                    diagnostic: Some("native replay requires Linux with Bubblewrap".into()),
+                };
+                hydir_execution::validate_replay_report(&bytes, &candidate, &replay)?;
+                claim = if replay.status == hydir_execution::ReplayStatus::GoalMatched {
+                    "native_validated_candidate"
+                } else {
+                    "function_witness"
+                };
+                candidate_spec = Some(candidate);
+                native_replay = Some(replay);
+            }
+            let report = json!({
+                "schema_version": 1,
+                "operation": "snapshot_return",
+                "claim": claim,
+                "binary_sha256": plan.binary_sha256,
+                "input_sha256": plan.input_sha256,
+                "snapshot_sha256": plan.snapshot_sha256,
+                "probe_sha256": plan.probe_sha256,
+                "origin_probe_evidence": plan.origin_probe_evidence,
+                "assumptions": plan.assumptions,
+                "bridge": bridge,
+                "candidate_input": candidate_spec,
+                "native_replay": native_replay,
+            });
+            let json = serde_json::to_vec_pretty(&report)?;
+            if let Some(path) = report_output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
         }
         Some("replay")
             if !matches!(args.get(1).map(String::as_str), Some("init" | "verify"))
@@ -657,6 +834,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "input_spec_v1": true,
                     "origin_probe_v1": true,
                     "origin_probe_scope": "analyst-selected captured register versus input-origin bytes; exact snapshot-bound byte equality only, not channel provenance",
+                    "snapshot_resume_plan_v1": true,
+                    "snapshot_resume_scope": "exact digest-bound snapshot/probe/code/page/register handoff for up to 32 original bytes and a selected 4096-byte pure validator; captured-state Triton solve awaits Linux native replay gate",
+                    "snapshot_return_solve_v1": false,
                     "native_replay_v1": false,
                     "bubblewrap_installed": bwrap_version.is_some(),
                     "bubblewrap_version": bwrap_version,
@@ -1872,6 +2052,80 @@ fn configured_triton_python() -> String {
         })
         .cloned()
         .unwrap_or_else(|| "python".to_owned())
+}
+
+fn validate_snapshot_bridge_result(
+    plan: &hydir_execution::SnapshotResumePlan,
+    result: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    if result["schema_version"] != 1
+        || result["operation"] != "snapshot_return"
+        || result["backend"] != "triton"
+        || result["binary_sha256"] != plan.binary_sha256
+        || result["input_sha256"] != plan.input_sha256
+        || result["snapshot_sha256"] != plan.snapshot_sha256
+        || result["probe_sha256"] != plan.probe_sha256
+        || result["origin_id"] != plan.symbolic_origin.id
+        || result["origin_probe_evidence"] != "byte_equality_only"
+        || result["assumptions"]
+            != json!([
+                "analyst_selected_origin_address_has_input_channel_bytes",
+                "selected_code_extent_and_captured_pages_cover_this_function_path"
+            ])
+        || result["return_equals"] != plan.return_equals
+    {
+        return Err("Triton snapshot result identity or scope mismatch".into());
+    }
+    let status = result["status"]
+        .as_str()
+        .ok_or("Triton snapshot result status is missing")?;
+    if !matches!(
+        status,
+        "function_witness"
+            | "budget_exhausted"
+            | "unsupported_effect"
+            | "solver_timeout"
+            | "solver_unknown"
+            | "search_exhausted"
+    ) {
+        return Err("Triton snapshot result status is invalid".into());
+    }
+    if result["explored_seeds"]
+        .as_u64()
+        .is_none_or(|count| count > u64::from(plan.max_seeds))
+        || result["processed_instructions"]
+            .as_u64()
+            .is_none_or(|count| {
+                count > u64::from(plan.max_seeds) * u64::from(plan.max_instructions_per_seed) * 2
+            })
+        || result["unsupported_paths"]
+            .as_u64()
+            .is_none_or(|count| count > u64::from(plan.max_seeds))
+        || result["solver_queries"]
+            .as_u64()
+            .is_none_or(|count| count > u64::from(plan.max_solver_queries))
+    {
+        return Err("Triton snapshot result exceeds declared budget".into());
+    }
+    let candidate = result["candidate_hex"].as_str();
+    if status == "function_witness" {
+        let bytes = hydir_execution::decode_hex(
+            candidate.ok_or("function witness has no candidate bytes")?,
+            32,
+        )?;
+        if bytes.len() != plan.symbolic_origin.length {
+            return Err("function witness candidate length differs from origin".into());
+        }
+    } else if !result["candidate_hex"].is_null() {
+        return Err("non-witness Triton result contains candidate bytes".into());
+    }
+    if result["diagnostic"]
+        .as_str()
+        .is_some_and(|message| message.len() > 512)
+    {
+        return Err("Triton snapshot diagnostic exceeds limit".into());
+    }
+    Ok(())
 }
 
 fn run_triton_bridge(request: &serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {

@@ -160,7 +160,7 @@ pub fn validate_origin_probe(
     Ok(())
 }
 
-fn origin_bytes(input: &InputSpec, origin_id: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn origin_bytes(input: &InputSpec, origin_id: &str) -> Result<Vec<u8>, String> {
     let origin = input
         .origins
         .iter()

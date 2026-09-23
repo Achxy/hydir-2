@@ -23,3 +23,19 @@ Capture argv remains limited to ASCII letters, digits, `_`, `-`, `.`, and `/`; r
 ## OriginProbe v1
 
 `hydirctl snapshot probe-origin <elf> <input.json> <snapshot.json> <origin-id> --register <name> [--output <probe.json>]` compares the declared input-origin bytes with the memory pointed to by an analyst-selected captured register. The versioned report binds the binary, input, and exact snapshot digests. It records the chosen location, runtime address, observed bytes when available, and a `matched`, `different`, or `unavailable` result. `hydirctl snapshot verify-origin <elf> <input.json> <snapshot.json> <probe.json>` recomputes and checks the report. Missing pages and unavailable registers remain unavailable; they never become a mismatch or a match. The evidence scope is always `byte_equality_only`: equality does not establish that those memory bytes came from the declared input channel. A solver using this mapping must record the analyst assumption, and only fresh native replay can validate a proposed original input.
+
+## SnapshotResumePlan v1 and experimental return solve
+
+For a stopped snapshot and matched origin probe, build a bounded Triton handoff:
+
+```bash
+hydirctl snapshot plan-return program.elf input.json snapshot.json probe.json --code-bytes 64 --return 1 --output plan.json
+hydirctl snapshot verify-plan program.elf input.json snapshot.json probe.json plan.json
+hydirctl solve snapshot-return program.elf input.json snapshot.json probe.json plan.json --candidate-output candidate.json --output solve.json
+```
+
+`--code-bytes` is an analyst-selected extent starting at the captured RIP. The plan requires exact captured code bytes within one executable mapping, all 16 general-purpose registers plus RIP and EFLAGS, at most eight present pages, and an origin of 1–32 bytes. It binds the canonical snapshot and probe hashes to the ELF/input hashes. The bridge rejects uncaptured memory/register reads, writes to uncaptured or non-writable pages, self-modifying code in the selected extent, calls, syscalls, and control flow outside that extent. Raw and ASCII input origins are supported; UTF-8-specific symbolic constraints are not yet supported.
+
+The experimental solver runs a bounded concrete seed, queries the return-value condition, flips observed branches for additional seeds, and re-executes a candidate in Triton before returning a `function_witness`. The current plan fixes limits of 16 seeds, 1,024 instructions per seed, 32 solver queries, 1 second per query, and 20 seconds overall. Its status distinguishes unsupported effects, solver uncertainty, and search-budget exhaustion; none means global unreachability. The CLI replaces only the declared origin bytes in a new `InputSpec` and attempts fresh native replay. It labels the candidate `native_validated_candidate` only when the original ELF meets the declared `InputSpec` goal. On Windows, the replay status remains `unsupported_host` and the claim remains `function_witness`.
+
+The Python bridge's pure-function and missing-state tests run locally where Triton is installed. The Linux CI workflow now includes a post-input capture → solve → replay smoke fixture; that gate has not been observed passing in this Windows development environment. `doctor` keeps `snapshot_return_solve_v1` false pending the live end-to-end result.
