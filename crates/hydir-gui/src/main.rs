@@ -31,7 +31,10 @@ use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, decompile_function_at, decompile_symbol,
     discover_functions, measure_native_coverage,
 };
-use hydir_hlc::{HighLevelCir, HighStatement, emit_typed_c, lower_high_level_cir};
+use hydir_hlc::{
+    HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement, emit_typed_c,
+    emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
+};
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
     MachineOperation, StateFunctionIr,
@@ -2333,6 +2336,7 @@ enum NativeViewMode {
 struct TypedNativeView {
     model: AnalysisModel,
     ir: Option<HighLevelCir>,
+    cfg_ir: Option<HighLevelCfgCir>,
     c: Option<String>,
     diagnostic: Option<String>,
 }
@@ -2355,19 +2359,33 @@ fn local_typed_view(
         model
     };
     hydir_model::validate_model(bytes, &model)?;
-    let (ir, c, diagnostic) =
+    let (ir, cfg_ir, c, diagnostic) =
         match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
             Ok(ir) => match emit_typed_c(&ir, &model) {
-                Ok(c) => (Some(ir), Some(c), None),
-                Err(error) => (Some(ir), None, Some(error)),
+                Ok(c) => (Some(ir), None, Some(c), None),
+                Err(error) => (Some(ir), None, None, Some(error)),
             },
-            Err(error) => (None, None, Some(error)),
+            Err(linear_error) => {
+                match lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model) {
+                    Ok(cfg) => match emit_typed_cfg_c(&cfg, &model) {
+                        Ok(c) => (None, Some(cfg), Some(c), None),
+                        Err(error) => (None, Some(cfg), None, Some(error)),
+                    },
+                    Err(cfg_error) => (
+                        None,
+                        None,
+                        None,
+                        Some(format!("Linear: {linear_error}; CFG: {cfg_error}")),
+                    ),
+                }
+            }
         };
     // The model remains available for type inspection even when typed C is
     // outside the current lowering contract.
     Ok(TypedNativeView {
         model,
         ir,
+        cfg_ir,
         c,
         diagnostic,
     })
@@ -2380,6 +2398,35 @@ fn typed_source_sites(ui: &mut egui::Ui, ir: &HighLevelCir) -> Option<u64> {
             HighStatement::Let { name, site, .. } => (format!("local {name}"), site),
             HighStatement::StoreField { field, site, .. } => (format!("store {field}"), site),
             HighStatement::Return { site, .. } => ("return".to_owned(), site),
+        };
+        if ui
+            .small_button(format!("0x{:x} · {label}", site.value.0))
+            .clicked()
+        {
+            selected = Some(site.value.0);
+        }
+    }
+    selected
+}
+
+fn typed_cfg_source_sites(ui: &mut egui::Ui, ir: &HighLevelCfgCir) -> Option<u64> {
+    let mut selected = None;
+    for block in &ir.blocks {
+        for statement in &block.statements {
+            if ui
+                .small_button(format!(
+                    "0x{:x} · {}",
+                    statement.site.value.0, statement.target
+                ))
+                .clicked()
+            {
+                selected = Some(statement.site.value.0);
+            }
+        }
+        let (label, site) = match &block.terminator {
+            HighCfgTerminator::Goto { site, .. } => ("goto", site),
+            HighCfgTerminator::Branch { site, .. } => ("branch", site),
+            HighCfgTerminator::Return { site, .. } => ("return", site),
         };
         if ui
             .small_button(format!("0x{:x} · {label}", site.value.0))
@@ -7131,7 +7178,16 @@ impl AnalystApp {
                         )
                         .color(MUTED),
                     );
-                    typed.ir.as_ref().and_then(|ir| typed_source_sites(ui, ir))
+                    typed
+                        .ir
+                        .as_ref()
+                        .and_then(|ir| typed_source_sites(ui, ir))
+                        .or_else(|| {
+                            typed
+                                .cfg_ir
+                                .as_ref()
+                                .and_then(|ir| typed_cfg_source_sites(ui, ir))
+                        })
                 } else {
                     ui.colored_label(
                         ACCENT,

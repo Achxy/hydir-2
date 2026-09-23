@@ -4,7 +4,7 @@ use super::{decompile_native_selection, read_binary, resolve_native_function};
 use hydir_analysis::analyze_spec_elf;
 use hydir_backend::import_elf;
 use hydir_core::{AnnotationKind, overlay_analyst_assumptions, parse_annotation_address};
-use hydir_hlc::{emit_typed_c, lower_high_level_cir};
+use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_model::{init_model, parse_model};
 use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore};
 use serde_json::json;
@@ -130,10 +130,21 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             {
                 print!("{cached}");
             } else {
-                let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
-                let c = emit_typed_c(&ir, &model)?;
-                store.cache_typed_c(&project, &model, &ir, &native.function_ir, &c, "")?;
-                print!("{c}");
+                match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
+                    Ok(ir) => {
+                        let c = emit_typed_c(&ir, &model)?;
+                        store.cache_typed_c(&project, &model, &ir, &native.function_ir, &c, "")?;
+                        print!("{c}");
+                    }
+                    Err(_) => {
+                        let ir = lower_high_level_cfg_cir(
+                            &native.machine_ir,
+                            &native.function_ir,
+                            &model,
+                        )?;
+                        print!("{}", emit_typed_cfg_c(&ir, &model)?);
+                    }
+                }
             }
         }
         _ => return Err(HELP.into()),

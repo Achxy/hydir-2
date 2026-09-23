@@ -13,4 +13,5 @@ serde.workspace = true
 
 [dev-dependencies]
 hydir-decompile = { path = "../hydir-decompile" }
+serde_json.workspace = true
 tempfile = "3.23"

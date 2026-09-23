@@ -12,6 +12,7 @@ hydirctl model import-dwarf program.elf model.json --output model-dwarf.json
 hydirctl model infer program.elf model-dwarf.json --output model-inferred.json
 hydirctl model verify program.elf model-inferred.json
 hydirctl lift program.elf --function some_function --ir high-level --model model-inferred.json
+hydirctl lift program.elf --function some_function --ir high-level-cfg --model model-inferred.json
 hydirctl decompile program.elf --function some_function --view typed --model model-inferred.json
 ```
 
@@ -58,15 +59,20 @@ Resolved direct calls with a fixed, explicit SysV prototype become C call
 expressions; their caller-saved registers are invalidated. The scalar pair
 and direct-call fixtures emit typed C at both `-O0` and `-O2`. It carries
 instruction-address provenance and produces a C11 typed view with checked
-field offsets. Branches, indirect calls, unknown call prototypes, indexed
-accesses, unsupported widths, and opaque effects currently return a
-diagnostic. The native `low` and `structured` views remain available
-for those functions. Typed C is marked semantically conservative and never
-rewrite ready; the source-level view does not model all machine fault and
-environment behavior.
+field offsets. `HighLevelCfgCir v2` covers a separate exact, memory-free
+64-bit scalar subset with direct branches, joins, and loops. It snapshots
+comparison operands at the flag-setting instruction and emits C11 labels and
+gotos that preserve the CFG. The typed command and desktop view try v1 first,
+then v2; the local project caches v1 output and regenerates v2 output. Both
+artifacts retain instruction sites. The CFG subset currently rejects memory
+accesses, calls, unsupported flag origins, opaque effects, and non-64-bit
+operands. The native `low` and `structured` views remain available for those
+functions. Typed C is marked semantically conservative and never rewrite
+ready; the source-level view does not model all machine fault and environment
+behavior.
 
-The v3 API and Python SDK expose `analysis_model`, `high_level_cir`, and
-`typed_c` read artifacts. Each artifact uses the same bounded automatic model
+The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,
+`high_level_cfg_cir`, and `typed_c` read artifacts. Each artifact uses the same bounded automatic model
 for the current binary revision, so `HighLevelCIR.model_revision` matches the
 model artifact's `revision`. The desktop native explorer has Typed C and Types
 tabs; selecting a type evidence or C statement address links to the existing
