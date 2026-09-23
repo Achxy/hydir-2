@@ -20,6 +20,7 @@ use hydir_decompile::{
     export_function_ir_llvm, lift_machine_function, lift_machine_function_at, lower_cir,
     lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
+use hydir_execution::{InputSpec, ReplayBudget, ReplayGoal, parse_input_spec, validate_input_spec};
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
@@ -79,6 +80,9 @@ Usage:
   hydirctl model infer <elf> <model.json> [--output <new-model.json>]
   hydirctl vm-profile <linked-elf> <profile.json>
   hydirctl vm-explore <linked-elf> <profile.json>
+  hydirctl replay init <linked-elf> [--output <input.json>]
+  hydirctl replay verify <linked-elf> <input.json>
+  hydirctl replay <linked-elf> <input.json> [--output <report.json>]
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -104,6 +108,8 @@ address mode requires an analyst-supplied virtual entry and exact byte extent,
 and works on stripped linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
+Replay uses an experimental local Linux Bubblewrap runner. Other hosts return
+an unsupported-host report. See docs/REPLAY_PROTOCOL.md for its current scope.
 Rebuild supports local and authenticated-loopback operations for a narrow
 freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
@@ -126,6 +132,95 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("replay")
+            if !matches!(args.get(1).map(String::as_str), Some("init" | "verify"))
+                && (args.len() == 3 || args.len() == 5 && args[3] == "--output") =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let spec = parse_input_spec(&fs::read(&args[2])?)?;
+            validate_input_spec(&bytes, &spec)?;
+            #[cfg(target_os = "linux")]
+            let report = hydir_execution::replay_local(&bytes, &spec)?;
+            #[cfg(not(target_os = "linux"))]
+            let report = hydir_execution::NativeReplayReport {
+                schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                binary_sha256: spec.binary_sha256.clone(),
+                input_sha256: hydir_execution::input_sha256(&spec)?,
+                status: hydir_execution::ReplayStatus::UnsupportedHost,
+                exit_code: None,
+                signal: None,
+                stdout_hex: String::new(),
+                stderr_hex: String::new(),
+                elapsed_ms: 0,
+                runner: "unavailable".into(),
+                diagnostic: Some("native replay currently requires Linux with Bubblewrap".into()),
+            };
+            hydir_execution::validate_replay_report(&bytes, &spec, &report)?;
+            let json = serde_json::to_vec_pretty(&report)?;
+            if args.len() == 5 {
+                write_new_or_identical(&args[4], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("replay")
+            if args.get(1).map(String::as_str) == Some("init")
+                && (args.len() == 3 || args.len() == 5) =>
+        {
+            let output = if args.len() == 5 {
+                if args[3] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[4].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let spec = InputSpec {
+                schema_version: hydir_execution::INPUT_SPEC_VERSION,
+                binary_sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
+                argv_hex: Vec::new(),
+                stdin_hex: String::new(),
+                files: Vec::new(),
+                origins: Vec::new(),
+                goal: ReplayGoal {
+                    exit_code: Some(0),
+                    stdout_contains_hex: None,
+                    stderr_contains_hex: None,
+                },
+                budget: ReplayBudget {
+                    timeout_ms: 5000,
+                    memory_bytes: 256 * 1024 * 1024,
+                    output_bytes: 64 * 1024,
+                },
+            };
+            validate_input_spec(&bytes, &spec)?;
+            let json = serde_json::to_vec_pretty(&spec)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("replay") if args.get(1).map(String::as_str) == Some("verify") && args.len() == 4 => {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&fs::read(&args[3])?)?;
+            validate_input_spec(&bytes, &spec)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": 1,
+                    "valid": true,
+                    "binary_sha256": spec.binary_sha256,
+                    "input_sha256": hydir_execution::input_sha256(&spec)?,
+                    "argv": spec.argv_hex.len(),
+                    "files": spec.files.len(),
+                    "origins": spec.origins.len(),
+                }))?
+            );
+        }
         Some("model")
             if args.get(1).map(String::as_str) == Some("init")
                 && (args.len() == 3 || args.len() == 5) =>
@@ -310,6 +405,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Some("doctor") if args.len() == 1 => {
+            let bwrap_version = Command::new("bwrap")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.lines().next().map(str::to_owned));
             let clang = Command::new("clang").arg("--version").output();
             let clang_version = clang
                 .ok()
@@ -383,7 +485,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "typed_cfg_v3": true,
                     "typed_c_local_cache": true,
                     "execution_snapshot_v1": false,
+                    "input_spec_v1": true,
                     "native_replay_v1": false,
+                    "bubblewrap_installed": bwrap_version.is_some(),
+                    "bubblewrap_version": bwrap_version,
                     "vm_profile_v1": true,
                     "vm_explorer_scope": "bounded host/VPC exploration; guest CFG and rewrite readiness are not established",
                     "native_loader_metadata": "ELF64 program headers, GNU-versioned dynamic symbols, location-aware relocations, PLT/GOT/TLS ranges, linked .eh_frame FDEs, init/fini arrays, and symbol-backed ET_REL lifting",
