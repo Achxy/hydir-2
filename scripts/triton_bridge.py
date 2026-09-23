@@ -507,6 +507,8 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict,
 
 
 def run_snapshot_return(request: dict) -> dict:
+    from triton import VERSION
+
     plan = validate_snapshot_request(request)
     budget = {
         "deadline": time.monotonic() + plan["wall_timeout_ms"] / 1000,
@@ -574,6 +576,7 @@ def run_snapshot_return(request: dict) -> dict:
         "schema_version": 1,
         "operation": "snapshot_return",
         "backend": "triton",
+        "backend_version": f"{VERSION.MAJOR}.{VERSION.MINOR}.{VERSION.BUILD}",
         "binary_sha256": request["binary_sha256"],
         "input_sha256": request["input_sha256"],
         "snapshot_sha256": request["snapshot_sha256"],

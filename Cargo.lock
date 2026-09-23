@@ -2194,6 +2194,7 @@ dependencies = [
  "hydir-vm",
  "iced-x86",
  "object",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
