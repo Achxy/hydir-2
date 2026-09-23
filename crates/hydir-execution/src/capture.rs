@@ -359,14 +359,14 @@ fn run_to_target(
             session.required(&format!("-break-insert {symbol}"))?;
             run_command(
                 session,
-                "-interpreter-exec console \"run < /work/.hydir-stdin\"",
+                "-interpreter-exec console \"run < /work/.hydir-stdin > /dev/null 2>&1\"",
             )?;
             require_breakpoint_hit(session.wait_stop()?)?;
         }
         CaptureTarget::ElfVaddr(address) => {
             run_command(
                 session,
-                "-interpreter-exec console \"starti < /work/.hydir-stdin\"",
+                "-interpreter-exec console \"starti < /work/.hydir-stdin > /dev/null 2>&1\"",
             )?;
             let first_stop = session.wait_stop()?;
             let reason = stop_reason(&first_stop);
@@ -418,7 +418,18 @@ fn run_to_target(
             if first_pc != runtime {
                 session.required(&format!("-break-insert *0x{runtime:x}"))?;
                 run_command(session, "-exec-continue")?;
-                require_breakpoint_hit(session.wait_stop()?)?;
+                let final_stop = session.wait_stop()?;
+                if stop_reason(&final_stop) != "breakpoint-hit" {
+                    let exit_code = final_stop
+                        .field("exit-code")
+                        .and_then(MiValue::as_text)
+                        .unwrap_or("unknown");
+                    return Err(format!(
+                        "process stopped before requested ELF address 0x{address:x} (runtime 0x{runtime:x}, bias 0x{bias:x}): reason={}, exit-code={exit_code}",
+                        stop_reason(&final_stop)
+                    )
+                    .into());
+                }
             }
         }
     }
