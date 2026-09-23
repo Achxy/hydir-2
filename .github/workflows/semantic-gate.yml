@@ -37,6 +37,10 @@ jobs:
         env:
           HYDIR_TRITON_PYTHON: .venv/bin/python
         run: python3 scripts/snapshot-solve-smoke.py
+      - name: Live runtime capability report
+        env:
+          HYDIR_TRITON_PYTHON: .venv/bin/python
+        run: python3 scripts/doctor-live-gate.py
       - name: Semantic report protocol tests
         run: python3 tests/semantic_gate_report_test.py -q
       - name: Compiler-output semantic gate

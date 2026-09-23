@@ -142,6 +142,46 @@ command. ELF bytes are never written to that database.
 
 const EMBEDDED_TRITON_HELPER: &str = include_str!("../../../scripts/triton_bridge.py");
 
+fn probe_bubblewrap_isolation() -> bool {
+    if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
+        return false;
+    }
+    let Ok(mut child) = Command::new("bwrap")
+        .args([
+            "--unshare-user",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("hydirctl: {err}");
@@ -795,6 +835,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .and_then(|value| value.lines().next().map(str::to_owned));
             let triton_helper_available =
                 triton_helper.exists() || env::var_os("HYDIR_TRITON_HELPER").is_none();
+            let bubblewrap_isolation_ready =
+                bwrap_version.is_some() && probe_bubblewrap_isolation();
+            let replay_ready = bubblewrap_isolation_ready;
+            let capture_ready = replay_ready && gdb_version.is_some();
+            let snapshot_solve_ready =
+                capture_ready && triton_helper_available && triton_module_version.is_some();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -826,19 +872,23 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "typed_cfg_v2": false,
                     "typed_cfg_v3": true,
                     "typed_c_local_cache": true,
-                    "execution_snapshot_v1": false,
+                    "execution_snapshot_v1": capture_ready,
                     "execution_snapshot_schema_v1": true,
                     "gdb_mi_parser_v1": true,
-                    "gdb_mi_parser_scope": "bounded result, async, and stream records with nested tuples/lists and C-style escaped bytes; experimental session controller awaits Linux gate",
-                    "gdb_capture_v1": false,
+                    "gdb_mi_parser_scope": "bounded result, async, and stream records with nested tuples/lists and C-style escaped bytes; named and stripped PIE address capture passed the Ubuntu 24.04 semantic gate",
+                    "gdb_capture_v1": capture_ready,
+                    "gdb_capture_scope": "experimental single-thread x86-64 ELF capture at a named function or relocated file-backed address; up to eight selected pages; missing state and runner failures remain explicit",
                     "input_spec_v1": true,
                     "origin_probe_v1": true,
                     "origin_probe_scope": "analyst-selected captured register versus input-origin bytes; exact snapshot-bound byte equality only, not channel provenance",
                     "snapshot_resume_plan_v1": true,
-                    "snapshot_resume_scope": "exact digest-bound snapshot/probe/code/page/register handoff for up to 32 original bytes and a selected 4096-byte pure validator; captured-state Triton solve awaits Linux native replay gate",
-                    "snapshot_return_solve_v1": false,
-                    "native_replay_v1": false,
+                    "snapshot_resume_scope": "exact digest-bound snapshot/probe/code/page/register handoff for up to 32 original bytes and a selected 4096-byte pure validator; one captured-state solve and native replay passed the Ubuntu 24.04 semantic gate",
+                    "snapshot_return_solve_v1": snapshot_solve_ready,
+                    "snapshot_return_solve_scope": "experimental pure validator return goal from matched captured origin bytes; bounded seeds, instructions, solver queries and wall time; a function witness is not a native success until fresh replay matches",
+                    "native_replay_v1": replay_ready,
+                    "native_replay_scope": "local Linux x86-64 Bubblewrap replay with private network namespace, bounded argv/stdin/files, exact exit/output goals and explicit setup/timeout/output-limit failures; Ubuntu 24.04 smoke gate passed",
                     "bubblewrap_installed": bwrap_version.is_some(),
+                    "bubblewrap_isolation_ready": bubblewrap_isolation_ready,
                     "bubblewrap_version": bwrap_version,
                     "gdb_installed": gdb_version.is_some(),
                     "gdb_version": gdb_version,
