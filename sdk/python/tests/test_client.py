@@ -126,6 +126,22 @@ class ClientBoundaryTests(unittest.TestCase):
                 client.get_program_artifact("project", 4, "machine")
             with self.assertRaises(ValueError):
                 client.get_program_artifact("project", 4, "coverage", "function")
+            cfg_content = json.dumps({
+                "schema_version": 2,
+                "binary_sha256": "a" * 64,
+                "model_revision": 1,
+                "blocks": [],
+            }).encode("utf-8")
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=__import__("hashlib").sha256(cfg_content).hexdigest(),
+                media_type="application/vnd.hydir.high-level-cfg-cir+json;version=2",
+                content=cfg_content,
+                project_revision=4,
+            )
+            artifact = client.get_program_artifact(
+                "project", 4, "high_level_cfg_cir", "hydir_cfg_sum"
+            )
+            self.assertEqual(artifact["schema_version"], 2)
 
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:

@@ -160,11 +160,12 @@ class HydirClient:
             "unit": ("application/vnd.hydir.decompilation-unit+json;version=2", 2),
             "analysis_model": ("application/vnd.hydir.analysis-model+json;version=1", 1),
             "high_level_cir": ("application/vnd.hydir.high-level-cir+json;version=1", 1),
+            "high_level_cfg_cir": ("application/vnd.hydir.high-level-cfg-cir+json;version=2", 2),
             "typed_c": ("text/x-c;view=typed", None),
         }
         if stage not in media_types:
             raise ValueError("Unsupported native artifact stage")
-        function_scoped = stage in {"machine", "state", "function", "cir", "llvm", "unit", "high_level_cir", "typed_c"}
+        function_scoped = stage in {"machine", "state", "function", "cir", "llvm", "unit", "high_level_cir", "high_level_cfg_cir", "typed_c"}
         if function_scoped and not function_selector:
             raise ValueError("Function-scoped native artifact requires a selector")
         if not function_scoped and function_selector:

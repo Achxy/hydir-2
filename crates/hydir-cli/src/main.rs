@@ -20,7 +20,7 @@ use hydir_decompile::{
     export_function_ir_llvm, lift_machine_function, lift_machine_function_at, lower_cir,
     lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
-use hydir_hlc::{emit_typed_c, lower_high_level_cir};
+use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
@@ -64,7 +64,7 @@ Usage:
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
   hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|expression|function|cir|llvm>
-  hydirctl lift <elf> --function <function-id-or-symbol> --ir high-level --model <model.json>
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir <high-level|high-level-cfg> --model <model.json>
   hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
@@ -378,7 +378,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "expression_ir_v1": true,
                     "expression_ir_scope": "supported scalar writes, condition flags/predicates, little-endian MOV loads/stores with complete alias-region dependencies, 64/32-bit LEA, and component SSA joins; unsupported effects remain residual",
                     "typed_c_v1": true,
-                    "typed_c_scope": "complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; other functions retain low-level C",
+                    "typed_c_scope": "v1: complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; v2 CFG: exact memory-free 64-bit scalar branches and loops with gotos; other functions retain low-level C",
+                    "typed_cfg_v2": true,
                     "typed_c_local_cache": true,
                     "vm_profile_v1": true,
                     "vm_explorer_scope": "bounded host/VPC exploration; guest CFG and rewrite readiness are not established",
@@ -731,7 +732,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             if args.len() == 8
                 && args[2] == "--function"
                 && args[4] == "--ir"
-                && args[5] == "high-level"
+                && matches!(args[5].as_str(), "high-level" | "high-level-cfg")
                 && args[6] == "--model" =>
         {
             let bytes = read_binary(&args[1])?;
@@ -739,8 +740,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             validate_model(&bytes, &model)?;
             let selection = resolve_native_function(&bytes, &args[3])?;
             let native = decompile_native_selection(&bytes, &selection)?;
-            let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
-            println!("{}", serde_json::to_string_pretty(&ir)?);
+            if args[5] == "high-level-cfg" {
+                let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)?;
+                println!("{}", serde_json::to_string_pretty(&ir)?);
+            } else {
+                let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
+                println!("{}", serde_json::to_string_pretty(&ir)?);
+            }
         }
         Some("lift") if args.len() == 6 && args[2] == "--function" && args[4] == "--ir" => {
             let bytes = read_binary(&args[1])?;
@@ -860,8 +866,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             validate_model(&bytes, &model)?;
             let selection = resolve_native_function(&bytes, &args[3])?;
             let native = decompile_native_selection(&bytes, &selection)?;
-            let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
-            print!("{}", emit_typed_c(&ir, &model)?);
+            match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
+                Ok(ir) => print!("{}", emit_typed_c(&ir, &model)?),
+                Err(linear_error) => {
+                    let ir =
+                        lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+                            .map_err(|cfg_error| {
+                            format!("typed C unavailable: linear: {linear_error}; CFG: {cfg_error}")
+                        })?;
+                    print!("{}", emit_typed_cfg_c(&ir, &model)?);
+                }
+            }
         }
         Some("decompile") if args.len() == 6 && args[2] == "--function" && args[4] == "--view" => {
             let bytes = read_binary(&args[1])?;

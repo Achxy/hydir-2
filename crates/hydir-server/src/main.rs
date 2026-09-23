@@ -32,7 +32,7 @@ use hydir_decompile::{
     export_function_ir_llvm, lift_machine_function_at, lower_cir, lower_function_ir,
     lower_state_ir, measure_native_coverage,
 };
-use hydir_hlc::{emit_typed_c, lower_high_level_cir};
+use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
     STATE_FUNCTION_IR_VERSION,
@@ -2048,6 +2048,7 @@ fn native_artifact_media_type(stage: &str) -> Option<&'static str> {
         "unit" => Some("application/vnd.hydir.decompilation-unit+json;version=2"),
         "analysis_model" => Some("application/vnd.hydir.analysis-model+json;version=1"),
         "high_level_cir" => Some("application/vnd.hydir.high-level-cir+json;version=1"),
+        "high_level_cfg_cir" => Some("application/vnd.hydir.high-level-cfg-cir+json;version=2"),
         "typed_c" => Some("text/x-c;view=typed"),
         _ => None,
     }
@@ -2137,13 +2138,22 @@ fn native_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String>
             if stage == "function" {
                 return serde_json::to_vec(&function).map_err(|error| error.to_string());
             }
-            if matches!(stage, "high_level_cir" | "typed_c") {
+            if matches!(stage, "high_level_cir" | "high_level_cfg_cir" | "typed_c") {
                 let model = automatic_analysis_model(bytes)?;
-                let high = lower_high_level_cir(&machine, &function, &model)?;
-                return if stage == "typed_c" {
-                    emit_typed_c(&high, &model).map(String::into_bytes)
-                } else {
-                    serde_json::to_vec(&high).map_err(|error| error.to_string())
+                if stage == "high_level_cfg_cir" {
+                    let high = lower_high_level_cfg_cir(&machine, &function, &model)?;
+                    return serde_json::to_vec(&high).map_err(|error| error.to_string());
+                }
+                return match lower_high_level_cir(&machine, &function, &model) {
+                    Ok(high) if stage == "typed_c" => {
+                        emit_typed_c(&high, &model).map(String::into_bytes)
+                    }
+                    Ok(high) => serde_json::to_vec(&high).map_err(|error| error.to_string()),
+                    Err(_) if stage == "typed_c" => {
+                        let high = lower_high_level_cfg_cir(&machine, &function, &model)?;
+                        emit_typed_cfg_c(&high, &model).map(String::into_bytes)
+                    }
+                    Err(error) => Err(error),
                 };
             }
             if stage == "llvm" {
@@ -3858,6 +3868,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
                 | "llvm"
                 | "unit"
                 | "high_level_cir"
+                | "high_level_cfg_cir"
                 | "typed_c"
         ) {
             valid_symbol(&input.function_selector)?;
@@ -5179,6 +5190,48 @@ mod tests {
             }
             assert!(native_artifact_media_type(stage).is_some());
         }
+    }
+
+    #[test]
+    fn v3_cfg_artifact_and_typed_c_cover_bounded_scalar_loop() {
+        use std::process::Command;
+        let directory = tempfile::tempdir().unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+        let object = directory.path().join("typed_cfg.o");
+        let output = Command::new("clang")
+            .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+            .arg(fixture)
+            .arg("-o")
+            .arg(&object)
+            .output();
+        let Ok(output) = output else { return };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let binary = std::fs::read(object).unwrap();
+        let json = serde_json::to_string(&NativeArtifactSelector {
+            stage: "high_level_cfg_cir".to_owned(),
+            function: "hydir_cfg_sum".to_owned(),
+        })
+        .unwrap();
+        let content = native_artifact(&binary, &json).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&content).unwrap();
+        assert_eq!(artifact["schema_version"], 2);
+        assert!(artifact["blocks"].as_array().unwrap().len() > 2);
+        assert_eq!(
+            native_artifact_media_type("high_level_cfg_cir"),
+            Some("application/vnd.hydir.high-level-cfg-cir+json;version=2")
+        );
+        let json = serde_json::to_string(&NativeArtifactSelector {
+            stage: "typed_c".to_owned(),
+            function: "hydir_cfg_sum".to_owned(),
+        })
+        .unwrap();
+        let c = String::from_utf8(native_artifact(&binary, &json).unwrap()).unwrap();
+        assert!(c.contains("goto hydir_bb_") && c.contains("if ("));
     }
 
     #[cfg(unix)]
