@@ -6,7 +6,7 @@ use crate::{
     StopPoint, decode_hex, input_sha256, parse_mi_line, validate_execution_snapshot,
     validate_input_spec,
 };
-use object::{Object, ObjectKind, ObjectSegment};
+use object::{Object, ObjectKind, ObjectSegment, SegmentFlags};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
@@ -46,12 +46,36 @@ impl From<&str> for CaptureFailure {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CaptureTarget<'a> {
+    Symbol(&'a str),
+    ElfVaddr(u64),
+}
+
 /// Capture one symbol entry. Arbitrary-byte argv and multi-threaded state are
 /// explicitly outside this first worker's scope; replay accepts broader argv.
 pub fn capture_function_entry(
     elf: &[u8],
     input: &InputSpec,
     symbol: &str,
+) -> Result<ExecutionSnapshot, String> {
+    capture_target(elf, input, CaptureTarget::Symbol(symbol))
+}
+
+/// Capture at a file-backed executable ELF virtual address, including in a
+/// stripped PIE. The runtime address is resolved after starting the inferior.
+pub fn capture_elf_address(
+    elf: &[u8],
+    input: &InputSpec,
+    elf_vaddr: u64,
+) -> Result<ExecutionSnapshot, String> {
+    capture_target(elf, input, CaptureTarget::ElfVaddr(elf_vaddr))
+}
+
+fn capture_target(
+    elf: &[u8],
+    input: &InputSpec,
+    target: CaptureTarget<'_>,
 ) -> Result<ExecutionSnapshot, String> {
     validate_input_spec(elf, input)?;
     let mut snapshot = ExecutionSnapshot {
@@ -68,7 +92,7 @@ pub fn capture_function_entry(
         runner: "bubblewrap-gdb-mi-linux-v1".into(),
         diagnostics: Vec::new(),
     };
-    let result = capture_inner(elf, input, symbol, snapshot.clone());
+    let result = capture_inner(elf, input, target, snapshot.clone());
     match result {
         Ok(candidate) => match validate_execution_snapshot(elf, input, &candidate) {
             Ok(()) => return Ok(candidate),
@@ -93,20 +117,15 @@ pub fn capture_function_entry(
 fn capture_inner(
     elf: &[u8],
     input: &InputSpec,
-    symbol: &str,
+    target: CaptureTarget<'_>,
     mut snapshot: ExecutionSnapshot,
 ) -> Result<ExecutionSnapshot, CaptureFailure> {
-    if symbol.is_empty()
-        || symbol.len() > 128
-        || !symbol
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        || !symbol
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err("capture requires a simple C function symbol".into());
+    match target {
+        CaptureTarget::Symbol(symbol) if !valid_capture_symbol(symbol) => {
+            return Err("capture requires a simple C function symbol".into());
+        }
+        CaptureTarget::ElfVaddr(address) => validate_elf_address(elf, address)?,
+        _ => {}
     }
     let argv = input
         .argv_hex
@@ -241,21 +260,7 @@ fn capture_inner(
     session.required("-gdb-set pagination off")?;
     session.required("-gdb-set confirm off")?;
     session.required("-gdb-set disable-randomization off")?;
-    session.required(&format!("-break-insert {symbol}"))?;
-    let run = session.command("-interpreter-exec console \"run < /work/.hydir-stdin\"")?;
-    if !matches!(run.class(), "done" | "running") {
-        return Err(run.error().into());
-    }
-    let stop = session.wait_stop()?;
-    if stop.field("reason").and_then(MiValue::as_text) != Some("breakpoint-hit") {
-        return Err(format!(
-            "process stopped before requested function: {}",
-            stop.field("reason")
-                .and_then(MiValue::as_text)
-                .unwrap_or("unknown")
-        )
-        .into());
-    }
+    run_to_target(&mut session, elf, target)?;
     let thread = session.required("-thread-info")?;
     let (thread_count, thread_id) = parse_threads(&thread.record)?;
     if thread_count != 1 {
@@ -272,16 +277,8 @@ fn capture_inner(
     let rip = required_register(&registers, "rip")?;
     let rsp = required_register(&registers, "rsp")?;
     required_register(&registers, "eflags")?;
-    let maps = session.required(
-        "-interpreter-exec console \"python exec(open('/work/.hydir-maps.py').read())\"",
-    )?;
-    let mappings = parse_maps_console(&maps.console)?;
-    if !mappings.iter().any(|mapping| {
-        mapping.path.as_deref() == Some("/work/.hydir-program")
-            && mapping.executable
-            && mapping.start <= rip
-            && rip < mapping.end
-    }) {
+    let mappings = read_mappings(&mut session)?;
+    if !in_staged_executable_mapping(&mappings, rip) {
         return Err("stop PC is not in the staged ELF mapping".into());
     }
     let bias = elf_load_bias(elf, &mappings);
@@ -290,6 +287,11 @@ fn capture_inner(
         None => (None, None),
         Some(_) => (None, None),
     };
+    if let CaptureTarget::ElfVaddr(requested) = target {
+        if elf_vaddr != Some(requested) {
+            return Err("stopped address differs from requested ELF virtual address".into());
+        }
+    }
     let mut selected = BTreeSet::new();
     for name in ["rip", "rsp", "rdi", "rsi", "rdx", "rcx", "r8", "r9"] {
         if let Some(RegisterObservation::Present { value }) = registers.get(name) {
@@ -332,7 +334,10 @@ fn capture_inner(
         runtime_pc: rip,
         elf_vaddr,
         load_bias,
-        symbol: Some(symbol.to_owned()),
+        symbol: match target {
+            CaptureTarget::Symbol(symbol) => Some(symbol.to_owned()),
+            CaptureTarget::ElfVaddr(_) => None,
+        },
     });
     snapshot.thread_id = Some(thread_id);
     snapshot.thread_count = thread_count;
@@ -340,6 +345,106 @@ fn capture_inner(
     snapshot.mappings = mappings;
     snapshot.pages = pages;
     Ok(snapshot)
+}
+
+fn run_to_target(
+    session: &mut MiSession,
+    elf: &[u8],
+    target: CaptureTarget<'_>,
+) -> Result<(), CaptureFailure> {
+    match target {
+        CaptureTarget::Symbol(symbol) => {
+            session.required(&format!("-break-insert {symbol}"))?;
+            run_command(
+                session,
+                "-interpreter-exec console \"run < /work/.hydir-stdin\"",
+            )?;
+            require_breakpoint_hit(session.wait_stop()?)?;
+        }
+        CaptureTarget::ElfVaddr(address) => {
+            run_command(
+                session,
+                "-interpreter-exec console \"starti < /work/.hydir-stdin\"",
+            )?;
+            let first_stop = session.wait_stop()?;
+            let reason = stop_reason(&first_stop);
+            if !matches!(
+                reason,
+                "breakpoint-hit" | "end-stepping-range" | "location-reached"
+            ) {
+                return Err(
+                    format!("process did not stop at its first instruction: {reason}").into(),
+                );
+            }
+            let mappings = read_mappings(session)?;
+            let bias = elf_load_bias(elf, &mappings)
+                .ok_or("cannot resolve the staged ELF load bias at process start")?;
+            let runtime = address
+                .checked_add(bias)
+                .ok_or("ELF virtual address overflows after relocation")?;
+            if !in_staged_executable_mapping(&mappings, runtime) {
+                return Err("requested ELF address is not executable in the staged process".into());
+            }
+            let first_pc = first_stop
+                .field("frame")
+                .and_then(|value| match value {
+                    MiValue::Tuple(fields) => tuple_field(fields, "addr"),
+                    _ => None,
+                })
+                .and_then(MiValue::as_text)
+                .and_then(parse_hex_u64);
+            if first_pc != Some(runtime) {
+                session.required(&format!("-break-insert *0x{runtime:x}"))?;
+                run_command(session, "-exec-continue")?;
+                require_breakpoint_hit(session.wait_stop()?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_command(session: &mut MiSession, command: &str) -> Result<(), CaptureFailure> {
+    let reply = session.command(command)?;
+    if matches!(reply.class(), "done" | "running") {
+        Ok(())
+    } else {
+        Err(reply.error().into())
+    }
+}
+
+fn stop_reason(record: &MiRecord) -> &str {
+    record
+        .field("reason")
+        .and_then(MiValue::as_text)
+        .unwrap_or("unknown")
+}
+
+fn require_breakpoint_hit(record: MiRecord) -> Result<(), CaptureFailure> {
+    if stop_reason(&record) == "breakpoint-hit" {
+        Ok(())
+    } else {
+        Err(format!(
+            "process stopped before requested target: {}",
+            stop_reason(&record)
+        )
+        .into())
+    }
+}
+
+fn read_mappings(session: &mut MiSession) -> Result<Vec<MemoryMapping>, CaptureFailure> {
+    let reply = session.required(
+        "-interpreter-exec console \"python exec(open('/work/.hydir-maps.py').read())\"",
+    )?;
+    parse_maps_console(&reply.console)
+}
+
+fn in_staged_executable_mapping(mappings: &[MemoryMapping], address: u64) -> bool {
+    mappings.iter().any(|mapping| {
+        mapping.path.as_deref() == Some("/work/.hydir-program")
+            && mapping.executable
+            && mapping.start <= address
+            && address < mapping.end
+    })
 }
 
 struct CommandReply {
@@ -716,6 +821,42 @@ fn parse_maps_console(console: &[u8]) -> Result<Vec<MemoryMapping>, CaptureFailu
     Ok(result)
 }
 
+fn valid_capture_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.len() <= 128
+        && symbol
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn validate_elf_address(elf: &[u8], address: u64) -> Result<(), CaptureFailure> {
+    let file = object::File::parse(elf).map_err(|_| "capture ELF cannot be parsed")?;
+    if !matches!(file.kind(), ObjectKind::Executable | ObjectKind::Dynamic) {
+        return Err("capture address requires a linked executable ELF".into());
+    }
+    let covered = file.segments().any(|segment| {
+        let executable = matches!(
+            segment.flags(),
+            SegmentFlags::Elf { p_flags } if p_flags & object::elf::PF_X != 0
+        );
+        let (_, file_size) = segment.file_range();
+        executable
+            && segment.address() <= address
+            && segment
+                .address()
+                .checked_add(file_size)
+                .is_some_and(|end| address < end)
+    });
+    if !covered {
+        return Err("capture address is outside file-backed executable ELF segments".into());
+    }
+    Ok(())
+}
+
 fn elf_load_bias(elf: &[u8], mappings: &[MemoryMapping]) -> Option<u64> {
     let file = object::File::parse(elf).ok()?;
     match file.kind() {
@@ -818,5 +959,22 @@ mod tests {
             parse_memory_page(&empty, 0x55555000),
             MemoryPageState::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn address_target_must_be_file_backed_executable_code() {
+        let elf = include_bytes!("../../../demo/hydir-prism.elf");
+        let file = object::File::parse(elf.as_slice()).unwrap();
+        let code = file
+            .segments()
+            .find(|segment| {
+                matches!(
+                    segment.flags(),
+                    SegmentFlags::Elf { p_flags } if p_flags & object::elf::PF_X != 0
+                ) && segment.file_range().1 > 0
+            })
+            .unwrap();
+        assert!(validate_elf_address(elf, code.address()).is_ok());
+        assert!(validate_elf_address(elf, u64::MAX).is_err());
     }
 }

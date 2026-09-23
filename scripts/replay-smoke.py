@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise fresh replay across argv, stdin, and file input on Linux CI."""
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -24,6 +25,19 @@ def expect_report(path: Path, status: str, exit_code: int) -> None:
     assert len(report["input_sha256"]) == 64, report
 
 
+def symbol_address(binary: Path, symbol: str) -> int:
+    result = subprocess.run(
+        ["nm", "-an", str(binary)], cwd=ROOT, check=True, capture_output=True, text=True
+    )
+    matches = [
+        int(parts[0], 16)
+        for line in result.stdout.splitlines()
+        if len(parts := line.split()) == 3 and parts[2] == symbol
+    ]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hydir-replay-smoke-") as directory:
         work = Path(directory)
@@ -33,7 +47,12 @@ def main() -> None:
         mismatching = work / "mismatching.json"
         crashed = work / "crashed.json"
         snapshot_path = work / "snapshot.json"
-        run("clang", "-O1", ROOT / "tests" / "fixtures" / "replay_channels.c", "-o", binary)
+        stripped = work / "replay_channels.stripped.elf"
+        stripped_specification = work / "stripped-input.json"
+        stripped_snapshot_path = work / "stripped-snapshot.json"
+        run("clang", "-O1", "-fPIE", "-pie", ROOT / "tests" / "fixtures" / "replay_channels.c", "-o", binary)
+        main_address = symbol_address(binary, "main")
+        run("strip", "--strip-all", "-o", stripped, binary)
         run("cargo", "build", "--locked", "-q", "-p", "hydir-cli")
         run(CTL, "replay", "init", binary, "--output", specification)
         spec = json.loads(specification.read_text(encoding="utf-8"))
@@ -60,6 +79,16 @@ def main() -> None:
         assert snapshot["thread_count"] == 1, snapshot
         assert snapshot["stop"]["runtime_pc"] == snapshot["stop"]["elf_vaddr"] + snapshot["stop"]["load_bias"], snapshot
         assert any(page["value"]["state"] == "present" for page in snapshot["pages"]), snapshot
+        stripped_spec = dict(spec)
+        stripped_spec["binary_sha256"] = hashlib.sha256(stripped.read_bytes()).hexdigest()
+        stripped_specification.write_text(json.dumps(stripped_spec), encoding="utf-8")
+        run(CTL, "replay", "verify", stripped, stripped_specification)
+        run(CTL, "capture", stripped, stripped_specification, "--address", hex(main_address), "--output", stripped_snapshot_path)
+        run(CTL, "snapshot", "verify", stripped, stripped_specification, stripped_snapshot_path)
+        stripped_snapshot = json.loads(stripped_snapshot_path.read_text(encoding="utf-8"))
+        assert stripped_snapshot["status"] == "stopped", stripped_snapshot
+        assert stripped_snapshot["stop"]["elf_vaddr"] == main_address, stripped_snapshot
+        assert stripped_snapshot["stop"]["symbol"] is None, stripped_snapshot
         spec["stdin_hex"] = b"wrong\n".hex()
         specification.write_text(json.dumps(spec), encoding="utf-8")
         run(CTL, "replay", binary, specification, "--output", mismatching)
