@@ -68,6 +68,11 @@ the same predicate as `cmp`, including when both paths join before a branch.
 Addition also snapshots its original operands: a later `jc`/`jnc` compares the
 wrapped sum with the first operand, and `jo`/`jno` checks the sign-bit overflow
 formula. Zero and sign checks after addition use the same modular sum.
+For 64-bit `test`, `and`, `or`, and `xor`, the CFG lowerer also derives signed
+and unsigned compound predicates from the result's sign and zero bits. These
+operations clear carry and overflow, so branches reading only those flags have
+a constant outcome. Simple zero tests keep a direct form for C structuring.
+The flag rules follow the [AMD64 architecture manual](https://docs.amd.com/v/u/en-US/24592_3.24).
 The C11 renderer folds
 single-entry chains, private diamonds, and simple pre-test loops into readable
 statements. Other control flow retains explicit gotos. A flag snapshot is
@@ -102,9 +107,10 @@ supported scalar register writes, including the `xor reg, reg` zeroing idiom.
 It also checks normalized zero-flag assignments and branch conditions, so
 `jz`/`jnz` after supported 64-bit arithmetic can be rendered and tested.
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
-use the bounded compare/test/subtract interpretation; addition supports direct
-zero, sign, carry, and overflow checks. Compound conditions after addition,
-arbitrary flag SSA, and other arithmetic carry/overflow sources remain future
+use the bounded compare/test/subtract interpretation; logical operations cover
+their defined zero, sign, carry, and overflow combinations. Addition supports
+direct zero, sign, carry, and overflow checks. Compound conditions after
+addition, arbitrary flag SSA, and other arithmetic carry/overflow sources remain future
 work. The memory helpers use integer-to-pointer
 conversion in the supported x86-64 execution environment. The CFG lowerer also
 handles normalized 64-bit `lea` expressions. A single-write register derived

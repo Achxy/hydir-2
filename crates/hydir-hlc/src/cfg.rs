@@ -1134,6 +1134,49 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
     if source == Some(FlagSource::Add) {
         return addition_predicate(family);
     }
+    // Keep the direct two-operand form when the branch reads only ZF. The
+    // structurer can then fold sole-reader snapshots back into readable C.
+    let simple_zero = match (source, family) {
+        (Some(FlagSource::Test), "je" | "jz" | "jbe" | "jna") => Some(HighCfgCompareOp::TestZero),
+        (Some(FlagSource::Test), "jne" | "jnz" | "ja" | "jnbe") => {
+            Some(HighCfgCompareOp::TestNonzero)
+        }
+        (Some(FlagSource::ResultZero), "je" | "jz" | "jbe" | "jna") => {
+            Some(HighCfgCompareOp::Equal)
+        }
+        (Some(FlagSource::ResultZero), "jne" | "jnz" | "ja" | "jnbe") => {
+            Some(HighCfgCompareOp::NotEqual)
+        }
+        _ => None,
+    };
+    if let Some(op) = simple_zero {
+        return Ok(HighCfgPredicate {
+            op,
+            left: HighExpr::Variable {
+                name: FLAG_LEFT.to_owned(),
+            },
+            right: HighExpr::Variable {
+                name: FLAG_RIGHT.to_owned(),
+            },
+        });
+    }
+    if matches!(source, Some(FlagSource::Test | FlagSource::ResultZero)) {
+        let left = HighExpr::Variable {
+            name: FLAG_LEFT.to_owned(),
+        };
+        let result = if source == Some(FlagSource::Test) {
+            HighExpr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(HighExpr::Variable {
+                    name: FLAG_RIGHT.to_owned(),
+                }),
+            }
+        } else {
+            left
+        };
+        return logical_flag_predicate(family, result);
+    }
     let op = match (source, family) {
         (Some(FlagSource::Compare), "je" | "jz") => HighCfgCompareOp::Equal,
         (Some(FlagSource::Compare), "jne" | "jnz") => HighCfgCompareOp::NotEqual,
@@ -1147,10 +1190,6 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
         (Some(FlagSource::Compare), "jle" | "jng") => HighCfgCompareOp::SignedLessEqual,
         (Some(FlagSource::Compare), "jg" | "jnle") => HighCfgCompareOp::SignedGreater,
         (Some(FlagSource::Compare), "jge" | "jnl") => HighCfgCompareOp::SignedGreaterEqual,
-        (Some(FlagSource::Test), "je" | "jz") => HighCfgCompareOp::TestZero,
-        (Some(FlagSource::Test), "jne" | "jnz") => HighCfgCompareOp::TestNonzero,
-        (Some(FlagSource::ResultZero), "je" | "jz") => HighCfgCompareOp::Equal,
-        (Some(FlagSource::ResultZero), "jne" | "jnz") => HighCfgCompareOp::NotEqual,
         _ => {
             return Err(format!(
                 "typed CFG has no supported flag proof for {family}"
@@ -1166,6 +1205,39 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
             name: FLAG_RIGHT.to_owned(),
         },
     })
+}
+
+/// TEST, AND, OR, and XOR clear CF and OF. Their signed and unsigned branches
+/// therefore depend only on the sign and zero bits of the exact 64-bit result.
+fn logical_flag_predicate(family: &str, result: HighExpr) -> Result<HighCfgPredicate, String> {
+    let zero = HighExpr::Constant { value: 0 };
+    let high_bit = HighExpr::Constant {
+        value: 0x8000_0000_0000_0000,
+    };
+    let (op, left, right) = match family {
+        "je" | "jz" | "jbe" | "jna" => (HighCfgCompareOp::Equal, result, zero),
+        "jne" | "jnz" | "ja" | "jnbe" => (HighCfgCompareOp::NotEqual, result, zero),
+        "js" | "jl" | "jnge" => (HighCfgCompareOp::TestNonzero, result, high_bit),
+        "jns" | "jge" | "jnl" => (HighCfgCompareOp::TestZero, result, high_bit),
+        "jle" | "jng" => (HighCfgCompareOp::SignedLessEqual, result, zero),
+        "jg" | "jnle" => (HighCfgCompareOp::SignedGreater, result, zero),
+        "jb" | "jc" | "jnae" | "jo" => (
+            HighCfgCompareOp::NotEqual,
+            HighExpr::Constant { value: 0 },
+            HighExpr::Constant { value: 0 },
+        ),
+        "jae" | "jnb" | "jnc" | "jno" => (
+            HighCfgCompareOp::Equal,
+            HighExpr::Constant { value: 0 },
+            HighExpr::Constant { value: 0 },
+        ),
+        _ => {
+            return Err(format!(
+                "typed CFG has no supported logical flag proof for {family}"
+            ));
+        }
+    };
+    Ok(HighCfgPredicate { op, left, right })
 }
 
 fn addition_predicate(family: &str) -> Result<HighCfgPredicate, String> {

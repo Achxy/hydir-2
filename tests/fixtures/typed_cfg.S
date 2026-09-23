@@ -160,6 +160,69 @@ hydir_cfg_xor_flags:
     retq
 .size hydir_cfg_xor_flags, .-hydir_cfg_xor_flags
 
+.globl hydir_cfg_test_signed_le
+.type hydir_cfg_test_signed_le,@function
+hydir_cfg_test_signed_le:
+    testq %rsi, %rdi
+    jle .Ltest_signed_le_yes
+    movq $0, %rax
+    retq
+.Ltest_signed_le_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_test_signed_le, .-hydir_cfg_test_signed_le
+
+.globl hydir_cfg_test_unsigned_above
+.type hydir_cfg_test_unsigned_above,@function
+hydir_cfg_test_unsigned_above:
+    testq %rsi, %rdi
+    ja .Ltest_unsigned_above_yes
+    movq $0, %rax
+    retq
+.Ltest_unsigned_above_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_test_unsigned_above, .-hydir_cfg_test_unsigned_above
+
+.globl hydir_cfg_xor_signed_gt
+.type hydir_cfg_xor_signed_gt,@function
+hydir_cfg_xor_signed_gt:
+    movq %rdi, %rax
+    xorq %rsi, %rax
+    jg .Lxor_signed_gt_yes
+    movq $0, %rax
+    retq
+.Lxor_signed_gt_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_xor_signed_gt, .-hydir_cfg_xor_signed_gt
+
+.globl hydir_cfg_and_carry_clear
+.type hydir_cfg_and_carry_clear,@function
+hydir_cfg_and_carry_clear:
+    movq %rdi, %rax
+    andq %rsi, %rax
+    jnc .Land_carry_clear_yes
+    movq $0, %rax
+    retq
+.Land_carry_clear_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_and_carry_clear, .-hydir_cfg_and_carry_clear
+
+.globl hydir_cfg_or_overflow_set
+.type hydir_cfg_or_overflow_set,@function
+hydir_cfg_or_overflow_set:
+    movq %rdi, %rax
+    orq %rsi, %rax
+    jo .Lor_overflow_set_yes
+    movq $0, %rax
+    retq
+.Lor_overflow_set_yes:
+    movq $1, %rax
+    retq
+.size hydir_cfg_or_overflow_set, .-hydir_cfg_or_overflow_set
+
 .globl hydir_cfg_memory
 .type hydir_cfg_memory,@function
 hydir_cfg_memory:

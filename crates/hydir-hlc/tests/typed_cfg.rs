@@ -354,6 +354,94 @@ fn arithmetic_zero_flags_compile_and_match_boundary_oracles() {
 }
 
 #[test]
+fn logical_result_compound_flags_match_signed_and_unsigned_oracles() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let mut source = String::from("#include <stdint.h>\n");
+    for (symbol, renamed) in [
+        ("hydir_cfg_test_signed_le", "generated_test_signed_le"),
+        ("hydir_cfg_test_unsigned_above", "generated_test_above"),
+        ("hydir_cfg_xor_signed_gt", "generated_xor_gt"),
+        ("hydir_cfg_and_carry_clear", "generated_and_no_carry"),
+        ("hydir_cfg_or_overflow_set", "generated_or_overflow"),
+    ] {
+        let native = decompile_symbol(&bytes, symbol).unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+            .unwrap_or_else(|error| panic!("{symbol}: {error}"));
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        source.push_str(&format!(
+            "#define {symbol} {renamed}\n{c}\n#undef {symbol}\n"
+        ));
+    }
+    source.push_str(
+        r#"static int check(uint64_t a, uint64_t b) {
+  uint64_t test_result = a & b, xor_result = a ^ b;
+  uint64_t high_bit = UINT64_C(0x8000000000000000);
+  if (generated_test_signed_le(a,b) !=
+      (test_result == 0 || (test_result & high_bit) != 0)) return 1;
+  if (generated_test_above(a,b) != (test_result != 0)) return 2;
+  if (generated_xor_gt(a,b) !=
+      (xor_result != 0 && (xor_result & high_bit) == 0)) return 3;
+  if (generated_and_no_carry(a,b) != 1) return 4;
+  if (generated_or_overflow(a,b) != 0) return 5;
+  return 0;
+}
+int main(void) {
+  const uint64_t edge[] = {0, 1, 2, UINT64_C(0x7fffffffffffffff),
+                           UINT64_C(0x8000000000000000), UINT64_MAX};
+  for (unsigned i = 0; i < 6; ++i) for (unsigned j = 0; j < 6; ++j)
+    if (check(edge[i],edge[j])) return 1;
+  uint64_t state = UINT64_C(0xe7037ed1a0b428db);
+  for (unsigned i = 0; i < 10000; ++i) {
+    state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+    uint64_t a = state;
+    state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+    if (check(a,state)) return 2;
+  }
+  return 0;
+}
+"#,
+    );
+    let path = temp.path().join("logical_flags.c");
+    fs::write(&path, source).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let exe = temp.path().join(format!("logical_flags_{compiler}.exe"));
+        let result = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(Command::new(exe).status().unwrap().success());
+    }
+}
+
+#[test]
 fn addition_carry_and_overflow_use_prewrite_operands() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
