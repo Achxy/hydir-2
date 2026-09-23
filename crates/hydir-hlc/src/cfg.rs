@@ -4,6 +4,11 @@
 
 use crate::{BinaryOp, HighExpr, HighParameter, parameters, u64_type, valid_ident};
 use hydir_core::Location;
+use hydir_decompile::{lower_expression_ir, lower_state_ir};
+use hydir_ir::expression::{
+    BinaryOperator as ExpressionBinaryOperator, Expression, ExpressionFunctionIr,
+    ExpressionInstruction, validate_expression_function_ir,
+};
 use hydir_ir::{
     FunctionIr, MachineControlEffect, MachineEdgeKind, MachineFunctionIr, MachineInstruction,
     MachineMemoryEffect, MachineOperand, MachineOperation, SemanticFidelity,
@@ -123,6 +128,76 @@ fn value(operand: &MachineOperand) -> Result<HighExpr, String> {
         } => Ok(HighExpr::Constant { value: *value }),
         _ => Err("typed CFG requires a 64-bit register or normalized immediate".to_owned()),
     }
+}
+
+fn scalar_expression(expression: &Expression) -> Result<HighExpr, String> {
+    match expression {
+        Expression::Read {
+            source,
+            width_bits: 64,
+        } => {
+            let name = source
+                .component
+                .strip_prefix("register:")
+                .ok_or("typed CFG expression reads a non-register component")?;
+            Ok(HighExpr::Variable { name: local(name)? })
+        }
+        Expression::Constant {
+            value,
+            width_bits: 64,
+        } => Ok(HighExpr::Constant { value: *value }),
+        Expression::Binary {
+            operator: ExpressionBinaryOperator::Xor,
+            width_bits: 64,
+            left,
+            right,
+        } if matches!((left.as_ref(), right.as_ref()),
+            (Expression::Read { source: a, width_bits: 64 }, Expression::Read { source: b, width_bits: 64 }) if a == b) =>
+        {
+            // x86's XOR-zeroing idiom does not read the old register value.
+            Ok(HighExpr::Constant { value: 0 })
+        }
+        Expression::Binary {
+            operator,
+            width_bits: 64,
+            left,
+            right,
+        } => {
+            let op = match operator {
+                ExpressionBinaryOperator::Add => BinaryOp::Add,
+                ExpressionBinaryOperator::Subtract => BinaryOp::Sub,
+                ExpressionBinaryOperator::And => BinaryOp::And,
+                ExpressionBinaryOperator::Or => BinaryOp::Or,
+                ExpressionBinaryOperator::Xor => BinaryOp::Xor,
+            };
+            Ok(HighExpr::Binary {
+                op,
+                left: Box::new(scalar_expression(left)?),
+                right: Box::new(scalar_expression(right)?),
+            })
+        }
+        _ => {
+            Err("typed CFG requires a normalized 64-bit scalar ExpressionIR assignment".to_owned())
+        }
+    }
+}
+
+fn normalized_register_value(
+    instruction: &ExpressionInstruction,
+    register_name: &str,
+) -> Result<HighExpr, String> {
+    let component = format!("register:{register_name}");
+    let mut assignments = instruction
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.target.component == component);
+    let assignment = assignments
+        .next()
+        .ok_or("typed CFG register write lacks normalized ExpressionIR semantics")?;
+    if assignments.next().is_some() || assignment.value.width_bits() != 64 {
+        return Err("typed CFG register write has ambiguous ExpressionIR semantics".to_owned());
+    }
+    scalar_expression(&assignment.value)
 }
 
 fn edge(instruction: &MachineInstruction, kind: MachineEdgeKind) -> Result<Location, String> {
@@ -253,9 +328,17 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
 
 fn lower_instruction(
     instruction: &MachineInstruction,
+    semantic: &ExpressionInstruction,
     flag_source: &mut Option<FlagSource>,
     statements: &mut Vec<HighCfgStatement>,
 ) -> Result<Option<HighCfgTerminator>, String> {
+    if instruction.address != semantic.address
+        || instruction.bytes_hex != semantic.bytes_hex
+        || instruction.mnemonic != semantic.mnemonic
+        || instruction.edges != semantic.edges
+    {
+        return Err("typed CFG MachineIR and ExpressionIR instruction differ".to_owned());
+    }
     let MachineOperation::Exact { family } = &instruction.operation else {
         return Err("typed CFG cannot lower an opaque operation".to_owned());
     };
@@ -279,37 +362,21 @@ fn lower_instruction(
         });
     };
     let terminator = match (family.as_str(), operands) {
-        ("mov", [destination, source])
-            if instruction.effects.control == MachineControlEffect::Next =>
-        {
-            assign(register(destination)?, value(source)?);
-            None
-        }
-        ("add" | "sub" | "xor" | "and" | "or", [destination, source])
+        ("mov", [destination, _source])
             if instruction.effects.control == MachineControlEffect::Next =>
         {
             let target = register(destination)?;
-            let right = value(source)?;
-            let op = match family.as_str() {
-                "add" => BinaryOp::Add,
-                "sub" => BinaryOp::Sub,
-                "xor" => BinaryOp::Xor,
-                "and" => BinaryOp::And,
-                _ => BinaryOp::Or,
-            };
-            let expression = if op == BinaryOp::Xor
-                && matches!(&right, HighExpr::Variable { name } if name == &target)
-            {
-                HighExpr::Constant { value: 0 }
-            } else {
-                HighExpr::Binary {
-                    op,
-                    left: Box::new(HighExpr::Variable {
-                        name: target.clone(),
-                    }),
-                    right: Box::new(right),
-                }
-            };
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            let expression = normalized_register_value(semantic, register_name)?;
+            assign(target, expression);
+            None
+        }
+        ("add" | "sub" | "xor" | "and" | "or", [destination, _source])
+            if instruction.effects.control == MachineControlEffect::Next =>
+        {
+            let target = register(destination)?;
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            let expression = normalized_register_value(semantic, register_name)?;
             assign(target, expression);
             *flag_source = None;
             None
@@ -382,17 +449,36 @@ pub fn lower_high_level_cfg_cir(
     function: &FunctionIr,
     model: &AnalysisModel,
 ) -> Result<HighLevelCfgCir, String> {
+    let state = lower_state_ir(machine)?;
+    let expression = lower_expression_ir(machine, &state)?;
+    lower_high_level_cfg_cir_from_expression(machine, function, model, &expression)
+}
+
+// Consume the freshly validated ExpressionIR artifact for scalar register
+// writes. Branch flag snapshots still use the bounded MachineIR subset.
+fn lower_high_level_cfg_cir_from_expression(
+    machine: &MachineFunctionIr,
+    function: &FunctionIr,
+    model: &AnalysisModel,
+    expression: &ExpressionFunctionIr,
+) -> Result<HighLevelCfgCir, String> {
     validate_structure(model)?;
     validate_machine_function_ir(machine)?;
     validate_function_ir(function)?;
+    validate_expression_function_ir(expression)?;
     if machine.binary_sha256 != model.binary_sha256
         || function.binary_sha256 != model.binary_sha256
+        || expression.binary_sha256 != model.binary_sha256
         || machine.entry != function.entry
+        || machine.entry != expression.entry
         || machine.function_id != function.function_id
+        || machine.function_id != expression.function_id
         || machine.structural_completeness != StructuralCompleteness::Complete
         || machine.semantic_fidelity != SemanticFidelity::ExactUnderModel
+        || expression.structural_completeness != StructuralCompleteness::Complete
         || machine.blocks.is_empty()
         || machine.blocks.len() > 4096
+        || machine.blocks.len() != expression.blocks.len()
     {
         return Err("typed CFG requires a complete, exact, model-bound function".to_owned());
     }
@@ -432,17 +518,28 @@ pub fn lower_high_level_cfg_cir(
         });
     let flag_input = flag_inputs(machine)?;
     let mut blocks = Vec::with_capacity(machine.blocks.len());
-    for block in &machine.blocks {
+    for (block, expression_block) in machine.blocks.iter().zip(&expression.blocks) {
+        if block.address != expression_block.address
+            || block.instructions.len() != expression_block.instructions.len()
+        {
+            return Err("typed CFG MachineIR and ExpressionIR blocks differ".to_owned());
+        }
         let mut statements = Vec::new();
         let mut flag_source = *flag_input
             .get(&block.address)
             .ok_or("typed CFG block flag state is missing")?;
         let mut terminator = None;
-        for (index, instruction) in block.instructions.iter().enumerate() {
+        for (index, (instruction, semantic)) in block
+            .instructions
+            .iter()
+            .zip(&expression_block.instructions)
+            .enumerate()
+        {
             if terminator.is_some() {
                 return Err("typed CFG has instructions after a control transfer".to_owned());
             }
-            terminator = lower_instruction(instruction, &mut flag_source, &mut statements)?;
+            terminator =
+                lower_instruction(instruction, semantic, &mut flag_source, &mut statements)?;
             if terminator.is_some() && index + 1 != block.instructions.len() {
                 return Err("typed CFG has an internal control transfer".to_owned());
             }

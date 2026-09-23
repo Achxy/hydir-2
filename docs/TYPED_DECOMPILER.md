@@ -74,6 +74,11 @@ functions. Typed C is marked semantically conservative and never rewrite
 ready; the source-level view does not model all machine fault and environment
 behavior.
 
+The CFG lowerer now consumes freshly computed `ExpressionIR v1` assignments
+for supported scalar register writes, including the `xor reg, reg` zeroing
+idiom. Branch flag snapshots remain a bounded MachineIR lowering until flag
+expressions and joins are translated through the shared layer.
+
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,
 `high_level_cfg_cir`, and `typed_c` read artifacts. Each artifact uses the same bounded automatic model
 for the current binary revision, so `HighLevelCIR.model_revision` matches the
