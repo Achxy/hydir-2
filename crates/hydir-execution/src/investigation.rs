@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const INVESTIGATION_CLAIM_VERSION: u32 = 1;
 pub const ANALYSIS_RECIPE_VERSION: u32 = 1;
-pub const MAX_ANALYSIS_RECIPE_JSON_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ANALYSIS_RECIPE_JSON_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,7 +77,7 @@ pub struct AnalysisRecipe {
 
 pub fn parse_analysis_recipe(json: &[u8]) -> Result<AnalysisRecipe, String> {
     if json.len() > MAX_ANALYSIS_RECIPE_JSON_BYTES {
-        return Err("AnalysisRecipe exceeds 8 MiB JSON limit".into());
+        return Err("AnalysisRecipe exceeds 16 MiB JSON limit".into());
     }
     serde_json::from_slice(json).map_err(|error| format!("invalid AnalysisRecipe JSON: {error}"))
 }

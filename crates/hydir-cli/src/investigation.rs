@@ -222,7 +222,7 @@ pub(super) fn validate_recipe(elf: &[u8], recipe: &AnalysisRecipe) -> Result<(),
         return Err("InvestigationClaim differs from bound recipe evidence".into());
     }
     if serde_json::to_vec(recipe)?.len() > hydir_execution::MAX_ANALYSIS_RECIPE_JSON_BYTES {
-        return Err("AnalysisRecipe exceeds 8 MiB JSON limit".into());
+        return Err("AnalysisRecipe exceeds 16 MiB JSON limit".into());
     }
     Ok(())
 }
