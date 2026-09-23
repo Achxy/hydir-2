@@ -1,8 +1,25 @@
 # Hydir master plan: understand binaries, solve challenges, verify results
 
-Status: active implementation roadmap. Updated 2026-09-23.
+Status: active implementation roadmap. Updated 2026-09-23. This is the single source of truth for launch scope, order, gates, and claims.
 
 This document consolidates the typed-decompiler milestone, CTF workflow, VM roadmap, competitor research, desktop workbench, and launch requirements. It replaces the earlier fragmented proposals. The status below distinguishes implemented capabilities from proposed launch gates. No competitive benchmark or end-to-end launch workflow has passed yet.
+
+## 0. The launch decision
+
+Hydir should win a **specific investigation**, not a feature-count contest: an analyst opens an unfamiliar stripped x86-64 ELF, finds the check that rejects an input, understands the relevant code and data, produces a changed input, and sees that input succeed in a fresh run of the original binary. The project must retain enough evidence to reproduce and challenge that answer. A second, bounded demo explains a virtualized check through a guest graph and checked expression simplification. General decompiler parity, broad architectures, and commercial VM support are later goals.
+
+| Order | User-visible result | Engineering gate | Status on launch branch |
+| --- | --- | --- | --- |
+| 1. Trust the base | Open a binary and retain low-level views when recovery fails | M0 compatibility, deterministic fixtures, truthful capability report | Partly integrated; full GUI/package gate open |
+| 2. Understand the check | Navigate from a condition to typed C, field evidence, calls, and machine instructions | M1 expressions, M2 typed flow and type constraints, M3 dependency invalidation | Model and typed subsets implemented; widths, calls, indirect flow, and targeted rediscovery open |
+| 3. Observe the original | Run a controlled input, stop at a useful boundary, inspect real state, and replay | M4 capture, origin mapping, runner, PIE/missing-memory gates | Replay and snapshot contracts exist; named-symbol capture is experimental and awaits live Linux gate |
+| 4. Solve and explain | Show the bytes behind failure, generate a candidate, and validate it natively | M5 guided solving plus M6 slices, trace indexing, and result states | Function-level Triton bridge exists; guided input solve is open |
+| 5. Explain a VM | Map host activity to a bounded guest CFG and check one scoped simplification | M7 guest graph, effects, multiple-input comparison, equivalence query | VM profile and bounded VPC explorer exist; guest CFG/checks open |
+| 6. Ship and compare | Complete the investigation in the installed app and reproduce it by CLI | M8 usability, package, independent challenges, fair baselines | Not yet gated |
+
+The order expresses dependencies, not six isolated projects. Build UI affordances and regression fixtures with the feature they expose. Prioritize a failed end-to-end workflow over adding another disconnected analysis pass.
+
+**Launch rule:** a result card must distinguish an observation, a static inference, an analyst assertion, a solver result under assumptions, and a native-validated candidate. A timeout, incomplete CFG, missing page, or unknown alias must remain visible at the point where it affects the answer. Never use C compilation, one successful replay, or an SMT equivalence of a small expression as a broader correctness claim.
 
 ## 1. Product objective and positioning
 
@@ -59,6 +76,7 @@ The first public demo requires all five steps. An earlier typed-C or solver prev
 | Low-level C | Existing structured flow and goto fallbacks | Preserve availability throughout typed-C work |
 | Cache/API/SDK | Local selective typed cache; model/HLC/typed-C read artifacts | General artifact dependency tracking, remote writes/cache, execution artifacts |
 | Triton integration | Bounded function-level symbolic bridge with two symbolic argument registers; solver timeout/unknown no longer reports UNSAT | Captured process state, input models, environment summaries, goal solving, native replay |
+| Execution foundation | `InputSpec v1`, bounded Bubblewrap replay, `NativeReplayReport v1`, `ExecutionSnapshot v1`, sparse reads, and an experimental named-symbol GDB/MI capture producer | Live Linux capture gate, address and post-input stops, original-byte origin mapping, Triton resumption, cancellation, WSL2 launch |
 | VM support | Profile and bounded host/VPC explorer | Guest CFG, traces, slices, checked simplification; current completeness/rewrite flags remain false |
 
 The integrated branch passes `cargo test --workspace --locked`; the Triton bridge, instruction oracle, SDK boundary, CLI doctor, model verification, and ExpressionIR smoke checks also passed in this development environment. The typed CFG now snapshots ordered 64-bit subtraction operands before a register write and uses their compare-equivalent flags across a bounded CFG join. It also handles direct and compound addition checks over carry, overflow, sign, and zero from prewrite operands, plus signed and unsigned compound branches after 64-bit `test`, `and`, `or`, and `xor`. Logical results are normalized so `test` and `and` flag paths can rejoin. These tests cover bounded behavior and do not establish launch readiness. GCC and WSL2 are absent on the current Windows host, so Linux runner and dual-compiler gates require another environment. Replace any approximate completion percentage with this capability matrix and the gates below.
@@ -98,19 +116,24 @@ Existing StateIR has component SSA, but its operations still describe machine op
 
 | Reference | Principle used in Hydir |
 | --- | --- |
-| [angr decompiler](https://docs.angr.io/en/latest/analyses/decompiler.html) | Explicit passes for ABI recovery, expressions, variables, simplification, structuring, and rendering; inspectable intermediate results |
+| [angr decompiler API](https://docs.angr.io/en/latest/api/angr.analyses.decompiler.html) | Keep expression, variable, call-site, structuring, and rendering passes independently inspectable; cache intermediate graphs for retyping |
+| [angr CFG recovery](https://docs.angr.io/en/v9.2.140/analyses/cfg.html) and [guided exploration](https://docs.angr.io/en/latest/api/angr.exploration_techniques.explorer.html) | Start with fast static recovery, invoke expensive execution on selected unknowns, and retain find/avoid/exhausted result sets explicitly |
 | [Ghidra p-code](https://ghidra.re/ghidra_docs/languages/html/pcoderef.html) | Separate instruction semantics from recovered source expressions; keep mappings between levels |
 | [rev.ng artifacts](https://docs.rev.ng/user-manual/key-concepts/artifacts-and-analyses/) | Editable model facts, function-level artifacts, and dependency-based invalidation |
 | [Retypd](https://arxiv.org/abs/1603.05495) and [Symless](https://github.com/thalium/symless) | Interprocedural type constraints, recursive aggregates, and analyst-selected roots for structure propagation |
 | [SAILR](https://www.usenix.org/conference/usenixsecurity24/presentation/basque) | Compiler-aware control-flow recovery; preserve useful gotos when structure cannot be justified |
 | [angr Symbion](https://angr.io/blog/angr_symbion/) | Execute startup concretely, capture at a useful boundary, then perform focused symbolic work |
-| [Miasm dependency analysis](https://github.com/cea-sec/miasm/blob/master/miasm/analysis/depgraph.py) | Explicit dependency slices, including unresolved dependencies and control effects |
+| [Miasm dynamic symbolic execution](https://github.com/cea-sec/miasm/blob/master/miasm/analysis/dse.py) and [dependency analysis](https://github.com/cea-sec/miasm/blob/master/miasm/analysis/depgraph.py) | Follow concrete runs with symbolic input bytes, explicit path constraints and external-effect handlers; expose unresolved dependencies |
 | [FLOSS](https://github.com/mandiant/flare-floss/blob/master/doc/theory.md) and [capa](https://github.com/mandiant/capa) | Recover hidden strings and show explainable behavioral hints with supporting locations |
 | [Tenet](https://github.com/gaasedelen/tenet) | Indexed navigation through trace occurrences and register/memory changes |
 | [Remill](https://github.com/lifting-bits/remill) and [McSema limitations](https://github.com/lifting-bits/mcsema/blob/master/docs/Limitations.md) | Treat instruction semantics, recovered control flow, and execution environment as separate correctness obligations |
 | [Hackyboiz VM study](https://hackyboiz.github.io/2025/09/11/banda/LLVM_based_VMP/en/), [Aftermath Themida](https://aftermathlabs.net/blog/09/05/2026/), [Aftermath Tencent VM](https://aftermathlabs.net/blog/31/07/2026/) | Combine VM context, effect tracking, multiple paths, and correct loop joins; retain the scope of every specialization |
 
 Apply these ideas within the chosen architecture. Pin upstream versions for comparisons and retain attribution and applicable licensing information for any reused code or fixtures.
+
+The proposed product contribution is the **evidence-linked repair loop**: from one failed condition, show the static and observed dependencies, the input-byte origin, the assumptions used to generate a candidate, the precise changed bytes, and the fresh native result in one navigable project. Individual ingredients exist elsewhere, including Symbion and Miasm's dynamic symbolic execution. Treat the integrated workflow as a hypothesis to validate with user trials, not as a novelty or superiority claim until measured.
+
+Add a small versioned `InvestigationClaim v1` artifact once the first solve works. It should bind a single user-facing statement (for example, “bytes 4–7 caused this branch” or “this candidate reaches success”) to binary/input hashes, address and trace references, model revision, assumptions, evidence kind, coverage, and invalidation dependencies. Exporting a claim must reproduce its check or state why that check is unavailable. This gives both the UI and CLI one honest contract for explaining results, without building a general theorem prover or claiming whole-program correctness.
 
 ## 5. Milestone M0 — Integrate and establish the baseline
 
@@ -230,6 +253,7 @@ Total session time and memory cap every profile. Persist remaining frontiers for
 - Build chunked traces with indexes for instruction occurrences, input events, register changes, and memory reads/writes; virtualize large lists and graphs.
 - Add previous/next writer, last write to this field, input bytes influencing this condition, and comparison of failing/successful runs at the first relevant divergence.
 - Label native observations and Triton-derived execution separately. Include syscall-origin memory writes in the event model.
+- Build `InvestigationClaim v1` for the first supported failed-condition explanation and replayed candidate. Link each claim to its evidence, assumptions, binary/input identity, and invalidation dependencies. Unknown dependencies remain listed rather than silently excluded.
 
 Use [FLOSS](https://github.com/mandiant/flare-floss/blob/master/doc/theory.md), [capa](https://github.com/mandiant/capa), and [Tenet](https://github.com/gaasedelen/tenet) as design references. Implement the launch subset through Hydir and Triton.
 
@@ -291,7 +315,7 @@ Implement UI work alongside each milestone, then use this stage for end-to-end i
 
 Keep existing `model init|verify|infer|import-dwarf` and `decompile --view typed --model` interfaces. Add command families for capture, trace, slice, solve, replay, check, VM recovery, and bundle export. Every GUI workflow must have a reproducible CLI/SDK equivalent.
 
-Version the following artifacts: `ExpressionIR v1`, `AnalysisModel v2`, `HighLevelCIR v2`, `ExecutionSnapshot`, `ExecutionTrace`, `InputSpec`, `AnalysisRecipe`, `SliceReport`, `SolveReport`, `NativeReplayReport`, `GuestCFG`, and `EquivalenceCheck`. New artifact formats start at v1 and specify limits and validation rules.
+Version the following artifacts: `ExpressionIR v1`, `AnalysisModel v2`, `HighLevelCIR v2`, `ExecutionSnapshot`, `ExecutionTrace`, `InputSpec`, `AnalysisRecipe`, `SliceReport`, `SolveReport`, `NativeReplayReport`, `InvestigationClaim`, `GuestCFG`, and `EquivalenceCheck`. New artifact formats start at v1 and specify limits and validation rules.
 
 Use API capability negotiation and additive endpoints for artifact/job access and revision-checked model writes. Preserve old ProgramSpec, CIR, low-level C, model-v1, and HLC-v1 readers through compatible routes or explicit migration. Execution is a local runner service in this release; remote analysis/model editing does not implicitly enable remote binary execution.
 
@@ -375,10 +399,10 @@ After launch gates pass, expand in this order:
 4. Extend the checked region-patching path with explicit ABI, memory, exit, and environmental contracts; preserve original binaries and scoped verification artifacts.
 5. Add deeper hypothesis comparison, reusable analysis extensions, additional architectures/formats, and collaboration when demand and correctness coverage justify them.
 
-**Next implementation action:** run and gate the experimental replay path on Linux, then add GDB/MI input-boundary capture and a snapshot with explicit memory coverage. In parallel, extend struct-array and pointer annotations beyond entry-block derivations and add bounded call effects and the remaining supported widths. **First new execution payoff:** capture an input boundary, explain a failed condition, and replay a working input against the original binary.
+**Next implementation action:** run the experimental replay and named-symbol capture smoke on Linux; fix any GDB/MI, namespace, and PIE failures. Then support a validated address stop in a stripped ELF, move capture to an input-consumption boundary, and connect captured bytes to `InputSpec` origins before Triton resumption. In parallel, extend struct-array and pointer annotations beyond entry-block derivations and add bounded call effects and the remaining supported widths. **First new execution payoff:** explain a failed condition from captured input bytes and replay a working input against the original binary.
 
-**M4 progress (2026-09-23):** `InputSpec v1` and `NativeReplayReport v1` now have binary/input digest binding, bounded stdin/argv/file bytes, origin ranges, goals, and validation. The CLI can initialize and verify input specs. An experimental Linux Bubblewrap runner emits explicit matched, mismatched, timeout, output-limit, and runner-error reports. Windows emits an unsupported-host report. The runner has only compiled on this Windows host for the Linux target; live Linux replay, GDB/MI capture, snapshots, and the M4 gate remain open. See [the replay protocol](REPLAY_PROTOCOL.md).
+**M4 progress (2026-09-23):** `InputSpec v1` and `NativeReplayReport v1` have binary/input digest binding, bounded stdin/argv/file bytes, origin ranges, goals, and validation. The CLI can initialize and verify input specs. An experimental Linux Bubblewrap runner emits explicit matched, mismatched, timeout, output-limit, and runner-error reports. Windows emits an unsupported-host report. A named-symbol GDB/MI snapshot producer now compiles for the Linux target; live Linux replay/capture, input-boundary origin mapping, and the full M4 gate remain open. See [the replay protocol](REPLAY_PROTOCOL.md).
 
-**M4 artifact follow-up:** `ExecutionSnapshot v1` now has bounded mappings, register observations, selected pages, stop/load-bias identity, digest binding, and a sparse-memory reader that errors on missing pages. `hydirctl snapshot verify` validates the artifact. No stopped-process producer exists yet, so `execution_snapshot_v1` remains false in `doctor`. Replay now rejects ambiguous Bubblewrap exit values of 128 or more as unverified; CI includes a crash fixture to check that it cannot become a native success.
+**M4 artifact follow-up:** `ExecutionSnapshot v1` now has bounded mappings, register observations, selected pages, stop/load-bias identity, digest binding, and a sparse-memory reader that errors on missing pages. `hydirctl snapshot verify` validates the artifact. Replay rejects ambiguous Bubblewrap exit values of 128 or more as unverified; CI includes a crash fixture to check that it cannot become a native success.
 
-The bounded GDB/MI record parser now handles result, asynchronous, and stream records with nested values. The next M4 implementation step is a local session controller that uses it to stop a single-threaded process, record mappings and selected pages, and emit a validated snapshot. The Linux smoke gate must then demonstrate both replay and capture before the capability claim changes.
+The bounded GDB/MI record parser handles result, asynchronous, and stream records with nested values. An experimental local session controller now stops a single-threaded process at a named function, records mappings and selected pages, and emits a validated snapshot. It disables GDB init files and auto-loading before the ELF is loaded. Cross-compilation and parser checks pass on Windows; the Linux smoke gate must demonstrate both replay and capture before the capability claim changes. `doctor` keeps `gdb_capture_v1` false pending that gate.
