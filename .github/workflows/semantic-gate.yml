@@ -11,7 +11,12 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Install native tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv bubblewrap gdb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc python3-venv bubblewrap gdb apparmor-profiles apparmor-utils
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true
       - name: Install Triton binary-analysis bindings
         run: |
           python3 -m venv .venv

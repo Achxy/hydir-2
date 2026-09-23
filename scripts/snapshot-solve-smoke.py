@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import traceback
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,4 +97,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        detail = traceback.format_exc()[-4000:]
+        annotation = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=Captured-state solve smoke::{annotation}", flush=True)
+        raise
