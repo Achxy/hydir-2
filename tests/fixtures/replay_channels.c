@@ -2,6 +2,10 @@
 #include <signal.h>
 #include <string.h>
 
+__attribute__((noinline)) int check_line(const char *line) {
+    return strcmp(line, "secret\n") == 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "crash") == 0) {
         raise(SIGSEGV);
@@ -16,7 +20,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && strcmp(argv[1], "open") == 0
         && fgets(line, sizeof(line), stdin) != NULL
-        && strcmp(line, "secret\n") == 0
+        && check_line(line)
         && file_ok && memcmp(key, "key", 3) == 0) {
         puts("ACCESS GRANTED");
         return 0;
