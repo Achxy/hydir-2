@@ -4,10 +4,10 @@
 //! Consumers must keep residuals when simplifying or rendering the graph.
 
 use crate::{
-    InstructionDecorators, IrDiagnostic, MachineControlEffect, MachineEdge, MachineMemoryEffect,
-    MachineOperand, SemanticFidelity, StateComponentPhi, StateComponentVersion,
-    StructuralCompleteness, VerificationStatus, validate_diagnostics, validate_edges,
-    validate_instruction_decorators, validate_location, validate_machine_operand,
+    InstructionDecorators, IrDiagnostic, MachineControlEffect, MachineEdge, MachineEdgeKind,
+    MachineMemoryEffect, MachineOperand, SemanticFidelity, StateComponentPhi,
+    StateComponentVersion, StructuralCompleteness, VerificationStatus, validate_diagnostics,
+    validate_edges, validate_instruction_decorators, validate_location, validate_machine_operand,
 };
 use hydir_core::Location;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,13 @@ pub enum BinaryOperator {
     And,
     Or,
     Xor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOperator {
+    Equal,
+    UnsignedLess,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -59,6 +66,15 @@ pub enum Expression {
         left: Box<Expression>,
         right: Box<Expression>,
     },
+    Compare {
+        operator: ComparisonOperator,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
+    /// Even parity of the low eight bits, as defined by x86 PF.
+    ParityEven {
+        value: Box<Expression>,
+    },
 }
 
 impl Expression {
@@ -70,6 +86,7 @@ impl Expression {
             | Self::ZeroExtend { width_bits, .. }
             | Self::InsertBits { width_bits, .. }
             | Self::Binary { width_bits, .. } => *width_bits,
+            Self::Compare { .. } | Self::ParityEven { .. } => 1,
         }
     }
 }
@@ -103,6 +120,10 @@ pub struct ExpressionInstruction {
     pub input_components: Vec<StateComponentVersion>,
     pub output_components: Vec<StateComponentVersion>,
     pub assignments: Vec<ExpressionAssignment>,
+    /// Taken-edge predicate for a supported conditional branch. The control
+    /// output remains in the residual until control lowering is implemented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Expression>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub residual: Option<ResidualEffect>,
     pub edges: Vec<MachineEdge>,
@@ -192,6 +213,21 @@ fn validate_expression(
             validate_expression(right, inputs, depth + 1)?;
             if left.width_bits() != *width_bits || right.width_bits() != *width_bits {
                 return Err("ExpressionIR binary operands have inconsistent widths".to_owned());
+            }
+            Ok(())
+        }
+        Expression::Compare { left, right, .. } => {
+            validate_expression(left, inputs, depth + 1)?;
+            validate_expression(right, inputs, depth + 1)?;
+            if left.width_bits() != right.width_bits() {
+                return Err("ExpressionIR comparison operands have inconsistent widths".to_owned());
+            }
+            Ok(())
+        }
+        Expression::ParityEven { value } => {
+            validate_expression(value, inputs, depth + 1)?;
+            if value.width_bits() < 8 {
+                return Err("ExpressionIR parity input is narrower than one byte".to_owned());
             }
             Ok(())
         }
@@ -292,6 +328,23 @@ pub fn validate_expression_function_ir(ir: &ExpressionFunctionIr) -> Result<(), 
                     return Err("ExpressionIR assignment does not define one output".to_owned());
                 }
                 validate_expression(&assignment.value, &inputs, 0)?;
+            }
+            if let Some(condition) = &instruction.condition {
+                validate_expression(condition, &inputs, 0)?;
+                if condition.width_bits() != 1
+                    || !instruction.residual.as_ref().is_some_and(|residual| {
+                        residual.control == MachineControlEffect::ConditionalBranch
+                    })
+                    || !instruction
+                        .edges
+                        .iter()
+                        .any(|edge| edge.kind == MachineEdgeKind::Taken)
+                {
+                    return Err(
+                        "ExpressionIR branch predicate lacks a conditional control effect"
+                            .to_owned(),
+                    );
+                }
             }
             let remaining = outputs
                 .difference(&assigned)

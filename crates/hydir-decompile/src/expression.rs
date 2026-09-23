@@ -1,9 +1,9 @@
 //! Normalize supported StateIR definitions without losing other effects.
 
 use hydir_ir::expression::{
-    BinaryOperator, EXPRESSION_FUNCTION_IR_VERSION, Expression, ExpressionAssignment,
-    ExpressionBlock, ExpressionFunctionIr, ExpressionInstruction, ResidualEffect,
-    validate_expression_function_ir,
+    BinaryOperator, ComparisonOperator, EXPRESSION_FUNCTION_IR_VERSION, Expression,
+    ExpressionAssignment, ExpressionBlock, ExpressionFunctionIr, ExpressionInstruction,
+    ResidualEffect, validate_expression_function_ir,
 };
 use hydir_ir::{
     IrDiagnostic, MachineControlEffect, MachineFunctionIr, MachineInstruction, MachineMemoryEffect,
@@ -167,8 +167,232 @@ fn normalized_register_assignment(
     Some(ExpressionAssignment { target, value })
 }
 
-/// This ExpressionIR lowering slice normalizes width-aware scalar GPR
-/// definitions. Every unsupported flag, memory, control, and register effect
+fn binary(operator: BinaryOperator, left: Expression, right: Expression) -> Expression {
+    Expression::Binary {
+        operator,
+        width_bits: left.width_bits(),
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn compare(operator: ComparisonOperator, left: Expression, right: Expression) -> Expression {
+    Expression::Compare {
+        operator,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn bit_not(value: Expression) -> Expression {
+    binary(
+        BinaryOperator::Xor,
+        value,
+        Expression::Constant {
+            value: 1,
+            width_bits: 1,
+        },
+    )
+}
+
+fn flag_read(inputs: &[StateComponentVersion], name: &str) -> Option<Expression> {
+    Some(Expression::Read {
+        source: component_version(inputs, "flag", name)?,
+        width_bits: 1,
+    })
+}
+
+fn normalized_scalar_flags(
+    instruction: &MachineInstruction,
+    family: &str,
+    inputs: &[StateComponentVersion],
+    outputs: &[StateComponentVersion],
+) -> Option<Vec<ExpressionAssignment>> {
+    if !matches!(
+        family,
+        "cmp" | "test" | "add" | "sub" | "and" | "or" | "xor"
+    ) || instruction.effects.memory != MachineMemoryEffect::None
+        || instruction.effects.control != MachineControlEffect::Next
+        || instruction.effects.conservative
+        || instruction.decorators != Default::default()
+    {
+        return None;
+    }
+    let [left_operand, right_operand] = instruction.operands.as_slice() else {
+        return None;
+    };
+    let left = register_value(left_operand, 0, instruction, inputs)?;
+    let right = register_value(right_operand, 1, instruction, inputs)?;
+    if left.width_bits() != right.width_bits() {
+        return None;
+    }
+    let width_bits = left.width_bits();
+    let result = match family {
+        "cmp" | "sub" => binary(BinaryOperator::Subtract, left.clone(), right.clone()),
+        "add" => binary(BinaryOperator::Add, left.clone(), right.clone()),
+        "test" | "and" => binary(BinaryOperator::And, left.clone(), right.clone()),
+        "or" => binary(BinaryOperator::Or, left.clone(), right.clone()),
+        "xor" => binary(BinaryOperator::Xor, left.clone(), right.clone()),
+        _ => return None,
+    };
+    let zf = if family == "cmp" {
+        compare(ComparisonOperator::Equal, left.clone(), right.clone())
+    } else {
+        compare(
+            ComparisonOperator::Equal,
+            result.clone(),
+            Expression::Constant {
+                value: 0,
+                width_bits,
+            },
+        )
+    };
+    let sf = Expression::Extract {
+        value: Box::new(result.clone()),
+        lsb_bits: width_bits - 1,
+        width_bits: 1,
+    };
+    let (cf, of) = match family {
+        "cmp" | "sub" => {
+            let overflow = binary(
+                BinaryOperator::And,
+                binary(BinaryOperator::Xor, left.clone(), right.clone()),
+                binary(BinaryOperator::Xor, left.clone(), result.clone()),
+            );
+            (
+                compare(
+                    ComparisonOperator::UnsignedLess,
+                    left.clone(),
+                    right.clone(),
+                ),
+                Expression::Extract {
+                    value: Box::new(overflow),
+                    lsb_bits: width_bits - 1,
+                    width_bits: 1,
+                },
+            )
+        }
+        "add" => {
+            let mask = if width_bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << width_bits) - 1
+            };
+            let same_sign = binary(
+                BinaryOperator::Xor,
+                binary(BinaryOperator::Xor, left.clone(), right.clone()),
+                Expression::Constant {
+                    value: mask,
+                    width_bits,
+                },
+            );
+            let overflow = binary(
+                BinaryOperator::And,
+                same_sign,
+                binary(BinaryOperator::Xor, left.clone(), result.clone()),
+            );
+            (
+                compare(
+                    ComparisonOperator::UnsignedLess,
+                    result.clone(),
+                    left.clone(),
+                ),
+                Expression::Extract {
+                    value: Box::new(overflow),
+                    lsb_bits: width_bits - 1,
+                    width_bits: 1,
+                },
+            )
+        }
+        _ => (
+            Expression::Constant {
+                value: 0,
+                width_bits: 1,
+            },
+            Expression::Constant {
+                value: 0,
+                width_bits: 1,
+            },
+        ),
+    };
+    let mut flags = [("zf", zf), ("cf", cf), ("sf", sf), ("of", of)]
+        .into_iter()
+        .map(|(name, value)| {
+            Some(ExpressionAssignment {
+                target: component_version(outputs, "flag", name)?,
+                value,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    flags.push(ExpressionAssignment {
+        target: component_version(outputs, "flag", "pf")?,
+        value: Expression::ParityEven {
+            value: Box::new(result.clone()),
+        },
+    });
+    if matches!(family, "cmp" | "add" | "sub") {
+        flags.push(ExpressionAssignment {
+            target: component_version(outputs, "flag", "af")?,
+            value: Expression::Extract {
+                value: Box::new(binary(
+                    BinaryOperator::Xor,
+                    binary(BinaryOperator::Xor, left, right),
+                    result,
+                )),
+                lsb_bits: 4,
+                width_bits: 1,
+            },
+        });
+    }
+    Some(flags)
+}
+
+fn normalized_branch_condition(
+    instruction: &MachineInstruction,
+    family: &str,
+    inputs: &[StateComponentVersion],
+) -> Option<Expression> {
+    if instruction.effects.control != MachineControlEffect::ConditionalBranch
+        || instruction.effects.conservative
+        || instruction.decorators != Default::default()
+    {
+        return None;
+    }
+    let flag = |name| flag_read(inputs, name);
+    let same_sign = || Some(compare(ComparisonOperator::Equal, flag("sf")?, flag("of")?));
+    match family {
+        "je" | "jz" => flag("zf"),
+        "jne" | "jnz" => Some(bit_not(flag("zf")?)),
+        "js" => flag("sf"),
+        "jns" => Some(bit_not(flag("sf")?)),
+        "jo" => flag("of"),
+        "jno" => Some(bit_not(flag("of")?)),
+        "jb" | "jc" | "jnae" => flag("cf"),
+        "jae" | "jnb" | "jnc" => Some(bit_not(flag("cf")?)),
+        "jbe" | "jna" => Some(binary(BinaryOperator::Or, flag("cf")?, flag("zf")?)),
+        "ja" | "jnbe" => Some(binary(
+            BinaryOperator::And,
+            bit_not(flag("cf")?),
+            bit_not(flag("zf")?),
+        )),
+        "jl" | "jnge" => Some(bit_not(same_sign()?)),
+        "jge" | "jnl" => same_sign(),
+        "jle" | "jng" => Some(binary(
+            BinaryOperator::Or,
+            flag("zf")?,
+            bit_not(same_sign()?),
+        )),
+        "jg" | "jnle" => Some(binary(
+            BinaryOperator::And,
+            bit_not(flag("zf")?),
+            same_sign()?,
+        )),
+        _ => None,
+    }
+}
+
+/// This ExpressionIR lowering slice normalizes supported scalar GPR writes,
+/// selected status flags, and taken-edge predicates. Every unsupported effect
 /// remains an explicit residual with its original StateIR component versions.
 pub fn lower_expression_ir(
     machine: &MachineFunctionIr,
@@ -251,7 +475,18 @@ pub fn lower_expression_ir(
                     normalized_register_assignment(machine_instruction, family, inputs, outputs)
                 })
                 .flatten();
-            let assignments = assignment.into_iter().collect::<Vec<_>>();
+            let mut assignments = assignment.into_iter().collect::<Vec<_>>();
+            if unknown_reason.is_none() {
+                if let Some(flags) =
+                    normalized_scalar_flags(machine_instruction, family, inputs, outputs)
+                {
+                    assignments.extend(flags);
+                }
+            }
+            let condition = unknown_reason
+                .is_none()
+                .then(|| normalized_branch_condition(machine_instruction, family, inputs))
+                .flatten();
             let remaining = outputs
                 .iter()
                 .filter(|output| {
@@ -267,7 +502,9 @@ pub fn lower_expression_ir(
                 Some(ResidualEffect {
                     family: family.to_owned(),
                     reason: unknown_reason
-                        .unwrap_or(if assignments.is_empty() {
+                        .unwrap_or(if condition.is_some() {
+                            "branch control effect remains explicit"
+                        } else if assignments.is_empty() {
                             "operation has no normalized expression semantics"
                         } else {
                             "remaining flag or state effects require normalization"
@@ -291,6 +528,7 @@ pub fn lower_expression_ir(
                 input_components: inputs.clone(),
                 output_components: outputs.clone(),
                 assignments,
+                condition,
                 residual,
                 edges: machine_instruction.edges.clone(),
             });
