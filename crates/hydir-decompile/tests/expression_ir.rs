@@ -1,7 +1,7 @@
 use hydir_decompile::{decompile_symbol, lower_expression_ir};
 use hydir_ir::SemanticFidelity;
-use hydir_ir::expression::{ExpressionFunctionIr, validate_expression_function_ir};
-use std::{fs, path::PathBuf};
+use hydir_ir::expression::{Expression, ExpressionFunctionIr, validate_expression_function_ir};
+use std::{fs, path::PathBuf, process::Command};
 
 fn prism() -> Vec<u8> {
     fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../demo/hydir-prism.elf")).unwrap()
@@ -80,4 +80,65 @@ fn expression_ir_never_loses_a_register_or_flag_definition() {
         .expect("the arithmetic flags or return state remain explicit");
     instruction.residual = None;
     assert!(validate_expression_function_ir(&expressions).is_err());
+}
+
+#[test]
+fn expression_ir_handles_32_bit_and_low_byte_writes_and_preserves_high_byte_unknowns() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/expression_widths.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("expression_widths.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("Clang is required for the width fixture");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let native = decompile_symbol(&fs::read(object).unwrap(), "hydir_expression_widths").unwrap();
+    let expressions = lower_expression_ir(&native.machine_ir, &native.state_ir).unwrap();
+    let assignments = expressions
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .flat_map(|instruction| &instruction.assignments)
+        .collect::<Vec<_>>();
+    assert!(
+        assignments
+            .iter()
+            .any(|assignment| matches!(assignment.value, Expression::ZeroExtend { .. }))
+    );
+    let byte_writes = expressions
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction.bytes_hex.as_str(), "88dc" | "88c8"))
+        .collect::<Vec<_>>();
+    assert_eq!(byte_writes.len(), 2);
+    let high_byte = byte_writes
+        .iter()
+        .find(|instruction| instruction.bytes_hex == "88dc")
+        .unwrap();
+    assert!(high_byte.assignments.is_empty());
+    let residual = high_byte
+        .residual
+        .as_ref()
+        .expect("AH write must remain explicit");
+    assert!(residual.reason.contains("register AH unsupported"));
+    assert_eq!(residual.outputs.len(), high_byte.output_components.len());
+    let low_byte = byte_writes
+        .iter()
+        .find(|instruction| instruction.bytes_hex == "88c8")
+        .unwrap();
+    assert!(low_byte.residual.is_none());
+    assert!(matches!(
+        low_byte.assignments[0].value,
+        Expression::InsertBits { lsb_bits: 0, .. }
+    ));
+    validate_expression_function_ir(&expressions).unwrap();
 }

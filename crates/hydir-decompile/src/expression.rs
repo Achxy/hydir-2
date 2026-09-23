@@ -6,10 +6,11 @@ use hydir_ir::expression::{
     validate_expression_function_ir,
 };
 use hydir_ir::{
-    IrDiagnostic, MachineControlEffect, MachineFunctionIr, MachineMemoryEffect, MachineOperand,
-    MachineOperation, SemanticFidelity, StateComponentVersion, StateFunctionIr, StateOperation,
-    VerificationStatus, validate_machine_function_ir, validate_state_function_ir,
+    IrDiagnostic, MachineControlEffect, MachineFunctionIr, MachineInstruction, MachineMemoryEffect,
+    MachineOperand, MachineOperation, SemanticFidelity, StateComponentVersion, StateFunctionIr,
+    StateOperation, VerificationStatus, validate_machine_function_ir, validate_state_function_ir,
 };
+use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
 
 fn component_version(
     versions: &[StateComponentVersion],
@@ -23,65 +24,109 @@ fn component_version(
         .cloned()
 }
 
+fn register_bit_offset(instruction: &MachineInstruction, operand_index: u32) -> Option<u16> {
+    let bytes = instruction
+        .bytes_hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut decoder = Decoder::with_ip(
+        64,
+        &bytes,
+        instruction.address.value.0,
+        DecoderOptions::NONE,
+    );
+    let decoded = decoder.decode();
+    if decoded.is_invalid()
+        || decoded.next_ip().checked_sub(instruction.address.value.0)? != bytes.len() as u64
+        || operand_index >= decoded.op_count()
+        || decoded.op_kind(operand_index) != OpKind::Register
+    {
+        return None;
+    }
+    Some(match decoded.op_register(operand_index) {
+        Register::AH | Register::BH | Register::CH | Register::DH => 8,
+        _ => 0,
+    })
+}
+
 fn register_value(
     operand: &MachineOperand,
+    operand_index: u32,
+    instruction: &MachineInstruction,
     inputs: &[StateComponentVersion],
 ) -> Option<Expression> {
     match operand {
-        MachineOperand::Register {
-            name,
-            width_bits: 64,
-        } => Some(Expression::Read {
-            source: component_version(inputs, "register", name)?,
-            width_bits: 64,
-        }),
-        MachineOperand::Immediate {
-            value,
-            width_bits: 64,
-        } => Some(Expression::Constant {
-            value: *value,
-            width_bits: 64,
-        }),
+        MachineOperand::Register { name, width_bits }
+            if matches!(*width_bits, 8 | 16 | 32 | 64) =>
+        {
+            let read = Expression::Read {
+                source: component_version(inputs, "register", name)?,
+                width_bits: 64,
+            };
+            if *width_bits == 64 {
+                Some(read)
+            } else {
+                Some(Expression::Extract {
+                    value: Box::new(read),
+                    lsb_bits: if *width_bits == 8 {
+                        register_bit_offset(instruction, operand_index)?
+                    } else {
+                        0
+                    },
+                    width_bits: *width_bits,
+                })
+            }
+        }
+        MachineOperand::Immediate { value, width_bits }
+            if matches!(*width_bits, 8 | 16 | 32 | 64) =>
+        {
+            Some(Expression::Constant {
+                value: if *width_bits == 64 {
+                    *value
+                } else {
+                    *value & ((1u64 << *width_bits) - 1)
+                },
+                width_bits: *width_bits,
+            })
+        }
         _ => None,
     }
 }
 
 fn normalized_register_assignment(
+    instruction: &MachineInstruction,
     family: &str,
-    operands: &[MachineOperand],
     inputs: &[StateComponentVersion],
     outputs: &[StateComponentVersion],
-    memory: MachineMemoryEffect,
-    control: MachineControlEffect,
-    conservative: bool,
-    has_decorators: bool,
 ) -> Option<ExpressionAssignment> {
-    if memory != MachineMemoryEffect::None
-        || control != MachineControlEffect::Next
-        || conservative
-        || has_decorators
+    if instruction.effects.memory != MachineMemoryEffect::None
+        || instruction.effects.control != MachineControlEffect::Next
+        || instruction.effects.conservative
+        || instruction.decorators != Default::default()
     {
         return None;
     }
-    let [
-        MachineOperand::Register {
-            name,
-            width_bits: 64,
-        },
-        source,
-    ] = operands
+    let [MachineOperand::Register { name, width_bits }, source] = instruction.operands.as_slice()
     else {
         return None;
     };
+    if !matches!(*width_bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
     let target = component_version(outputs, "register", name)?;
-    let right = register_value(source, inputs)?;
-    let value = match family {
+    let right = register_value(source, 1, instruction, inputs)?;
+    if right.width_bits() != *width_bits {
+        return None;
+    }
+    let narrow_value = match family {
         "mov" => right,
         "add" | "sub" | "and" | "or" | "xor" => {
-            let left = Expression::Read {
-                source: component_version(inputs, "register", name)?,
-                width_bits: 64,
-            };
+            let left = register_value(&instruction.operands[0], 0, instruction, inputs)?;
             let operator = match family {
                 "add" => BinaryOperator::Add,
                 "sub" => BinaryOperator::Subtract,
@@ -91,17 +136,38 @@ fn normalized_register_assignment(
             };
             Expression::Binary {
                 operator,
-                width_bits: 64,
+                width_bits: *width_bits,
                 left: Box::new(left),
                 right: Box::new(right),
             }
         }
         _ => return None,
     };
+    let value = match *width_bits {
+        64 => narrow_value,
+        32 => Expression::ZeroExtend {
+            value: Box::new(narrow_value),
+            width_bits: 64,
+        },
+        8 | 16 => Expression::InsertBits {
+            original: Box::new(Expression::Read {
+                source: component_version(inputs, "register", name)?,
+                width_bits: 64,
+            }),
+            value: Box::new(narrow_value),
+            lsb_bits: if *width_bits == 8 {
+                register_bit_offset(instruction, 0)?
+            } else {
+                0
+            },
+            width_bits: 64,
+        },
+        _ => return None,
+    };
     Some(ExpressionAssignment { target, value })
 }
 
-/// The first ExpressionIR lowering slice normalizes full-width scalar GPR
+/// This ExpressionIR lowering slice normalizes width-aware scalar GPR
 /// definitions. Every unsupported flag, memory, control, and register effect
 /// remains an explicit residual with its original StateIR component versions.
 pub fn lower_expression_ir(
@@ -182,16 +248,7 @@ pub fn lower_expression_ir(
             let assignment = unknown_reason
                 .is_none()
                 .then(|| {
-                    normalized_register_assignment(
-                        family,
-                        &machine_instruction.operands,
-                        inputs,
-                        outputs,
-                        machine_instruction.effects.memory,
-                        machine_instruction.effects.control,
-                        machine_instruction.effects.conservative,
-                        machine_instruction.decorators != Default::default(),
-                    )
+                    normalized_register_assignment(machine_instruction, family, inputs, outputs)
                 })
                 .flatten();
             let assignments = assignment.into_iter().collect::<Vec<_>>();
