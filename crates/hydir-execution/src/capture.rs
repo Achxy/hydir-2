@@ -293,7 +293,11 @@ fn capture_inner(
         }
     }
     let mut selected = BTreeSet::new();
-    for name in ["rip", "rsp", "rdi", "rsi", "rdx", "rcx", "r8", "r9"] {
+    // Reserve code and stack pages before optional argument pages. A sorted
+    // inventory must not evict the high-address stack page at the page limit.
+    selected.insert(rip & !((crate::snapshot::PAGE_BYTES as u64) - 1));
+    selected.insert(rsp & !((crate::snapshot::PAGE_BYTES as u64) - 1));
+    for name in ["rdi", "rsi", "rdx", "rcx", "r8", "r9"] {
         if let Some(RegisterObservation::Present { value }) = registers.get(name) {
             let page = value & !((crate::snapshot::PAGE_BYTES as u64) - 1);
             if mappings.iter().any(|mapping| {
@@ -308,8 +312,6 @@ fn capture_inner(
             break;
         }
     }
-    selected.insert(rip & !((crate::snapshot::PAGE_BYTES as u64) - 1));
-    selected.insert(rsp & !((crate::snapshot::PAGE_BYTES as u64) - 1));
     let mut pages = Vec::new();
     for address in selected.into_iter().take(MAX_CAPTURE_PAGES) {
         let mapped = mappings.iter().any(|mapping| {
