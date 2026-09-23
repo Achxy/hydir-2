@@ -74,8 +74,12 @@ versions on each load/store. A validated pointer-to-struct or pointer-to-union
 parameter can name a fixed 64-bit field across CFG branches and loops when its
 base register is unchanged throughout the function. The generated address uses
 `offsetof` and the model's layout assertions while the bytewise helper preserves
-unaligned and alias-safe access. A modified pointer, indexed address, ambiguous
-field, or unmatched width stays as a raw memory access. It still rejects other memory operations, calls,
+unaligned and alias-safe access. A modeled fixed-size array field with eight-byte
+elements can also name indexed loads and stores; the address retains the exact
+index arithmetic and uses `sizeof` for the modeled element. This annotation does
+not establish that a runtime index is in bounds. A modified pointer, unsupported
+stride, overlapping union interpretation, or unmatched width stays as a raw
+memory access. It still rejects other memory operations, calls,
 unsupported flag origins, opaque effects, and non-64-bit operands. The native
 `low` and `structured` views remain available for those
 functions. Typed C is marked semantically conservative and never rewrite
@@ -89,8 +93,8 @@ It also checks normalized zero-flag assignments and branch conditions, so
 Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
 still use the bounded compare/test interpretation; general flag SSA translation
 through joins remains future work. The memory helpers use integer-to-pointer
-conversion in the supported x86-64 execution environment. Modeled arrays and
-derived pointer bases are not yet named in the CFG view. Absolute memory addresses
+conversion in the supported x86-64 execution environment. Arrays of structures
+and derived pointer bases are not yet named in the CFG view. Absolute memory addresses
 remain unsupported until their ELF load bias is represented in the C view.
 
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,

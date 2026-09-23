@@ -203,6 +203,27 @@ hydir_cfg_ctx_shift:
     retq
 .size hydir_cfg_ctx_shift, .-hydir_cfg_ctx_shift
 
+.globl hydir_cfg_ctx_slot_add
+.type hydir_cfg_ctx_slot_add,@function
+hydir_cfg_ctx_slot_add:
+    cmpq $4, %rsi
+    jae .Lctx_slot_bad
+    movq 8(%rdi,%rsi,8), %rax
+    addq %rdx, %rax
+    movq %rax, 8(%rdi,%rsi,8)
+    retq
+.Lctx_slot_bad:
+    movq $0, %rax
+    retq
+.size hydir_cfg_ctx_slot_add, .-hydir_cfg_ctx_slot_add
+
+.globl hydir_cfg_ctx_bad_stride
+.type hydir_cfg_ctx_bad_stride,@function
+hydir_cfg_ctx_bad_stride:
+    movq 8(%rdi,%rsi,4), %rax
+    retq
+.size hydir_cfg_ctx_bad_stride, .-hydir_cfg_ctx_bad_stride
+
 .globl hydir_cfg_callee_saved
 .type hydir_cfg_callee_saved,@function
 hydir_cfg_callee_saved:

@@ -68,6 +68,10 @@ pub struct HighCfgFieldView {
     pub field: String,
     pub base: HighExpr,
     pub offset_bytes: u64,
+    /// An array subscript is a layout annotation, not a proof that the
+    /// runtime index is within the modeled array's bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_index: Option<HighExpr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -269,11 +273,19 @@ fn address_expression(address: &AddressExpression) -> Result<HighExpr, String> {
     Ok(result)
 }
 
-fn eight_byte_field(field: &ModelField) -> bool {
-    match &field.ty {
+fn eight_byte_type(ty: &TypeRef) -> bool {
+    match ty {
         TypeRef::Primitive { name } => name.size_bytes() == Some(8),
         TypeRef::Pointer { .. } => true,
         _ => false,
+    }
+}
+
+fn eight_byte_field(field: &ModelField, indexed: bool) -> bool {
+    if indexed {
+        matches!(&field.ty, TypeRef::Array { of, .. } if eight_byte_type(of))
+    } else {
+        eight_byte_type(&field.ty)
     }
 }
 
@@ -316,7 +328,7 @@ fn field_view_from_address(
     roots: &BTreeMap<String, String>,
     model: &AnalysisModel,
 ) -> Option<HighCfgFieldView> {
-    if address.index.is_some() || address.absolute.is_some() {
+    if address.absolute.is_some() || (address.index.is_some() && address.scale != 8) {
         return None;
     }
     let offset_bytes = u64::try_from(address.displacement).ok()?;
@@ -334,9 +346,20 @@ fn field_view_from_address(
         .iter()
         .find(|definition| &definition.id == type_id)?;
     let (aggregate_kind, fields) = aggregate_fields(definition)?;
-    let mut matching = fields
-        .iter()
-        .filter(|field| field.offset_bytes == offset_bytes && eight_byte_field(field));
+    // A union with several views has no selected interpretation. Leave its
+    // memory access raw even if only one member has this exact width.
+    if aggregate_kind == HighCfgAggregateKind::Union && fields.len() > 1 {
+        return None;
+    }
+    let array_index = address
+        .index
+        .as_deref()
+        .map(scalar_expression)
+        .transpose()
+        .ok()?;
+    let mut matching = fields.iter().filter(|field| {
+        field.offset_bytes == offset_bytes && eight_byte_field(field, array_index.is_some())
+    });
     let field = matching.next()?;
     if matching.next().is_some() {
         return None;
@@ -350,21 +373,33 @@ fn field_view_from_address(
             name: local(register_name).ok()?,
         },
         offset_bytes,
+        array_index,
     })
 }
 
 fn field_view_address(view: &HighCfgFieldView) -> HighExpr {
-    if view.offset_bytes == 0 {
-        view.base.clone()
-    } else {
-        HighExpr::Binary {
+    let mut address = view.base.clone();
+    if let Some(index) = &view.array_index {
+        address = HighExpr::Binary {
             op: BinaryOp::Add,
-            left: Box::new(view.base.clone()),
+            left: Box::new(address),
+            right: Box::new(HighExpr::Binary {
+                op: BinaryOp::Mul,
+                left: Box::new(index.clone()),
+                right: Box::new(HighExpr::Constant { value: 8 }),
+            }),
+        };
+    }
+    if view.offset_bytes != 0 {
+        address = HighExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(address),
             right: Box::new(HighExpr::Constant {
                 value: view.offset_bytes,
             }),
-        }
+        };
     }
+    address
 }
 
 fn normalized_memory_load(
@@ -1182,6 +1217,9 @@ fn validate_field_view(view: &HighCfgFieldView, address: &HighExpr) -> Result<()
     {
         return Err("typed CFG field annotation differs from its address".to_owned());
     }
+    if let Some(index) = &view.array_index {
+        scalar_reads(index, &mut BTreeSet::new(), 0)?;
+    }
     Ok(())
 }
 
@@ -1475,12 +1513,20 @@ fn c_memory_address(address: &HighExpr, field_view: &Option<HighCfgFieldView>) -
         HighCfgAggregateKind::Struct => "struct",
         HighCfgAggregateKind::Union => "union",
     };
-    format!(
-        "({} + (uint64_t)offsetof({kind} {}, {}))",
-        c_expr(&view.base),
-        view.type_name,
-        view.field
-    )
+    let base = c_expr(&view.base);
+    let offset = format!(
+        "(uint64_t)offsetof({kind} {}, {})",
+        view.type_name, view.field
+    );
+    match &view.array_index {
+        None => format!("({base} + {offset})"),
+        Some(index) => format!(
+            "(({base} + {offset}) + ({} * (uint64_t)sizeof((({kind} {} *)0)->{}[0])))",
+            c_expr(index),
+            view.type_name,
+            view.field
+        ),
+    }
 }
 
 fn c_statement(statement: &HighCfgStatement) -> String {
@@ -1591,12 +1637,13 @@ fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Re
             let (kind, fields) = aggregate_fields(definition)
                 .ok_or("typed CFG field annotation refers to a non-aggregate")?;
             if kind != view.aggregate_kind
+                || (kind == HighCfgAggregateKind::Union && fields.len() > 1)
                 || fields
                     .iter()
                     .filter(|field| {
                         field.name == view.field
                             && field.offset_bytes == view.offset_bytes
-                            && eight_byte_field(field)
+                            && eight_byte_field(field, view.array_index.is_some())
                     })
                     .count()
                     != 1
