@@ -374,9 +374,26 @@ fn run_to_target(
                 reason,
                 "breakpoint-hit" | "end-stepping-range" | "location-reached"
             ) {
-                return Err(
-                    format!("process did not stop at its first instruction: {reason}").into(),
-                );
+                let signal = first_stop
+                    .field("signal-name")
+                    .and_then(MiValue::as_text)
+                    .unwrap_or("unknown");
+                let meaning = first_stop
+                    .field("signal-meaning")
+                    .and_then(MiValue::as_text)
+                    .unwrap_or("unknown");
+                let pc = first_stop
+                    .field("frame")
+                    .and_then(|value| match value {
+                        MiValue::Tuple(fields) => tuple_field(fields, "addr"),
+                        _ => None,
+                    })
+                    .and_then(MiValue::as_text)
+                    .unwrap_or("unknown");
+                return Err(format!(
+                    "process did not stop at its first instruction: {reason}, signal={signal}, meaning={meaning}, pc={pc}"
+                )
+                .into());
             }
             let mappings = read_mappings(session)?;
             let bias = elf_load_bias(elf, &mappings)
