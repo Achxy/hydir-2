@@ -3,8 +3,8 @@
 //! not the versioned CFG artifact or its source-address provenance.
 
 use super::{
-    FLAG_LEFT, FLAG_RIGHT, HighCfgBlock, HighCfgCompareOp, HighCfgPredicate, HighCfgTerminator,
-    HighLevelCfgCir, c_expr, c_label, c_predicate, successors,
+    FLAG_LEFT, FLAG_RIGHT, HighCfgBlock, HighCfgCompareOp, HighCfgPredicate, HighCfgStatement,
+    HighCfgTerminator, HighLevelCfgCir, c_expr, c_label, c_predicate, c_statement, successors,
 };
 use crate::HighExpr;
 use hydir_core::Location;
@@ -69,7 +69,18 @@ impl<'a> Graph<'a> {
         let mut flag_reads = BTreeMap::new();
         for block in &ir.blocks {
             for statement in &block.statements {
-                count_flag_reads(&statement.value, &mut flag_reads);
+                match statement {
+                    HighCfgStatement::Assign { value, .. } => {
+                        count_flag_reads(value, &mut flag_reads);
+                    }
+                    HighCfgStatement::Load { address, .. } => {
+                        count_flag_reads(address, &mut flag_reads);
+                    }
+                    HighCfgStatement::Store { address, value, .. } => {
+                        count_flag_reads(address, &mut flag_reads);
+                        count_flag_reads(value, &mut flag_reads);
+                    }
+                }
             }
             match &block.terminator {
                 HighCfgTerminator::Branch { predicate, .. } => {
@@ -149,11 +160,7 @@ impl<'a> Graph<'a> {
         for address in path {
             for statement in &self.block(*address).statements {
                 if index + skip < total {
-                    output.push_str(&format!(
-                        "{indent}{} = {};\n",
-                        statement.target,
-                        c_expr(&statement.value)
-                    ));
+                    output.push_str(&format!("{indent}{}\n", c_statement(statement)));
                 }
                 index += 1;
             }
@@ -189,13 +196,28 @@ impl<'a> Graph<'a> {
         }
         let left = statements[statements.len() - 2];
         let right = statements[statements.len() - 1];
-        if left.target != FLAG_LEFT || right.target != FLAG_RIGHT || left.site != right.site {
+        let (
+            HighCfgStatement::Assign {
+                target: left_target,
+                value: left_value,
+                site: left_site,
+            },
+            HighCfgStatement::Assign {
+                target: right_target,
+                value: right_value,
+                site: right_site,
+            },
+        ) = (left, right)
+        else {
+            return (predicate.clone(), 0);
+        };
+        if left_target != FLAG_LEFT || right_target != FLAG_RIGHT || left_site != right_site {
             return (predicate.clone(), 0);
         }
         let direct = HighCfgPredicate {
             op: predicate.op,
-            left: left.value.clone(),
-            right: right.value.clone(),
+            left: left_value.clone(),
+            right: right_value.clone(),
         };
         (direct, 2)
     }

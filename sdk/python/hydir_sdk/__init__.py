@@ -160,7 +160,7 @@ class HydirClient:
             "unit": ("application/vnd.hydir.decompilation-unit+json;version=2", 2),
             "analysis_model": ("application/vnd.hydir.analysis-model+json;version=1", 1),
             "high_level_cir": ("application/vnd.hydir.high-level-cir+json;version=1", 1),
-            "high_level_cfg_cir": ("application/vnd.hydir.high-level-cfg-cir+json;version=2", 2),
+            "high_level_cfg_cir": ("application/vnd.hydir.high-level-cfg-cir+json;version=3", 3),
             "typed_c": ("text/x-c;view=typed", None),
         }
         if stage not in media_types:

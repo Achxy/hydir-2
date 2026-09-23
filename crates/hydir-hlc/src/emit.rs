@@ -207,6 +207,7 @@ fn emit_expr(expr: &HighExpr) -> String {
             let op = match op {
                 BinaryOp::Add => "+",
                 BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
                 BinaryOp::Xor => "^",
                 BinaryOp::And => "&",
                 BinaryOp::Or => "|",

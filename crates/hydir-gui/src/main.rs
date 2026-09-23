@@ -32,8 +32,8 @@ use hydir_decompile::{
     discover_functions, measure_native_coverage,
 };
 use hydir_hlc::{
-    HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement, emit_typed_c,
-    emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
+    HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
+    emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -2413,14 +2413,16 @@ fn typed_cfg_source_sites(ui: &mut egui::Ui, ir: &HighLevelCfgCir) -> Option<u64
     let mut selected = None;
     for block in &ir.blocks {
         for statement in &block.statements {
+            let (label, site) = match statement {
+                HighCfgStatement::Assign { target, site, .. } => (target.as_str(), site),
+                HighCfgStatement::Load { target, site, .. } => (target.as_str(), site),
+                HighCfgStatement::Store { site, .. } => ("store", site),
+            };
             if ui
-                .small_button(format!(
-                    "0x{:x} · {}",
-                    statement.site.value.0, statement.target
-                ))
+                .small_button(format!("0x{:x} · {label}", site.value.0))
                 .clicked()
             {
-                selected = Some(statement.site.value.0);
+                selected = Some(site.value.0);
             }
         }
         let (label, site) = match &block.terminator {
