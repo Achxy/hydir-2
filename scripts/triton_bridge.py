@@ -9,6 +9,7 @@ only a function witness; original-program validation belongs to native replay.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import sys
 import time
@@ -20,6 +21,8 @@ MAX_PATHS = 64
 MAX_PATH_INSTRUCTIONS = 1024
 MAX_CONSOLE_COMMANDS = 64
 MAX_CONSOLE_COMMAND_BYTES = 4096
+MAX_SLICE_AST_NODES = 65536
+MAX_SLICE_DECISIONS = 64
 SNAPSHOT_REGISTERS = (
     "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9",
     "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags",
@@ -208,6 +211,10 @@ def validate_snapshot_request(request: dict) -> dict:
         if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
             fail(f"{name} must be within 1..={maximum}")
     return {
+        "binary_sha256": request["binary_sha256"],
+        "input_sha256": request["input_sha256"],
+        "snapshot_sha256": request["snapshot_sha256"],
+        "probe_sha256": request["probe_sha256"],
         "code_address": code_address,
         "code": code,
         "registers": registers,
@@ -324,7 +331,43 @@ def _solve_snapshot_query(context, clauses, variables, seed, timeout, budget):
     return bytes(candidate), "sat"
 
 
-def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict):
+def _ast_dependencies(node, variable_offsets: dict[int, int],
+                      expression_sources: dict[int, int], slice_budget: dict):
+    """Bounded structural dependencies, including referenced expression bodies."""
+    from triton import AST_NODE
+
+    pending = [node]
+    expanded_expressions = set()
+    offsets = set()
+    sources = set()
+    while pending:
+        if slice_budget["remaining"] == 0:
+            slice_budget["truncated"] = True
+            break
+        slice_budget["remaining"] -= 1
+        current = pending.pop()
+        kind = current.getType()
+        if kind == AST_NODE.VARIABLE:
+            offset = variable_offsets.get(current.getSymbolicVariable().getId())
+            if offset is None:
+                slice_budget["unknown_variable"] = True
+            else:
+                offsets.add(offset)
+        elif kind == AST_NODE.REFERENCE:
+            expression = current.getSymbolicExpression()
+            expression_id = expression.getId()
+            source = expression_sources.get(expression_id)
+            if source is not None:
+                sources.add(source)
+            if expression_id not in expanded_expressions:
+                expanded_expressions.add(expression_id)
+                pending.append(expression.getAst())
+        pending.extend(current.getChildren())
+    return sorted(offsets), sorted(sources)
+
+
+def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict,
+                           collect_slice: bool = False):
     from triton import EXCEPTION, Instruction
 
     context, variables = _snapshot_context(plan, seed)
@@ -333,6 +376,12 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict)
     alternatives = []
     seen_constraints = 0
     instructions = 0
+    trace = []
+    decisions = []
+    expression_sources = {}
+    variable_offsets = {variable.getId(): index for index, variable in enumerate(variables)}
+    slice_budget = {"remaining": MAX_SLICE_AST_NODES, "truncated": False,
+                    "unknown_variable": False}
     while instructions < plan["max_instructions"]:
         if time.monotonic() >= budget["deadline"]:
             raise SnapshotBudgetExhausted("snapshot solver wall budget exhausted")
@@ -355,6 +404,12 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict)
             raise UnsupportedSnapshot(f"Triton cannot process 0x{pc:x}: {outcome}")
         instructions += 1
         budget["processed_instructions"] += 1
+        if collect_slice:
+            occurrence = instructions - 1
+            trace.append({"index": occurrence, "address": pc,
+                          "code_offset": offset, "disassembly": text})
+            for expression in instruction.getSymbolicExpressions():
+                expression_sources[expression.getId()] = occurrence
         if explore:
             constraints = context.getPathConstraints()
             for constraint in constraints[seen_constraints:]:
@@ -364,6 +419,19 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict)
                 taken = [branch for branch in options if branch["isTaken"]]
                 if len(taken) != 1:
                     raise UnsupportedSnapshot(f"ambiguous branch at 0x{pc:x}")
+                if collect_slice:
+                    if len(decisions) < MAX_SLICE_DECISIONS:
+                        offsets, sources = _ast_dependencies(
+                            taken[0]["constraint"], variable_offsets,
+                            expression_sources, slice_budget
+                        )
+                        decisions.append({
+                            "kind": "branch", "occurrence": occurrence,
+                            "address": pc, "taken_target": taken[0]["dstAddr"],
+                            "origin_offsets": offsets, "source_occurrences": sources,
+                        })
+                    else:
+                        slice_budget["truncated"] = True
                 for branch in options:
                     if branch["isTaken"]:
                         continue
@@ -376,8 +444,57 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict)
             seen_constraints = len(constraints)
         if mnemonic.startswith("ret"):
             value = context.getConcreteRegisterValue(context.registers.rax, callbacks=False)
+            slice_report = None
+            if collect_slice and value != plan["return_equals"]:
+                offsets, sources = _ast_dependencies(
+                    context.getRegisterAst(context.registers.rax), variable_offsets,
+                    expression_sources, slice_budget
+                )
+                decisions.append({
+                    "kind": "return", "occurrence": occurrence,
+                    "address": pc, "observed_value": value,
+                    "origin_offsets": offsets, "source_occurrences": sources,
+                })
+                relevant = [decision for decision in decisions
+                            if decision["origin_offsets"]]
+                source_indices = sorted({index for decision in relevant
+                                         for index in decision["source_occurrences"]})
+                unresolved = [
+                    "origin_channel_provenance_unproven_byte_equality_only",
+                    "other_paths_and_environment_not_in_this_trace",
+                    "symbolic_memory_address_dependencies_not_analyzed",
+                ]
+                if slice_budget["truncated"]:
+                    unresolved.append("slice_ast_or_decision_budget_exhausted")
+                if slice_budget["unknown_variable"]:
+                    unresolved.append("unmapped_symbolic_variable")
+                slice_report = {
+                    "schema_version": 1,
+                    "kind": "input_condition_slice",
+                    "scope": "captured_seed_trace_structural_dependencies",
+                    "binary_sha256": plan["binary_sha256"],
+                    "input_sha256": plan["input_sha256"],
+                    "snapshot_sha256": plan["snapshot_sha256"],
+                    "probe_sha256": plan["probe_sha256"],
+                    "code_sha256": hashlib.sha256(plan["code"]).hexdigest(),
+                    "code_address": plan["code_address"],
+                    "origin_id": plan["origin"]["id"],
+                    "channel": plan["origin"]["channel"],
+                    "channel_offset": plan["origin"]["offset"],
+                    "seed_hex": seed.hex(),
+                    "observed_return": value,
+                    "return_equals": plan["return_equals"],
+                    "ast_walk_complete": not slice_budget["truncated"]
+                    and not slice_budget["unknown_variable"],
+                    "relevant_origin_offsets": sorted({offset for decision in relevant
+                                                       for offset in decision["origin_offsets"]}),
+                    "source_occurrences": source_indices,
+                    "instructions": trace,
+                    "decisions": decisions,
+                    "unresolved_dependencies": unresolved,
+                }
             if not explore:
-                return value, None, "not_run", [], instructions
+                return value, None, "not_run", [], instructions, slice_report
             goal = context.getRegisterAst(context.registers.rax) == context.getAstContext().bv(
                 plan["return_equals"], 64
             )
@@ -385,7 +502,7 @@ def _execute_snapshot_seed(plan: dict, seed: bytes, explore: bool, budget: dict)
                 context, [context.getPathPredicate(), goal] + allowed,
                 variables, seed, plan["solver_timeout_ms"], budget
             )
-            return value, candidate, state, alternatives, instructions
+            return value, candidate, state, alternatives, instructions, slice_report
     raise SnapshotBudgetExhausted("snapshot path exceeds instruction budget")
 
 
@@ -403,6 +520,7 @@ def run_snapshot_return(request: dict) -> dict:
     uncertainty = set()
     unsupported = []
     budget_hit = None
+    input_condition_slice = None
     while queued and explored < plan["max_seeds"]:
         seed = queued.pop(0)
         if seed in seen:
@@ -410,13 +528,15 @@ def run_snapshot_return(request: dict) -> dict:
         seen.add(seed)
         explored += 1
         try:
-            value, candidate, state, alternatives, _ = _execute_snapshot_seed(
-                plan, seed, True, budget
+            value, candidate, state, alternatives, _, trace_slice = _execute_snapshot_seed(
+                plan, seed, True, budget, collect_slice=seed == plan["seed"]
             )
+            if trace_slice is not None:
+                input_condition_slice = trace_slice
             if state == "sat" and candidate is not None:
                 if any(byte not in plan["allowed"] for byte in candidate):
                     raise UnsupportedSnapshot("solver candidate violates origin constraints")
-                checked, _, _, _, _ = _execute_snapshot_seed(
+                checked, _, _, _, _, _ = _execute_snapshot_seed(
                     plan, candidate, False, budget
                 )
                 if checked != plan["return_equals"]:
@@ -469,6 +589,7 @@ def run_snapshot_return(request: dict) -> dict:
         "solver_queries": budget["queries"],
         "unsupported_paths": len(unsupported),
         "diagnostic": budget_hit or (unsupported[0] if unsupported else None),
+        "input_condition_slice": input_condition_slice,
     }
 
 

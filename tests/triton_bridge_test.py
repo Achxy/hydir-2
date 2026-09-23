@@ -188,6 +188,14 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertEqual(report["candidate_hex"], "41")
         self.assertEqual(report["origin_probe_evidence"], "byte_equality_only")
         self.assertEqual(report["return_equals"], 1)
+        trace = report["input_condition_slice"]
+        self.assertEqual(trace["scope"], "captured_seed_trace_structural_dependencies")
+        self.assertEqual(trace["relevant_origin_offsets"], [0])
+        self.assertEqual(trace["instructions"][0]["address"], 0x1000)
+        self.assertEqual(trace["decisions"][-1]["kind"], "return")
+        self.assertTrue(trace["ast_walk_complete"])
+        self.assertIn("origin_channel_provenance_unproven_byte_equality_only",
+                      trace["unresolved_dependencies"])
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_snapshot_return_flips_a_branch_after_failed_seed(self) -> None:
@@ -201,6 +209,22 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertEqual(report["status"], "function_witness")
         self.assertEqual(report["candidate_hex"], "41")
         self.assertGreaterEqual(report["explored_seeds"], 2)
+        trace = report["input_condition_slice"]
+        self.assertEqual(trace["relevant_origin_offsets"], [0])
+        self.assertEqual(trace["decisions"][0]["kind"], "branch")
+        self.assertEqual(trace["decisions"][0]["address"], 0x1004)
+        self.assertEqual(trace["decisions"][0]["origin_offsets"], [0])
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_slice_excludes_unread_origin_byte(self) -> None:
+        request = self.snapshot_request()
+        request["seed_hex"] = "425a"
+        request["symbolic_origin"]["length"] = 2
+        request["pages"][1]["bytes_hex"] = (b"BZ" + bytes(4094)).hex()
+        report = json.loads(self.run_bridge(request).stdout)
+        self.assertEqual(report["status"], "function_witness")
+        self.assertEqual(report["candidate_hex"], "415a")
+        self.assertEqual(report["input_condition_slice"]["relevant_origin_offsets"], [0])
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_snapshot_return_reports_query_budget_without_unsat_claim(self) -> None:
@@ -239,6 +263,7 @@ class TritonBridgeTests(unittest.TestCase):
         self.assertEqual(report["status"], "unsupported_effect")
         self.assertIsNone(report["candidate_hex"])
         self.assertIn("uncaptured memory", report["diagnostic"])
+        self.assertIsNone(report["input_condition_slice"])
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_symbolic_add2(self) -> None:
