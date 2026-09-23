@@ -504,13 +504,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                 candidate_spec = Some(candidate);
                 native_replay = Some(replay);
             }
-            let recipe = match (&candidate_spec, &native_replay) {
-                (Some(candidate), Some(replay))
+            #[cfg(target_os = "linux")]
+            let original_replay = if native_replay
+                .as_ref()
+                .is_some_and(|replay| replay.status == hydir_execution::ReplayStatus::GoalMatched)
+                && !bridge["input_condition_slice"].is_null()
+            {
+                let observed = hydir_execution::replay_local(&bytes, &spec)?;
+                hydir_execution::validate_replay_report(&bytes, &spec, &observed)?;
+                Some(observed)
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let original_replay: Option<hydir_execution::NativeReplayReport> = None;
+            let recipe = match (&candidate_spec, &native_replay, &original_replay) {
+                (Some(candidate), Some(replay), Some(original))
                     if replay.status == hydir_execution::ReplayStatus::GoalMatched
+                        && original.status == hydir_execution::ReplayStatus::GoalMismatched
                         && !bridge["input_condition_slice"].is_null() =>
                 {
                     Some(investigation::build_recipe(
-                        &bytes, &spec, &snapshot, &probe, &plan, &bridge, candidate, replay,
+                        &bytes, &spec, &snapshot, &probe, &plan, &bridge, candidate, original,
+                        replay,
                     )?)
                 }
                 _ => None,
@@ -540,6 +556,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "assumptions": plan.assumptions,
                 "bridge": bridge,
                 "candidate_input": candidate_spec,
+                "original_replay": original_replay,
                 "native_replay": native_replay,
                 "investigation_claim": recipe.as_ref().map(|recipe| &recipe.claim),
             });
@@ -568,11 +585,28 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "valid": true,
                     "claim": recipe.claim,
                     "verification_scope": "recorded_artifact_consistency_only",
-                    "fresh_replay": null,
+                    "fresh_original_replay": null,
+                    "fresh_candidate_replay": null,
                 })
             } else {
                 #[cfg(target_os = "linux")]
+                let original = hydir_execution::replay_local(&bytes, &recipe.original_input)?;
+                #[cfg(target_os = "linux")]
                 let replay = hydir_execution::replay_local(&bytes, &recipe.candidate_input)?;
+                #[cfg(not(target_os = "linux"))]
+                let original = hydir_execution::NativeReplayReport {
+                    schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                    binary_sha256: recipe.original_input.binary_sha256.clone(),
+                    input_sha256: hydir_execution::input_sha256(&recipe.original_input)?,
+                    status: hydir_execution::ReplayStatus::UnsupportedHost,
+                    exit_code: None,
+                    signal: None,
+                    stdout_hex: String::new(),
+                    stderr_hex: String::new(),
+                    elapsed_ms: 0,
+                    runner: "unavailable".into(),
+                    diagnostic: Some("recipe replay requires Linux with Bubblewrap".into()),
+                };
                 #[cfg(not(target_os = "linux"))]
                 let replay = hydir_execution::NativeReplayReport {
                     schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
@@ -587,13 +621,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     runner: "unavailable".into(),
                     diagnostic: Some("recipe replay requires Linux with Bubblewrap".into()),
                 };
+                hydir_execution::validate_replay_report(&bytes, &recipe.original_input, &original)?;
                 hydir_execution::validate_replay_report(&bytes, &recipe.candidate_input, &replay)?;
                 json!({
                     "schema_version": 1,
                     "operation": "recipe_replay",
-                    "claim_reproduced": replay.status == hydir_execution::ReplayStatus::GoalMatched,
-                    "recorded_replay": recipe.recorded_native_replay,
-                    "fresh_replay": replay,
+                    "claim_reproduced": original.status == hydir_execution::ReplayStatus::GoalMismatched
+                        && replay.status == hydir_execution::ReplayStatus::GoalMatched,
+                    "recorded_original_replay": recipe.recorded_original_replay,
+                    "recorded_candidate_replay": recipe.recorded_native_replay,
+                    "fresh_original_replay": original,
+                    "fresh_candidate_replay": replay,
                     "claim": recipe.claim,
                 })
             };
