@@ -6,8 +6,8 @@ use crate::{BinaryOp, HighExpr, HighParameter, parameters, u64_type, valid_ident
 use hydir_core::Location;
 use hydir_decompile::{lower_expression_ir, lower_state_ir};
 use hydir_ir::expression::{
-    BinaryOperator as ExpressionBinaryOperator, Expression, ExpressionFunctionIr,
-    ExpressionInstruction, validate_expression_function_ir,
+    BinaryOperator as ExpressionBinaryOperator, ComparisonOperator, Expression,
+    ExpressionFunctionIr, ExpressionInstruction, validate_expression_function_ir,
 };
 use hydir_ir::{
     FunctionIr, MachineControlEffect, MachineEdgeKind, MachineFunctionIr, MachineInstruction,
@@ -117,19 +117,6 @@ fn register(operand: &MachineOperand) -> Result<String, String> {
     }
 }
 
-fn value(operand: &MachineOperand) -> Result<HighExpr, String> {
-    match operand {
-        MachineOperand::Register { .. } => Ok(HighExpr::Variable {
-            name: register(operand)?,
-        }),
-        MachineOperand::Immediate {
-            value,
-            width_bits: 64,
-        } => Ok(HighExpr::Constant { value: *value }),
-        _ => Err("typed CFG requires a 64-bit register or normalized immediate".to_owned()),
-    }
-}
-
 fn scalar_expression(expression: &Expression) -> Result<HighExpr, String> {
     match expression {
         Expression::Read {
@@ -200,6 +187,108 @@ fn normalized_register_value(
     scalar_expression(&assignment.value)
 }
 
+fn normalized_zero_flag(
+    semantic: &ExpressionInstruction,
+) -> Result<(&Expression, &Expression), String> {
+    let mut assignments = semantic
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.target.component == "flag:zf");
+    let assignment = assignments
+        .next()
+        .ok_or("typed CFG flag write lacks normalized ExpressionIR semantics")?;
+    if assignments.next().is_some() {
+        return Err("typed CFG has ambiguous zero-flag semantics".to_owned());
+    }
+    match &assignment.value {
+        Expression::Compare {
+            operator: ComparisonOperator::Equal,
+            left,
+            right,
+        } if left.width_bits() == 64 && right.width_bits() == 64 => Ok((left, right)),
+        _ => Err("typed CFG requires a normalized 64-bit zero-flag comparison".to_owned()),
+    }
+}
+
+fn zero_constant(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::Constant {
+            value: 0,
+            width_bits: 64
+        }
+    )
+}
+
+fn normalized_flag_operands(
+    semantic: &ExpressionInstruction,
+    family: &str,
+) -> Result<(HighExpr, HighExpr), String> {
+    let (left, right) = normalized_zero_flag(semantic)?;
+    if family == "cmp" {
+        return Ok((scalar_expression(left)?, scalar_expression(right)?));
+    }
+    if family == "test"
+        && zero_constant(right)
+        && let Expression::Binary {
+            operator: ExpressionBinaryOperator::And,
+            width_bits: 64,
+            left,
+            right,
+        } = left
+    {
+        return Ok((scalar_expression(left)?, scalar_expression(right)?));
+    }
+    Err("typed CFG test flags lack normalized ExpressionIR operands".to_owned())
+}
+
+fn normalized_result_zero(
+    semantic: &ExpressionInstruction,
+    family: &str,
+) -> Result<HighExpr, String> {
+    let (result, zero) = normalized_zero_flag(semantic)?;
+    let operator = match family {
+        "add" => ExpressionBinaryOperator::Add,
+        "sub" => ExpressionBinaryOperator::Subtract,
+        "and" => ExpressionBinaryOperator::And,
+        "or" => ExpressionBinaryOperator::Or,
+        "xor" => ExpressionBinaryOperator::Xor,
+        _ => return Err("typed CFG has no normalized arithmetic flag result".to_owned()),
+    };
+    if !zero_constant(zero)
+        || !matches!(result, Expression::Binary { operator: actual, width_bits: 64, .. } if *actual == operator)
+    {
+        return Err("typed CFG arithmetic flag result differs from its register write".to_owned());
+    }
+    scalar_expression(result)
+}
+
+fn normalized_zero_branch(semantic: &ExpressionInstruction, family: &str) -> bool {
+    let flag_read = |expression: &Expression| matches!(expression, Expression::Read { source, width_bits: 1 } if source.component == "flag:zf");
+    match (family, semantic.condition.as_ref()) {
+        ("je" | "jz", Some(condition)) => flag_read(condition),
+        (
+            "jne" | "jnz",
+            Some(Expression::Binary {
+                operator: ExpressionBinaryOperator::Xor,
+                width_bits: 1,
+                left,
+                right,
+            }),
+        ) => {
+            flag_read(left)
+                && matches!(
+                    right.as_ref(),
+                    Expression::Constant {
+                        value: 1,
+                        width_bits: 1
+                    }
+                )
+        }
+        _ => false,
+    }
+}
+
 fn edge(instruction: &MachineInstruction, kind: MachineEdgeKind) -> Result<Location, String> {
     let mut matching = instruction.edges.iter().filter(|edge| edge.kind == kind);
     let result = matching
@@ -216,6 +305,73 @@ fn edge(instruction: &MachineInstruction, kind: MachineEdgeKind) -> Result<Locat
 enum FlagSource {
     Compare,
     Test,
+    ResultZero,
+}
+
+fn writes_flags(instruction: &MachineInstruction) -> bool {
+    matches!(
+        &instruction.operation,
+        MachineOperation::Exact { family }
+            if matches!(family.as_str(), "cmp" | "test" | "add" | "sub" | "xor" | "and" | "or")
+    )
+}
+
+// A flag-setting instruction needs C snapshots only when some branch reads its
+// flags before the next write. Work backwards through edges so loops and joins
+// keep the same snapshots as straight-line code.
+fn flag_snapshot_sites(machine: &MachineFunctionIr) -> Result<BTreeSet<Location>, String> {
+    let mut live_in = machine
+        .blocks
+        .iter()
+        .map(|block| (block.address, false))
+        .collect::<BTreeMap<_, _>>();
+    for _ in 0..(machine.blocks.len() * 4 + 1) {
+        let mut changed = false;
+        for block in machine.blocks.iter().rev() {
+            let last = block
+                .instructions
+                .last()
+                .ok_or("typed CFG block is empty")?;
+            let mut live = last
+                .edges
+                .iter()
+                .filter_map(|edge| edge.target)
+                .any(|target| live_in.get(&target).copied().unwrap_or(false));
+            for instruction in block.instructions.iter().rev() {
+                if instruction.effects.control == MachineControlEffect::ConditionalBranch {
+                    live = true;
+                }
+                if writes_flags(instruction) {
+                    live = false;
+                }
+            }
+            changed |= live_in.insert(block.address, live) != Some(live);
+        }
+        if !changed {
+            let mut sites = BTreeSet::new();
+            for block in &machine.blocks {
+                let last = block.instructions.last().unwrap();
+                let mut live = last
+                    .edges
+                    .iter()
+                    .filter_map(|edge| edge.target)
+                    .any(|target| live_in.get(&target).copied().unwrap_or(false));
+                for instruction in block.instructions.iter().rev() {
+                    if instruction.effects.control == MachineControlEffect::ConditionalBranch {
+                        live = true;
+                    }
+                    if writes_flags(instruction) {
+                        if live {
+                            sites.insert(instruction.address);
+                        }
+                        live = false;
+                    }
+                }
+            }
+            return Ok(sites);
+        }
+    }
+    Err("typed CFG flag liveness did not converge".to_owned())
 }
 
 fn flag_transfer(
@@ -228,7 +384,7 @@ fn flag_transfer(
     match family.as_str() {
         "cmp" => Some(FlagSource::Compare),
         "test" => Some(FlagSource::Test),
-        "add" | "sub" | "xor" | "and" | "or" => None,
+        "add" | "sub" | "xor" | "and" | "or" => Some(FlagSource::ResultZero),
         _ => incoming,
     }
 }
@@ -309,6 +465,8 @@ fn predicate(family: &str, source: Option<FlagSource>) -> Result<HighCfgPredicat
         (Some(FlagSource::Compare), "jge" | "jnl") => HighCfgCompareOp::SignedGreaterEqual,
         (Some(FlagSource::Test), "je" | "jz") => HighCfgCompareOp::TestZero,
         (Some(FlagSource::Test), "jne" | "jnz") => HighCfgCompareOp::TestNonzero,
+        (Some(FlagSource::ResultZero), "je" | "jz") => HighCfgCompareOp::Equal,
+        (Some(FlagSource::ResultZero), "jne" | "jnz") => HighCfgCompareOp::NotEqual,
         _ => {
             return Err(format!(
                 "typed CFG has no supported flag proof for {family}"
@@ -330,6 +488,7 @@ fn lower_instruction(
     instruction: &MachineInstruction,
     semantic: &ExpressionInstruction,
     flag_source: &mut Option<FlagSource>,
+    snapshot_flags: bool,
     statements: &mut Vec<HighCfgStatement>,
 ) -> Result<Option<HighCfgTerminator>, String> {
     if instruction.address != semantic.address
@@ -377,16 +536,26 @@ fn lower_instruction(
             let target = register(destination)?;
             let register_name = target.strip_prefix("hydir_").unwrap();
             let expression = normalized_register_value(semantic, register_name)?;
-            assign(target, expression);
-            *flag_source = None;
+            if snapshot_flags && normalized_result_zero(semantic, family)? != expression {
+                return Err("typed CFG arithmetic result and zero flag disagree".to_owned());
+            }
+            assign(target.clone(), expression);
+            if snapshot_flags {
+                assign(FLAG_LEFT.to_owned(), HighExpr::Variable { name: target });
+                assign(FLAG_RIGHT.to_owned(), HighExpr::Constant { value: 0 });
+            }
+            *flag_source = Some(FlagSource::ResultZero);
             None
         }
-        ("cmp" | "test", [left, right])
+        ("cmp" | "test", [_left, _right])
             if instruction.effects.control == MachineControlEffect::Next =>
         {
             // Snapshot operands now: later register writes must not alter the flags.
-            assign(FLAG_LEFT.to_owned(), value(left)?);
-            assign(FLAG_RIGHT.to_owned(), value(right)?);
+            if snapshot_flags {
+                let (left, right) = normalized_flag_operands(semantic, family)?;
+                assign(FLAG_LEFT.to_owned(), left);
+                assign(FLAG_RIGHT.to_owned(), right);
+            }
             *flag_source = Some(if family == "cmp" {
                 FlagSource::Compare
             } else {
@@ -425,6 +594,12 @@ fn lower_instruction(
             if taken != *target || instruction.edges.len() != 2 {
                 return Err("typed CFG branch operand and edges disagree".to_owned());
             }
+            if semantic.condition.is_none()
+                || (matches!(family, "je" | "jz" | "jne" | "jnz")
+                    && !normalized_zero_branch(semantic, family))
+            {
+                return Err("typed CFG branch lacks matching ExpressionIR condition".to_owned());
+            }
             Some(HighCfgTerminator::Branch {
                 predicate: predicate(family, *flag_source)?,
                 taken,
@@ -454,8 +629,9 @@ pub fn lower_high_level_cfg_cir(
     lower_high_level_cfg_cir_from_expression(machine, function, model, &expression)
 }
 
-// Consume the freshly validated ExpressionIR artifact for scalar register
-// writes. Branch flag snapshots still use the bounded MachineIR subset.
+// Consume freshly validated ExpressionIR scalar writes and zero-flag
+// expressions. Other branch predicates still use the bounded compare/test
+// interpretation of their recovered operands.
 fn lower_high_level_cfg_cir_from_expression(
     machine: &MachineFunctionIr,
     function: &FunctionIr,
@@ -517,6 +693,7 @@ fn lower_high_level_cfg_cir_from_expression(
             )
         });
     let flag_input = flag_inputs(machine)?;
+    let flag_snapshots = flag_snapshot_sites(machine)?;
     let mut blocks = Vec::with_capacity(machine.blocks.len());
     for (block, expression_block) in machine.blocks.iter().zip(&expression.blocks) {
         if block.address != expression_block.address
@@ -538,8 +715,13 @@ fn lower_high_level_cfg_cir_from_expression(
             if terminator.is_some() {
                 return Err("typed CFG has instructions after a control transfer".to_owned());
             }
-            terminator =
-                lower_instruction(instruction, semantic, &mut flag_source, &mut statements)?;
+            terminator = lower_instruction(
+                instruction,
+                semantic,
+                &mut flag_source,
+                flag_snapshots.contains(&instruction.address),
+                &mut statements,
+            )?;
             if terminator.is_some() && index + 1 != block.instructions.len() {
                 return Err("typed CFG has an internal control transfer".to_owned());
             }
@@ -894,7 +1076,7 @@ fn c_predicate(predicate: &HighCfgPredicate) -> String {
             "!=",
         ),
     };
-    format!("({left} {op} {right})")
+    format!("{left} {op} {right}")
 }
 
 fn c_label(address: Location) -> String {
