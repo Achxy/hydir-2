@@ -280,6 +280,39 @@ hydir_cfg_lea_index:
     retq
 .size hydir_cfg_lea_index, .-hydir_cfg_lea_index
 
+.globl hydir_cfg_record_add
+.type hydir_cfg_record_add,@function
+hydir_cfg_record_add:
+    leaq (%rsi,%rsi), %rcx
+    cmpq $4, %rsi
+    jae .Lrecord_add_bad
+    movq 16(%rdi,%rcx,8), %rax
+    addq %rdx, %rax
+    movq %rax, 16(%rdi,%rcx,8)
+    retq
+.Lrecord_add_bad:
+    movq $0, %rax
+    retq
+.size hydir_cfg_record_add, .-hydir_cfg_record_add
+
+.globl hydir_cfg_record_mutated_index
+.type hydir_cfg_record_mutated_index,@function
+hydir_cfg_record_mutated_index:
+    leaq (%rsi,%rsi), %rcx
+    addq $1, %rcx
+    movq 16(%rdi,%rcx,8), %rax
+    retq
+.size hydir_cfg_record_mutated_index, .-hydir_cfg_record_mutated_index
+
+.globl hydir_cfg_record_mutated_origin
+.type hydir_cfg_record_mutated_origin,@function
+hydir_cfg_record_mutated_origin:
+    leaq (%rsi,%rsi), %rcx
+    addq $1, %rsi
+    movq 16(%rdi,%rcx,8), %rax
+    retq
+.size hydir_cfg_record_mutated_origin, .-hydir_cfg_record_mutated_origin
+
 .globl hydir_cfg_callee_saved
 .type hydir_cfg_callee_saved,@function
 hydir_cfg_callee_saved:

@@ -74,6 +74,21 @@ pub struct HighCfgFieldView {
     /// runtime index is within the modeled array's bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_index: Option<HighExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_element: Option<HighCfgArrayElementView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HighCfgArrayElementView {
+    pub element_type_id: String,
+    pub element_type_name: String,
+    pub field: String,
+    pub field_offset_bytes: u64,
+    /// Register and scale encoded by the memory instruction. The register is
+    /// a proven multiple of `array_index` at this access.
+    pub raw_index: String,
+    pub raw_scale: u32,
+    pub index_multiplier: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -315,6 +330,61 @@ struct FieldRoot {
     origin_offset_bytes: i64,
 }
 
+#[derive(Clone, Debug)]
+struct IndexRoot {
+    origin_register: String,
+    multiplier: u64,
+}
+
+/// Returns coefficient and constant for a bounded unsigned affine expression
+/// in one register. All arithmetic is checked before it becomes a layout
+/// claim; the emitted C still uses the exact modular register expression.
+fn affine_coefficient(expr: &HighExpr, variable: &str, depth: usize) -> Option<(u64, u64)> {
+    if depth > 32 {
+        return None;
+    }
+    match expr {
+        HighExpr::Variable { name } if name == variable => Some((1, 0)),
+        HighExpr::Constant { value } => Some((0, *value)),
+        HighExpr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
+            let (left_coefficient, left_constant) = affine_coefficient(left, variable, depth + 1)?;
+            let (right_coefficient, right_constant) =
+                affine_coefficient(right, variable, depth + 1)?;
+            Some((
+                left_coefficient.checked_add(right_coefficient)?,
+                left_constant.checked_add(right_constant)?,
+            ))
+        }
+        HighExpr::Binary {
+            op: BinaryOp::Mul,
+            left,
+            right,
+        } => {
+            let (left_coefficient, left_constant) = affine_coefficient(left, variable, depth + 1)?;
+            let (right_coefficient, right_constant) =
+                affine_coefficient(right, variable, depth + 1)?;
+            if left_coefficient == 0 {
+                Some((
+                    right_coefficient.checked_mul(left_constant)?,
+                    right_constant.checked_mul(left_constant)?,
+                ))
+            } else if right_coefficient == 0 {
+                Some((
+                    left_coefficient.checked_mul(right_constant)?,
+                    left_constant.checked_mul(right_constant)?,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn register_read(expression: &Expression) -> Option<&str> {
     let Expression::Read {
         source,
@@ -425,12 +495,95 @@ fn stable_field_roots(
     roots
 }
 
+fn stable_index_roots(
+    parameters: &[HighParameter],
+    expression: &ExpressionFunctionIr,
+) -> BTreeMap<String, IndexRoot> {
+    let mut writes = BTreeMap::<&str, usize>::new();
+    for component in expression
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .flat_map(|instruction| &instruction.output_components)
+        .map(|output| output.component.as_str())
+    {
+        *writes.entry(component).or_default() += 1;
+    }
+    let mut roots = parameters
+        .iter()
+        .filter(|parameter| {
+            parameter.ty == u64_type()
+                && !writes.contains_key(format!("register:{}", parameter.location).as_str())
+        })
+        .map(|parameter| {
+            (
+                parameter.location.clone(),
+                IndexRoot {
+                    origin_register: parameter.location.clone(),
+                    multiplier: 1,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some(entry_block) = expression
+        .blocks
+        .iter()
+        .find(|block| block.address == expression.entry)
+    {
+        for instruction in &entry_block.instructions {
+            if instruction.residual.is_some() || !instruction.memory_writes.is_empty() {
+                continue;
+            }
+            for assignment in &instruction.assignments {
+                let Some(target) = assignment.target.component.strip_prefix("register:") else {
+                    continue;
+                };
+                if roots.contains_key(target)
+                    || parameters
+                        .iter()
+                        .any(|parameter| parameter.location == target)
+                    || writes.get(assignment.target.component.as_str()) != Some(&1)
+                {
+                    continue;
+                }
+                let Ok(value) = scalar_expression(&assignment.value) else {
+                    continue;
+                };
+                let mut candidates = roots.iter().filter_map(|(register, root)| {
+                    if root.origin_register != *register {
+                        return None;
+                    }
+                    let variable = local(register).ok()?;
+                    let (factor, constant) = affine_coefficient(&value, &variable, 0)?;
+                    (constant == 0 && (1..=1_000_000).contains(&factor))
+                        .then(|| (root.origin_register.clone(), factor))
+                });
+                let Some((origin_register, multiplier)) = candidates.next() else {
+                    continue;
+                };
+                if candidates.next().is_some() {
+                    continue;
+                }
+                roots.insert(
+                    target.to_owned(),
+                    IndexRoot {
+                        origin_register,
+                        multiplier,
+                    },
+                );
+            }
+        }
+    }
+    roots
+}
+
 fn field_view_from_address(
     address: &AddressExpression,
     roots: &BTreeMap<String, FieldRoot>,
+    index_roots: &BTreeMap<String, IndexRoot>,
     model: &AnalysisModel,
 ) -> Option<HighCfgFieldView> {
-    if address.absolute.is_some() || (address.index.is_some() && address.scale != 8) {
+    if address.absolute.is_some() {
         return None;
     }
     let Expression::Read {
@@ -442,7 +595,7 @@ fn field_view_from_address(
     };
     let register_name = source.component.strip_prefix("register:")?;
     let root = roots.get(register_name)?;
-    let offset_bytes =
+    let total_offset =
         u64::try_from(root.origin_offset_bytes.checked_add(address.displacement)?).ok()?;
     let type_id = &root.type_id;
     let definition = model
@@ -455,19 +608,79 @@ fn field_view_from_address(
     if aggregate_kind == HighCfgAggregateKind::Union && fields.len() > 1 {
         return None;
     }
-    let array_index = address
-        .index
-        .as_deref()
-        .map(scalar_expression)
-        .transpose()
-        .ok()?;
-    let mut matching = fields.iter().filter(|field| {
-        field.offset_bytes == offset_bytes && eight_byte_field(field, array_index.is_some())
-    });
-    let field = matching.next()?;
-    if matching.next().is_some() {
+    let mut matching = Vec::new();
+    if let Some(index) = address.index.as_deref() {
+        if address.scale == 8 {
+            let raw_index = scalar_expression(index).ok()?;
+            for field in fields
+                .iter()
+                .filter(|field| field.offset_bytes == total_offset && eight_byte_field(field, true))
+            {
+                matching.push((field, Some(raw_index.clone()), None));
+            }
+        }
+        if let Some(raw_register) = register_read(index) {
+            if let Some(index_root) = index_roots.get(raw_register) {
+                let stride = index_root
+                    .multiplier
+                    .checked_mul(u64::from(address.scale))?;
+                for field in fields {
+                    let TypeRef::Array { of, .. } = &field.ty else {
+                        continue;
+                    };
+                    let TypeRef::Named { id } = of.as_ref() else {
+                        continue;
+                    };
+                    let Some(element_type) = model.types.iter().find(|item| item.id == *id) else {
+                        continue;
+                    };
+                    if element_type.size_is_lower_bound || element_type.size_bytes != stride {
+                        continue;
+                    }
+                    let TypeDefinitionKind::Struct {
+                        fields: element_fields,
+                    } = &element_type.kind
+                    else {
+                        continue;
+                    };
+                    for element_field in element_fields {
+                        if !eight_byte_type(&element_field.ty)
+                            || field.offset_bytes.checked_add(element_field.offset_bytes)
+                                != Some(total_offset)
+                        {
+                            continue;
+                        }
+                        matching.push((
+                            field,
+                            Some(HighExpr::Variable {
+                                name: local(&index_root.origin_register).ok()?,
+                            }),
+                            Some(HighCfgArrayElementView {
+                                element_type_id: element_type.id.clone(),
+                                element_type_name: element_type.name.clone(),
+                                field: element_field.name.clone(),
+                                field_offset_bytes: element_field.offset_bytes,
+                                raw_index: local(raw_register).ok()?,
+                                raw_scale: address.scale,
+                                index_multiplier: index_root.multiplier,
+                            }),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        for field in fields
+            .iter()
+            .filter(|field| field.offset_bytes == total_offset && eight_byte_field(field, false))
+        {
+            matching.push((field, None, None));
+        }
+    }
+    if matching.len() != 1 {
         return None;
     }
+    let (field, array_index, array_element) = matching.pop()?;
     let derived_base = if root.origin_register != register_name {
         Some(HighCfgDerivedBase {
             register: local(register_name).ok()?,
@@ -484,26 +697,50 @@ fn field_view_from_address(
         base: HighExpr::Variable {
             name: local(&root.origin_register).ok()?,
         },
-        offset_bytes,
+        offset_bytes: field.offset_bytes,
         derived_base,
         array_index,
+        array_element,
     })
 }
 
 fn field_view_address(view: &HighCfgFieldView) -> Option<HighExpr> {
+    let total_offset = view.offset_bytes.checked_add(
+        view.array_element
+            .as_ref()
+            .map_or(0, |element| element.field_offset_bytes),
+    )?;
     let (mut address, displacement) = if let Some(derived) = &view.derived_base {
         (
             HighExpr::Variable {
                 name: derived.register.clone(),
             },
-            i64::try_from(view.offset_bytes)
+            i64::try_from(total_offset)
                 .ok()?
                 .checked_sub(derived.origin_offset_bytes)?,
         )
     } else {
-        (view.base.clone(), i64::try_from(view.offset_bytes).ok()?)
+        (view.base.clone(), i64::try_from(total_offset).ok()?)
     };
-    if let Some(index) = &view.array_index {
+    if let Some(element) = &view.array_element {
+        let mut raw_index = HighExpr::Variable {
+            name: element.raw_index.clone(),
+        };
+        if element.raw_scale != 1 {
+            raw_index = HighExpr::Binary {
+                op: BinaryOp::Mul,
+                left: Box::new(raw_index),
+                right: Box::new(HighExpr::Constant {
+                    value: u64::from(element.raw_scale),
+                }),
+            };
+        }
+        address = HighExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(address),
+            right: Box::new(raw_index),
+        };
+    } else if let Some(index) = &view.array_index {
         address = HighExpr::Binary {
             op: BinaryOp::Add,
             left: Box::new(address),
@@ -534,6 +771,7 @@ fn normalized_memory_load(
     semantic: &ExpressionInstruction,
     register_name: &str,
     roots: &BTreeMap<String, FieldRoot>,
+    index_roots: &BTreeMap<String, IndexRoot>,
     model: &AnalysisModel,
 ) -> Result<
     (
@@ -567,7 +805,7 @@ fn normalized_memory_load(
         } => Ok((
             address_expression(address)?,
             memory_inputs.clone(),
-            field_view_from_address(address, roots, model),
+            field_view_from_address(address, roots, index_roots, model),
         )),
         _ => Err("typed CFG requires a normalized 64-bit memory load".to_owned()),
     }
@@ -576,6 +814,7 @@ fn normalized_memory_load(
 fn normalized_memory_store(
     semantic: &ExpressionInstruction,
     roots: &BTreeMap<String, FieldRoot>,
+    index_roots: &BTreeMap<String, IndexRoot>,
     model: &AnalysisModel,
 ) -> Result<
     (
@@ -602,7 +841,7 @@ fn normalized_memory_store(
         scalar_expression(&write.value)?,
         write.memory_inputs.clone(),
         write.memory_outputs.clone(),
-        field_view_from_address(&write.address, roots, model),
+        field_view_from_address(&write.address, roots, index_roots, model),
     ))
 }
 
@@ -938,6 +1177,7 @@ fn lower_instruction(
     instruction: &MachineInstruction,
     semantic: &ExpressionInstruction,
     field_roots: &BTreeMap<String, FieldRoot>,
+    index_roots: &BTreeMap<String, IndexRoot>,
     model: &AnalysisModel,
     flag_source: &mut Option<FlagSource>,
     snapshot_flags: bool,
@@ -978,7 +1218,7 @@ fn lower_instruction(
             let target = register(destination)?;
             let register_name = target.strip_prefix("hydir_").unwrap();
             let (address, memory_inputs, field_view) =
-                normalized_memory_load(semantic, register_name, field_roots, model)?;
+                normalized_memory_load(semantic, register_name, field_roots, index_roots, model)?;
             statements.push(HighCfgStatement::Load {
                 target,
                 address,
@@ -995,7 +1235,7 @@ fn lower_instruction(
                 && instruction.effects.memory == MachineMemoryEffect::Write =>
         {
             let (address, value, memory_inputs, memory_outputs, field_view) =
-                normalized_memory_store(semantic, field_roots, model)?;
+                normalized_memory_store(semantic, field_roots, index_roots, model)?;
             statements.push(HighCfgStatement::Store {
                 address,
                 value,
@@ -1213,6 +1453,7 @@ fn lower_high_level_cfg_cir_from_expression(
     let flag_input = flag_inputs(machine)?;
     let flag_snapshots = flag_snapshot_sites(machine)?;
     let field_roots = stable_field_roots(&parameters, expression);
+    let index_roots = stable_index_roots(&parameters, expression);
     let mut blocks = Vec::with_capacity(machine.blocks.len());
     for (block, expression_block) in machine.blocks.iter().zip(&expression.blocks) {
         if block.address != expression_block.address
@@ -1238,6 +1479,7 @@ fn lower_high_level_cfg_cir_from_expression(
                 instruction,
                 semantic,
                 &field_roots,
+                &index_roots,
                 model,
                 &mut flag_source,
                 flag_snapshots.contains(&instruction.address),
@@ -1366,6 +1608,18 @@ fn validate_field_view(view: &HighCfgFieldView, address: &HighExpr) -> Result<()
                 .strip_prefix("hydir_")
                 .is_some_and(|register| REGISTERS.contains(&register))
                 || matches!(&view.base, HighExpr::Variable { name } if name == &derived.register)
+        })
+        || view.array_element.as_ref().is_some_and(|element| {
+            view.array_index.is_none()
+                || element.element_type_id.is_empty()
+                || !valid_ident(&element.element_type_name)
+                || !valid_ident(&element.field)
+                || !matches!(element.raw_scale, 1 | 2 | 4 | 8)
+                || !(1..=1_000_000).contains(&element.index_multiplier)
+                || !element
+                    .raw_index
+                    .strip_prefix("hydir_")
+                    .is_some_and(|register| REGISTERS.contains(&register))
         })
         || field_view_address(view).as_ref() != Some(address)
     {
@@ -1684,6 +1938,16 @@ fn c_memory_address(address: &HighExpr, field_view: &Option<HighCfgFieldView>) -
     } else {
         (c_expr(&view.base), offset)
     };
+    if let Some(element) = &view.array_element {
+        return format!(
+            "((({base} + {offset}) + ({} * ((uint64_t)sizeof(struct {}) / UINT64_C({})))) + (uint64_t)offsetof(struct {}, {}))",
+            element.raw_index,
+            element.element_type_name,
+            element.index_multiplier,
+            element.element_type_name,
+            element.field
+        );
+    }
     match &view.array_index {
         None => format!("({base} + {offset})"),
         Some(index) => format!(
@@ -1813,17 +2077,130 @@ fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Re
                 .ok_or("typed CFG field annotation refers to a non-aggregate")?;
             if kind != view.aggregate_kind
                 || (kind == HighCfgAggregateKind::Union && fields.len() > 1)
-                || fields
-                    .iter()
-                    .filter(|field| {
-                        field.name == view.field
-                            && field.offset_bytes == view.offset_bytes
-                            && eight_byte_field(field, view.array_index.is_some())
-                    })
-                    .count()
-                    != 1
             {
                 return Err("typed CFG field annotation differs from model layout".to_owned());
+            }
+            let mut matching_fields = fields.iter().filter(|field| {
+                field.name == view.field && field.offset_bytes == view.offset_bytes
+            });
+            let Some(field) = matching_fields.next() else {
+                return Err("typed CFG field annotation differs from model layout".to_owned());
+            };
+            if matching_fields.next().is_some() {
+                return Err("typed CFG field annotation is ambiguous".to_owned());
+            }
+            if let Some(element) = &view.array_element {
+                let TypeRef::Array { of, .. } = &field.ty else {
+                    return Err("typed CFG element view has no array field".to_owned());
+                };
+                let TypeRef::Named { id } = of.as_ref() else {
+                    return Err("typed CFG array element is not a named type".to_owned());
+                };
+                let element_type = model
+                    .types
+                    .iter()
+                    .find(|item| {
+                        item.id == *id
+                            && item.id == element.element_type_id
+                            && item.name == element.element_type_name
+                    })
+                    .ok_or("typed CFG array element type differs from model")?;
+                let TypeDefinitionKind::Struct {
+                    fields: element_fields,
+                } = &element_type.kind
+                else {
+                    return Err("typed CFG array element is not a struct".to_owned());
+                };
+                if element_type.size_is_lower_bound
+                    || element
+                        .index_multiplier
+                        .checked_mul(u64::from(element.raw_scale))
+                        != Some(element_type.size_bytes)
+                    || element_fields
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.name == element.field
+                                && candidate.offset_bytes == element.field_offset_bytes
+                                && eight_byte_type(&candidate.ty)
+                        })
+                        .count()
+                        != 1
+                {
+                    return Err(
+                        "typed CFG array element layout or stride differs from model".to_owned(),
+                    );
+                }
+                let Some(HighExpr::Variable {
+                    name: logical_index,
+                }) = &view.array_index
+                else {
+                    return Err(
+                        "typed CFG array element needs an invariant integer index".to_owned()
+                    );
+                };
+                let (logical_position, logical_parameter) = ir
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .find(|(_, parameter)| {
+                        parameter.ty == u64_type()
+                            && local(&parameter.location).ok().as_deref() == Some(logical_index)
+                    })
+                    .ok_or("typed CFG array index is not an integer parameter")?;
+                if writes.contains_key(logical_index.as_str()) {
+                    return Err("typed CFG array index is not an invariant parameter".to_owned());
+                }
+                let index_row = model_row.ok_or("typed CFG array index has no function model")?;
+                let modeled_index_type = index_row
+                    .prototype
+                    .as_ref()
+                    .and_then(|prototype| {
+                        prototype
+                            .parameters
+                            .get(logical_position)
+                            .map(|item| &item.ty)
+                    })
+                    .or_else(|| {
+                        index_row
+                            .inferred_parameters
+                            .get(&logical_parameter.location)
+                    });
+                if modeled_index_type != Some(&logical_parameter.ty) {
+                    return Err("typed CFG array index differs from current model".to_owned());
+                }
+                if element.raw_index == *logical_index {
+                    if element.index_multiplier != 1 {
+                        return Err(
+                            "typed CFG direct array index has a nonunit multiplier".to_owned()
+                        );
+                    }
+                } else {
+                    if ir.parameters.iter().any(|parameter| {
+                        local(&parameter.location).ok().as_deref()
+                            == Some(element.raw_index.as_str())
+                    }) {
+                        return Err(
+                            "typed CFG derived array index is an input parameter".to_owned()
+                        );
+                    }
+                    let Some(assignments) = writes.get(element.raw_index.as_str()) else {
+                        return Err("typed CFG derived array index has no assignment".to_owned());
+                    };
+                    let [(site, Some(value))] = assignments.as_slice() else {
+                        return Err("typed CFG derived array index has multiple writes".to_owned());
+                    };
+                    if *site != ir.entry
+                        || affine_coefficient(value, logical_index, 0)
+                            != Some((element.index_multiplier, 0))
+                    {
+                        return Err(
+                            "typed CFG derived array index lacks a dominating scale proof"
+                                .to_owned(),
+                        );
+                    }
+                }
+            } else if !eight_byte_field(field, view.array_index.is_some()) {
+                return Err("typed CFG scalar field width differs from model".to_owned());
             }
             let HighExpr::Variable { name: base } = &view.base else {
                 return Err("typed CFG field base is not an invariant parameter".to_owned());
