@@ -38,6 +38,21 @@ def symbol_address(binary: Path, symbol: str) -> int:
     return matches[0]
 
 
+def captured_bytes(snapshot: dict, address: int, length: int) -> bytes:
+    result = bytearray()
+    while len(result) < length:
+        page_address = address & ~4095
+        pages = [page for page in snapshot["pages"] if page["address"] == page_address]
+        assert len(pages) == 1 and pages[0]["value"]["state"] == "present", pages
+        page = bytes.fromhex(pages[0]["value"]["bytes_hex"])
+        offset = address - page_address
+        chunk = page[offset:offset + length - len(result)]
+        assert chunk, (address, length)
+        result.extend(chunk)
+        address += len(chunk)
+    return bytes(result)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hydir-replay-smoke-") as directory:
         work = Path(directory)
@@ -51,8 +66,12 @@ def main() -> None:
         stripped_specification = work / "stripped-input.json"
         stripped_snapshot_path = work / "stripped-snapshot.json"
         run("clang", "-O1", "-fPIE", "-pie", ROOT / "tests" / "fixtures" / "replay_channels.c", "-o", binary)
-        main_address = symbol_address(binary, "main")
+        validator_address = symbol_address(binary, "check_line")
         run("strip", "--strip-all", "-o", stripped, binary)
+        stripped_nm = subprocess.run(
+            ["nm", "-an", str(stripped)], cwd=ROOT, capture_output=True, text=True
+        )
+        assert "check_line" not in stripped_nm.stdout, stripped_nm.stdout
         run("cargo", "build", "--locked", "-q", "-p", "hydir-cli")
         run(CTL, "replay", "init", binary, "--output", specification)
         spec = json.loads(specification.read_text(encoding="utf-8"))
@@ -83,12 +102,20 @@ def main() -> None:
         stripped_spec["binary_sha256"] = hashlib.sha256(stripped.read_bytes()).hexdigest()
         stripped_specification.write_text(json.dumps(stripped_spec), encoding="utf-8")
         run(CTL, "replay", "verify", stripped, stripped_specification)
-        run(CTL, "capture", stripped, stripped_specification, "--address", hex(main_address), "--output", stripped_snapshot_path)
+        run(CTL, "capture", stripped, stripped_specification, "--address", hex(validator_address), "--output", stripped_snapshot_path)
         run(CTL, "snapshot", "verify", stripped, stripped_specification, stripped_snapshot_path)
         stripped_snapshot = json.loads(stripped_snapshot_path.read_text(encoding="utf-8"))
         assert stripped_snapshot["status"] == "stopped", stripped_snapshot
-        assert stripped_snapshot["stop"]["elf_vaddr"] == main_address, stripped_snapshot
+        assert stripped_snapshot["stop"]["elf_vaddr"] == validator_address, stripped_snapshot
+        assert stripped_snapshot["stop"]["load_bias"] != 0, stripped_snapshot
         assert stripped_snapshot["stop"]["symbol"] is None, stripped_snapshot
+        origin = stripped_spec["origins"][0]
+        assert origin["channel"]["kind"] == "stdin", origin
+        source = bytes.fromhex(stripped_spec["stdin_hex"])
+        expected = source[origin["offset"]:origin["offset"] + origin["length"]]
+        argument = stripped_snapshot["registers"]["rdi"]
+        assert argument["state"] == "present", stripped_snapshot
+        assert captured_bytes(stripped_snapshot, argument["value"], len(expected)) == expected
         spec["stdin_hex"] = b"wrong\n".hex()
         specification.write_text(json.dumps(spec), encoding="utf-8")
         run(CTL, "replay", binary, specification, "--output", mismatching)
