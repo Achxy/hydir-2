@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at,
@@ -16,7 +18,7 @@ use hydir_decompile::{
     decompile_indexed_function, decompile_indexed_function_unit, decompile_symbol,
     decompile_symbol_unit, discover_function_candidates, discover_functions,
     export_function_ir_llvm, lift_machine_function, lift_machine_function_at, lower_cir,
-    lower_function_ir, lower_state_ir, measure_native_coverage,
+    lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
 use hydir_hlc::{emit_typed_c, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
@@ -61,7 +63,7 @@ Usage:
   hydirctl region <elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
-  hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|function|cir|llvm>
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|expression|function|cir|llvm>
   hydirctl lift <elf> --function <function-id-or-symbol> --ir high-level --model <model.json>
   hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
@@ -373,6 +375,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_decompiler_scope": "ProgramSpec v5 -> FunctionIndex v1 -> MachineIR -> StateIR -> FunctionIR -> CIR -> C11; symbol, unwind-FDE, entry, direct-call and init/fini seeds; partial results fail closed",
                     "analysis_model_v1": true,
                     "analysis_model_scope": "ELF SHA-256-bound JSON with bounded DWARF import, aggregate inference, visible conflicts, and revision-checked local analyst edits",
+                    "expression_ir_v1": true,
+                    "expression_ir_scope": "full-width scalar register definitions and component SSA joins; remaining effects retain explicit residuals",
                     "typed_c_v1": true,
                     "typed_c_scope": "complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; other functions retain low-level C",
                     "typed_c_local_cache": true,
@@ -748,6 +752,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "{}",
                     serde_json::to_string_pretty(&lower_state_ir(&machine)?)?
                 ),
+                "expression" => {
+                    let state = lower_state_ir(&machine)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&lower_expression_ir(&machine, &state)?)?
+                    );
+                }
                 "function" => {
                     let state = lower_state_ir(&machine)?;
                     println!(
@@ -769,7 +780,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     print!("{}", export_function_ir_llvm(&function)?);
                 }
                 _ => {
-                    return Err("native --ir must be machine, state, function, cir, or llvm".into());
+                    return Err(
+                        "native --ir must be machine, state, expression, function, cir, or llvm"
+                            .into(),
+                    );
                 }
             }
         }
