@@ -2,6 +2,7 @@
 //! whose scalar behavior can be expressed without an opaque machine state.
 //! Each branch retains its recovered target and instruction site.
 
+use crate::emit::{c_decl, collect_used_types, emit_model_type_declarations};
 use crate::{BinaryOp, HighExpr, HighParameter, parameters, u64_type, valid_ident};
 use hydir_core::Location;
 use hydir_decompile::{lower_expression_ir, lower_state_ir};
@@ -14,7 +15,9 @@ use hydir_ir::{
     MachineMemoryEffect, MachineOperand, MachineOperation, SemanticFidelity, StateComponentVersion,
     StructuralCompleteness, validate_function_ir, validate_machine_function_ir,
 };
-use hydir_model::{AnalysisModel, TypeRef, validate_structure};
+use hydir_model::{
+    AnalysisModel, ModelField, TypeDefinition, TypeDefinitionKind, TypeRef, validate_structure,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -50,6 +53,23 @@ pub struct HighCfgPredicate {
     pub right: HighExpr,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HighCfgAggregateKind {
+    Struct,
+    Union,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HighCfgFieldView {
+    pub type_id: String,
+    pub type_name: String,
+    pub aggregate_kind: HighCfgAggregateKind,
+    pub field: String,
+    pub base: HighExpr,
+    pub offset_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HighCfgStatement {
@@ -64,6 +84,8 @@ pub enum HighCfgStatement {
         width_bits: u16,
         byte_order: MemoryByteOrder,
         memory_inputs: Vec<StateComponentVersion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field_view: Option<HighCfgFieldView>,
         site: Location,
     },
     Store {
@@ -73,6 +95,8 @@ pub enum HighCfgStatement {
         byte_order: MemoryByteOrder,
         memory_inputs: Vec<StateComponentVersion>,
         memory_outputs: Vec<StateComponentVersion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field_view: Option<HighCfgFieldView>,
         site: Location,
     },
 }
@@ -245,10 +269,117 @@ fn address_expression(address: &AddressExpression) -> Result<HighExpr, String> {
     Ok(result)
 }
 
+fn eight_byte_field(field: &ModelField) -> bool {
+    match &field.ty {
+        TypeRef::Primitive { name } => name.size_bytes() == Some(8),
+        TypeRef::Pointer { .. } => true,
+        _ => false,
+    }
+}
+
+fn aggregate_fields(definition: &TypeDefinition) -> Option<(HighCfgAggregateKind, &[ModelField])> {
+    match &definition.kind {
+        TypeDefinitionKind::Struct { fields } => Some((HighCfgAggregateKind::Struct, fields)),
+        TypeDefinitionKind::Union { fields } => Some((HighCfgAggregateKind::Union, fields)),
+        _ => None,
+    }
+}
+
+fn stable_field_roots(
+    parameters: &[HighParameter],
+    expression: &ExpressionFunctionIr,
+) -> BTreeMap<String, String> {
+    let writes = expression
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .flat_map(|instruction| &instruction.output_components)
+        .map(|output| output.component.as_str())
+        .collect::<BTreeSet<_>>();
+    parameters
+        .iter()
+        .filter_map(|parameter| {
+            let TypeRef::Pointer { to } = &parameter.ty else {
+                return None;
+            };
+            let TypeRef::Named { id } = to.as_ref() else {
+                return None;
+            };
+            (!writes.contains(format!("register:{}", parameter.location).as_str()))
+                .then(|| (parameter.location.clone(), id.clone()))
+        })
+        .collect()
+}
+
+fn field_view_from_address(
+    address: &AddressExpression,
+    roots: &BTreeMap<String, String>,
+    model: &AnalysisModel,
+) -> Option<HighCfgFieldView> {
+    if address.index.is_some() || address.absolute.is_some() {
+        return None;
+    }
+    let offset_bytes = u64::try_from(address.displacement).ok()?;
+    let Expression::Read {
+        source,
+        width_bits: 64,
+    } = address.base.as_deref()?
+    else {
+        return None;
+    };
+    let register_name = source.component.strip_prefix("register:")?;
+    let type_id = roots.get(register_name)?;
+    let definition = model
+        .types
+        .iter()
+        .find(|definition| &definition.id == type_id)?;
+    let (aggregate_kind, fields) = aggregate_fields(definition)?;
+    let mut matching = fields
+        .iter()
+        .filter(|field| field.offset_bytes == offset_bytes && eight_byte_field(field));
+    let field = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(HighCfgFieldView {
+        type_id: type_id.clone(),
+        type_name: definition.name.clone(),
+        aggregate_kind,
+        field: field.name.clone(),
+        base: HighExpr::Variable {
+            name: local(register_name).ok()?,
+        },
+        offset_bytes,
+    })
+}
+
+fn field_view_address(view: &HighCfgFieldView) -> HighExpr {
+    if view.offset_bytes == 0 {
+        view.base.clone()
+    } else {
+        HighExpr::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(view.base.clone()),
+            right: Box::new(HighExpr::Constant {
+                value: view.offset_bytes,
+            }),
+        }
+    }
+}
+
 fn normalized_memory_load(
     semantic: &ExpressionInstruction,
     register_name: &str,
-) -> Result<(HighExpr, Vec<StateComponentVersion>), String> {
+    roots: &BTreeMap<String, String>,
+    model: &AnalysisModel,
+) -> Result<
+    (
+        HighExpr,
+        Vec<StateComponentVersion>,
+        Option<HighCfgFieldView>,
+    ),
+    String,
+> {
     let component = format!("register:{register_name}");
     let mut assignments = semantic
         .assignments
@@ -270,19 +401,26 @@ fn normalized_memory_load(
             width_bits: 64,
             byte_order: MemoryByteOrder::Little,
             memory_inputs,
-        } => Ok((address_expression(address)?, memory_inputs.clone())),
+        } => Ok((
+            address_expression(address)?,
+            memory_inputs.clone(),
+            field_view_from_address(address, roots, model),
+        )),
         _ => Err("typed CFG requires a normalized 64-bit memory load".to_owned()),
     }
 }
 
 fn normalized_memory_store(
     semantic: &ExpressionInstruction,
+    roots: &BTreeMap<String, String>,
+    model: &AnalysisModel,
 ) -> Result<
     (
         HighExpr,
         HighExpr,
         Vec<StateComponentVersion>,
         Vec<StateComponentVersion>,
+        Option<HighCfgFieldView>,
     ),
     String,
 > {
@@ -301,6 +439,7 @@ fn normalized_memory_store(
         scalar_expression(&write.value)?,
         write.memory_inputs.clone(),
         write.memory_outputs.clone(),
+        field_view_from_address(&write.address, roots, model),
     ))
 }
 
@@ -635,6 +774,8 @@ fn push_assignment(
 fn lower_instruction(
     instruction: &MachineInstruction,
     semantic: &ExpressionInstruction,
+    field_roots: &BTreeMap<String, String>,
+    model: &AnalysisModel,
     flag_source: &mut Option<FlagSource>,
     snapshot_flags: bool,
     statements: &mut Vec<HighCfgStatement>,
@@ -673,13 +814,15 @@ fn lower_instruction(
         {
             let target = register(destination)?;
             let register_name = target.strip_prefix("hydir_").unwrap();
-            let (address, memory_inputs) = normalized_memory_load(semantic, register_name)?;
+            let (address, memory_inputs, field_view) =
+                normalized_memory_load(semantic, register_name, field_roots, model)?;
             statements.push(HighCfgStatement::Load {
                 target,
                 address,
                 width_bits: 64,
                 byte_order: MemoryByteOrder::Little,
                 memory_inputs,
+                field_view,
                 site,
             });
             None
@@ -688,8 +831,8 @@ fn lower_instruction(
             if instruction.effects.control == MachineControlEffect::Next
                 && instruction.effects.memory == MachineMemoryEffect::Write =>
         {
-            let (address, value, memory_inputs, memory_outputs) =
-                normalized_memory_store(semantic)?;
+            let (address, value, memory_inputs, memory_outputs, field_view) =
+                normalized_memory_store(semantic, field_roots, model)?;
             statements.push(HighCfgStatement::Store {
                 address,
                 value,
@@ -697,6 +840,7 @@ fn lower_instruction(
                 byte_order: MemoryByteOrder::Little,
                 memory_inputs,
                 memory_outputs,
+                field_view,
                 site,
             });
             None
@@ -861,11 +1005,11 @@ fn lower_high_level_cfg_cir_from_expression(
         return Err("typed CFG requires a SysV AMD64 prototype".to_owned());
     }
     let parameters = parameters(model_row, function)?;
-    if parameters
-        .iter()
-        .any(|parameter| parameter.ty != u64_type())
-    {
-        return Err("typed CFG currently requires uint64_t parameters".to_owned());
+    if parameters.iter().any(|parameter| {
+        parameter.ty != u64_type()
+            && !matches!(&parameter.ty, TypeRef::Pointer { to } if matches!(to.as_ref(), TypeRef::Named { .. }))
+    }) {
+        return Err("typed CFG requires uint64_t or pointer-to-named parameters".to_owned());
     }
     let return_type = model_row
         .and_then(|row| row.prototype.as_ref())
@@ -886,6 +1030,7 @@ fn lower_high_level_cfg_cir_from_expression(
         });
     let flag_input = flag_inputs(machine)?;
     let flag_snapshots = flag_snapshot_sites(machine)?;
+    let field_roots = stable_field_roots(&parameters, expression);
     let mut blocks = Vec::with_capacity(machine.blocks.len());
     for (block, expression_block) in machine.blocks.iter().zip(&expression.blocks) {
         if block.address != expression_block.address
@@ -910,6 +1055,8 @@ fn lower_high_level_cfg_cir_from_expression(
             terminator = lower_instruction(
                 instruction,
                 semantic,
+                &field_roots,
+                model,
                 &mut flag_source,
                 flag_snapshots.contains(&instruction.address),
                 &mut statements,
@@ -1026,6 +1173,18 @@ fn valid_memory_versions(versions: &[StateComponentVersion]) -> bool {
         && versions.iter().collect::<BTreeSet<_>>().len() == versions.len()
 }
 
+fn validate_field_view(view: &HighCfgFieldView, address: &HighExpr) -> Result<(), String> {
+    if view.type_id.is_empty()
+        || !valid_ident(&view.type_name)
+        || !valid_ident(&view.field)
+        || !matches!(&view.base, HighExpr::Variable { name } if valid_local(name))
+        || field_view_address(view) != *address
+    {
+        return Err("typed CFG field annotation differs from its address".to_owned());
+    }
+    Ok(())
+}
+
 pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
     if ir.schema_version != HIGH_LEVEL_CFG_CIR_VERSION
         || ir.binary_sha256.len() != 64
@@ -1049,7 +1208,8 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
     let mut initial = BTreeSet::new();
     let mut parameter_names = BTreeSet::new();
     for parameter in &ir.parameters {
-        if parameter.ty != u64_type()
+        if (parameter.ty != u64_type()
+            && !matches!(&parameter.ty, TypeRef::Pointer { to } if matches!(to.as_ref(), TypeRef::Named { .. })))
             || !valid_ident(&parameter.name)
             || valid_local(&parameter.name)
             || !parameter_names.insert(parameter.name.clone())
@@ -1090,6 +1250,7 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
                     address,
                     width_bits,
                     memory_inputs,
+                    field_view,
                     ..
                 } => {
                     if !valid_local(target)
@@ -1099,6 +1260,9 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
                         return Err("typed CFG has an invalid memory load".to_owned());
                     }
                     scalar_reads(address, &mut BTreeSet::new(), 0)?;
+                    if let Some(view) = field_view {
+                        validate_field_view(view, address)?;
+                    }
                 }
                 HighCfgStatement::Store {
                     address,
@@ -1106,6 +1270,7 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
                     width_bits,
                     memory_inputs,
                     memory_outputs,
+                    field_view,
                     ..
                 } => {
                     if *width_bits != 64
@@ -1124,6 +1289,9 @@ pub fn validate_high_level_cfg_cir(ir: &HighLevelCfgCir) -> Result<(), String> {
                     }
                     scalar_reads(address, &mut BTreeSet::new(), 0)?;
                     scalar_reads(value, &mut BTreeSet::new(), 0)?;
+                    if let Some(view) = field_view {
+                        validate_field_view(view, address)?;
+                    }
                 }
             }
         }
@@ -1299,16 +1467,47 @@ fn c_expr(expr: &HighExpr) -> String {
     }
 }
 
+fn c_memory_address(address: &HighExpr, field_view: &Option<HighCfgFieldView>) -> String {
+    let Some(view) = field_view else {
+        return c_expr(address);
+    };
+    let kind = match view.aggregate_kind {
+        HighCfgAggregateKind::Struct => "struct",
+        HighCfgAggregateKind::Union => "union",
+    };
+    format!(
+        "({} + (uint64_t)offsetof({kind} {}, {}))",
+        c_expr(&view.base),
+        view.type_name,
+        view.field
+    )
+}
+
 fn c_statement(statement: &HighCfgStatement) -> String {
     match statement {
         HighCfgStatement::Assign { target, value, .. } => {
             format!("{target} = {};", c_expr(value))
         }
         HighCfgStatement::Load {
-            target, address, ..
-        } => format!("{target} = hydir_load_u64({});", c_expr(address)),
-        HighCfgStatement::Store { address, value, .. } => {
-            format!("hydir_store_u64({}, {});", c_expr(address), c_expr(value))
+            target,
+            address,
+            field_view,
+            ..
+        } => format!(
+            "{target} = hydir_load_u64({});",
+            c_memory_address(address, field_view)
+        ),
+        HighCfgStatement::Store {
+            address,
+            value,
+            field_view,
+            ..
+        } => {
+            format!(
+                "hydir_store_u64({}, {});",
+                c_memory_address(address, field_view),
+                c_expr(value)
+            )
         }
     }
 }
@@ -1361,6 +1560,79 @@ fn c_label(address: Location) -> String {
     format!("hydir_bb_{}_{:x}", address.address_space, address.value.0)
 }
 
+fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<(), String> {
+    let model_row = model.functions.iter().find(|row| row.entry == ir.entry);
+    let written = ir
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            HighCfgStatement::Assign { target, .. } | HighCfgStatement::Load { target, .. } => {
+                Some(target.as_str())
+            }
+            HighCfgStatement::Store { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for block in &ir.blocks {
+        for statement in &block.statements {
+            let view = match statement {
+                HighCfgStatement::Load { field_view, .. }
+                | HighCfgStatement::Store { field_view, .. } => field_view.as_ref(),
+                HighCfgStatement::Assign { .. } => None,
+            };
+            let Some(view) = view else { continue };
+            let definition = model
+                .types
+                .iter()
+                .find(|definition| {
+                    definition.id == view.type_id && definition.name == view.type_name
+                })
+                .ok_or("typed CFG field annotation has no matching model type")?;
+            let (kind, fields) = aggregate_fields(definition)
+                .ok_or("typed CFG field annotation refers to a non-aggregate")?;
+            if kind != view.aggregate_kind
+                || fields
+                    .iter()
+                    .filter(|field| {
+                        field.name == view.field
+                            && field.offset_bytes == view.offset_bytes
+                            && eight_byte_field(field)
+                    })
+                    .count()
+                    != 1
+            {
+                return Err("typed CFG field annotation differs from model layout".to_owned());
+            }
+            let HighExpr::Variable { name: base } = &view.base else {
+                return Err("typed CFG field base is not an invariant parameter".to_owned());
+            };
+            if written.contains(base.as_str()) {
+                return Err("typed CFG modeled field base is modified".to_owned());
+            }
+            let (index, parameter) = ir
+                .parameters
+                .iter()
+                .enumerate()
+                .find(|(_, parameter)| local(&parameter.location).ok().as_ref() == Some(base))
+                .ok_or("typed CFG modeled field base is not a parameter")?;
+            if !matches!(&parameter.ty, TypeRef::Pointer { to } if matches!(to.as_ref(), TypeRef::Named { id } if id == &view.type_id))
+            {
+                return Err("typed CFG modeled field base has a different pointer type".to_owned());
+            }
+            let row = model_row.ok_or("typed CFG modeled field has no function model")?;
+            let modeled_type = row
+                .prototype
+                .as_ref()
+                .and_then(|prototype| prototype.parameters.get(index).map(|item| &item.ty))
+                .or_else(|| row.inferred_parameters.get(&parameter.location));
+            if modeled_type != Some(&parameter.ty) {
+                return Err("typed CFG field parameter differs from current model".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Emit strict C11 for the bounded CFG. Gotos preserve loops and joins
 /// exactly; a later structuring pass may replace them when it can prove shape.
 pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<String, String> {
@@ -1369,25 +1641,45 @@ pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<S
     if ir.binary_sha256 != model.binary_sha256 || ir.model_revision != model.revision {
         return Err("typed CFG model identity/revision differs".to_owned());
     }
+    validate_model_field_views(ir, model)?;
     let body = structure::emit_body(ir);
-    let mut output = String::from("#include <stdint.h>\n\n");
+    let mut output = String::from("#include <stdint.h>\n#include <stddef.h>\n\n");
+    let mut used_types = BTreeSet::new();
+    for parameter in &ir.parameters {
+        collect_used_types(&parameter.ty, model, &mut used_types, 0)?;
+    }
+    if !used_types.is_empty() {
+        output.push_str(&emit_model_type_declarations(model, &used_types)?);
+    }
     if ir.blocks.iter().any(|block| {
-        block.statements.iter().any(|statement| {
-            matches!(
-                statement,
-                HighCfgStatement::Load { .. } | HighCfgStatement::Store { .. }
-            )
-        })
+        block
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, HighCfgStatement::Load { .. }))
     }) {
         output.push_str(
-            r#"#ifndef HYDIR_MEMORY_HELPERS_V1
-#define HYDIR_MEMORY_HELPERS_V1
+            r#"#ifndef HYDIR_LOAD_U64_V1
+#define HYDIR_LOAD_U64_V1
 static inline uint64_t hydir_load_u64(uint64_t address) {
   const unsigned char *bytes = (const unsigned char *)(uintptr_t)address;
   uint64_t value = UINT64_C(0);
   for (unsigned i = 0; i < 8; ++i) value |= ((uint64_t)bytes[i]) << (i * 8u);
   return value;
 }
+#endif
+
+"#,
+        );
+    }
+    if ir.blocks.iter().any(|block| {
+        block
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, HighCfgStatement::Store { .. }))
+    }) {
+        output.push_str(
+            r#"#ifndef HYDIR_STORE_U64_V1
+#define HYDIR_STORE_U64_V1
 static inline void hydir_store_u64(uint64_t address, uint64_t value) {
   unsigned char *bytes = (unsigned char *)(uintptr_t)address;
   for (unsigned i = 0; i < 8; ++i) bytes[i] = (unsigned char)(value >> (i * 8u));
@@ -1405,7 +1697,7 @@ static inline void hydir_store_u64(uint64_t address, uint64_t value) {
         if index != 0 {
             output.push_str(", ");
         }
-        output.push_str(&format!("uint64_t {}", parameter.name));
+        output.push_str(&c_decl(&parameter.ty, &parameter.name, model)?);
     }
     output.push_str(") {\n");
     let mut used = BTreeSet::new();
@@ -1448,12 +1740,16 @@ static inline void hydir_store_u64(uint64_t address, uint64_t value) {
             .parameters
             .iter()
             .find(|parameter| local(&parameter.location).ok().as_ref() == Some(name));
-        output.push_str(&format!(
-            "  uint64_t {name} = {};\n",
-            initializer
-                .map(|parameter| parameter.name.as_str())
-                .unwrap_or("UINT64_C(0)")
-        ));
+        let initializer = initializer
+            .map(|parameter| {
+                if parameter.ty == u64_type() {
+                    parameter.name.clone()
+                } else {
+                    format!("(uint64_t)(uintptr_t){}", parameter.name)
+                }
+            })
+            .unwrap_or_else(|| "UINT64_C(0)".to_owned());
+        output.push_str(&format!("  uint64_t {name} = {initializer};\n"));
         if !reads.contains(name) {
             output.push_str(&format!("  (void){name};\n"));
         }

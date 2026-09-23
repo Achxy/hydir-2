@@ -17,9 +17,9 @@ mod emit;
 pub use emit::emit_typed_c;
 mod cfg;
 pub use cfg::{
-    HIGH_LEVEL_CFG_CIR_VERSION, HighCfgBlock, HighCfgCompareOp, HighCfgPredicate, HighCfgStatement,
-    HighCfgTerminator, HighLevelCfgCir, emit_typed_cfg_c, lower_high_level_cfg_cir,
-    validate_high_level_cfg_cir,
+    HIGH_LEVEL_CFG_CIR_VERSION, HighCfgAggregateKind, HighCfgBlock, HighCfgCompareOp,
+    HighCfgFieldView, HighCfgPredicate, HighCfgStatement, HighCfgTerminator, HighLevelCfgCir,
+    emit_typed_cfg_c, lower_high_level_cfg_cir, validate_high_level_cfg_cir,
 };
 
 pub const HIGH_LEVEL_CIR_VERSION: u32 = 1;

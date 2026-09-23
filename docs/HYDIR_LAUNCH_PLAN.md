@@ -26,15 +26,36 @@ Reasons for a user to choose Hydir should be visible in ordinary use:
 
 These are product differentiation hypotheses. GUI symbolic execution, SSA, snapshots, taint analysis, structure recovery, and trace navigation already have substantial prior art, including [Ponce](https://github.com/illera88/Ponce).
 
+### Competitive contract
+
+| Reference | Established strength | Hydir's launch test |
+| --- | --- | --- |
+| [Ghidra](https://github.com/NationalSecurityAgency/ghidra/blob/master/GhidraDocs/languages/html/pcoderef.html) | Broad disassembly/decompilation built on explicit instruction semantics | Recover the declared ELF subset accurately, then move from a failed check to its input bytes and a verified repair in one project |
+| [angr and angr-management](https://docs.angr.io/en/latest/) | Symbolic execution, configurable exploration, decompilation, and a graphical analysis environment | Make a CTF solve reproducible from capture to native replay with visible constraints, unresolved effects, and a usable guided interface |
+| [rev.ng](https://docs.rev.ng/user-manual/key-concepts/artifacts-and-analyses/) | Validated editable model and function-granular cached artifacts | Connect each type edit to C, xrefs, slices, and observed execution while proving selective invalidation |
+| [Miasm](https://github.com/cea-sec/miasm) | Scriptable IR, emulation, symbolic execution, and expression simplification | Give a repeatable analyst workflow with inspectable intermediate artifacts and a checked result |
+
+This table defines experiments, not claims that Hydir already exceeds these tools. Compare the same binary, goal, hardware, budgets, and analyst guidance; count preparation time and failed runs.
+
+### Critical path to the first public demo
+
+1. **Make the existing spine trustworthy:** finish M0 integration and the bounded M1 expression/semantics gates. Preserve low-level output whenever a typed view is unsupported.
+2. **Make the binary understandable:** finish M2 typed flow, aggregate recovery, and model editing, then M3 targeted discovery and artifact invalidation. Demo a type edit changing C and xrefs without reprocessing unrelated functions.
+3. **Make a result verifiable:** implement M4 capture and fresh replay, then M5 goal solving and M6 input-to-condition slices. Demo a failing input, a generated candidate, and a native-confirmed success from the same project.
+4. **Explain the virtualized check:** complete the bounded M7 guest graph and checked simplification on the first-party VM fixture. Show unexplored edges and assumptions alongside the recovered logic.
+5. **Ship and measure:** complete M8 navigation, recipes, packaging, installation, external trials, and fair comparisons. Publish failures and unsupported cases with the successful demo.
+
+The first public demo requires all five steps. An earlier typed-C or solver preview can be shown with its narrower verified scope.
+
 ## 2. Current baseline
 
 | Area | Verified status | Remaining work |
 | --- | --- | --- |
 | Main checkout | `main` at `bec9a88`; native ELF discovery, artifact pipeline, low-level/structured C, desktop explorer, bounded Triton bridge, and existing patch/interchange paths | Merge the verified launch branch when the stage is reviewable |
-| Launch branch | `codex/hydir-launch` integrates the six typed/model/VM commits; it also fixes Triton solver-status handling, exposes capability status, and starts `ExpressionIR v1` | Finish M0 GUI/package gates and build M1 semantics |
+| Launch branch | `codex/hydir-launch` integrates the typed/model/VM foundation, fixes Triton solver-status handling, exposes capability status, and implements the first bounded `ExpressionIR v1` and typed CFG consumers | Finish M0 GUI/package gates and extend M1 semantics |
 | Analysis model | Digest-bound JSON, bounded DWARF import, named types/prototypes, evidence, local analyst edits and revision checks | Stronger propagation, stable variable identities, remote edits, better editing UX |
 | Aggregate recovery | Offset/width constraints, bounded cross-function propagation, recursive pointer evidence, explicit conflicts | Derived pointers, stronger array evidence, interactive roots, broader fixtures |
-| Typed C and expression layer | `HighLevelCIR v1` handles linear supported 64-bit operations, frame spills, fields, and fixed direct calls. `HighLevelCfgCir v3` adds a separate bounded 64-bit subset for direct branches, joins, loops, and normalized MOV memory reads/writes; its renderer structures private diamonds and simple pre-test loops, retaining gotos elsewhere. Scalar writes, live zero-flag snapshots, and memory addresses/effects lower from `ExpressionIR v1`. Each CFG memory action retains alias-region versions and emits a bytewise little-endian C11 helper. ExpressionIR preserves SSA joins, source bytes, and residual effects | Finish general flag/control translation, source-level typed fields/arrays across joins, calls, full widths, indirect control flow, and selective caching for v3 |
+| Typed C and expression layer | `HighLevelCIR v1` handles linear supported 64-bit operations, frame spills, fields, and fixed direct calls. `HighLevelCfgCir v3` adds a separate bounded 64-bit subset for direct branches, joins, loops, and normalized MOV memory reads/writes; its renderer structures private diamonds and simple pre-test loops, retaining gotos elsewhere. Scalar writes, live zero-flag snapshots, and memory addresses/effects lower from `ExpressionIR v1`. CFG memory actions retain alias-region versions, emit bytewise little-endian C11 helpers, and can carry model-backed fixed 64-bit field names for invariant pointer parameters. ExpressionIR preserves SSA joins, source bytes, and residual effects | Finish general flag/control translation, derived fields and arrays, calls, full widths, indirect control flow, and selective caching for v3 |
 | Low-level C | Existing structured flow and goto fallbacks | Preserve availability throughout typed-C work |
 | Cache/API/SDK | Local selective typed cache; model/HLC/typed-C read artifacts | General artifact dependency tracking, remote writes/cache, execution artifacts |
 | Triton integration | Bounded function-level symbolic bridge with two symbolic argument registers; solver timeout/unknown no longer reports UNSAT | Captured process state, input models, environment summaries, goal solving, native replay |
@@ -354,4 +375,4 @@ After launch gates pass, expand in this order:
 4. Extend the checked region-patching path with explicit ABI, memory, exit, and environmental contracts; preserve original binaries and scoped verification artifacts.
 5. Add deeper hypothesis comparison, reusable analysis extensions, additional architectures/formats, and collaboration when demand and correctness coverage justify them.
 
-**Next implementation action:** translate general ExpressionIR flag predicates through joins, render model-backed fields and arrays in CFG memory operations, then add bounded call effects and the remaining supported widths while preserving every unsupported effect. **First new execution payoff:** capture an input boundary, explain a failed condition, and replay a working input against the original binary.
+**Next implementation action:** translate general ExpressionIR flag predicates through joins, extend the new fixed-field CFG annotations to derived pointers and proven arrays, then add bounded call effects and the remaining supported widths while preserving every unsupported effect. **First new execution payoff:** capture an input boundary, explain a failed condition, and replay a working input against the original binary.
