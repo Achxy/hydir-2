@@ -522,7 +522,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 (Some(candidate), Some(replay), Some(original))
                     if replay.status == hydir_execution::ReplayStatus::GoalMatched
                         && original.status == hydir_execution::ReplayStatus::GoalMismatched
-                        && !bridge["input_condition_slice"].is_null() =>
+                        && !bridge["input_condition_slice"].is_null()
+                        && investigation::candidate_links_failed_trace(&plan, &bridge) =>
                 {
                     Some(investigation::build_recipe(
                         &bytes, &spec, &snapshot, &probe, &plan, &bridge, candidate, original,
@@ -2642,7 +2643,7 @@ int main(int argc, char **argv) {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_validation_cases, validate_input_condition_slice};
+    use super::{investigation, read_validation_cases, validate_input_condition_slice};
     use sha2::Digest;
 
     #[test]
@@ -2729,5 +2730,13 @@ mod tests {
         slice["code_sha256"] = serde_json::json!(format!("{:x}", sha2::Sha256::digest([0xc3])));
         slice["ast_walk_complete"] = serde_json::json!(false);
         assert!(validate_input_condition_slice(&plan, &slice).is_err());
+
+        let mut bridge = serde_json::json!({
+            "candidate_hex": "41",
+            "input_condition_slice": {"relevant_origin_offsets": [0]}
+        });
+        assert!(investigation::candidate_links_failed_trace(&plan, &bridge));
+        bridge["input_condition_slice"]["relevant_origin_offsets"] = serde_json::json!([]);
+        assert!(!investigation::candidate_links_failed_trace(&plan, &bridge));
     }
 }
