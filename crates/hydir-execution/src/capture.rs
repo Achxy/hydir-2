@@ -538,7 +538,10 @@ impl MiSession {
                         if line == b"\n" || line == b"\r\n" {
                             continue;
                         }
-                        let result = parse_mi_line(&line);
+                        let result = parse_mi_line(&line).map_err(|error| {
+                            let prefix = crate::encode_hex(&line[..line.len().min(64)]);
+                            format!("{error}: line_prefix_hex={prefix}")
+                        });
                         let failed = result.is_err();
                         if sender.send(result).is_err() || failed {
                             break;
