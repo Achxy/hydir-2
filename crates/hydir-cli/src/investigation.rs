@@ -27,6 +27,32 @@ fn dependency(kind: &str, sha256: String) -> ClaimDependency {
     }
 }
 
+pub(super) fn candidate_links_failed_trace(plan: &SnapshotResumePlan, bridge: &Value) -> bool {
+    let Some(candidate_hex) = bridge["candidate_hex"].as_str() else {
+        return false;
+    };
+    let Ok(seed) = decode_hex(&plan.seed_hex, 32) else {
+        return false;
+    };
+    let Ok(candidate) = decode_hex(candidate_hex, 32) else {
+        return false;
+    };
+    let Some(offsets) = bridge["input_condition_slice"]["relevant_origin_offsets"].as_array()
+    else {
+        return false;
+    };
+    offsets.iter().any(|offset| {
+        offset
+            .as_u64()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .is_some_and(|offset| {
+                seed.get(offset)
+                    .zip(candidate.get(offset))
+                    .is_some_and(|(before, after)| before != after)
+            })
+    })
+}
+
 fn build_claim(
     original: &InputSpec,
     plan: &SnapshotResumePlan,
@@ -77,7 +103,7 @@ fn build_claim(
         .map(|value| value.as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()
         .ok_or("recipe slice has an invalid uncertainty entry")?;
-    let changed_bytes = seed
+    let changed_bytes: Vec<ChangedOriginByte> = seed
         .iter()
         .zip(&bytes)
         .enumerate()
@@ -89,6 +115,14 @@ fn build_claim(
             after: *after,
         })
         .collect();
+    if changed_bytes.is_empty()
+        || relevant_origin_offsets.is_empty()
+        || !changed_bytes
+            .iter()
+            .any(|change| relevant_origin_offsets.contains(&change.origin_offset))
+    {
+        return Err("candidate changes no input byte linked to the failed trace".into());
+    }
     let original_input_sha256 = input_sha256(original)?;
     let candidate_input_sha256 = input_sha256(candidate)?;
     let plan_sha256 = digest_json(plan)?;
