@@ -11,7 +11,7 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Install native tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv bubblewrap gdb
       - name: Install Triton binary-analysis bindings
         run: |
           python3 -m venv .venv
