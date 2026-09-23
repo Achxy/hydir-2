@@ -2258,6 +2258,16 @@ fn validate_input_condition_slice(
         || unresolved[2] != "symbolic_memory_address_dependencies_not_analyzed"
         || unresolved.iter().any(|item| item.as_str().is_none())
         || (complete && unresolved.len() != 3)
+        || (!complete && unresolved.len() == 3)
+        || unresolved[3..].iter().enumerate().any(|(index, item)| {
+            let expected = if index == 0 {
+                "slice_ast_or_decision_budget_exhausted"
+            } else {
+                "unmapped_symbolic_variable"
+            };
+            item != expected
+                && !(index == 0 && unresolved.len() == 4 && item == "unmapped_symbolic_variable")
+        })
     {
         return Err("Triton slice uncertainty statement is invalid".into());
     }
@@ -2580,6 +2590,9 @@ mod tests {
         assert!(validate_input_condition_slice(&plan, &slice).is_err());
         slice["decisions"][0]["origin_offsets"] = serde_json::json!([0]);
         slice["code_sha256"] = serde_json::json!("4".repeat(64));
+        assert!(validate_input_condition_slice(&plan, &slice).is_err());
+        slice["code_sha256"] = serde_json::json!(format!("{:x}", sha2::Sha256::digest([0xc3])));
+        slice["ast_walk_complete"] = serde_json::json!(false);
         assert!(validate_input_condition_slice(&plan, &slice).is_err());
     }
 }
