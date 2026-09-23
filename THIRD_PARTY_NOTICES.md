@@ -41,7 +41,7 @@ upstream checkout; none of those implementation files is bundled here.
 The C11 emitter and restricted C-like patch parser/encoder in this checkout
 are first-party code. They were not copied or translated from IRENE-3,
 Rellic, or the separate older HydIR checkout. Their upstream-inspired scope
-is recorded in `PROVENANCE.md` and the patching contract.
+is described in the patching contract.
 
 The development Python SDK uses `grpcio` 1.84.0 (Apache-2.0), `protobuf`
 7.36.1 (BSD-3-Clause), and `typing-extensions` 4.16.0 (PSF-2.0), with
