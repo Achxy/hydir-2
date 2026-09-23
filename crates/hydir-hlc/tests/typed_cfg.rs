@@ -110,7 +110,7 @@ fn scalar_cfg_branches_and_loops_compile_and_match_oracles() {
 }
 
 #[test]
-fn scalar_cfg_rejects_unmodeled_flags_memory_and_callee_saved_writes() {
+fn scalar_cfg_rejects_memory_and_callee_saved_writes() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
     let temp = tempfile::tempdir().unwrap();
@@ -129,16 +129,88 @@ fn scalar_cfg_rejects_unmodeled_flags_memory_and_callee_saved_writes() {
     );
     let bytes = fs::read(&object).unwrap();
     let model = init_model(&bytes).unwrap();
-    for symbol in [
-        "hydir_cfg_add_flags",
-        "hydir_cfg_memory",
-        "hydir_cfg_callee_saved",
-    ] {
+    for symbol in ["hydir_cfg_memory", "hydir_cfg_callee_saved"] {
         let native = decompile_symbol(&bytes, symbol).unwrap();
         assert!(
             lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).is_err(),
             "{symbol} was admitted"
         );
+    }
+}
+
+#[test]
+fn arithmetic_zero_flags_compile_and_match_boundary_oracles() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let mut source = String::from("#include <stdint.h>\n");
+    for (symbol, renamed) in [
+        ("hydir_cfg_add_flags", "generated_add"),
+        ("hydir_cfg_add_snapshot", "generated_snapshot"),
+        ("hydir_cfg_sub_flags", "generated_sub"),
+        ("hydir_cfg_and_flags", "generated_and"),
+        ("hydir_cfg_xor_flags", "generated_xor"),
+    ] {
+        let native = decompile_symbol(&bytes, symbol).unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+            .unwrap_or_else(|error| panic!("{symbol}: {error}"));
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        if symbol == "hydir_cfg_add_snapshot" {
+            assert!(c.contains("hydir_flag_left"));
+        }
+        source.push_str(&format!(
+            "#define {symbol} {renamed}\n{c}\n#undef {symbol}\n"
+        ));
+    }
+    source.push_str("int main(void) {\n");
+    source.push_str(
+        "  uint64_t edge[] = {0, 1, 2, UINT64_C(0x7fffffffffffffff), UINT64_C(0x8000000000000000), UINT64_MAX};\n"
+    );
+    source.push_str("  for (unsigned i = 0; i < 6; ++i) for (unsigned j = 0; j < 6; ++j) {\n");
+    source.push_str(
+        "    uint64_t a = edge[i], b = edge[j], sum = a + b, diff = a - b, bits = a & b;\n",
+    );
+    source.push_str("    if (generated_add(a,b) != (sum == 0 ? 1 : sum)) return 1;\n");
+    source.push_str("    if (generated_snapshot(a,b) != (sum == 0 ? 1 : 2)) return 2;\n");
+    source.push_str("    if (generated_sub(a,b) != (diff == 0 ? 11 : diff)) return 3;\n");
+    source.push_str("    if (generated_and(a,b) != (bits == 0 ? 13 : bits)) return 4;\n");
+    source.push_str("    if (generated_xor() != 17) return 5;\n");
+    source.push_str("  }\n  return 0;\n}\n");
+    let path = temp.path().join("arithmetic_flags.c");
+    fs::write(&path, source).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let exe = temp.path().join(format!("arithmetic_flags_{compiler}.exe"));
+        let result = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(Command::new(exe).status().unwrap().success());
     }
 }
 

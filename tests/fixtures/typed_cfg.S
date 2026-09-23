@@ -38,6 +38,56 @@ hydir_cfg_add_flags:
     retq
 .size hydir_cfg_add_flags, .-hydir_cfg_add_flags
 
+.globl hydir_cfg_add_snapshot
+.type hydir_cfg_add_snapshot,@function
+hydir_cfg_add_snapshot:
+    movq %rdi, %rax
+    addq %rsi, %rax
+    movq $99, %rax
+    jnz .Ladd_snapshot_nonzero
+    movq $1, %rax
+    retq
+.Ladd_snapshot_nonzero:
+    movq $2, %rax
+    retq
+.size hydir_cfg_add_snapshot, .-hydir_cfg_add_snapshot
+
+.globl hydir_cfg_sub_flags
+.type hydir_cfg_sub_flags,@function
+hydir_cfg_sub_flags:
+    movq %rdi, %rax
+    subq %rsi, %rax
+    jz .Lsub_zero
+    retq
+.Lsub_zero:
+    movq $11, %rax
+    retq
+.size hydir_cfg_sub_flags, .-hydir_cfg_sub_flags
+
+.globl hydir_cfg_and_flags
+.type hydir_cfg_and_flags,@function
+hydir_cfg_and_flags:
+    movq %rdi, %rax
+    andq %rsi, %rax
+    jnz .Land_nonzero
+    movq $13, %rax
+    retq
+.Land_nonzero:
+    retq
+.size hydir_cfg_and_flags, .-hydir_cfg_and_flags
+
+.globl hydir_cfg_xor_flags
+.type hydir_cfg_xor_flags,@function
+hydir_cfg_xor_flags:
+    xorq %rax, %rax
+    jz .Lxor_zero
+    movq $0, %rax
+    retq
+.Lxor_zero:
+    movq $17, %rax
+    retq
+.size hydir_cfg_xor_flags, .-hydir_cfg_xor_flags
+
 .globl hydir_cfg_memory
 .type hydir_cfg_memory,@function
 hydir_cfg_memory:

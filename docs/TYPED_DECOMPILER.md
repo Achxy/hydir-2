@@ -61,7 +61,8 @@ and direct-call fixtures emit typed C at both `-O0` and `-O2`. It carries
 instruction-address provenance and produces a C11 typed view with checked
 field offsets. `HighLevelCfgCir v2` covers a separate exact, memory-free
 64-bit scalar subset with direct branches, joins, and loops. It snapshots
-comparison operands at the flag-setting instruction. The C11 renderer folds
+live comparison operands and arithmetic results from normalized ExpressionIR
+zero-flag assignments. The C11 renderer folds
 single-entry chains, private diamonds, and simple pre-test loops into readable
 statements. Other control flow retains explicit gotos. A flag snapshot is
 inlined into a condition only when that branch is its sole reader. The typed
@@ -74,10 +75,13 @@ functions. Typed C is marked semantically conservative and never rewrite
 ready; the source-level view does not model all machine fault and environment
 behavior.
 
-The CFG lowerer now consumes freshly computed `ExpressionIR v1` assignments
-for supported scalar register writes, including the `xor reg, reg` zeroing
-idiom. Branch flag snapshots remain a bounded MachineIR lowering until flag
-expressions and joins are translated through the shared layer.
+The CFG lowerer consumes freshly computed `ExpressionIR v1` assignments for
+supported scalar register writes, including the `xor reg, reg` zeroing idiom.
+It also checks normalized zero-flag assignments and branch conditions, so
+`jz`/`jnz` after supported 64-bit arithmetic can be rendered and tested.
+Dead flag snapshots are omitted. Signed, carry, and compound branch conditions
+still use the bounded compare/test interpretation; general flag SSA translation
+through joins remains future work.
 
 The v3 API and Python SDK expose `analysis_model`, `high_level_cir`,
 `high_level_cfg_cir`, and `typed_c` read artifacts. Each artifact uses the same bounded automatic model
