@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import traceback
 from pathlib import Path
 
 
@@ -125,4 +126,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        detail = traceback.format_exc()[-4000:]
+        annotation = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=Native replay smoke::{annotation}", flush=True)
+        raise
