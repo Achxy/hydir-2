@@ -2182,6 +2182,7 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-execution",
  "hydir-hlc",
  "hydir-interchange",
  "hydir-ir",
@@ -2221,6 +2222,18 @@ dependencies = [
  "hydir-loader",
  "hydir-semantics",
  "iced-x86",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "hydir-execution"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "object",
  "serde",
  "serde_json",
  "sha2 0.10.9",
