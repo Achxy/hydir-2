@@ -142,3 +142,34 @@ class LocalGhidra:
         if not isinstance(data, dict) or data.get("binary_sha256") != digest:
             raise RuntimeError("Hydir trace belongs to another binary")
         return data
+
+    def trace_path(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        start: int | None = None,
+        max_operations: int = 4096,
+        max_visits: int = 1024,
+    ) -> dict[str, Any]:
+        """Follow one bounded concrete path through selected Ghidra instructions."""
+        if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("P-code start must be a 64-bit address")
+        if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
+            raise ValueError("P-code path budgets must be 0..262144")
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        args = [
+            "ghidra-snapshot", "trace-path", str(binary_path), str(snapshot_path), str(seed_path),
+            "--max-ops", str(max_operations), "--max-visits", str(max_visits),
+        ]
+        if start is not None:
+            args.extend(["--start", hex(start)])
+        data = json.loads(self._run(*args))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir trace belongs to another binary")
+        return data
