@@ -27,6 +27,9 @@ jobs:
         run: |
           cargo build --locked -p hydir-cli --bin hydirctl
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_bit_gate_native_test.py -q
+      - name: Direct-call PRISM native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_call_chain_native_test.py -q
       - name: Native execution of checked P-code rewrite fixture
         run: |
           clang -O0 -no-pie -DHYDIR_NO_START \

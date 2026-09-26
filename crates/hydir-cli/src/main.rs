@@ -39,6 +39,7 @@ use hydir_model::{
 };
 use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod ghidra_calls;
 mod local;
 mod passes;
 mod patch;
@@ -68,6 +69,7 @@ Usage:
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
+  hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
@@ -84,6 +86,7 @@ Usage:
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
@@ -366,6 +369,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 println!("{}", String::from_utf8(bytes)?);
             }
+        }
+        Some("ghidra") if args.len() >= 6 && args[1] == "trace-calls" => {
+            ghidra_calls::run_automatic(&args[2..])?;
+        }
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-calls" => {
+            ghidra_calls::run_snapshots(&args[2..])?;
         }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-path" => {
             let mut max_operations = 4096usize;

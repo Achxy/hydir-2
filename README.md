@@ -73,11 +73,15 @@ setup is required. The GUI starts the same analysis when you open the ELF.
 cargo run --locked -p hydir-cli -- ghidra analyze demo/hydir-prism.elf --output target/prism-ghidra.json --function 0x20137c
 cargo run --locked -p hydir-cli -- ghidra-snapshot verify demo/hydir-prism.elf target/prism-ghidra.json
 cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf target/prism-ghidra.json
+cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
 ```
 
 Replace the ELF path and function selector with your own. `discover` returns
 FunctionIndex IDs for entries without usable names. The GUI also opens an ELF
-through its local file control. [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
+through its local file control. The call trace uses a concrete seed and stops
+explicitly at unsupported or unresolved call boundaries. In the GUI, open
+`hydir_stage_call_chain` and use the Direct-call trace panel with the seed JSON.
+[Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.
 

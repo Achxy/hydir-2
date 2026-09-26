@@ -79,6 +79,22 @@ class LocalGhidraTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
 
+    def test_call_trace_uses_managed_worker_and_checks_binary(self):
+        seed = Path(self.directory.name) / "seed.json"
+        seed.write_text("{}", encoding="utf-8")
+        artifact = {"binary_sha256": self.digest, "schema_version": 1, "calls": []}
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
+            result = self.client.trace_calls(self.binary, seed, function=0x401000)
+        self.assertEqual(result["calls"], [])
+        self.assertEqual(run.call_args.args[:2], ("ghidra", "trace-calls"))
+        self.assertIn("--function", run.call_args.args)
+        self.assertIn("0x401000", run.call_args.args)
+        with self.assertRaises(ValueError):
+            self.client.trace_calls(self.binary, seed, function=0x401000, max_depth=17)
+        with patch.object(self.client, "_run", return_value=b'{"binary_sha256":"wrong"}'):
+            with self.assertRaises(RuntimeError):
+                self.client.trace_calls(self.binary, seed, function=0x401000)
+
     def test_slice_uses_bounded_source_artifact(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         artifact = {

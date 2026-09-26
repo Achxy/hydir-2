@@ -44,10 +44,10 @@ use hydir_hlc::{
 };
 use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
-    MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeBackwardSlice, PcodeCoverageReport, PcodeEffect,
-    PcodePathDestination, PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr,
-    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
-    parse_ghidra_snapshot, parse_pcode_seed,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeBackwardSlice,
+    PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace, PcodePathDestination,
+    PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr, PcodeSimplificationArtifact,
+    PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -151,6 +151,12 @@ enum Task {
         binary: PathBuf,
         binary_sha256: String,
         function: Option<String>,
+    },
+    TraceGhidraCalls {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: String,
+        seed_json: String,
     },
     OpenRemote {
         endpoint: String,
@@ -256,6 +262,11 @@ enum Event {
     GhidraAnalyzed {
         binary_sha256: String,
         result: Result<(GhidraSnapshot, Option<String>), String>,
+    },
+    GhidraCallsTraced {
+        binary_sha256: String,
+        function: String,
+        result: Result<PcodeInterproceduralTrace, String>,
     },
     RemoteProjectCreated(String),
     Selected {
@@ -1859,6 +1870,65 @@ fn run_ghidra_cli(
     }
 }
 
+fn run_ghidra_call_trace(
+    binary: &Path,
+    binary_sha256: &str,
+    function: &str,
+    seed_json: &str,
+) -> Result<PcodeInterproceduralTrace, String> {
+    if seed_json.len() > MAX_PCODE_SEED_BYTES {
+        return Err("Ghidra call seed exceeds the JSON input limit".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let seed_path = scratch.path().join("seed.json");
+    let trace_path = scratch.path().join("calls.json");
+    fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let output = Command::new(hydirctl_path())
+        .args(["ghidra", "trace-calls"])
+        .arg(binary)
+        .arg(&seed_path)
+        .arg("--function")
+        .arg(function)
+        .arg("--max-functions")
+        .arg("8")
+        .arg("--output")
+        .arg(&trace_path)
+        .output()
+        .map_err(|error| format!("Could not start Ghidra call tracing: {error}"))?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Ghidra call tracing failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(detail)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+                .trim()
+        ));
+    }
+    let size = fs::metadata(&trace_path)
+        .map_err(|error| format!("Ghidra call tracing produced no artifact: {error}"))?
+        .len();
+    if size == 0 || size > 16 * 1024 * 1024 {
+        return Err("Ghidra call trace exceeds the GUI artifact limit".to_owned());
+    }
+    let trace: PcodeInterproceduralTrace =
+        serde_json::from_slice(&fs::read(&trace_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("Invalid Ghidra call trace: {error}"))?;
+    if trace.schema_version != 1
+        || trace.binary_sha256 != binary_sha256
+        || trace.root_entry.offset != function
+    {
+        return Err("Ghidra call trace differs from the opened binary or function".to_owned());
+    }
+    Ok(trace)
+}
+
 fn persist_ghidra_snapshot(
     database: &Path,
     binary: &Path,
@@ -2133,6 +2203,35 @@ fn ghidra_trace_lines(trace: &PcodePathTrace) -> Vec<(Option<u64>, String)> {
             ),
         })
         .collect()
+}
+
+fn ghidra_call_trace_lines(trace: &PcodeInterproceduralTrace) -> Vec<(Option<u64>, String)> {
+    let mut lines = Vec::new();
+    for (index, segment) in trace.segments.iter().enumerate() {
+        lines.push((
+            parse_ghidra_offset(&segment.function_entry.offset),
+            format!(
+                "Function {} · segment {}",
+                segment.function_entry.offset,
+                index + 1
+            ),
+        ));
+        lines.extend(ghidra_trace_lines(&segment.path));
+        if let Some(call) = trace
+            .calls
+            .iter()
+            .find(|call| segment.path.instruction_visits.last() == Some(&call.call_site))
+        {
+            lines.push((
+                parse_ghidra_offset(&call.call_site.offset),
+                format!(
+                    "CALL {} → {} · resume {}",
+                    call.call_site.offset, call.callee_entry.offset, call.return_address.offset
+                ),
+            ));
+        }
+    }
+    lines
 }
 
 fn pcode_display_lines(
@@ -2427,6 +2526,30 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     let result = run_ghidra_cli(&binary, &binary_sha256, function.as_deref());
                     let _ = completion.send(Event::GhidraAnalyzed {
                         binary_sha256,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::TraceGhidraCalls {
+                binary,
+                binary_sha256,
+                function,
+                seed_json,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_call_trace(
+                        &binary,
+                        &binary_sha256,
+                        &function,
+                        &seed_json,
+                    );
+                    let _ = completion.send(Event::GhidraCallsTraced {
+                        binary_sha256,
+                        function,
                         result,
                     });
                     repaint.request_repaint();
@@ -3270,6 +3393,9 @@ struct AnalystApp {
     ghidra_trace_start: String,
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
     ghidra_path_lines: Vec<(Option<u64>, String)>,
+    ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
+    ghidra_call_lines: Vec<(Option<u64>, String)>,
+    ghidra_call_busy: bool,
     ghidra_busy: bool,
     ghidra_runtime_status: Option<GhidraRuntimeStatus>,
     ghidra_cli_available: Option<bool>,
@@ -3407,6 +3533,9 @@ impl AnalystApp {
             ghidra_trace_start: String::new(),
             ghidra_path_trace: None,
             ghidra_path_lines: Vec::new(),
+            ghidra_call_trace: None,
+            ghidra_call_lines: Vec::new(),
+            ghidra_call_busy: false,
             ghidra_busy: false,
             ghidra_runtime_status: None,
             ghidra_cli_available: None,
@@ -3510,7 +3639,10 @@ impl AnalystApp {
             }
         }
         while let Ok(event) = self.events.try_recv() {
-            if !matches!(&event, Event::GhidraAnalyzed { .. }) {
+            if !matches!(
+                &event,
+                Event::GhidraAnalyzed { .. } | Event::GhidraCallsTraced { .. }
+            ) {
                 self.busy = false;
             }
             match event {
@@ -3604,6 +3736,8 @@ impl AnalystApp {
                     self.ghidra_trace_start.clear();
                     self.ghidra_path_trace = None;
                     self.ghidra_path_lines.clear();
+                    self.ghidra_call_trace = None;
+                    self.ghidra_call_lines.clear();
                     self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
@@ -3780,6 +3914,8 @@ impl AnalystApp {
                                 snapshot.selected_function.entry.offset.clone();
                             self.ghidra_path_trace = None;
                             self.ghidra_path_lines.clear();
+                            self.ghidra_call_trace = None;
+                            self.ghidra_call_lines.clear();
                             self.ghidra_snapshot = Some(snapshot);
                             self.failure = persistence_warning.clone();
                             if let Some(warning) = persistence_warning {
@@ -3795,6 +3931,36 @@ impl AnalystApp {
                     if let Some((binary, digest)) = self.pending_ghidra.take() {
                         self.enqueue_ghidra(binary, digest, None);
                     }
+                }
+                Event::GhidraCallsTraced {
+                    binary_sha256,
+                    function,
+                    result,
+                } => {
+                    self.ghidra_call_busy = false;
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.selected_function.entry.offset != function
+                        })
+                    {
+                        continue;
+                    }
+                    self.ghidra_call_lines = result
+                        .as_ref()
+                        .map(ghidra_call_trace_lines)
+                        .unwrap_or_default();
+                    self.status = match &result {
+                        Ok(trace) => format!(
+                            "Ghidra call trace: {} calls, {} instruction visits",
+                            trace.calls.len(),
+                            trace.instruction_visits
+                        ),
+                        Err(_) => "Ghidra call tracing failed".to_owned(),
+                    };
+                    self.ghidra_call_trace = Some(result);
                 }
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
@@ -6227,6 +6393,8 @@ impl AnalystApp {
                     .code_editor().desired_rows(8).desired_width(f32::INFINITY)).changed() {
                         self.ghidra_path_trace = None;
                         self.ghidra_path_lines.clear();
+                        self.ghidra_call_trace = None;
+                        self.ghidra_call_lines.clear();
                     }
                 if ui.button("Trace path").clicked() {
                     let result: Result<PcodePathTrace, String> = (|| {
@@ -6269,6 +6437,94 @@ impl AnalystApp {
                                         RichText::new(line).monospace().size(11.0)).clicked() {
                                             if linked.is_some() { self.selected_address = linked; }
                                         }
+                                }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("Direct-call trace")
+            .id_salt("ghidra_direct_call_trace")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Use the seed JSON above to follow direct calls through automatically analyzed functions. The trace stops at missing callees, indirect calls, unknown values, recursion, or a budget limit.")
+                    .size(11.0).color(MUTED));
+                let can_trace = !self.ghidra_busy
+                    && !self.ghidra_call_busy
+                    && self.current_local_path.is_some();
+                if ui.add_enabled(can_trace, egui::Button::new("Trace direct calls")).clicked() {
+                    let result = parse_pcode_seed(
+                        self.ghidra_trace_seed_json.as_bytes(), snapshot,
+                    );
+                    match result {
+                        Err(error) => {
+                            self.ghidra_call_trace = Some(Err(error));
+                            self.ghidra_call_lines.clear();
+                        }
+                        Ok(_) => {
+                            let task = Task::TraceGhidraCalls {
+                                binary: self.current_local_path.clone().expect("checked above"),
+                                binary_sha256: snapshot.binary_sha256.clone(),
+                                function: snapshot.selected_function.entry.offset.clone(),
+                                seed_json: self.ghidra_trace_seed_json.clone(),
+                            };
+                            match self.tasks.try_send(task) {
+                                Ok(()) => {
+                                    self.ghidra_call_busy = true;
+                                    self.ghidra_call_trace = None;
+                                    self.ghidra_call_lines.clear();
+                                    self.status = "Collecting Ghidra callees and tracing…".to_owned();
+                                }
+                                Err(_) => {
+                                    self.ghidra_call_trace = Some(Err(
+                                        "Analysis queue is full. Retry the call trace.".to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.ghidra_call_busy {
+                    ui.spinner();
+                    ui.label("Analyzing direct callees…");
+                }
+                match &self.ghidra_call_trace {
+                    Some(Ok(trace)) => {
+                        let stop = serde_json::to_value(&trace.stop).unwrap_or_default();
+                        let kind = stop.get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        ui.label(RichText::new(format!(
+                            "{} calls · {} function segments · {} visits · stop: {kind}",
+                            trace.calls.len(), trace.segments.len(), trace.instruction_visits
+                        )).size(11.0).color(ACCENT));
+                        if ui.button("Copy call trace JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(trace) {
+                                ui.ctx().copy_text(json);
+                            }
+                        for diagnostic in &trace.snapshot_diagnostics {
+                            ui.label(RichText::new(diagnostic).size(11.0).color(BAD));
+                        }
+                        egui::CollapsingHeader::new("Stop detail")
+                            .id_salt("ghidra_call_stop_detail")
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(stop.to_string()).monospace().size(11.0));
+                            });
+                        egui::ScrollArea::vertical().id_salt("ghidra_call_events")
+                            .max_height(220.0)
+                            .show_rows(ui, 18.0, self.ghidra_call_lines.len(), |ui, range| {
+                                for row in range {
+                                    let (address, line) = &self.ghidra_call_lines[row];
+                                    let linked = address.and_then(|value| address_map.as_ref()
+                                        .and_then(|map| map.to_linked_raw(value)));
+                                    if ui.selectable_label(
+                                        linked.is_some() && self.selected_address == linked,
+                                        RichText::new(line).monospace().size(11.0),
+                                    ).clicked() && linked.is_some() {
+                                        self.selected_address = linked;
+                                    }
                                 }
                             });
                     }

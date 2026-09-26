@@ -74,6 +74,33 @@ fn real_ghidra_rewrite_flows_into_cfg_llvm_with_provenance() {
 }
 
 #[test]
+fn real_prism_call_trace_uses_two_binary_bound_snapshots() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "trace-calls"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_calls_flow_v2.json"))
+        .arg(root.join("tests/fixtures/ghidra_prism_call_seed_v1.json"))
+        .arg("--callee")
+        .arg(root.join("tests/fixtures/ghidra_prism_leaf_add_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let trace: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(trace["schema_version"], 1);
+    assert_eq!(trace["stop"]["kind"], "return");
+    assert_eq!(trace["segments"].as_array().unwrap().len(), 3);
+    assert_eq!(trace["calls"][0]["callee_entry"]["offset"], "0x2013a2");
+    assert_eq!(trace["calls"][0]["return_address"]["offset"], "0x2013b2");
+    assert_eq!(trace["final_state"]["register_bytes"]["0"], 12);
+    assert_eq!(trace["snapshot_diagnostics"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn ghidra_function_index_imports_into_analysis_model() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = tempfile::tempdir().unwrap();

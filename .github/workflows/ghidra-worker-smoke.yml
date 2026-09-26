@@ -111,6 +111,25 @@ jobs:
           pathlib.Path(sys.argv[3]).write_text(transformed['llvm']['llvm_ir'])
           PY
           clang -x ir -c "$RUNNER_TEMP/ghidra-add-zero.ll" -o "$RUNNER_TEMP/ghidra-add-zero.o"
+      - name: Follow a direct call with automatic callee export
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra trace-calls \
+            demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json \
+            --function 0x2013a9 --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-call-trace.json"
+          python3 - "$RUNNER_TEMP/ghidra-call-trace.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          trace = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert trace['stop']['kind'] == 'return'
+          assert len(trace['segments']) == 3
+          assert len(trace['calls']) == 1
+          assert trace['calls'][0]['callee_entry']['offset'] == '0x2013a2'
+          assert trace['final_state']['register_bytes']['0'] == 12
+          assert trace['snapshot_diagnostics'] == []
+          PY
       - name: Run the automatic v3 RPC against the same container worker
         run: |
           cargo test --locked -p hydir-server --bin hydird \
@@ -126,3 +145,4 @@ jobs:
             ${{ runner.temp }}/ghidra-add-zero-snapshot.json
             ${{ runner.temp }}/ghidra-add-zero-rewrite.json
             ${{ runner.temp }}/ghidra-add-zero-llvm.json
+            ${{ runner.temp }}/ghidra-call-trace.json
