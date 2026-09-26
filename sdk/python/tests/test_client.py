@@ -321,6 +321,45 @@ class ClientBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual(len(requests), 1)
 
+    def test_v3_direct_call_trace_is_seed_and_revision_bound(self):
+        digest = "a" * 64
+        seed = json.dumps({
+            "schema_version": 1,
+            "binary_sha256": digest,
+            "entry": {"space": "ram", "offset": "0x2013a9"},
+            "registers": [], "memory": [],
+        }).encode()
+        trace = json.dumps({
+            "schema_version": 1, "binary_sha256": digest,
+            "root_entry": {"space": "ram", "offset": "0x2013a9"},
+            "segments": [], "calls": [],
+        }).encode()
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request, **kwargs):
+                self.assertIs(method, client._stub_v3.TraceGhidraCalls)
+                requests.append((request, kwargs))
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(trace).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-call-trace+json;version=1",
+                    content=trace, project_revision=4,
+                )
+            client._call = call
+            result = client.trace_ghidra_calls(
+                "project", 4, seed, function_entry=0x2013a9, max_functions=2,
+            )
+            self.assertEqual(result["root_entry"]["offset"], "0x2013a9")
+            self.assertEqual(requests[0][0].seed_json, seed)
+            self.assertEqual(requests[0][0].max_functions, 2)
+            self.assertEqual(requests[0][1]["timeout"], 180.0)
+            with self.assertRaises(ValueError):
+                client.trace_ghidra_calls("project", 4, seed, function_entry=0x2013a2)
+            with self.assertRaises(ValueError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9, max_functions=9,
+                )
+            self.assertEqual(len(requests), 1)
+
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):

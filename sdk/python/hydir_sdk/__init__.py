@@ -23,6 +23,7 @@ from .ghidra import LocalGhidra
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
+MAX_PCODE_SEED_BYTES = 1024 * 1024
 MAX_ANALYSIS_MODEL_BYTES = 16 * 1024 * 1024
 
 
@@ -111,8 +112,11 @@ class HydirClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _call(self, method, request):
-        return method(request, metadata=self._metadata, timeout=self._timeout)
+    def _call(self, method, request, *, timeout: float | None = None):
+        return method(
+            request, metadata=self._metadata,
+            timeout=self._timeout if timeout is None else timeout,
+        )
 
     def discover(self):
         reply = self._call(self._stub.Discover, proto.DiscoverRequest())
@@ -379,6 +383,98 @@ class HydirClient:
             input_index=input_index,
             automatic=True,
         )
+
+    def trace_ghidra_calls(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Trace a seeded direct-call path through the uploaded ELF."""
+        if isinstance(function_entry, bool):
+            raise ValueError("Function entry must be a 64-bit address")
+        if isinstance(function_entry, int):
+            entry = function_entry
+        elif isinstance(function_entry, str) and function_entry.startswith("0x"):
+            digits = function_entry[2:]
+            if not 1 <= len(digits) <= 16 or any(
+                character not in "0123456789abcdef" for character in digits
+            ):
+                raise ValueError("Function entry must be lowercase hexadecimal")
+            entry = int(digits, 16)
+        else:
+            raise ValueError("Function entry must be a 64-bit address")
+        if not 0 <= entry <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("Function entry must fit in 64 bits")
+        function_hex = f"0x{entry:x}"
+        if isinstance(seed, bytes):
+            content = seed
+        else:
+            path = Path(seed)
+            if path.stat().st_size > MAX_PCODE_SEED_BYTES:
+                raise ValueError("P-code call seed exceeds 1 MiB")
+            content = path.read_bytes()
+        if not 1 <= len(content) <= MAX_PCODE_SEED_BYTES:
+            raise ValueError("P-code call seed must be 1..=1 MiB")
+        try:
+            seed_json = json.loads(content)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError("P-code call seed is invalid JSON") from error
+        if (
+            not isinstance(seed_json, dict)
+            or seed_json.get("schema_version") != 1
+            or not isinstance(seed_json.get("entry"), dict)
+            or seed_json["entry"].get("offset") != function_hex
+            or not isinstance(seed_json.get("binary_sha256"), str)
+            or len(seed_json["binary_sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in seed_json["binary_sha256"])
+        ):
+            raise ValueError("P-code call seed version, entry, or digest is invalid")
+        limits = (
+            ("max_functions", max_functions, 1, 8),
+            ("max_operations", max_operations, 0, 65_536),
+            ("max_visits", max_visits, 0, 65_536),
+            ("max_depth", max_depth, 0, 16),
+        )
+        for name, value, minimum, maximum in limits:
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(f"{name} must be {minimum}..={maximum}")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        request = proto_v3.GhidraCallTraceRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            function_entry=function_hex,
+            seed_json=content,
+        )
+        for name, value, _, _ in limits:
+            if value is not None:
+                setattr(request, name, value)
+        reply = self._call(
+            self._stub_v3.TraceGhidraCalls, request,
+            timeout=max(self._timeout, 180.0) if timeout is None else timeout,
+        )
+        artifact = self._checked_json_artifact(
+            reply, revision=revision,
+            media_type="application/vnd.hydir.pcode-call-trace+json;version=1",
+            schema_version=1,
+        )
+        if (
+            artifact.get("binary_sha256") != seed_json["binary_sha256"]
+            or artifact.get("root_entry", {}).get("offset") != function_hex
+        ):
+            raise RuntimeError("Ghidra call trace differs from the requested binary or function")
+        return artifact
 
     def start_program_analysis(
         self, project_id: str, revision: int, *, idempotency_key: str | None = None,

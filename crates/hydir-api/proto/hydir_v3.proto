@@ -14,6 +14,7 @@ service HydirV3 {
   rpc GetAnalysisModel (AnalysisModelRequest) returns (ArtifactReply);
   rpc SaveAnalysisModel (SaveAnalysisModelRequest) returns (MutationReply);
   rpc AnalyzeGhidraSnapshot (GhidraSnapshotArtifactRequest) returns (ArtifactReply);
+  rpc TraceGhidraCalls (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
 
@@ -33,6 +34,7 @@ message DiscoverReply {
   bool ghidra_snapshot_analysis = 12;
   bool automatic_ghidra_analysis = 13;
   bool revisioned_analysis_model_edits = 14;
+  bool ghidra_call_tracing = 15;
 }
 
 // Returns the newest saved model for the current binary, or an inferred v1
@@ -128,6 +130,20 @@ message GhidraSnapshotArtifactRequest {
   optional uint32 input_index = 8;
   string selected_function_entry = 9;
   bool automatic = 10;
+}
+
+// Runs the managed Ghidra worker on the project's uploaded ELF, collects a
+// bounded set of direct callees, then executes one seeded path in isolated
+// Rust analysis. Omitted budgets use the documented server defaults.
+message GhidraCallTraceRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string function_entry = 3;
+  bytes seed_json = 4;
+  optional uint32 max_functions = 5;
+  optional uint32 max_operations = 6;
+  optional uint32 max_visits = 7;
+  optional uint32 max_depth = 8;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.

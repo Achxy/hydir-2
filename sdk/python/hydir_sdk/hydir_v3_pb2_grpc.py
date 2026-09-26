@@ -82,6 +82,11 @@ class HydirV3Stub:
                 request_serializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.SerializeToString,
                 response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.TraceGhidraCalls = channel.unary_unary(
+                '/hydir.v3.HydirV3/TraceGhidraCalls',
+                request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
         self.UpdateAnalystFact = channel.unary_unary(
                 '/hydir.v3.HydirV3/UpdateAnalystFact',
                 request_serializer=hydir__v3__pb2.AnalystFactRequest.SerializeToString,
@@ -149,6 +154,12 @@ class HydirV3Servicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def TraceGhidraCalls(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def UpdateAnalystFact(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -201,6 +212,11 @@ def add_HydirV3Servicer_to_server(servicer, server):
             'AnalyzeGhidraSnapshot': grpc.unary_unary_rpc_method_handler(
                     servicer.AnalyzeGhidraSnapshot,
                     request_deserializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'TraceGhidraCalls': grpc.unary_unary_rpc_method_handler(
+                    servicer.TraceGhidraCalls,
+                    request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
                     response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
             ),
             'UpdateAnalystFact': grpc.unary_unary_rpc_method_handler(
@@ -454,6 +470,33 @@ class HydirV3:
             target,
             '/hydir.v3.HydirV3/AnalyzeGhidraSnapshot',
             hydir__v3__pb2.GhidraSnapshotArtifactRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TraceGhidraCalls(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/TraceGhidraCalls',
+            hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
             hydir__v3__pb2.ArtifactReply.FromString,
             options,
             channel_credentials,

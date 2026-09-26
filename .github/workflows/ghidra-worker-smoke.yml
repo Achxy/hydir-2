@@ -134,6 +134,10 @@ jobs:
         run: |
           cargo test --locked -p hydir-server --bin hydird \
             automatic_ghidra_worker_exports_selected_real_elf -- --ignored
+      - name: Trace a direct call through the automatic v3 RPC
+        run: |
+          cargo test --locked -p hydir-server --bin hydird \
+            automatic_ghidra_call_trace_collects_real_prism_callee -- --ignored
       - name: Retain snapshot and Ghidra diagnostics
         if: always()
         uses: actions/upload-artifact@v4

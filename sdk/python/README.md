@@ -23,6 +23,10 @@ explicit stop reason; it does not claim whole-function equivalence.
 concrete interpreter against a binary-bound JSON seed and returns its trace.
 `trace_path(...)` follows a bounded path through selected instructions and
 returns source-linked branch events and its explicit stop reason.
+`LocalGhidra.trace_calls(binary, seed, function=...)` follows bounded direct
+calls and automatically collects callee snapshots. For an uploaded project,
+`HydirClient.trace_ghidra_calls(project_id, revision, seed, function_entry=...)`
+provides the same artifact through the authenticated v3 service.
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,
