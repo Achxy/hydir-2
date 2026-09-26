@@ -38,6 +38,19 @@ pub fn import_ghidra_functions(
         return Err("Ghidra selected function is outside the linked ELF RAM space".to_owned());
     }
     let spec = import_elf(bytes).map_err(|error| error.to_string())?;
+    let selected_address = u64::from_str_radix(
+        snapshot
+            .selected_function
+            .entry
+            .offset
+            .strip_prefix("0x")
+            .ok_or("Ghidra selected function offset lacks 0x prefix")?,
+        16,
+    )
+    .map_err(|_| "invalid selected function offset")?;
+    if !annotation_address_in_spec(&spec, Address(selected_address)) {
+        return Err("Ghidra selected function is outside the linked ELF image".to_owned());
+    }
     let mut candidate = model.clone();
     let mut added_functions = 0;
     let mut matched_functions = 0;
@@ -124,10 +137,7 @@ pub fn import_ghidra_functions(
         binary_sha256: candidate.binary_sha256.clone(),
         selected_function: Location {
             address_space: 0,
-            value: Address(
-                u64::from_str_radix(&snapshot.selected_function.entry.offset[2..], 16)
-                    .map_err(|_| "invalid selected function offset")?,
-            ),
+            value: Address(selected_address),
         },
         added_functions,
         matched_functions,

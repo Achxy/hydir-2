@@ -34,6 +34,7 @@ A versioned P-code coverage inventory now reports per-opcode counts and source-l
 The exporter and Rust snapshot validator now carry optional memory block and defined-symbol evidence within schema v2. The new real PRISM export contains 11 blocks and 24 symbols; older v2 snapshots remain readable. Range, size, order, space, and count checks reject malformed metadata. Prototypes, type facts, analyst changes, and complete project identity still require later contract work.
 
 The v3 service can now analyze a caller-supplied, digest-bound Ghidra snapshot for P-code, semantic, state, CFG, coverage, and bounded CFG LLVM artifacts through its isolated worker. The RPC checks project authorization and revision; it does not launch Ghidra or retain the raw snapshot as a project source. `hydirctl model import-ghidra` imports mapped function names as Ghidra evidence into AnalysisModel, preserves analyst names, and records disagreements. Prototype and type import remain open.
+The GUI applies the same conservative name import to its local model when it saves an automatically analyzed snapshot, leaving repeated imports at the current project revision.
 
 ## Architecture and artifact contract
 

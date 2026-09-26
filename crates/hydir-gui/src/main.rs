@@ -49,7 +49,10 @@ use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
     MachineOperation, StateFunctionIr,
 };
-use hydir_model::{AnalysisModel, TypeDefinitionKind, import_dwarf, infer_model, init_model};
+use hydir_model::{
+    AnalysisModel, TypeDefinitionKind, import_dwarf, import_ghidra_functions, infer_model,
+    init_model,
+};
 use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
     parse_patch_document,
@@ -1795,7 +1798,7 @@ fn run_ghidra_cli(
             persist_ghidra_snapshot(&database, binary, binary_sha256, &snapshot)
         })()
         .err()
-        .map(|error| format!("Ghidra snapshot is available but project save failed: {error}"));
+        .map(|error| format!("Ghidra snapshot is available but project update failed: {error}"));
         Ok((snapshot, persistence_warning))
     }
 }
@@ -1814,7 +1817,20 @@ fn persist_ghidra_snapshot(
     }
     let mut store = LocalProjectStore::open(database)?;
     let project = store.open_binary(binary, &spec)?;
-    store.save_ghidra_snapshot(&project, snapshot)
+    store.save_ghidra_snapshot(&project, snapshot)?;
+    let mut model = match store.load_model(&project)? {
+        Some(model) => model,
+        None => init_model(&original)?,
+    };
+    let previous = model.clone();
+    import_ghidra_functions(&original, &mut model, snapshot)?;
+    if model != previous {
+        let snapshot_json = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+        let digest = format!("{:x}", Sha256::digest(snapshot_json));
+        let key = format!("ghidra-{digest}-r{}", project.revision);
+        store.save_model(&project, &model, &key)?;
+    }
+    Ok(())
 }
 
 fn pcode_varnode(varnode: &PcodeVarnode) -> String {
@@ -10569,6 +10585,17 @@ mod tests {
                 .unwrap(),
             Some(snapshot.clone())
         );
+        let model = store.load_model(&project).unwrap().unwrap();
+        assert!(model.functions.iter().any(|function| {
+            function
+                .evidence
+                .iter()
+                .any(|evidence| evidence.source == hydir_model::ModelSource::GhidraAnalysis)
+        }));
+        let revision = project.revision;
+        persist_ghidra_snapshot(&database, &binary, &spec.binary_sha256, &snapshot).unwrap();
+        let reopened = store.open_binary(Path::new(&binary), &spec).unwrap();
+        assert_eq!(reopened.revision, revision);
         assert!(
             persist_ghidra_snapshot(&database, &binary, "wrong", &snapshot)
                 .unwrap_err()
