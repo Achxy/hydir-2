@@ -29,6 +29,7 @@ use hydir_execution::{
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
+use hydir_ir::pcode::{MAX_GHIDRA_SNAPSHOT_BYTES, parse_ghidra_snapshot};
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod local;
@@ -59,6 +60,8 @@ Usage:
   hydirctl triton <elf> <function-symbol>
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
+  hydirctl ghidra-snapshot verify <binary> <snapshot.json>
+  hydirctl ghidra-snapshot pcode <binary> <snapshot.json> [--output <pcode-ir.json>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
   hydirctl hydir-spec-region <hydir-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
@@ -194,6 +197,44 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("ghidra-snapshot")
+            if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
+                && matches!(args[1].as_str(), "verify" | "pcode") =>
+        {
+            if args[1] == "verify" && args.len() != 4 {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let ir = snapshot.pcode_function_ir()?;
+            if args[1] == "verify" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": snapshot.schema_version,
+                        "binary_sha256": snapshot.binary_sha256,
+                        "program": snapshot.program.name,
+                        "language_id": snapshot.program.language_id,
+                        "functions": snapshot.functions.len(),
+                        "selected_function": ir.entry,
+                        "instructions": ir.instructions.len(),
+                        "pcode_operations": ir.instructions.iter().map(|instruction| instruction.pcode.len()).sum::<usize>(),
+                        "semantic_fidelity": ir.semantic_fidelity,
+                    }))?
+                );
+            } else {
+                let output = serde_json::to_vec_pretty(&ir)?;
+                if args.len() == 6 {
+                    write_new_or_identical(&args[5], &output)?;
+                } else {
+                    println!("{}", String::from_utf8(output)?);
+                }
+            }
+        }
         Some("capture")
             if (args.len() == 5 || args.len() == 7 && args[5] == "--output")
                 && matches!(args[3].as_str(), "--function" | "--address") =>

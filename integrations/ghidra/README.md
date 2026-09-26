@@ -1,0 +1,58 @@
+# Ghidra snapshot exporter
+
+`HydIRSnapshot.java` runs as a Ghidra post-analysis script. It exports a program
+function index and one function's **raw instruction P-code** in Hydir snapshot
+schema v2. It does not lift, simplify, or type the P-code. Those steps belong to
+Hydir's Rust core. `HydIRExport.java` remains the separate v1 graph exporter.
+
+Example (PowerShell, with Ghidra 12.1.4 installed):
+
+```powershell
+$ghidra = 'C:\path\to\ghidra_12.1.4_PUBLIC'
+$binary = (Resolve-Path '.\demo\hydir-prism.elf').Path
+$scripts = (Resolve-Path '.\integrations\ghidra').Path
+$snapshot = Join-Path (Get-Location) 'snapshot.json'
+$projectDir = Join-Path $env:TEMP 'hydir-ghidra-projects'
+New-Item -ItemType Directory -Force -Path $projectDir | Out-Null
+& "$ghidra\support\analyzeHeadless.bat" $projectDir HydirSnapshotDemo `
+  -import $binary -scriptPath $scripts `
+  -postScript HydIRSnapshot.java $snapshot $binary `
+  -deleteProject
+```
+
+The third script argument is an optional `0x`-prefixed function entry offset.
+Without it, the exporter selects the first indexed function with a body. For a
+real caller, pass an entry from the function index so selection is explicit.
+
+Hydir validates the export against the same binary and emits a versioned
+PcodeFunctionIr artifact:
+
+```powershell
+cargo run -p hydir-cli -- ghidra-snapshot verify $binary $snapshot
+cargo run -p hydir-cli -- ghidra-snapshot pcode $binary $snapshot --output .\pcode-ir.json
+```
+
+This first integration runs Ghidra headlessly through the command above. Hydir's
+automatic container worker and P-code-to-state/LLVM lowering are subsequent
+gates; the PcodeFunctionIr artifact currently reports `semantic_fidelity:
+unknown` and `verification: not_run`.
+
+The JSON includes the SHA-256 of the supplied original binary and requires it
+to match Ghidra's recorded import hash. Addresses are objects
+with `space` and lowercase hexadecimal `offset`; P-code varnodes add a byte
+`size`. `sequence_index` is the zero-based array position for each instruction;
+`sequence_time` is Ghidra's sub-address, retained for relative P-code branches.
+`source_address` comes from the P-code sequence number. `bytes` reflects
+Ghidra's effective instruction length, while `parsed_bytes` records all bytes
+the instruction prototype parsed when a length override is present. P-code is
+from `Instruction.getPcode(true)`, including analyzed flow overrides, and is
+distinct from decompiler high P-code. The top-level
+`flow_overrides_applied: true` records this choice. `CALLOTHER` retains the language-defined
+name in `userop_name` when Ghidra can resolve its constant ID; other ops use
+`null`.
+
+The export fails on missing functions/instructions, mismatched input hashes,
+or any size cap: 65,536 functions, 256 address spaces, 16,384 selected
+instructions, 262,144 total P-code ops, 256 ops per instruction, 256 inputs per
+op, 32 bytes per instruction, or 16 MiB JSON. It does not write a truncated
+snapshot. The output file is replaced only after a complete snapshot is built.

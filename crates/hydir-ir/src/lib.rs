@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub mod expression;
+pub mod pcode;
 
 pub const FUNCTION_INDEX_VERSION: u32 = 1;
 pub const MACHINE_FUNCTION_IR_VERSION: u32 = 1;
