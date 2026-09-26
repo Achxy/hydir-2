@@ -2,6 +2,8 @@
 // Run after analysis with: -postScript HydIRSnapshot.java <output.json> <binary> [entry-hex]
 
 import ghidra.app.script.GhidraScript;
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
 import ghidra.framework.Application;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
@@ -22,7 +24,11 @@ import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.PcodeOpAST;
+import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.pcode.VarnodeAST;
 import ghidra.program.model.symbol.FlowType;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Symbol;
@@ -38,6 +44,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Iterator;
 
 public class HydIRSnapshot extends GhidraScript {
     // A snapshot is one function plus the program index. Exceeding a cap fails the
@@ -51,6 +58,9 @@ public class HydIRSnapshot extends GhidraScript {
     private static final int MAX_PROTOTYPE_TYPE_DEPTH = 4;
     private static final int MAX_INSTRUCTIONS = 16_384;
     private static final int MAX_PCODE_OPS = 262_144;
+    private static final int MAX_HIGH_PCODE_OPS = 16_384;
+    private static final int MAX_HIGH_JSON_CHARS = 4 * 1024 * 1024;
+    private static final int HIGH_DECOMPILE_TIMEOUT_SECONDS = 30;
     private static final int MAX_OPS_PER_INSTRUCTION = 256;
     private static final int MAX_INPUTS_PER_OP = 256;
     private static final int MAX_FLOW_TARGETS_PER_INSTRUCTION = 256;
@@ -343,6 +353,99 @@ public class HydIRSnapshot extends GhidraScript {
             json.raw(",\"auto_parameter\":" + parameter.isAutoParameter() + "}");
         }
         json.raw("]}");
+    }
+
+    // Decompiler P-code is analysis evidence: it may merge, remove, or create
+    // operations and must never replace the instruction P-code above.
+    private static void writeHighVarnode(Json json, Varnode node) {
+        if (!(node instanceof VarnodeAST)) {
+            throw new IllegalStateException("Decompiler returned a non-SSA varnode");
+        }
+        VarnodeAST ast = (VarnodeAST) node;
+        json.raw("{\"varnode\":").varnode(node);
+        json.raw(",\"ssa_id\":" + ast.getUniqueId());
+        json.raw(",\"is_input\":" + ast.isInput());
+        HighVariable high = ast.getHigh();
+        json.raw(",\"high_name\":");
+        if (high == null || high.getName() == null || high.getName().isEmpty()) {
+            json.raw("null");
+        } else {
+            json.quoted(prototypeText(high.getName(), "high variable name"));
+        }
+        json.raw(",\"high_type\":");
+        if (high == null || high.getDataType() == null) json.raw("null");
+        else writeDataType(json, high.getDataType());
+        json.raw("}");
+    }
+
+    private static String highPcodeStatus(String status, String detail) {
+        Json result = new Json();
+        result.raw("{\"source\":\"ghidra_decompiler\",\"simplification_style\":\"decompile\"");
+        result.raw(",\"status\":").quoted(status);
+        result.raw(",\"detail\":").quoted(detail);
+        result.raw(",\"operations\":[]}");
+        return result.value.toString();
+    }
+
+    private String writeHighPcode(Function function) throws Exception {
+        DecompInterface decompiler = new DecompInterface();
+        try {
+            decompiler.toggleCCode(false);
+            decompiler.setSimplificationStyle("decompile");
+            if (!decompiler.openProgram(currentProgram)) {
+                return highPcodeStatus("unavailable", "decompiler could not open program");
+            }
+            DecompileResults result = decompiler.decompileFunction(
+                function, HIGH_DECOMPILE_TIMEOUT_SECONDS, monitor);
+            monitor.checkCancelled();
+            if (!result.decompileCompleted() || result.getHighFunction() == null) {
+                return highPcodeStatus("unavailable", "decompilation did not complete");
+            }
+            HighFunction high = result.getHighFunction();
+            Json evidence = new Json();
+            evidence.raw("{\"source\":\"ghidra_decompiler\","
+                + "\"simplification_style\":\"decompile\",\"status\":\"complete\","
+                + "\"detail\":\"\",\"operations\":[");
+            Iterator<PcodeOpAST> ops = high.getPcodeOps();
+            int count = 0;
+            while (ops.hasNext()) {
+                monitor.checkCancelled();
+                if (count >= MAX_HIGH_PCODE_OPS) {
+                    return highPcodeStatus("omitted_limit", "high P-code operation limit exceeded");
+                }
+                PcodeOpAST op = ops.next();
+                if (op.getNumInputs() > MAX_INPUTS_PER_OP) {
+                    return highPcodeStatus("omitted_limit", "high P-code input limit exceeded");
+                }
+                if (count != 0) evidence.raw(",");
+                evidence.raw("{\"index\":" + count);
+                evidence.raw(",\"mnemonic\":").quoted(op.getMnemonic());
+                evidence.raw(",\"opcode\":" + op.getOpcode());
+                evidence.raw(",\"sequence_time\":" + op.getSeqnum().getTime());
+                evidence.raw(",\"source_address\":").address(op.getSeqnum().getTarget());
+                evidence.raw(",\"is_dead\":" + op.isDead());
+                evidence.raw(",\"output\":");
+                if (op.getOutput() == null) evidence.raw("null");
+                else writeHighVarnode(evidence, op.getOutput());
+                evidence.raw(",\"inputs\":[");
+                for (int input = 0; input < op.getNumInputs(); input++) {
+                    if (input != 0) evidence.raw(",");
+                    writeHighVarnode(evidence, op.getInput(input));
+                }
+                evidence.raw("]}");
+                count++;
+                if (evidence.value.length() > MAX_HIGH_JSON_CHARS) {
+                    return highPcodeStatus("omitted_limit", "high P-code JSON limit exceeded");
+                }
+            }
+            evidence.raw("]}");
+            return evidence.value.toString();
+        } catch (RuntimeException invalid) {
+            // A malformed decompiler hint must not prevent exporting raw semantics.
+            return highPcodeStatus("unavailable", "decompiler evidence could not be serialized");
+        } finally {
+            decompiler.dispose();
+        }
     }
 
     private Function selectFunction(List<Function> functions, String[] args) {
@@ -678,7 +781,12 @@ public class HydIRSnapshot extends GhidraScript {
             if (i != 0) json.raw(",");
             callTargets.get(i).write(json);
         }
-        json.raw("]}}\n");
+        json.raw("]");
+        String highEvidence = writeHighPcode(selected);
+        if (json.value.length() + highEvidence.length() + 19 <= MAX_JSON_CHARS) {
+            json.raw(",\"high_pcode\":").raw(highEvidence);
+        }
+        json.raw("}}\n");
         writeAtomically(output, json.bytes());
         println("HydIR snapshot written to " + output.toAbsolutePath()
             + " (" + instructionCount + " instructions, " + totalOps + " raw P-code ops, "

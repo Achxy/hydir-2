@@ -41,9 +41,9 @@ use hydir_hlc::{
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeBackwardSlice,
-    PcodeCoverageReport, PcodeEffect, PcodePathDestination, PcodePathEvent, PcodePathTrace,
-    PcodeSemanticFunctionIr, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
+    GhidraHighVarnodeEvidence, GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress,
+    PcodeBackwardSlice, PcodeCoverageReport, PcodeEffect, PcodePathDestination, PcodePathEvent,
+    PcodePathTrace, PcodeSemanticFunctionIr, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
     parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
@@ -1836,6 +1836,20 @@ fn persist_ghidra_snapshot(
 
 fn pcode_varnode(varnode: &PcodeVarnode) -> String {
     format!("{}:{}[{}]", varnode.space, varnode.offset, varnode.size)
+}
+
+fn high_pcode_varnode(node: &GhidraHighVarnodeEvidence) -> String {
+    let name = node
+        .high_name
+        .as_deref()
+        .filter(|name| !name.is_empty() && *name != "UNNAMED")
+        .unwrap_or("?");
+    let data_type = node
+        .high_type
+        .as_ref()
+        .map(|data_type| data_type.display_name.as_str())
+        .unwrap_or("?");
+    format!("{name}:{data_type}#{}", node.ssa_id)
 }
 
 fn ghidra_seed_template(snapshot: &GhidraSnapshot) -> String {
@@ -6287,6 +6301,67 @@ impl AnalystApp {
                             .color(MUTED),
                         );
                     }
+                });
+        }
+        if let Some(high) = &snapshot.selected_function.high_pcode {
+            egui::CollapsingHeader::new("Ghidra decompiler SSA and type hints")
+                .id_salt("ghidra_high_pcode_evidence")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{:?} · {} operations · analysis evidence; raw P-code drives Hydir's lift",
+                            high.status,
+                            high.operations.len()
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    if !high.detail.is_empty() {
+                        ui.label(RichText::new(&high.detail).size(11.0).color(MUTED));
+                    }
+                    egui::ScrollArea::both()
+                        .id_salt("ghidra_high_pcode")
+                        .max_height(220.0)
+                        .show_rows(ui, 18.0, high.operations.len(), |ui, range| {
+                            for row in range {
+                                let operation = &high.operations[row];
+                                let address = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(
+                                        &operation.source_address.space,
+                                        &operation.source_address.offset,
+                                    )
+                                });
+                                let output = operation
+                                    .output
+                                    .as_ref()
+                                    .map(high_pcode_varnode)
+                                    .unwrap_or_else(|| "_".to_owned());
+                                let inputs = operation
+                                    .inputs
+                                    .iter()
+                                    .map(high_pcode_varnode)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let label = format!(
+                                    "{} #{} {output} = {}({inputs}){}",
+                                    operation.source_address.offset,
+                                    operation.index,
+                                    operation.mnemonic,
+                                    if operation.is_dead { " [dead]" } else { "" }
+                                );
+                                if ui
+                                    .selectable_label(
+                                        address.is_some() && self.selected_address == address,
+                                        RichText::new(label).monospace().size(11.0),
+                                    )
+                                    .clicked()
+                                {
+                                    if address.is_some() {
+                                        self.selected_address = address;
+                                    }
+                                }
+                            }
+                        });
                 });
         }
         ui.separator();
@@ -10741,12 +10816,12 @@ mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
         NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
-        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, indexed_function_action,
-        ir_slice, local_region_artifacts, native_function_excerpt, native_instruction_count,
-        native_opaque_instruction_count, pcode_display_lines, pcode_line_target, pcode_state_lines,
-        persist_ghidra_snapshot, preview_patch_local, resized_console_height,
-        selected_ghidra_trace_address, valid_bearer_token, validate_endpoint,
-        workbench_graph_layout,
+        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
+        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
+        native_instruction_count, native_opaque_instruction_count, pcode_display_lines,
+        pcode_line_target, pcode_state_lines, persist_ghidra_snapshot, preview_patch_local,
+        resized_console_height, selected_ghidra_trace_address, valid_bearer_token,
+        validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -10768,7 +10843,7 @@ mod tests {
         let bytes = include_bytes!("../../../tests/fixtures/ghidra_prototype.elf");
         let spec = import_elf(bytes).unwrap();
         let snapshot = parse_ghidra_snapshot(
-            include_bytes!("../../../tests/fixtures/ghidra_prototype_dwarf_v2.json"),
+            include_bytes!("../../../tests/fixtures/ghidra_prototype_high_v2.json"),
             &spec.binary_sha256,
         )
         .unwrap();
@@ -10778,6 +10853,12 @@ mod tests {
         assert_eq!(map.to_linked("ram", "0x101320"), Some(0x1320));
         assert_eq!(map.to_linked("ram", "0x101323"), Some(0x1323));
         assert_eq!(map.to_ghidra(0x1323), Some(0x101323));
+        let high = snapshot.selected_function.high_pcode.as_ref().unwrap();
+        assert_eq!(high.operations.len(), 17);
+        assert_eq!(
+            high_pcode_varnode(high.operations[0].output.as_ref().unwrap()),
+            "?:bool#10"
+        );
         assert_eq!(
             selected_ghidra_trace_address(&snapshot, Some(&map), Some(0x1323)),
             Some(0x101323)

@@ -52,6 +52,7 @@ const MAX_PROTOTYPE_PARAMETERS: usize = 256;
 const MAX_PROTOTYPE_TYPE_DEPTH: usize = 4;
 const MAX_INSTRUCTIONS: usize = 16_384;
 const MAX_OPERATIONS: usize = 262_144;
+const MAX_HIGH_PCODE_OPERATIONS: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,6 +239,52 @@ pub struct GhidraCallTarget {
     pub computed: bool,
 }
 
+/// One decompiler SSA varnode. The identity, name, and type are Ghidra analysis
+/// evidence; none of them change the raw instruction P-code semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraHighVarnodeEvidence {
+    pub varnode: PcodeVarnode,
+    pub ssa_id: i32,
+    pub is_input: bool,
+    pub high_name: Option<String>,
+    pub high_type: Option<GhidraDataTypeEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraHighPcodeOperation {
+    pub index: u32,
+    pub mnemonic: String,
+    pub opcode: u32,
+    pub sequence_time: i32,
+    /// May point to a decompiler-generated operation, not a raw instruction.
+    pub source_address: PcodeAddress,
+    pub is_dead: bool,
+    pub output: Option<GhidraHighVarnodeEvidence>,
+    pub inputs: Vec<GhidraHighVarnodeEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhidraHighPcodeStatus {
+    Complete,
+    Unavailable,
+    OmittedLimit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraHighPcodeEvidence {
+    /// Always `ghidra_decompiler`, distinct from `ghidra_raw_pcode`.
+    pub source: String,
+    pub simplification_style: String,
+    pub status: GhidraHighPcodeStatus,
+    /// Empty only on a successful decompilation.
+    pub detail: String,
+    pub operations: Vec<GhidraHighPcodeOperation>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GhidraSelectedFunction {
@@ -249,6 +296,9 @@ pub struct GhidraSelectedFunction {
     /// Optional in v2; derived from Ghidra's analyzed call flows.
     #[serde(default)]
     pub call_targets: Vec<GhidraCallTarget>,
+    /// Optional in v2. Ghidra's decompiler SSA/type hints are evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_pcode: Option<GhidraHighPcodeEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,6 +450,68 @@ fn validate_varnode(varnode: &PcodeVarnode) -> Result<(), String> {
     hex_u64(&varnode.offset)?;
     if !(1..=4096).contains(&varnode.size) {
         return Err("P-code varnode size must be 1..=4096 bytes".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_high_varnode(
+    node: &GhidraHighVarnodeEvidence,
+    space_names: &BTreeSet<&str>,
+) -> Result<(), String> {
+    validate_varnode(&node.varnode)?;
+    if !space_names.contains(node.varnode.space.as_str()) {
+        return Err("high P-code varnode references an unknown address space".to_owned());
+    }
+    if let Some(name) = &node.high_name {
+        bounded_text(name, "high P-code variable name", 4096)?;
+    }
+    if let Some(data_type) = &node.high_type {
+        validate_ghidra_data_type(data_type, 0)?;
+    }
+    Ok(())
+}
+
+fn validate_high_pcode(
+    evidence: &GhidraHighPcodeEvidence,
+    space_names: &BTreeSet<&str>,
+) -> Result<(), String> {
+    if evidence.source != "ghidra_decompiler" || evidence.simplification_style != "decompile" {
+        return Err("high P-code must identify Ghidra decompiler analysis".to_owned());
+    }
+    match evidence.status {
+        GhidraHighPcodeStatus::Complete if !evidence.detail.is_empty() => {
+            return Err("complete high P-code cannot have a failure detail".to_owned());
+        }
+        GhidraHighPcodeStatus::Complete => {}
+        _ if !evidence.operations.is_empty() => {
+            return Err("incomplete high P-code cannot contain operations".to_owned());
+        }
+        _ => bounded_text(&evidence.detail, "high P-code failure detail", 4096)?,
+    }
+    if evidence.operations.len() > MAX_HIGH_PCODE_OPERATIONS {
+        return Err("high P-code exceeds operation limit".to_owned());
+    }
+    for (index, operation) in evidence.operations.iter().enumerate() {
+        if operation.index as usize != index {
+            return Err("high P-code operation indices must be contiguous".to_owned());
+        }
+        bounded_text(&operation.mnemonic, "high P-code mnemonic", 128)?;
+        if operation.opcode > 65_535 || operation.inputs.len() > 256 {
+            return Err("high P-code opcode or input count exceeds limit".to_owned());
+        }
+        if operation.sequence_time < 0 {
+            return Err("high P-code sequence time must be nonnegative".to_owned());
+        }
+        offset(&operation.source_address)?;
+        if !space_names.contains(operation.source_address.space.as_str()) {
+            return Err("high P-code source references an unknown address space".to_owned());
+        }
+        if let Some(output) = &operation.output {
+            validate_high_varnode(output, space_names)?;
+        }
+        for input in &operation.inputs {
+            validate_high_varnode(input, space_names)?;
+        }
     }
     Ok(())
 }
@@ -647,6 +759,9 @@ pub fn validate_ghidra_snapshot(
             }
         }
     }
+    if let Some(high_pcode) = &snapshot.selected_function.high_pcode {
+        validate_high_pcode(high_pcode, &space_names)?;
+    }
     if snapshot.selected_function.flow_edges.len() > MAX_OPERATIONS
         || snapshot.selected_function.call_targets.len() > MAX_OPERATIONS
     {
@@ -769,6 +884,73 @@ mod tests {
         assert_eq!(
             ir.semantic_fidelity,
             super::super::SemanticFidelity::Unknown
+        );
+    }
+
+    #[test]
+    fn optional_high_pcode_is_bounded_analysis_evidence_only() {
+        let mut value = fixture();
+        let raw = parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &"a".repeat(64))
+            .unwrap()
+            .pcode_function_ir()
+            .unwrap();
+        value["selected_function"]["high_pcode"] = json!({
+            "source": "ghidra_decompiler", "simplification_style": "decompile",
+            "status": "complete", "detail": "", "operations": [{
+                "index": 0, "mnemonic": "COPY", "opcode": 1, "sequence_time": 0,
+                "source_address": {"space": "ram", "offset": "0x401000"},
+                "is_dead": false,
+                "output": {"varnode": {"space": "ram", "offset": "0x401000", "size": 8},
+                    "ssa_id": 7, "is_input": false, "high_name": "result", "high_type": {
+                        "display_name": "uint64_t", "path": "/uint64_t", "size_bytes": 8,
+                        "kind": "primitive", "target_type": null, "element_count": null,
+                        "detail_truncated": false
+                    }},
+                "inputs": [{"varnode": {"space": "const", "offset": "0x1", "size": 8},
+                    "ssa_id": 8, "is_input": true, "high_name": null, "high_type": null}]
+            }]
+        });
+        let snapshot =
+            parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &"a".repeat(64)).unwrap();
+        assert_eq!(
+            snapshot
+                .selected_function
+                .high_pcode
+                .as_ref()
+                .unwrap()
+                .operations[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .high_name
+                .as_deref(),
+            Some("result")
+        );
+        assert_eq!(snapshot.pcode_function_ir().unwrap(), raw);
+
+        let mut wrong_source = value.clone();
+        wrong_source["selected_function"]["high_pcode"]["source"] = json!("ghidra_raw_pcode");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&wrong_source).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("decompiler analysis")
+        );
+
+        let mut wrong_space = value.clone();
+        wrong_space["selected_function"]["high_pcode"]["operations"][0]["inputs"][0]["varnode"]["space"] =
+            json!("missing");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&wrong_space).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("unknown address space")
+        );
+
+        let mut wrong_status = value;
+        wrong_status["selected_function"]["high_pcode"]["status"] = json!("omitted_limit");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&wrong_status).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("incomplete high P-code")
         );
     }
 
@@ -1087,6 +1269,34 @@ mod tests {
         assert_eq!(
             prototype.parameters[1].data_type.kind,
             GhidraDataTypeKind::Primitive
+        );
+    }
+
+    #[test]
+    fn real_ghidra_high_pcode_fixture_keeps_ssa_and_type_hints_separate() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prototype_high_v2.json"
+        ));
+        let digest = "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f";
+        let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
+        let high = snapshot.selected_function.high_pcode.as_ref().unwrap();
+        assert_eq!(high.source, "ghidra_decompiler");
+        assert_eq!(high.status, GhidraHighPcodeStatus::Complete);
+        assert_eq!(high.operations.len(), 17);
+        let first_output = high.operations[0].output.as_ref().unwrap();
+        assert_eq!(first_output.ssa_id, 10);
+        assert_eq!(
+            first_output.high_type.as_ref().unwrap().display_name,
+            "bool"
+        );
+        assert_eq!(high.operations[0].source_address.offset, "0x101320");
+        let raw = snapshot.pcode_function_ir().unwrap();
+        assert_eq!(raw.source, "ghidra_raw_pcode");
+        assert_eq!(raw.instructions[0].pcode.len(), 9);
+        assert_eq!(
+            raw.semantic_fidelity,
+            super::super::SemanticFidelity::Unknown
         );
     }
 

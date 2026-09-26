@@ -3,10 +3,13 @@
 `HydIRSnapshot.java` runs as a Ghidra post-analysis script. It exports a program
 function index, one function's **raw instruction P-code**, analyzed flow edges,
 call targets, memory blocks, defined symbols, and source-tagged function
-prototype evidence in Hydir snapshot schema v2.
+prototype evidence in Hydir snapshot schema v2. An optional decompiler section
+records bounded high P-code operations, SSA identities, variable names and type
+hints with source addresses and a completion status. Hydir treats this section
+as Ghidra analysis evidence; raw instruction P-code remains the semantic input.
 These additional sections are optional so earlier v2 snapshots remain
-readable. It does not lift, simplify,
-or type the P-code. Those steps belong to
+readable. The exporter does not lift, simplify, or type raw instruction P-code;
+those steps belong to
 Hydir's Rust core. `HydIRExport.java` remains the separate v1 graph exporter.
 
 Hydir normally launches headless Ghidra for the user. The default path builds
