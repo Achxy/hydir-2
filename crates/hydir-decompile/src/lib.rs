@@ -7,6 +7,8 @@
 
 mod expression;
 pub use expression::lower_expression_ir;
+mod pcode_llvm;
+pub use pcode_llvm::emit_pcode_exact_operation_llvm;
 
 use hydir_analysis::recover_pointer_table_targets;
 use hydir_backend::{

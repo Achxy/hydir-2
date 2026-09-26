@@ -32,6 +32,7 @@ use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{MAX_GHIDRA_SNAPSHOT_BYTES, parse_ghidra_snapshot};
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod ghidra_worker;
 mod local;
 mod passes;
 mod patch;
@@ -60,8 +61,11 @@ Usage:
   hydirctl triton <elf> <function-symbol>
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
+  hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
   hydirctl ghidra-snapshot pcode <binary> <snapshot.json> [--output <pcode-ir.json>]
+  hydirctl ghidra-snapshot semantics <binary> <snapshot.json> [--output <semantic-ir.json>]
+  hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
   hydirctl hydir-spec-region <hydir-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
@@ -198,8 +202,67 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("ghidra-snapshot")
+            if (args.len() == 8 || args.len() == 10 && args[8] == "--output")
+                && args[1] == "llvm-op"
+                && args[4] == "--instruction"
+                && args[6] == "--op" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let requested_address = parse_u64_auto(&args[5], "P-code instruction address")?;
+            let operation_index = args[7].parse::<usize>()?;
+            let semantic = snapshot.pcode_function_ir()?.lower_semantics();
+            let mut matches = semantic.instructions.iter().filter(|instruction| {
+                parse_u64_auto(&instruction.address.offset, "P-code instruction address").ok()
+                    == Some(requested_address)
+            });
+            let instruction = matches
+                .next()
+                .ok_or("P-code instruction address is absent from snapshot")?;
+            if matches.next().is_some() {
+                return Err("P-code instruction address is ambiguous across address spaces".into());
+            }
+            let operation = instruction
+                .operations
+                .get(operation_index)
+                .ok_or("P-code operation index is absent from instruction")?;
+            let llvm = hydir_decompile::emit_pcode_exact_operation_llvm(operation)?;
+            if args.len() == 10 {
+                write_new_or_identical(&args[9], llvm.as_bytes())?;
+            } else {
+                print!("{llvm}");
+            }
+        }
+        Some("ghidra")
+            if (args.len() == 5 || args.len() == 7 && args[5] == "--function")
+                && args[1] == "analyze"
+                && args[3] == "--output" =>
+        {
+            let selected = if args.len() == 7 {
+                Some(parse_u64_auto(&args[6], "Ghidra function entry")?)
+            } else {
+                None
+            };
+            let snapshot =
+                ghidra_worker::analyze(Path::new(&args[2]), selected, Path::new(&args[4]))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "snapshot_path": args[4],
+                    "binary_sha256": snapshot.binary_sha256,
+                    "functions": snapshot.functions.len(),
+                    "selected_function": snapshot.selected_function.entry,
+                    "instructions": snapshot.selected_function.instructions.len(),
+                }))?
+            );
+        }
+        Some("ghidra-snapshot")
             if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
-                && matches!(args[1].as_str(), "verify" | "pcode") =>
+                && matches!(args[1].as_str(), "verify" | "pcode" | "semantics") =>
         {
             if args[1] == "verify" && args.len() != 4 {
                 return Err(HELP.into());
@@ -227,7 +290,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }))?
                 );
             } else {
-                let output = serde_json::to_vec_pretty(&ir)?;
+                let output = if args[1] == "semantics" {
+                    serde_json::to_vec_pretty(&ir.lower_semantics())?
+                } else {
+                    serde_json::to_vec_pretty(&ir)?
+                };
                 if args.len() == 6 {
                     write_new_or_identical(&args[5], &output)?;
                 } else {

@@ -5,7 +5,20 @@ function index and one function's **raw instruction P-code** in Hydir snapshot
 schema v2. It does not lift, simplify, or type the P-code. Those steps belong to
 Hydir's Rust core. `HydIRExport.java` remains the separate v1 graph exporter.
 
-Example (PowerShell, with Ghidra 12.1.4 installed):
+Hydir normally launches headless Ghidra for the user. The default path builds
+and runs the pinned `Dockerfile.worker` image, including Ghidra 12.1.4 and JDK
+21. On a development machine, set `HYDIR_GHIDRA_HOME` to an unpacked Ghidra
+12.1.4 directory instead. The container path has not been run on the current
+Windows development host because Docker is unavailable there.
+
+```powershell
+$env:HYDIR_GHIDRA_HOME = 'C:\path\to\ghidra_12.1.4_PUBLIC' # optional local override
+cargo run -p hydir-cli -- ghidra analyze .\demo\hydir-prism.elf --output .\snapshot.json
+cargo run -p hydir-cli -- ghidra-snapshot verify .\demo\hydir-prism.elf .\snapshot.json
+cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\snapshot.json --output .\semantic-ir.json
+```
+
+For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
 
 ```powershell
 $ghidra = 'C:\path\to\ghidra_12.1.4_PUBLIC'
@@ -32,10 +45,13 @@ cargo run -p hydir-cli -- ghidra-snapshot verify $binary $snapshot
 cargo run -p hydir-cli -- ghidra-snapshot pcode $binary $snapshot --output .\pcode-ir.json
 ```
 
-This first integration runs Ghidra headlessly through the command above. Hydir's
-automatic container worker and P-code-to-state/LLVM lowering are subsequent
-gates; the PcodeFunctionIr artifact currently reports `semantic_fidelity:
-unknown` and `verification: not_run`.
+Hydir's semantic artifact classifies a bounded integer/bitwise P-code subset
+as exact operations and retains other operations as explicit opaque effects.
+`ghidra-snapshot llvm-op` emits LLVM for one selected exact operation. These
+artifacts are inspectable building blocks; they do not yet represent a complete
+function lift or establish whole-function equivalence. The raw
+PcodeFunctionIr artifact reports `semantic_fidelity: unknown` and
+`verification: not_run`.
 
 The JSON includes the SHA-256 of the supplied original binary and requires it
 to match Ghidra's recorded import hash. Addresses are objects

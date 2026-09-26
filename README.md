@@ -27,10 +27,12 @@ core. The checked-in [`hydir_max2` walkthrough](https://hydir.wiki/articles/max2
 shows the path on a 16-byte function.
 
 The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
-GUI the entry point for automatic, containerized Ghidra analysis of a binary.
-Hydir will ingest the resulting P-code and project facts. That automatic bridge
-is planned, not implemented; today's Ghidra integration exports and views
-function/CFG/call-graph facts and provides a thin remote client.
+GUI the entry point for automatic Ghidra analysis. Opening a local ELF now starts
+a headless worker and imports a bounded raw P-code snapshot into Hydir. The
+default worker provisions a pinned container image; developers can set
+`HYDIR_GHIDRA_HOME` to use a local Ghidra 12.1.4 installation. Hydir also exposes
+Rust semantic classification and LLVM for a narrow exact operation subset.
+Whole-function P-code lifting and persistent Ghidra projects remain in progress.
 
 ## Quick start
 

@@ -6,6 +6,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub mod semantics;
+pub use semantics::{
+    PCODE_SEMANTIC_IR_VERSION, PcodeEffect, PcodeExactOp, PcodeOpaqueClass,
+    PcodeSemanticDiagnostic, PcodeSemanticFunctionIr, PcodeSemanticInstruction,
+    PcodeSemanticOperation,
+};
+
 pub const GHIDRA_SNAPSHOT_VERSION: u32 = 2;
 pub const PCODE_IR_VERSION: u32 = 1;
 pub const MAX_GHIDRA_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;

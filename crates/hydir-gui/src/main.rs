@@ -39,6 +39,10 @@ use hydir_hlc::{
     HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
+use hydir_ir::pcode::{
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeEffect, PcodeSemanticFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot,
+};
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
     MachineOperation, StateFunctionIr,
@@ -89,6 +93,11 @@ enum Task {
     Open(PathBuf),
     OpenRecipe(PathBuf),
     OpenGhidraGraph(PathBuf),
+    AnalyzeGhidra {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: Option<String>,
+    },
     OpenRemote {
         endpoint: String,
         token_file: PathBuf,
@@ -190,6 +199,10 @@ enum Event {
     },
     RecipeLoaded(Result<AnalysisRecipe, String>),
     GhidraGraphLoaded(Result<GhidraGraph, String>),
+    GhidraAnalyzed {
+        binary_sha256: String,
+        result: Result<GhidraSnapshot, String>,
+    },
     RemoteProjectCreated(String),
     Selected {
         symbol: String,
@@ -1685,6 +1698,166 @@ fn hydirctl_path() -> PathBuf {
     })
 }
 
+fn ghidra_snapshot_path(binary_sha256: &str, function: Option<&str>) -> Result<PathBuf, String> {
+    if binary_sha256.len() != 64
+        || !binary_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Invalid opened binary digest for Ghidra cache".to_owned());
+    }
+    let key = match function {
+        Some(entry) => {
+            let digits = entry
+                .strip_prefix("0x")
+                .ok_or("Ghidra function entry must be a hex address".to_owned())?;
+            let address = u64::from_str_radix(digits, 16)
+                .map_err(|_| "Invalid Ghidra function entry".to_owned())?;
+            format!("entry-{address:016x}")
+        }
+        None => "default".to_owned(),
+    };
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .ok_or("Cannot determine the Windows user cache directory".to_owned())?;
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Caches"))
+        .ok_or("Cannot determine the macOS user cache directory".to_owned())?;
+    #[cfg(target_os = "linux")]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .ok_or("Cannot determine the Linux user cache directory".to_owned())?;
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let base = std::env::temp_dir();
+    let output_dir = base.join("HydIR").join("ghidra").join(binary_sha256);
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("Could not prepare Ghidra cache directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not protect Ghidra cache directory: {error}"))?;
+    }
+    Ok(output_dir.join(format!("{key}.json")))
+}
+
+fn run_ghidra_cli(
+    binary: &Path,
+    binary_sha256: &str,
+    function: Option<&str>,
+) -> Result<GhidraSnapshot, String> {
+    let snapshot_path = ghidra_snapshot_path(binary_sha256, function)?;
+    {
+        let mut command = Command::new(hydirctl_path());
+        command
+            .args(["ghidra", "analyze"])
+            .arg(binary)
+            .arg("--output")
+            .arg(&snapshot_path);
+        if let Some(function) = function {
+            command.arg("--function").arg(function);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("Could not start automatic Ghidra analysis: {error}"))?;
+        if !output.status.success() {
+            let detail = if output.stderr.is_empty() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            let detail = String::from_utf8_lossy(detail);
+            return Err(format!(
+                "Ghidra analysis failed ({}): {}",
+                output.status,
+                detail.chars().take(4096).collect::<String>().trim()
+            ));
+        }
+        let size = fs::metadata(&snapshot_path)
+            .map_err(|error| format!("Ghidra did not produce a snapshot: {error}"))?
+            .len();
+        if size == 0 || size > MAX_GHIDRA_SNAPSHOT_BYTES as u64 {
+            return Err("Ghidra snapshot is empty or exceeds the GUI import limit".to_owned());
+        }
+        let bytes = fs::read(&snapshot_path)
+            .map_err(|error| format!("Could not read Ghidra snapshot: {error}"))?;
+        parse_ghidra_snapshot(&bytes, binary_sha256)
+    }
+}
+
+fn pcode_varnode(varnode: &PcodeVarnode) -> String {
+    format!("{}:{}[{}]", varnode.space, varnode.offset, varnode.size)
+}
+
+fn pcode_display_lines(
+    snapshot: &GhidraSnapshot,
+    semantics: Option<&PcodeSemanticFunctionIr>,
+) -> Vec<(Option<u64>, String)> {
+    let mut lines = Vec::new();
+    for (instruction_index, instruction) in
+        snapshot.selected_function.instructions.iter().enumerate()
+    {
+        let address =
+            u64::from_str_radix(instruction.address.offset.trim_start_matches("0x"), 16).ok();
+        lines.push((
+            address,
+            format!(
+                "{}:{}  {:<20} {}",
+                instruction.address.space,
+                instruction.address.offset,
+                instruction.bytes,
+                instruction.mnemonic
+            ),
+        ));
+        for (operation_index, operation) in instruction.pcode.iter().enumerate() {
+            let effect = semantics
+                .and_then(|semantics| semantics.instructions.get(instruction_index))
+                .and_then(|instruction| instruction.operations.get(operation_index))
+                .map(|operation| match &operation.effect {
+                    PcodeEffect::Assign { operation, .. } => format!(" [exact {operation:?}]"),
+                    PcodeEffect::Opaque { reason, .. } => format!(" [opaque: {reason}]"),
+                })
+                .unwrap_or_default();
+            let output = operation
+                .output
+                .as_ref()
+                .map(|varnode| format!("{} = ", pcode_varnode(varnode)))
+                .unwrap_or_default();
+            let inputs = operation
+                .inputs
+                .iter()
+                .map(pcode_varnode)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let userop = operation
+                .userop_name
+                .as_ref()
+                .map(|name| format!(" [{name}]"))
+                .unwrap_or_default();
+            lines.push((
+                address,
+                format!(
+                    "    {}:{} #{}:{}  {}{}{}({}){}",
+                    operation.source_address.space,
+                    operation.source_address.offset,
+                    operation.sequence_index,
+                    operation.sequence_time,
+                    output,
+                    operation.mnemonic,
+                    userop,
+                    inputs,
+                    effect
+                ),
+            ));
+        }
+    }
+    lines
+}
+
 fn run_triton_cli(path: &Path, symbol: &str) -> Result<serde_json::Value, String> {
     let path_text = path.display().to_string();
     let output = Command::new(hydirctl_path())
@@ -1834,6 +2007,23 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 }) {
                 Ok(graph) => Event::GhidraGraphLoaded(Ok(graph)),
                 Err(error) => Event::GhidraGraphLoaded(Err(error)),
+            },
+            Task::AnalyzeGhidra {
+                binary,
+                binary_sha256,
+                function,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_cli(&binary, &binary_sha256, function.as_deref());
+                    let _ = completion.send(Event::GhidraAnalyzed {
+                        binary_sha256,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
             },
             Task::OpenRemote {
                 endpoint,
@@ -2338,6 +2528,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
     Overview,
+    GhidraPcode,
     Investigation,
     RegionStudio,
     Native,
@@ -2655,6 +2846,11 @@ struct AnalystApp {
     function_index: Option<FunctionIndex>,
     function_index_error: Option<String>,
     ghidra_graph: Option<GhidraGraph>,
+    ghidra_snapshot: Option<GhidraSnapshot>,
+    ghidra_semantics: Option<PcodeSemanticFunctionIr>,
+    ghidra_pcode_lines: Vec<(Option<u64>, String)>,
+    ghidra_busy: bool,
+    pending_ghidra: Option<(PathBuf, String)>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
     ir: Option<String>,
@@ -2771,6 +2967,11 @@ impl AnalystApp {
             function_index: None,
             function_index_error: None,
             ghidra_graph: None,
+            ghidra_snapshot: None,
+            ghidra_semantics: None,
+            ghidra_pcode_lines: Vec::new(),
+            ghidra_busy: false,
+            pending_ghidra: None,
             symbol: None,
             cfg: None,
             ir: None,
@@ -2836,9 +3037,31 @@ impl AnalystApp {
         }
     }
 
+    fn enqueue_ghidra(&mut self, binary: PathBuf, binary_sha256: String, function: Option<String>) {
+        if self.ghidra_busy {
+            return;
+        }
+        match self.tasks.try_send(Task::AnalyzeGhidra {
+            binary,
+            binary_sha256,
+            function,
+        }) {
+            Ok(()) => {
+                self.ghidra_busy = true;
+                self.status = "Analyzing ELF with Ghidra…".to_owned();
+                self.failure = None;
+            }
+            Err(_) => {
+                self.failure = Some("Analysis queue is full. Retry Ghidra analysis.".to_owned());
+            }
+        }
+    }
+
     fn poll(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            self.busy = false;
+            if !matches!(&event, Event::GhidraAnalyzed { .. }) {
+                self.busy = false;
+            }
             match event {
                 Event::WorkbenchLoaded(result) => {
                     self.workbench_loaded = true;
@@ -2914,6 +3137,9 @@ impl AnalystApp {
                     self.native_coverage = None;
                     self.native_coverage_error = None;
                     self.disassembly_report = None;
+                    self.ghidra_snapshot = None;
+                    self.ghidra_semantics = None;
+                    self.ghidra_pcode_lines.clear();
                     self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
@@ -2942,12 +3168,24 @@ impl AnalystApp {
                         self.select(symbol);
                     }
                     self.enqueue(
-                        Task::RefreshAnnotations { binary_sha256 },
+                        Task::RefreshAnnotations {
+                            binary_sha256: binary_sha256.clone(),
+                        },
                         "Loading revisioned analyst annotations…",
                     );
                     if !remote && let Some(path) = self.startup_recipe_path.take() {
                         self.recipe_path_input = path.display().to_string();
                         self.enqueue(Task::OpenRecipe(path), "Verifying investigation recipe…");
+                    }
+                    if let Some(binary) = self.current_local_path.clone() {
+                        self.pending_ghidra = Some((binary, binary_sha256));
+                        if !self.ghidra_busy
+                            && let Some((binary, digest)) = self.pending_ghidra.take()
+                        {
+                            self.enqueue_ghidra(binary, digest, None);
+                        }
+                    } else {
+                        self.pending_ghidra = None;
                     }
                 }
                 Event::RecipeLoaded(result) => match result {
@@ -2996,6 +3234,47 @@ impl AnalystApp {
                         self.failure = Some(error);
                     }
                 },
+                Event::GhidraAnalyzed {
+                    binary_sha256,
+                    result,
+                } => {
+                    self.ghidra_busy = false;
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                    {
+                        if let Some((binary, digest)) = self.pending_ghidra.take() {
+                            self.enqueue_ghidra(binary, digest, None);
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok(snapshot) => {
+                            self.status = format!(
+                                "Ghidra analyzed {} functions; raw P-code is ready",
+                                snapshot.functions.len()
+                            );
+                            self.history.push(self.status.clone());
+                            self.ghidra_semantics = snapshot
+                                .pcode_function_ir()
+                                .ok()
+                                .map(|source| source.lower_semantics());
+                            self.ghidra_pcode_lines =
+                                pcode_display_lines(&snapshot, self.ghidra_semantics.as_ref());
+                            self.ghidra_snapshot = Some(snapshot);
+                            self.failure = None;
+                        }
+                        Err(error) => {
+                            self.status = "Ghidra analysis failed".to_owned();
+                            self.history.push(error.clone());
+                            self.failure = Some(error);
+                        }
+                    }
+                    if let Some((binary, digest)) = self.pending_ghidra.take() {
+                        self.enqueue_ghidra(binary, digest, None);
+                    }
+                }
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
                     self.status = format!(
@@ -3965,12 +4244,43 @@ impl AnalystApp {
         ui.separator();
         egui::CollapsingHeader::new("Ghidra bridge")
             .id_salt("ghidra_bridge")
+            .default_open(true)
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Load HydIRExport.java JSON as external evidence; native HydIR facts stay separate.")
+                    RichText::new("Hydir runs headless Ghidra for local ELFs and imports its validated P-code snapshot.")
                         .size(11.0)
                         .color(MUTED),
                 );
+                let analyze = ui.add_enabled(
+                    !self.busy
+                        && !self.ghidra_busy
+                        && self.current_local_path.is_some()
+                        && self.spec.is_some(),
+                    egui::Button::new("Analyze with Ghidra"),
+                );
+                if analyze.clicked()
+                    && let (Some(binary), Some(spec)) =
+                        (self.current_local_path.clone(), self.spec.as_ref())
+                {
+                    self.enqueue_ghidra(binary, spec.binary_sha256.clone(), None);
+                }
+                if let Some(snapshot) = &self.ghidra_snapshot {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} functions · {} · selected {}",
+                            snapshot.functions.len(),
+                            snapshot.program.ghidra_version,
+                            snapshot.selected_function.entry.offset
+                        ))
+                        .size(11.0)
+                        .color(ACCENT),
+                    );
+                    if ui.button("Browse raw P-code").clicked() {
+                        self.tab = Tab::GhidraPcode;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Legacy v1 graph import").size(11.0).color(MUTED));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.ghidra_graph_path)
                         .hint_text("/absolute/path/to/ghidra-graph.json")
@@ -4857,7 +5167,14 @@ impl AnalystApp {
         if let Some(failure) = &self.failure {
             ui.colored_label(BAD, failure);
         } else {
-            ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
+            ui.colored_label(
+                if self.busy || self.ghidra_busy {
+                    ACCENT
+                } else {
+                    GOOD
+                },
+                &self.status,
+            );
         }
         ui.add_space(12.0);
         ui.separator();
@@ -4928,6 +5245,7 @@ impl AnalystApp {
         ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
+                (Tab::GhidraPcode, "Ghidra P-code"),
                 (Tab::Investigation, "Investigation"),
                 (Tab::RegionStudio, "Region Studio"),
                 (Tab::Native, "Native decompiler"),
@@ -4949,6 +5267,7 @@ impl AnalystApp {
         ui.separator();
         match self.tab {
             Tab::Overview => self.overview_view(ui),
+            Tab::GhidraPcode => self.ghidra_pcode_view(ui),
             Tab::Investigation => self.investigation_view(ui),
             Tab::RegionStudio => self.region_studio(ui),
             Tab::Native => self.native_explorer_view(ui),
@@ -4960,6 +5279,158 @@ impl AnalystApp {
             Tab::Passes => self.passes_view(ui),
             Tab::Analysis => self.analysis_view(ui),
             Tab::C => self.c_view(ui),
+        }
+    }
+
+    fn ghidra_pcode_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Ghidra function index and raw P-code").color(ACCENT));
+        let Some(snapshot) = &self.ghidra_snapshot else {
+            ui.label(
+                RichText::new("Open a local ELF to run automatic Ghidra analysis, or retry from the Program pane.")
+                    .color(MUTED),
+            );
+            return;
+        };
+        ui.label(
+            RichText::new(format!(
+                "Snapshot v{} · {} · {} · binary SHA-256 {}",
+                snapshot.schema_version,
+                snapshot.program.language_id,
+                snapshot.program.compiler_spec_id,
+                snapshot.binary_sha256
+            ))
+            .size(11.0)
+            .color(MUTED),
+        );
+        ui.label(
+            RichText::new("P-code is imported evidence. Semantic lowering and equivalence are separate checks.")
+                .size(11.0)
+                .color(MUTED),
+        );
+        if let Some(semantics) = &self.ghidra_semantics {
+            let exact = semantics
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.operations)
+                .filter(|operation| matches!(operation.effect, PcodeEffect::Assign { .. }))
+                .count();
+            let opaque = semantics.diagnostics.len();
+            ui.label(
+                RichText::new(format!(
+                    "Rust semantic pass: {exact} exact operations · {opaque} opaque operations · function equivalence unverified"
+                ))
+                .size(11.0)
+                .color(if opaque == 0 { GOOD } else { ACCENT }),
+            );
+            if opaque > 0 {
+                egui::CollapsingHeader::new(format!("Opaque effect diagnostics ({opaque})"))
+                    .id_salt("ghidra_semantic_diagnostics")
+                    .show(ui, |ui| {
+                        for diagnostic in semantics.diagnostics.iter().take(30) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}:{} #{} · {}",
+                                    diagnostic.source_address.space,
+                                    diagnostic.source_address.offset,
+                                    diagnostic.sequence_index,
+                                    diagnostic.message
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(BAD),
+                            );
+                        }
+                        if opaque > 30 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} more; all are marked in raw P-code below",
+                                    opaque - 30
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                    });
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
+        let mut requested = None;
+        egui::ScrollArea::vertical()
+            .id_salt("ghidra_function_index")
+            .max_height(150.0)
+            .show_rows(ui, 26.0, snapshot.functions.len(), |ui, range| {
+                for row in range {
+                    let function = &snapshot.functions[row];
+                    let selected = function.entry == snapshot.selected_function.entry;
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.ghidra_busy,
+                            egui::Button::selectable(
+                                selected,
+                                format!(
+                                    "{}:{}  {}  ({} bytes)",
+                                    function.entry.space,
+                                    function.entry.offset,
+                                    function.name,
+                                    function.size
+                                ),
+                            ),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        requested = Some(function.entry.offset.clone());
+                    }
+                }
+            });
+        let selected_name = snapshot
+            .functions
+            .iter()
+            .find(|function| function.entry == snapshot.selected_function.entry)
+            .map_or("selected function", |function| function.name.as_str());
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "RAW P-CODE · {} · {} instructions",
+                    selected_name,
+                    snapshot.selected_function.instructions.len()
+                ))
+                .strong()
+                .color(INFO),
+            );
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(
+                    self.ghidra_pcode_lines
+                        .iter()
+                        .map(|(_, line)| line.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        });
+        egui::ScrollArea::both()
+            .id_salt("ghidra_raw_pcode")
+            .show_rows(ui, 18.0, self.ghidra_pcode_lines.len(), |ui, range| {
+                for row in range {
+                    let (address, line) = &self.ghidra_pcode_lines[row];
+                    if ui
+                        .selectable_label(
+                            self.selected_address == *address,
+                            RichText::new(line).monospace().size(11.0),
+                        )
+                        .clicked()
+                    {
+                        self.selected_address = *address;
+                    }
+                }
+            });
+        if let Some(function) = requested
+            && let (Some(binary), Some(spec)) =
+                (self.current_local_path.clone(), self.spec.as_ref())
+        {
+            self.enqueue_ghidra(binary, spec.binary_sha256.clone(), Some(function));
         }
     }
 
@@ -6325,7 +6796,14 @@ impl AnalystApp {
                         if let Some(failure) = &self.failure {
                             ui.colored_label(BAD, failure);
                         } else {
-                            ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
+                            ui.colored_label(
+                                if self.busy || self.ghidra_busy {
+                                    ACCENT
+                                } else {
+                                    GOOD
+                                },
+                                &self.status,
+                            );
                         }
                         if let Some(report) = &self.disassembly_report {
                             for warning in report.warnings.iter().take(8) {
@@ -9276,8 +9754,8 @@ mod tests {
         AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
         WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address, indexed_function_action,
         ir_slice, local_region_artifacts, native_function_excerpt, native_instruction_count,
-        native_opaque_instruction_count, preview_patch_local, resized_console_height,
-        valid_bearer_token, validate_endpoint, workbench_graph_layout,
+        native_opaque_instruction_count, pcode_display_lines, preview_patch_local,
+        resized_console_height, valid_bearer_token, validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -9288,7 +9766,32 @@ mod tests {
         decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
     };
     use hydir_execution::StopPoint;
+    use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect};
     use std::sync::mpsc;
+
+    #[test]
+    fn ghidra_fixture_rows_keep_source_and_semantic_status() {
+        let snapshot: GhidraSnapshot = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/ghidra_prism_snapshot_v2.json"
+        ))
+        .unwrap();
+        let semantics = snapshot.pcode_function_ir().unwrap().lower_semantics();
+        let lines = pcode_display_lines(&snapshot, Some(&semantics));
+        assert!(
+            lines
+                .iter()
+                .any(|(_, line)| line.contains("ram:0x20137f #1:1"))
+        );
+        assert!(lines.iter().any(|(_, line)| line.contains("[exact ")));
+        assert!(lines.iter().any(|(_, line)| line.contains("[opaque:")));
+        assert!(
+            semantics
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.operations)
+                .any(|operation| matches!(operation.effect, PcodeEffect::Opaque { .. }))
+        );
+    }
 
     #[test]
     fn recipe_navigation_translates_only_verified_captured_pie_code() {
