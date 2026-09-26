@@ -45,7 +45,8 @@ use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
     MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeBackwardSlice, PcodeCoverageReport, PcodeEffect,
     PcodePathDestination, PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr,
-    PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
+    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -3262,6 +3263,7 @@ struct AnalystApp {
     ghidra_llvm_operation: Option<String>,
     ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
     ghidra_llvm_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
+    ghidra_simplification: Option<Result<PcodeSimplificationArtifact, String>>,
     ghidra_trace_seed_json: String,
     ghidra_trace_start: String,
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
@@ -3397,6 +3399,7 @@ impl AnalystApp {
             ghidra_llvm_operation: None,
             ghidra_llvm_prefix: None,
             ghidra_llvm_cfg: None,
+            ghidra_simplification: None,
             ghidra_trace_seed_json: String::new(),
             ghidra_trace_start: String::new(),
             ghidra_path_trace: None,
@@ -3592,6 +3595,7 @@ impl AnalystApp {
                     self.ghidra_llvm_operation = None;
                     self.ghidra_llvm_prefix = None;
                     self.ghidra_llvm_cfg = None;
+                    self.ghidra_simplification = None;
                     self.ghidra_trace_seed_json.clear();
                     self.ghidra_trace_start.clear();
                     self.ghidra_path_trace = None;
@@ -3765,6 +3769,7 @@ impl AnalystApp {
                             self.ghidra_llvm_operation = None;
                             self.ghidra_llvm_prefix = None;
                             self.ghidra_llvm_cfg = None;
+                            self.ghidra_simplification = None;
                             self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
                             self.ghidra_trace_start =
                                 snapshot.selected_function.entry.offset.clone();
@@ -6257,6 +6262,50 @@ impl AnalystApp {
                                         RichText::new(line).monospace().size(11.0)).clicked() {
                                             if linked.is_some() { self.selected_address = linked; }
                                         }
+                                }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("Checked P-code simplification")
+            .id_salt("ghidra_checked_simplification")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Rewrites exact add-zero value operations in raw P-code. Each rule has local bitvector preconditions; equivalence with the original binary has not been established.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Analyze selected function").clicked() {
+                    self.ghidra_simplification = Some(snapshot.pcode_function_ir()
+                        .and_then(|raw| raw.simplify_checked()));
+                }
+                match &self.ghidra_simplification {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!("{} local rewrites · binary verification: {:?}",
+                            artifact.rewrites.len(), artifact.verification))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy rewrite artifact JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                ui.ctx().copy_text(json);
+                            }
+                        egui::ScrollArea::vertical().id_salt("ghidra_checked_rewrites")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for rewrite in &artifact.rewrites {
+                                    let linked = address_map.as_ref().and_then(|map| {
+                                        map.to_linked(&rewrite.source_address.space,
+                                            &rewrite.source_address.offset)
+                                    });
+                                    let label = format!("{} op {}: {} → {} · {:?}",
+                                        rewrite.source_address.offset, rewrite.sequence_index,
+                                        rewrite.before.mnemonic, rewrite.after.mnemonic, rewrite.rule);
+                                    if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                        RichText::new(label).monospace().size(11.0)).clicked()
+                                        && linked.is_some() {
+                                            self.selected_address = linked;
+                                        }
+                                    ui.label(RichText::new(&rewrite.reason).size(11.0).color(MUTED));
                                 }
                             });
                     }
