@@ -70,6 +70,20 @@ class LocalGhidraTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
 
+    def test_saved_snapshot_roundtrip_commands_check_binary_and_function(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        saved = {"binary_sha256": self.digest, "selected_function": {"space": "ram", "offset": "0x401000"}}
+        with patch.object(self.client, "_run", return_value=json.dumps(saved).encode()) as run:
+            self.client.save_snapshot(self.binary, self.snapshot)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-project", "save"))
+        reopened = {"binary_sha256": self.digest, "selected_function": {"entry": saved["selected_function"]}}
+        with patch.object(self.client, "_run", return_value=json.dumps(reopened).encode()) as run:
+            self.assertEqual(self.client.saved_snapshot(self.binary, 0x401000), reopened)
+        self.assertEqual(run.call_args.args[-2:], ("--function", "0x401000"))
+        with patch.object(self.client, "_run", return_value=json.dumps(reopened).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.saved_snapshot(self.binary, 0x401001)
+
     def test_concrete_trace_forwards_seed_and_checks_identity(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         seed = Path(self.directory.name) / "seed.json"
