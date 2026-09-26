@@ -512,22 +512,31 @@ fn run() -> Result<(), Box<dyn Error>> {
                 print!("{llvm}");
             }
         }
-        Some("ghidra")
-            if (args.len() == 5 || args.len() == 7 && args[5] == "--function")
-                && args[1] == "analyze"
-                && args[3] == "--output" =>
-        {
-            let selected = if args.len() == 7 {
-                Some(parse_u64_auto(&args[6], "Ghidra function entry")?)
-            } else {
-                None
-            };
+        Some("ghidra") if args.len() >= 5 && args[1] == "analyze" => {
+            let mut selected = None;
+            let mut output = None;
+            let mut options = args[3..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--function" if selected.is_none() => {
+                        selected = Some(parse_u64_auto(&pair[1], "Ghidra function entry")?);
+                    }
+                    "--output" if output.is_none() && !pair[1].is_empty() => {
+                        output = Some(pair[1].as_str());
+                    }
+                    _ => return Err("invalid Ghidra analysis option".into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err("Ghidra analysis options require values".into());
+            }
+            let output = output.ok_or("Ghidra analysis requires --output")?;
             let snapshot =
-                ghidra_worker::analyze(Path::new(&args[2]), selected, Path::new(&args[4]))?;
+                ghidra_worker::analyze(Path::new(&args[2]), selected, Path::new(output))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "snapshot_path": args[4],
+                    "snapshot_path": output,
                     "binary_sha256": snapshot.binary_sha256,
                     "functions": snapshot.functions.len(),
                     "selected_function": snapshot.selected_function.entry,
