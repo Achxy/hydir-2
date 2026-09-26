@@ -3707,6 +3707,9 @@ impl AnalystApp {
                     }
                     match result {
                         Ok((snapshot, persistence_warning)) => {
+                            if self.ghidra_snapshot.is_none() && self.tab == Tab::Overview {
+                                self.tab = Tab::GhidraPcode;
+                            }
                             self.ghidra_slice = None;
                             self.status = format!(
                                 "Ghidra analyzed {} functions; raw P-code is ready",
@@ -5816,7 +5819,11 @@ impl AnalystApp {
         ui.separator();
         match self.tab {
             Tab::Overview => self.overview_view(ui),
-            Tab::GhidraPcode => self.ghidra_pcode_view(ui),
+            Tab::GhidraPcode => {
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_workbench_scroll")
+                    .show(ui, |ui| self.ghidra_pcode_view(ui));
+            }
             Tab::Investigation => self.investigation_view(ui),
             Tab::RegionStudio => self.region_studio(ui),
             Tab::Native => self.native_explorer_view(ui),
@@ -5870,6 +5877,61 @@ impl AnalystApp {
             .size(11.0)
             .color(MUTED),
         );
+        ui.separator();
+        ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
+        let mut requested = None;
+        egui::ScrollArea::vertical()
+            .id_salt("ghidra_function_index")
+            .max_height(150.0)
+            .show_rows(ui, 26.0, snapshot.functions.len(), |ui, range| {
+                for row in range {
+                    let function = &snapshot.functions[row];
+                    let selected = function.entry == snapshot.selected_function.entry;
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.ghidra_busy,
+                            egui::Button::selectable(
+                                selected,
+                                format!(
+                                    "{}:{}  {}  ({} bytes)",
+                                    function.entry.space,
+                                    function.entry.offset,
+                                    function.name,
+                                    function.size
+                                ),
+                            ),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        requested = Some(function.entry.offset.clone());
+                        self.selected_address = address_map.as_ref().and_then(|map| {
+                            map.to_linked(&function.entry.space, &function.entry.offset)
+                        });
+                    }
+                }
+            });
+        let mut jump_to_raw_pcode = false;
+        let mut open_disassembly = None;
+        let entry_address = address_map.as_ref().and_then(|map| {
+            map.to_linked(
+                &snapshot.selected_function.entry.space,
+                &snapshot.selected_function.entry.offset,
+            )
+        });
+        ui.horizontal(|ui| {
+            jump_to_raw_pcode = ui.button("View raw P-code").clicked();
+            if ui
+                .add_enabled(
+                    !self.busy && entry_address.is_some(),
+                    egui::Button::new("Open linked disassembly"),
+                )
+                .clicked()
+            {
+                open_disassembly = entry_address;
+            }
+        });
+        ui.separator();
         if !snapshot.memory_blocks.is_empty() {
             egui::CollapsingHeader::new(format!(
                 "Ghidra memory map ({})",
@@ -6274,40 +6336,6 @@ impl AnalystApp {
                     None => {}
                 }
             });
-        ui.separator();
-        ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
-        let mut requested = None;
-        egui::ScrollArea::vertical()
-            .id_salt("ghidra_function_index")
-            .max_height(150.0)
-            .show_rows(ui, 26.0, snapshot.functions.len(), |ui, range| {
-                for row in range {
-                    let function = &snapshot.functions[row];
-                    let selected = function.entry == snapshot.selected_function.entry;
-                    if ui
-                        .add_enabled(
-                            !self.busy && !self.ghidra_busy,
-                            egui::Button::selectable(
-                                selected,
-                                format!(
-                                    "{}:{}  {}  ({} bytes)",
-                                    function.entry.space,
-                                    function.entry.offset,
-                                    function.name,
-                                    function.size
-                                ),
-                            ),
-                        )
-                        .clicked()
-                        && !selected
-                    {
-                        requested = Some(function.entry.offset.clone());
-                        self.selected_address = address_map.as_ref().and_then(|map| {
-                            map.to_linked(&function.entry.space, &function.entry.offset)
-                        });
-                    }
-                }
-            });
         if !snapshot.selected_function.call_targets.is_empty() {
             egui::CollapsingHeader::new(format!(
                 "Calls ({})",
@@ -6590,7 +6618,7 @@ impl AnalystApp {
                 });
         }
         ui.separator();
-        ui.horizontal(|ui| {
+        let raw_pcode_header = ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
                     "RAW P-CODE · {} · {} instructions",
@@ -6610,6 +6638,9 @@ impl AnalystApp {
                 );
             }
         });
+        if jump_to_raw_pcode {
+            ui.scroll_to_rect(raw_pcode_header.response.rect, Some(egui::Align::Min));
+        }
         egui::ScrollArea::both()
             .id_salt("ghidra_raw_pcode")
             .show_rows(ui, 18.0, self.ghidra_pcode_lines.len(), |ui, range| {
@@ -6719,6 +6750,15 @@ impl AnalystApp {
                 (self.current_local_path.clone(), self.spec.as_ref())
         {
             self.enqueue_ghidra(binary, spec.binary_sha256.clone(), Some(function));
+        }
+        if let Some(address) = open_disassembly {
+            self.selected_address = Some(address);
+            self.pending_disassembly_scroll = Some(address);
+            if self.disassembly_report.is_some() {
+                self.tab = Tab::Bytes;
+            } else {
+                self.enqueue(Task::Disassemble, "Disassembling selected Ghidra function…");
+            }
         }
     }
 
@@ -11269,6 +11309,40 @@ mod tests {
                 .unwrap_err()
                 .contains("changed")
         );
+    }
+
+    #[test]
+    fn first_ghidra_result_opens_artifacts_without_stealing_other_views() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(2);
+        app.events = receiver;
+        app.spec = Some(spec.clone());
+        sender
+            .send(Event::GhidraAnalyzed {
+                binary_sha256: spec.binary_sha256.clone(),
+                result: Ok((snapshot.clone(), None)),
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::GhidraPcode));
+        assert_eq!(app.ghidra_snapshot.as_ref(), Some(&snapshot));
+
+        app.tab = Tab::Bytes;
+        sender
+            .send(Event::GhidraAnalyzed {
+                binary_sha256: spec.binary_sha256,
+                result: Ok((snapshot, None)),
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::Bytes));
     }
 
     #[test]
