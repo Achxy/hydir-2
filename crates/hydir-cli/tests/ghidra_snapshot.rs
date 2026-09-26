@@ -437,13 +437,13 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     );
     let coverage: serde_json::Value = serde_json::from_slice(&coverage.stdout).unwrap();
     assert_eq!(coverage["semantic_fidelity"], "unknown");
-    assert!(coverage["exact_assignments"].as_u64().unwrap() >= 7);
+    assert!(coverage["exact_assignments"].as_u64().unwrap() >= 10);
     assert!(
-        coverage["opaque_sites"]
+        coverage["by_opcode"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|site| site["mnemonic"] == "POPCOUNT")
+            .any(|row| row["mnemonic"] == "POPCOUNT" && row["exact_assignments"] == 1)
     );
 
     let prefix = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
@@ -458,9 +458,9 @@ fn imports_snapshot_exported_by_headless_ghidra() {
         String::from_utf8_lossy(&prefix.stderr)
     );
     let prefix: serde_json::Value = serde_json::from_slice(&prefix.stdout).unwrap();
-    assert_eq!(prefix["emitted_operations"], 7);
+    assert_eq!(prefix["emitted_operations"], 10);
     assert_eq!(prefix["verification"], "not_run");
-    assert!(prefix["stop_reason"].as_str().unwrap().contains("POPCOUNT"));
+    assert!(prefix["stop_reason"].as_str().unwrap().contains("CBRANCH"));
     let standalone = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
         .args(["ghidra-snapshot", "llvm-standalone"])
         .arg(root.join("demo/hydir-prism.elf"))
@@ -473,7 +473,7 @@ fn imports_snapshot_exported_by_headless_ghidra() {
         String::from_utf8_lossy(&standalone.stderr)
     );
     let standalone: serde_json::Value = serde_json::from_slice(&standalone.stdout).unwrap();
-    assert_eq!(standalone["emitted_operations"], 7);
+    assert_eq!(standalone["emitted_operations"], 10);
     assert!(standalone["state_bytes"].as_u64().unwrap() > 0);
     assert!(
         standalone["llvm_ir"]
@@ -539,11 +539,11 @@ fn concrete_trace_prefix_uses_binary_bound_seed_and_reports_boundary() {
         String::from_utf8_lossy(&output.stderr)
     );
     let trace: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(trace["executed"].as_array().unwrap().len(), 7);
+    assert_eq!(trace["executed"].as_array().unwrap().len(), 10);
     assert_eq!(trace["schema_version"], 2);
     assert_eq!(trace["verification"], "not_run");
     assert_eq!(trace["stop"]["kind"], "opaque_boundary");
-    assert_eq!(trace["stop"]["source"]["mnemonic"], "POPCOUNT");
+    assert_eq!(trace["stop"]["source"]["mnemonic"], "CBRANCH");
 
     let mut wrong = seed.clone();
     wrong["binary_sha256"] = serde_json::json!("0".repeat(64));

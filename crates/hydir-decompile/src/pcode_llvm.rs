@@ -255,6 +255,43 @@ pub fn emit_pcode_exact_operation_llvm(
     let mut body = String::new();
     let value = match kind {
         PcodeExactOp::Copy => operands[0].clone(),
+        PcodeExactOp::PopCount => {
+            // A fixed 64-bit SWAR count avoids an external intrinsic
+            // declaration in each independently emitted helper. The source
+            // input is zero extended first; its high bits do not contribute.
+            let input_bits = operation.source.inputs[0].size * 8;
+            let wide_input = if input_bits == 64 {
+                operands[0].clone()
+            } else {
+                body.push_str(&format!(
+                    "  %pop_input = zext i{input_bits} {} to i64\n",
+                    operands[0]
+                ));
+                "%pop_input".to_owned()
+            };
+            body.push_str(&format!(
+                "  %pop_shift1 = lshr i64 {wide_input}, 1\n\
+                   %pop_mask1 = and i64 %pop_shift1, 6148914691236517205\n\
+                   %pop_sub = sub i64 {wide_input}, %pop_mask1\n\
+                   %pop_mask2 = and i64 %pop_sub, 3689348814741910323\n\
+                   %pop_shift2 = lshr i64 %pop_sub, 2\n\
+                   %pop_mask3 = and i64 %pop_shift2, 3689348814741910323\n\
+                   %pop_add2 = add i64 %pop_mask2, %pop_mask3\n\
+                   %pop_shift4 = lshr i64 %pop_add2, 4\n\
+                   %pop_add4 = add i64 %pop_add2, %pop_shift4\n\
+                   %pop_nibbles = and i64 %pop_add4, 1085102592571150095\n\
+                   %pop_sum = mul i64 %pop_nibbles, 72340172838076673\n\
+                   %pop_count = lshr i64 %pop_sum, 56\n"
+            ));
+            if result_bits == 64 {
+                "%pop_count".to_owned()
+            } else {
+                body.push_str(&format!(
+                    "  %result = trunc i64 %pop_count to {result_type}\n"
+                ));
+                "%result".to_owned()
+            }
+        }
         PcodeExactOp::ZeroExtend | PcodeExactOp::SignExtend => {
             let input_bits = operation.source.inputs[0].size * 8;
             let instruction = if kind == PcodeExactOp::ZeroExtend {
@@ -442,6 +479,7 @@ mod tests {
             29 => PcodeExactOp::ShiftLeft,
             30 => PcodeExactOp::LogicalShiftRight,
             31 => PcodeExactOp::ArithmeticShiftRight,
+            72 => PcodeExactOp::PopCount,
             _ => panic!("unexpected opcode"),
         };
         PcodeSemanticOperation {
@@ -520,6 +558,8 @@ mod tests {
             (29, "INT_LEFT", 1, vec![1, 8]),
             (30, "INT_RIGHT", 1, vec![1, 8]),
             (31, "INT_SRIGHT", 1, vec![1, 8]),
+            (72, "POPCOUNT", 1, vec![8]),
+            (72, "POPCOUNT", 8, vec![1]),
         ] {
             let llvm =
                 emit_pcode_exact_operation_llvm(&operation(opcode, mnemonic, output, &inputs))
@@ -592,6 +632,9 @@ mod tests {
             (31, "INT_SRIGHT", 1, &[1, 8], &[0x80, 2]),
             (31, "INT_SRIGHT", 1, &[1, 8], &[0x7f, 8]),
             (29, "INT_LEFT", 1, &[1, 8], &[3, 0x100]),
+            (72, "POPCOUNT", 1, &[8], &[u64::MAX]),
+            (72, "POPCOUNT", 8, &[1], &[0x81]),
+            (72, "POPCOUNT", 1, &[8], &[0]),
         ];
         for &(opcode, mnemonic, output, inputs, values) in cases {
             let mut op = operation(opcode, mnemonic, output, inputs);
@@ -607,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn real_ghidra_prefix_stops_before_opaque_flag_effect_and_verifies() {
+    fn real_ghidra_prefix_includes_popcount_and_stops_at_branch() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
@@ -616,9 +659,15 @@ mod tests {
         let snapshot = hydir_ir::pcode::parse_ghidra_snapshot(bytes, digest).unwrap();
         let artifact = emit_pcode_linear_prefix_llvm(&snapshot).unwrap();
         assert_eq!(artifact.binary_sha256, digest);
-        assert_eq!(artifact.emitted_operations, 7);
-        assert_eq!(artifact.stopped_at.as_ref().unwrap().offset, "0x2013d6");
-        assert!(artifact.stop_reason.contains("opaque POPCOUNT"));
+        assert_eq!(artifact.emitted_operations, 10);
+        assert_eq!(artifact.stopped_at.as_ref().unwrap().offset, "0x2013d9");
+        assert!(artifact.stop_reason.contains("opaque CBRANCH"));
+        assert!(
+            artifact
+                .source_operations
+                .iter()
+                .any(|operation| operation.mnemonic == "POPCOUNT")
+        );
         assert_eq!(artifact.semantic_fidelity, SemanticFidelity::Unknown);
         assert_eq!(artifact.verification, VerificationStatus::NotRun);
         assert_eq!(artifact.source_operations[0].address.offset, "0x2013cf");

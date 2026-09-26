@@ -250,15 +250,13 @@ mod tests {
             .iter()
             .find(|operation| operation.source.mnemonic == "POPCOUNT")
             .unwrap();
-        assert_eq!(popcount.accesses[0].kind, PcodeStateAccessKind::MayRead);
-        assert_eq!(popcount.accesses[1].kind, PcodeStateAccessKind::MayWrite);
-        assert!(popcount.may_clobber_unlisted_state);
+        assert_eq!(popcount.accesses[0].kind, PcodeStateAccessKind::Read);
+        assert_eq!(popcount.accesses[1].kind, PcodeStateAccessKind::Write);
+        assert!(!popcount.may_clobber_unlisted_state);
         assert!(matches!(
             popcount.effect,
-            PcodeEffect::Opaque {
-                may_read_memory: true,
-                may_write_memory: true,
-                may_change_control: true,
+            PcodeEffect::Assign {
+                operation: super::super::PcodeExactOp::PopCount,
                 ..
             }
         ));

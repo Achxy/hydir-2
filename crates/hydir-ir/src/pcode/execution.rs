@@ -1374,6 +1374,63 @@ mod tests {
     }
 
     #[test]
+    fn real_ghidra_test_popcount_branch_runs_from_function_entry() {
+        let snapshot = real_branch_snapshot();
+        for (second_input, branch_taken, result, visits) in [
+            (
+                0u64,
+                true,
+                0u64,
+                vec!["0x2013cf", "0x2013d6", "0x2013d9", "0x2013e2"],
+            ),
+            (
+                5u64,
+                false,
+                1u64,
+                vec!["0x2013cf", "0x2013d6", "0x2013d9", "0x2013db", "0x2013e2"],
+            ),
+        ] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&node("register", "0x38", 8), 7).unwrap();
+            seed.write_varnode(&node("register", "0x30", 8), second_input)
+                .unwrap();
+            seed.write_varnode(&node("register", "0x20", 8), 0x1000)
+                .unwrap();
+            seed.write_memory("ram", 0x1000, 8, 0xdead).unwrap();
+            // TEST produces the branch condition after executing POPCOUNT.
+            let trace = snapshot.execute_concrete_path(&seed, None, 64, 8).unwrap();
+            assert!(matches!(trace.stop, PcodePathStop::Return { .. }));
+            assert_eq!(
+                trace
+                    .instruction_visits
+                    .iter()
+                    .map(|address| address.offset.as_str())
+                    .collect::<Vec<_>>(),
+                visits
+            );
+            assert!(trace.events.iter().any(|event| matches!(
+                event,
+                PcodePathEvent::Branch {
+                    taken: Some(taken),
+                    branch_kind: PcodePathBranchKind::ConditionalBranch,
+                    ..
+                } if *taken == branch_taken
+            )));
+            assert_eq!(
+                trace
+                    .final_state
+                    .read_varnode(&node("register", "0x0", 8))
+                    .unwrap(),
+                Some(result)
+            );
+            assert!(trace.events.iter().any(|event| matches!(
+                event,
+                PcodePathEvent::Effect { operation } if operation.source.mnemonic == "POPCOUNT"
+            )));
+        }
+    }
+
+    #[test]
     fn path_stops_at_unknown_condition_or_effect_before_control() {
         let snapshot = real_branch_snapshot();
         let branch = snapshot
@@ -1392,12 +1449,11 @@ mod tests {
 
         let mut seed = PcodeConcreteState::default();
         seed.write_varnode(&node("register", "0x38", 8), 5).unwrap();
-        seed.write_varnode(&node("register", "0x30", 8), 1).unwrap();
         let entry = snapshot.execute_concrete_path(&seed, None, 32, 8).unwrap();
         assert!(matches!(
             entry.stop,
             PcodePathStop::EffectBoundary {
-                boundary: PcodeExecutionStop::OpaqueBoundary { .. }
+                boundary: PcodeExecutionStop::MissingInput { .. }
             }
         ));
     }

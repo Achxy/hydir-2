@@ -128,13 +128,16 @@ mod tests {
             report.operations,
             report.exact_assignments + report.opaque_effects
         );
-        assert!(report.exact_assignments >= 7);
+        assert!(report.exact_assignments >= 10);
         assert!(report.opaque_effects > 0);
+        assert!(report.by_opcode.iter().any(|row| row.mnemonic == "POPCOUNT"
+            && row.exact_assignments == 1
+            && row.opaque_effects == 0));
         assert!(
             report
                 .opaque_sites
                 .iter()
-                .any(|site| site.mnemonic == "POPCOUNT")
+                .any(|site| site.mnemonic == "CBRANCH")
         );
         assert_eq!(report.semantic_fidelity, SemanticFidelity::Unknown);
         assert_eq!(report.verification, VerificationStatus::NotRun);

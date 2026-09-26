@@ -227,7 +227,7 @@ mod tests {
         let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
         let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
         let artifact = emit_pcode_standalone_prefix_llvm(&snapshot).unwrap();
-        assert_eq!(artifact.emitted_operations, 7);
+        assert_eq!(artifact.emitted_operations, 10);
         assert!(artifact.state_bytes > 0 && artifact.state_bytes < 256);
         assert_eq!(artifact.byte_map.len(), artifact.state_bytes);
         assert!(artifact.llvm_ir.contains("define i64 @hydir_read_varnode"));
@@ -273,7 +273,10 @@ mod tests {
                 .execute_exact_prefix(&seed, 4096)
                 .unwrap();
             assert_eq!(trace.executed.len(), artifact.emitted_operations);
-            let output_node = snapshot.selected_function.instructions[1].pcode[2]
+            let output_node = snapshot.selected_function.instructions[1]
+                .pcode
+                .last()
+                .unwrap()
                 .output
                 .as_ref()
                 .unwrap();
@@ -285,7 +288,7 @@ mod tests {
             let output_index = artifact
                 .byte_map
                 .iter()
-                .find(|byte| byte.space == "unique" && byte.offset == output_node.offset)
+                .find(|byte| byte.space == "register" && byte.offset == output_node.offset)
                 .unwrap()
                 .index;
             let mut main = format!(

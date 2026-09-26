@@ -35,6 +35,7 @@ pub enum PcodeExactOp {
     ShiftLeft,
     LogicalShiftRight,
     ArithmeticShiftRight,
+    PopCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,6 +248,7 @@ impl PcodeSemanticOperation {
                     (value >> values[1]) as u64
                 }
             }
+            PcodeExactOp::PopCount => u64::from(values[0].count_ones()),
         };
         Ok(Some(result & mask(result_width_bits)))
     }
@@ -285,6 +287,7 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         29 => (Op::ShiftLeft, "INT_LEFT"),
         30 => (Op::LogicalShiftRight, "INT_RIGHT"),
         31 => (Op::ArithmeticShiftRight, "INT_SRIGHT"),
+        72 => (Op::PopCount, "POPCOUNT"),
         _ => return None,
     })
 }
@@ -353,6 +356,9 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
         let sizes = source.inputs.iter().map(|v| v.size).collect::<Vec<_>>();
         let valid = match operation {
             PcodeExactOp::Copy => sizes.as_slice() == [output.size],
+            // Ghidra permits independent input and output widths. Within our
+            // 64-bit bound the count (0..=64) fits even a one-byte output.
+            PcodeExactOp::PopCount => sizes.len() == 1,
             PcodeExactOp::ZeroExtend | PcodeExactOp::SignExtend => {
                 sizes.len() == 1 && sizes[0] < output.size
             }
@@ -563,7 +569,7 @@ mod tests {
                 ..
             }
         ));
-        let unknown = lower_operation(&op(72, "POPCOUNT", Some(8), &[8]));
+        let unknown = lower_operation(&op(73, "UNSUPPORTED", Some(8), &[8]));
         assert!(matches!(
             unknown,
             PcodeEffect::Opaque {
@@ -574,6 +580,45 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn popcount_counts_only_input_width_and_zero_extends_output() {
+        for (input_bytes, output_bytes, input, expected) in [
+            (1, 1, 0, 0),
+            (1, 8, 0xff, 8),
+            (2, 1, 0xffff, 16),
+            (4, 4, 0x8000_0001, 2),
+            (8, 1, u64::MAX, 64),
+            (8, 8, 0xaaaa_aaaa_aaaa_aaaa, 32),
+        ] {
+            let operation = lowered(op(72, "POPCOUNT", Some(output_bytes), &[input_bytes]));
+            assert!(matches!(
+                operation.effect,
+                PcodeEffect::Assign {
+                    operation: PcodeExactOp::PopCount,
+                    ..
+                }
+            ));
+            assert_eq!(operation.evaluate_exact(&[input]).unwrap(), Some(expected));
+        }
+        assert_eq!(
+            lowered(op(72, "POPCOUNT", Some(1), &[1]))
+                .evaluate_exact(&[0x1ff])
+                .unwrap(),
+            Some(8)
+        );
+        for source in [
+            op(72, "POPCOUNT", Some(1), &[]),
+            op(72, "POPCOUNT", Some(1), &[1, 1]),
+            op(72, "POPCOUNT", Some(1), &[9]),
+            op(72, "POPCOUNT", None, &[8]),
+        ] {
+            assert!(matches!(
+                lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+        }
     }
 
     #[test]

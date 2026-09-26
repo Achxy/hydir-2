@@ -1324,6 +1324,45 @@ mod tests {
     }
 
     #[test]
+    fn real_prism_test_popcount_branch_matches_llvm_from_entry() {
+        let snapshot = fixture();
+        let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        assert_eq!(artifact.start, snapshot.selected_function.entry);
+        assert!(
+            artifact
+                .source_operations
+                .iter()
+                .any(|source| source.mnemonic == "POPCOUNT")
+        );
+        verify(&artifact.llvm_ir);
+        for (second_input, expected_rax, taken) in [(0u64, 0u8, true), (5, 1, false)] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), 7).unwrap();
+            seed.write_varnode(&register("0x30", 8), second_input)
+                .unwrap();
+            let rust = snapshot.execute_concrete_path(&seed, None, 64, 8).unwrap();
+            assert!(matches!(rust.stop, PcodePathStop::EffectBoundary { .. }));
+            assert!(rust.events.iter().any(|event| matches!(
+                event,
+                PcodePathEvent::Branch { taken: Some(value), .. } if *value == taken
+            )));
+            assert!(rust.events.iter().any(|event| matches!(
+                event,
+                PcodePathEvent::Effect { operation } if operation.source.mnemonic == "POPCOUNT"
+            )));
+            let ids = source_event_ids(&artifact, &rust);
+            run_lli(
+                &artifact,
+                &seed,
+                64,
+                PcodeCfgLlvmStatus::MemoryUnknownAlias,
+                &ids,
+                Some(expected_rax),
+            );
+        }
+    }
+
+    #[test]
     fn synthetic_branch_loop_hits_runtime_operation_budget() {
         let mut snapshot = fixture();
         snapshot.selected_function.instructions.truncate(1);

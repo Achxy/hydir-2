@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn follows_exact_unique_definitions_but_stops_at_opaque_value() {
+    fn follows_exact_unique_definitions_through_popcount_then_stops_at_opaque_flag() {
         let slice = fixture()
             .backward_pcode_slice(PcodeSliceTarget {
                 instruction_index: 0,
@@ -542,12 +542,13 @@ mod tests {
         assert_eq!(slice.steps[0].source.mnemonic, "INT_EQUAL");
         assert_eq!(slice.steps[1].source.mnemonic, "INT_AND");
         assert_eq!(slice.steps[2].source.mnemonic, "POPCOUNT");
+        assert_eq!(slice.steps[3].source.mnemonic, "INT_AND");
         assert!(slice.boundaries.iter().any(|boundary| {
             boundary.kind == PcodeSliceBoundaryKind::OpaqueEffect
                 && boundary
                     .varnode
                     .as_ref()
-                    .is_some_and(|node| node.space == "unique")
+                    .is_some_and(|node| node.space == "register")
         }));
         assert!(!slice.path_proven);
     }
