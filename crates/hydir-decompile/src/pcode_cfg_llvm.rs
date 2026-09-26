@@ -1340,8 +1340,20 @@ mod tests {
             seed.write_varnode(&register("0x38", 8), 7).unwrap();
             seed.write_varnode(&register("0x30", 8), second_input)
                 .unwrap();
+            seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+            seed.write_memory("ram", 0x700000, 8, 0xdeadbeef).unwrap();
             let rust = snapshot.execute_concrete_path(&seed, None, 64, 8).unwrap();
-            assert!(matches!(rust.stop, PcodePathStop::EffectBoundary { .. }));
+            assert!(matches!(rust.stop, PcodePathStop::Return { .. }));
+            assert_eq!(
+                rust.final_state.read_varnode(&register("0x20", 8)).unwrap(),
+                Some(0x700008)
+            );
+            assert_eq!(
+                rust.final_state
+                    .read_varnode(&register("0x288", 8))
+                    .unwrap(),
+                Some(0xdeadbeef)
+            );
             assert!(rust.events.iter().any(|event| matches!(
                 event,
                 PcodePathEvent::Branch { taken: Some(value), .. } if *value == taken
@@ -1351,11 +1363,30 @@ mod tests {
                 PcodePathEvent::Effect { operation } if operation.source.mnemonic == "POPCOUNT"
             )));
             let ids = source_event_ids(&artifact, &rust);
-            run_lli(
+            run_lli_with_guest(
                 &artifact,
                 &seed,
+                &GuestTestMemory {
+                    space_id: 433,
+                    base: 0x700000,
+                    bytes: vec![
+                        Some(0xef),
+                        Some(0xbe),
+                        Some(0xad),
+                        Some(0xde),
+                        Some(0),
+                        Some(0),
+                        Some(0),
+                        Some(0),
+                    ],
+                    expected: Vec::new(),
+                    expected_state: vec![
+                        ("register".to_owned(), "0x20".to_owned(), 8, true),
+                        ("register".to_owned(), "0x288".to_owned(), 0xef, true),
+                    ],
+                },
                 64,
-                PcodeCfgLlvmStatus::MemoryUnknownAlias,
+                PcodeCfgLlvmStatus::Return,
                 &ids,
                 Some(expected_rax),
             );
