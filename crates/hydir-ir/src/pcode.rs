@@ -40,6 +40,8 @@ pub const GHIDRA_SNAPSHOT_VERSION: u32 = 2;
 pub const PCODE_IR_VERSION: u32 = 1;
 pub const MAX_GHIDRA_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FUNCTIONS: usize = 65_536;
+const MAX_MEMORY_BLOCKS: usize = 4_096;
+const MAX_SYMBOLS: usize = 65_536;
 const MAX_INSTRUCTIONS: usize = 16_384;
 const MAX_OPERATIONS: usize = 262_144;
 
@@ -113,6 +115,37 @@ pub struct GhidraFunctionIndexEntry {
     pub size: u64,
 }
 
+/// An analyzed Ghidra memory range. `end` is inclusive and `size` is bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraMemoryBlock {
+    pub name: String,
+    pub start: PcodeAddress,
+    pub end: PcodeAddress,
+    pub size: u64,
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+    pub initialized: bool,
+    pub loaded: bool,
+    pub overlay: bool,
+    pub block_type: String,
+}
+
+/// Defined addressable symbol evidence; local-variable and namespace-only
+/// symbols are outside this snapshot slice.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraSymbol {
+    pub address: PcodeAddress,
+    pub name: String,
+    pub namespace: String,
+    pub symbol_type: String,
+    pub source_type: String,
+    pub primary: bool,
+    pub external: bool,
+}
+
 /// Ghidra's analyzed instruction flow, including overrides and references.
 /// A missing target is an unresolved flow, not a proven absent edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -167,6 +200,12 @@ pub struct GhidraSnapshot {
     pub binary_sha256: String,
     pub program: GhidraProgram,
     pub address_spaces: Vec<GhidraAddressSpace>,
+    /// Optional in v2 for compatibility with snapshots exported before this slice.
+    #[serde(default)]
+    pub memory_blocks: Vec<GhidraMemoryBlock>,
+    /// Optional in v2 for compatibility with snapshots exported before this slice.
+    #[serde(default)]
+    pub symbols: Vec<GhidraSymbol>,
     pub functions: Vec<GhidraFunctionIndexEntry>,
     pub selected_function: GhidraSelectedFunction,
 }
@@ -294,6 +333,80 @@ pub fn validate_ghidra_snapshot(
     }
     if !space_names.contains(snapshot.program.image_base.space.as_str()) {
         return Err("image base references an unknown address space".to_owned());
+    }
+    if snapshot.memory_blocks.len() > MAX_MEMORY_BLOCKS {
+        return Err(format!(
+            "Ghidra snapshot exceeds memory block limit {MAX_MEMORY_BLOCKS}"
+        ));
+    }
+    let mut previous_block: Option<(String, u64, u64)> = None;
+    for block in &snapshot.memory_blocks {
+        bounded_text(&block.name, "memory block name", 4096)?;
+        bounded_text(&block.block_type, "memory block type", 128)?;
+        let start = offset(&block.start)?;
+        let end = offset(&block.end)?;
+        if !space_names.contains(block.start.space.as_str()) || block.start.space != block.end.space
+        {
+            return Err("memory block references unknown or differing address spaces".to_owned());
+        }
+        if start > end || block.size == 0 || block.size > (1_u64 << 40) {
+            return Err("memory block has invalid range or byte size".to_owned());
+        }
+        let unit_size = snapshot
+            .address_spaces
+            .iter()
+            .find(|space| space.name == block.start.space)
+            .expect("memory block address space checked above")
+            .addressable_unit_size as u64;
+        let expected_size = end
+            .checked_sub(start)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|units| units.checked_mul(unit_size))
+            .ok_or("memory block range byte size overflows")?;
+        if block.size != expected_size {
+            return Err("memory block byte size disagrees with its address range".to_owned());
+        }
+        if let Some((prior_space, prior_start, prior_end)) = &previous_block {
+            if (prior_space.as_str(), *prior_start) >= (block.start.space.as_str(), start) {
+                return Err("Ghidra memory blocks must be strictly sorted".to_owned());
+            }
+            if prior_space == &block.start.space && start <= *prior_end {
+                return Err("Ghidra memory blocks overlap".to_owned());
+            }
+        }
+        previous_block = Some((block.start.space.clone(), start, end));
+    }
+    if snapshot.symbols.len() > MAX_SYMBOLS {
+        return Err(format!(
+            "Ghidra snapshot exceeds symbol limit {MAX_SYMBOLS}"
+        ));
+    }
+    let mut previous_symbol = None;
+    for symbol in &snapshot.symbols {
+        let symbol_offset = offset(&symbol.address)?;
+        if !space_names.contains(symbol.address.space.as_str()) {
+            return Err("symbol references an unknown address space".to_owned());
+        }
+        bounded_text(&symbol.name, "symbol name", 4096)?;
+        if !symbol.namespace.is_empty() {
+            bounded_text(&symbol.namespace, "symbol namespace", 4096)?;
+        }
+        bounded_text(&symbol.symbol_type, "symbol type", 128)?;
+        bounded_text(&symbol.source_type, "symbol source", 128)?;
+        let key = (
+            symbol.address.space.clone(),
+            symbol_offset,
+            symbol.namespace.clone(),
+            symbol.name.clone(),
+            symbol.symbol_type.clone(),
+            symbol.source_type.clone(),
+            symbol.primary,
+            symbol.external,
+        );
+        if previous_symbol.as_ref().is_some_and(|prior| prior >= &key) {
+            return Err("Ghidra symbols must be strictly sorted and unique".to_owned());
+        }
+        previous_symbol = Some(key);
     }
     if snapshot.functions.is_empty() || snapshot.functions.len() > MAX_FUNCTIONS {
         return Err(format!(
@@ -587,6 +700,106 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicate Ghidra flow")
         );
+    }
+
+    #[test]
+    fn optional_memory_and_symbol_metadata_preserve_older_v2_snapshots() {
+        let legacy =
+            parse_ghidra_snapshot(&serde_json::to_vec(&fixture()).unwrap(), &"a".repeat(64))
+                .unwrap();
+        assert!(legacy.memory_blocks.is_empty());
+        assert!(legacy.symbols.is_empty());
+
+        let mut value = fixture();
+        value["memory_blocks"] = json!([{
+            "name": ".text", "start": {"space": "ram", "offset": "0x401000"},
+            "end": {"space": "ram", "offset": "0x40100f"}, "size": 16,
+            "read": true, "write": false, "execute": true, "initialized": true,
+            "loaded": true, "overlay": false, "block_type": "Default"
+        }]);
+        value["symbols"] = json!([{
+            "address": {"space": "ram", "offset": "0x401000"}, "name": "f",
+            "namespace": "Global", "symbol_type": "Function", "source_type": "IMPORTED",
+            "primary": true, "external": false
+        }]);
+        let snapshot =
+            parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &"a".repeat(64)).unwrap();
+        assert_eq!(snapshot.schema_version, GHIDRA_SNAPSHOT_VERSION);
+        assert_eq!(snapshot.memory_blocks[0].size, 16);
+        assert_eq!(snapshot.symbols[0].name, "f");
+        let round_trip = serde_json::to_vec(&snapshot).unwrap();
+        assert_eq!(
+            parse_ghidra_snapshot(&round_trip, &"a".repeat(64)).unwrap(),
+            snapshot
+        );
+
+        let mut overlap = value.clone();
+        let mut second = overlap["memory_blocks"][0].clone();
+        second["name"] = json!(".text2");
+        second["start"]["offset"] = json!("0x401008");
+        second["end"]["offset"] = json!("0x401017");
+        overlap["memory_blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&overlap).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("overlap")
+        );
+
+        let mut wrong_size = value.clone();
+        wrong_size["memory_blocks"][0]["size"] = json!(15);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&wrong_size).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("byte size disagrees")
+        );
+
+        let mut wrong_space = value.clone();
+        wrong_space["symbols"][0]["address"]["space"] = json!("missing");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&wrong_space).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("symbol references")
+        );
+
+        let mut duplicate = value.clone();
+        let symbol = duplicate["symbols"][0].clone();
+        duplicate["symbols"].as_array_mut().unwrap().push(symbol);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&duplicate).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("sorted and unique")
+        );
+    }
+
+    #[test]
+    fn real_ghidra_metadata_fixture_keeps_layout_and_symbol_provenance() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prism_metadata_v2.json"
+        ));
+        let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
+        let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
+        assert_eq!(snapshot.schema_version, GHIDRA_SNAPSHOT_VERSION);
+        assert_eq!(snapshot.memory_blocks.len(), 11);
+        assert_eq!(snapshot.symbols.len(), 24);
+        let text = snapshot
+            .memory_blocks
+            .iter()
+            .find(|block| block.name == ".text")
+            .unwrap();
+        assert!(text.read && text.execute && text.initialized && text.loaded);
+        assert!(!text.write);
+        let decision = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "hydir_stage_decision")
+            .unwrap();
+        assert_eq!(decision.address.offset, "0x20137c");
+        assert_eq!(decision.source_type, "IMPORTED");
+        assert_eq!(decision.symbol_type, "Function");
     }
 
     #[test]

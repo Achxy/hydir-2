@@ -2,8 +2,9 @@
 
 `HydIRSnapshot.java` runs as a Ghidra post-analysis script. It exports a program
 function index, one function's **raw instruction P-code**, analyzed flow edges,
-and call targets in Hydir snapshot schema v2. Flow and call sections are
-optional so earlier v2 snapshots remain readable. It does not lift, simplify,
+call targets, memory blocks, and defined symbols in Hydir snapshot schema v2.
+These additional sections are optional so earlier v2 snapshots remain
+readable. It does not lift, simplify,
 or type the P-code. Those steps belong to
 Hydir's Rust core. `HydIRExport.java` remains the separate v1 graph exporter.
 
@@ -35,7 +36,10 @@ For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
 ```powershell
 $ghidra = 'C:\path\to\ghidra_12.1.4_PUBLIC'
 $binary = (Resolve-Path '.\demo\hydir-prism.elf').Path
-$scripts = (Resolve-Path '.\integrations\ghidra').Path
+$scripts = Join-Path $env:TEMP 'hydir-snapshot-scripts'
+New-Item -ItemType Directory -Force -Path $scripts | Out-Null
+Copy-Item -LiteralPath (Resolve-Path '.\integrations\ghidra\HydIRSnapshot.java').Path `
+  -Destination (Join-Path $scripts 'HydIRSnapshot.java') -Force
 $snapshot = Join-Path (Get-Location) 'snapshot.json'
 $projectDir = Join-Path $env:TEMP 'hydir-ghidra-projects'
 New-Item -ItemType Directory -Force -Path $projectDir | Out-Null
@@ -48,6 +52,8 @@ New-Item -ItemType Directory -Force -Path $projectDir | Out-Null
 The third script argument is an optional `0x`-prefixed function entry offset.
 Without it, the exporter selects the first indexed function with a body. For a
 real caller, pass an entry from the function index so selection is explicit.
+The isolated script directory keeps Ghidra from compiling unrelated extension
+and legacy exporter Java files during this manual run.
 
 Hydir validates the export against the same binary and emits a versioned
 PcodeFunctionIr artifact:
@@ -72,6 +78,10 @@ The `ghidra-project save|get` commands and `LocalGhidra.save_snapshot` /
 `saved_snapshot` allow an external script to preserve and reopen the same
 validated snapshot without rerunning Ghidra. `HYDIR_LOCAL_DB` can point to an
 absolute alternate database path for isolated projects or tests.
+Schema v2 optionally carries analyzed memory block ranges and permissions,
+plus defined program and external symbols with source, type, and namespace
+evidence. Older v2 snapshots without these arrays still import. Metadata is
+evidence for analysis, not lifted machine semantics.
 The CFG artifact joins instruction nodes to analyzed edges and keeps calls
 separate. Its completeness is explicitly `incomplete`, including when all
 visible edges have concrete targets.
