@@ -42,11 +42,13 @@ whole-function P-code lifting remains in progress.
 The v3 service and Python SDK can run the same managed worker on an uploaded
 ELF and return a validated snapshot, raw P-code, state effects, CFG LLVM, and
 bounded dependency slices.
+Revision-checked AnalysisModel edits are available through the v3 service and
+Python SDK; saved models feed subsequent typed C artifacts.
 
-The [Ubuntu container smoke test](https://github.com/Achxy/hydir-2/actions/runs/36261135599)
+The [Ubuntu container smoke test](https://github.com/Achxy/hydir-2/actions/runs/36262451695)
 exercises automatic CLI and v3 API analysis on a real ELF. A separate
-[Ghidra emulator comparison](integrations/ghidra/README.md) checks selected
-seeded paths against Hydir's Rust executor. These gates cover a declared
+[Ghidra emulator comparison](integrations/ghidra/README.md) checks both PRISM
+branch outcomes from function entry against Hydir's Rust executor. These gates cover a declared
 subset; unresolved operations remain visible in coverage reports.
 
 ## Quick start
@@ -56,6 +58,7 @@ Open the checked-in PRISM ELF for a tour of the workbench. Use the smaller
 repository root with Rust 1.96:
 
 ```bash
+cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydir -- --open-local demo/hydir-prism.elf hydir_stage_decision
 cargo run --locked --bin hydirctl -- discover fuzz/corpus/elf_import/max2.elf
 cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/max2.elf --function hydir_max2 --ir state

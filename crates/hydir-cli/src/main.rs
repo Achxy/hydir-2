@@ -57,7 +57,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELP: &str = "HydIR native x86-64 ELF vertical slice
+const HELP: &str = "Hydir: Ghidra-backed binary lifting and reverse engineering
 
 Usage:
   hydirctl doctor
