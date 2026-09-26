@@ -96,11 +96,11 @@ fn resized_console_height(current: f32, drag_delta_y: f32, maximum: f32) -> f32 
     (current - drag_delta_y).clamp(CONSOLE_MIN_HEIGHT, maximum)
 }
 
-fn probe_ghidra_runtime(ctx: &egui::Context) -> Receiver<GhidraRuntimeStatus> {
+fn probe_ghidra_runtime(ctx: &egui::Context) -> Receiver<(GhidraRuntimeStatus, bool)> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let repaint = ctx.clone();
     thread::spawn(move || {
-        let _ = sender.send(runtime_status());
+        let _ = sender.send((runtime_status(), hydirctl_available()));
         repaint.request_repaint();
     });
     receiver
@@ -1750,6 +1750,15 @@ fn hydirctl_path() -> PathBuf {
     })
 }
 
+fn hydirctl_available() -> bool {
+    let executable = hydirctl_path();
+    executable.is_file()
+        || std::env::var_os("PATH").is_some_and(|search_path| {
+            std::env::split_paths(&search_path)
+                .any(|directory| directory.join(&executable).is_file())
+        })
+}
+
 fn ghidra_snapshot_path(binary_sha256: &str, function: Option<&str>) -> Result<PathBuf, String> {
     if binary_sha256.len() != 64
         || !binary_sha256
@@ -3259,7 +3268,8 @@ struct AnalystApp {
     ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_busy: bool,
     ghidra_runtime_status: Option<GhidraRuntimeStatus>,
-    ghidra_runtime_probe: Option<Receiver<GhidraRuntimeStatus>>,
+    ghidra_cli_available: Option<bool>,
+    ghidra_runtime_probe: Option<Receiver<(GhidraRuntimeStatus, bool)>>,
     pending_ghidra: Option<(PathBuf, String)>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
@@ -3393,6 +3403,7 @@ impl AnalystApp {
             ghidra_path_lines: Vec::new(),
             ghidra_busy: false,
             ghidra_runtime_status: None,
+            ghidra_cli_available: None,
             ghidra_runtime_probe: Some(probe_ghidra_runtime(ctx)),
             pending_ghidra: None,
             symbol: None,
@@ -3483,8 +3494,9 @@ impl AnalystApp {
     fn poll(&mut self) {
         if let Some(probe) = &self.ghidra_runtime_probe {
             match probe.try_recv() {
-                Ok(status) => {
+                Ok((status, cli_available)) => {
                     self.ghidra_runtime_status = Some(status);
+                    self.ghidra_cli_available = Some(cli_available);
                     self.ghidra_runtime_probe = None;
                 }
                 Err(TryRecvError::Disconnected) => self.ghidra_runtime_probe = None,
@@ -4757,6 +4769,7 @@ impl AnalystApp {
                         .clicked()
                     {
                         self.ghidra_runtime_status = None;
+                        self.ghidra_cli_available = None;
                         self.ghidra_runtime_probe = Some(probe_ghidra_runtime(ui.ctx()));
                     }
                 });
@@ -4770,6 +4783,13 @@ impl AnalystApp {
                     );
                     ui.label(RichText::new(&status.detail).size(11.0).color(MUTED));
                     ui.label(RichText::new(action).size(11.0).color(MUTED));
+                    if self.ghidra_cli_available == Some(false) {
+                        ui.label(
+                            RichText::new("hydirctl missing: install it beside Hydir or on PATH, then Refresh.")
+                                .size(11.0)
+                                .color(BAD),
+                        );
+                    }
                 } else if self.ghidra_runtime_probe.is_some() {
                     ui.label(RichText::new("Checking Ghidra runtime…").size(11.0).color(MUTED));
                 } else {
@@ -4778,6 +4798,11 @@ impl AnalystApp {
                 let analyze = ui.add_enabled(
                     !self.busy
                         && !self.ghidra_busy
+                        && self.ghidra_cli_available == Some(true)
+                        && self
+                            .ghidra_runtime_status
+                            .as_ref()
+                            .is_some_and(|status| status.runtime_ready)
                         && self.current_local_path.is_some()
                         && self.spec.is_some(),
                     egui::Button::new("Analyze with Ghidra"),
