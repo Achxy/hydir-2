@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "binary_sha256": "9568944aec254be3cb78235667b0575d3104cd063101428abc4055dacb067582",
+  "entry": { "space": "ram", "offset": "0x20117c" },
+  "registers": [
+    { "offset": "0x0", "size": 8, "value": "0x201174" },
+    { "offset": "0x20", "size": 8, "value": "0x700000" }
+  ],
+  "memory": [
+    { "space": "ram", "byte_offset": "0x700000", "size": 8, "value": "0xdeadbeef" }
+  ]
+}

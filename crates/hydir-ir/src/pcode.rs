@@ -30,7 +30,7 @@ pub use execution::{
 };
 pub use interprocedural::{
     PCODE_CALL_PATH_VERSION, PcodeCallPathSegment, PcodeCallPathStop, PcodeCallTransition,
-    PcodeInterproceduralTrace, execute_concrete_call_path,
+    PcodeInterproceduralTrace, execute_concrete_call_path, unloaded_call_target,
 };
 pub use seed::{MAX_PCODE_SEED_BYTES, PCODE_SEED_VERSION, parse_pcode_seed};
 pub use semantics::{

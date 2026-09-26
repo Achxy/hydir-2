@@ -6446,15 +6446,15 @@ impl AnalystApp {
                     None => {}
                 }
             });
-        egui::CollapsingHeader::new("Direct-call trace")
+        egui::CollapsingHeader::new("Call trace")
             .id_salt("ghidra_direct_call_trace")
             .show(ui, |ui| {
-                ui.label(RichText::new("Use the seed JSON above to follow direct calls through automatically analyzed functions. The trace stops at missing callees, indirect calls, unknown values, recursion, or a budget limit.")
+                ui.label(RichText::new("Use the seed JSON above to follow direct calls and concrete indirect targets through automatically analyzed functions. Unknown targets, missing callees, recursion, and budget limits stop explicitly.")
                     .size(11.0).color(MUTED));
                 let can_trace = !self.ghidra_busy
                     && !self.ghidra_call_busy
                     && self.current_local_path.is_some();
-                if ui.add_enabled(can_trace, egui::Button::new("Trace direct calls")).clicked() {
+                if ui.add_enabled(can_trace, egui::Button::new("Trace calls")).clicked() {
                     let result = parse_pcode_seed(
                         self.ghidra_trace_seed_json.as_bytes(), snapshot,
                     );
@@ -6488,7 +6488,7 @@ impl AnalystApp {
                 }
                 if self.ghidra_call_busy {
                     ui.spinner();
-                    ui.label("Analyzing direct callees…");
+                    ui.label("Analyzing callees…");
                 }
                 match &self.ghidra_call_trace {
                     Some(Ok(trace)) => {

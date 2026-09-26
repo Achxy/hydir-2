@@ -1,4 +1,4 @@
-//! Bounded concrete paths across validated, directly called raw-P-code functions.
+//! Bounded concrete paths across validated raw-P-code functions.
 //! Each snapshot still represents one function. Calls are followed only when
 //! the machine P-code target, Ghidra's call evidence, and a loaded callee agree.
 
@@ -88,22 +88,44 @@ fn call_target(
     snapshot: &GhidraSnapshot,
     source: &PcodeOperation,
     site: &PcodeAddress,
+    state: &PcodeConcreteState,
 ) -> Result<(PcodeAddress, PcodeAddress), String> {
-    if source.opcode != 7 || source.mnemonic != "CALL" || source.inputs.len() != 1 {
-        return Err("only direct CALL P-code can enter a callee".to_owned());
+    if !matches!(source.opcode, 7 | 8)
+        || source.mnemonic
+            != if source.opcode == 7 {
+                "CALL"
+            } else {
+                "CALLIND"
+            }
+        || source.inputs.len() != 1
+        || source.output.is_some()
+    {
+        return Err("only validated CALL or CALLIND P-code can enter a callee".to_owned());
     }
     let input = &source.inputs[0];
+    let target_space = if source.opcode == 7 {
+        input.space.as_str()
+    } else {
+        site.space.as_str()
+    };
     let space = snapshot
         .address_spaces
         .iter()
-        .find(|space| space.name == input.space)
-        .ok_or("direct CALL target has an unknown address space")?;
+        .find(|space| space.name == target_space)
+        .ok_or("CALL target has an unknown address space")?;
     if input.size != space.pointer_size || !(1..=8).contains(&input.size) {
-        return Err("direct CALL target width differs from its address space".to_owned());
+        return Err("CALL target width differs from its address space".to_owned());
     }
+    let value = if source.opcode == 7 {
+        hex_u64(&input.offset)?
+    } else {
+        state
+            .read_varnode(input)?
+            .ok_or("CALLIND target is unknown in concrete state")?
+    };
     let target = PcodeAddress {
-        space: input.space.clone(),
-        offset: format!("0x{:x}", hex_u64(&input.offset)?),
+        space: space.name.clone(),
+        offset: format!("0x{value:x}"),
     };
     let calls = snapshot
         .selected_function
@@ -111,19 +133,28 @@ fn call_target(
         .iter()
         .filter(|call| key(&call.call_site).ok() == key(site).ok())
         .collect::<Vec<_>>();
-    if calls.len() != 1
-        || calls[0].conditional
-        || calls[0].computed
-        || calls[0]
-            .target
-            .as_ref()
-            .and_then(|evidence| key(evidence).ok())
-            != Some(key(&target)?)
-    {
-        return Err(
-            "direct CALL target disagrees with unique unconditional Ghidra call evidence"
-                .to_owned(),
-        );
+    let evidence_ok = if source.opcode == 7 {
+        calls.len() == 1
+            && !calls[0].conditional
+            && !calls[0].computed
+            && calls[0]
+                .target
+                .as_ref()
+                .and_then(|evidence| key(evidence).ok())
+                == Some(key(&target)?)
+    } else {
+        calls.len() == 1
+            && calls[0].computed
+            && !calls[0].conditional
+            && (calls[0].target.is_none()
+                || calls[0]
+                    .target
+                    .as_ref()
+                    .and_then(|evidence| key(evidence).ok())
+                    == Some(key(&target)?))
+    };
+    if !evidence_ok {
+        return Err("CALL target disagrees with Ghidra call evidence".to_owned());
     }
     let continuations = snapshot
         .selected_function
@@ -134,26 +165,68 @@ fn call_target(
         })
         .collect::<Vec<_>>();
     if continuations.len() != 1 {
-        return Err("direct CALL has no unique analyzed fallthrough".to_owned());
+        return Err("CALL has no unique analyzed fallthrough".to_owned());
     }
     let continuation = continuations[0]
         .target
         .as_ref()
-        .ok_or("direct CALL fallthrough target is unresolved")?;
+        .ok_or("CALL fallthrough target is unresolved")?;
     if !snapshot
         .selected_function
         .instructions
         .iter()
         .any(|instruction| key(&instruction.address).ok() == key(continuation).ok())
     {
-        return Err("direct CALL fallthrough is outside its caller".to_owned());
+        return Err("CALL fallthrough is outside its caller".to_owned());
     }
     Ok((target, continuation.clone()))
 }
 
-/// Follow direct, nonrecursive calls in one bounded set of snapshots.
-/// The first snapshot is the root. Unknown, indirect, mismatched, or missing
-/// call evidence stops explicitly. Shared register and RAM state follows raw
+/// Return a missing, Ghidra-indexed callee only when the current concrete
+/// trace stopped at a validated call. An unknown target or conflicting call
+/// evidence never requests another Ghidra export.
+pub fn unloaded_call_target(
+    snapshots: &[GhidraSnapshot],
+    trace: &PcodeInterproceduralTrace,
+) -> Result<Option<PcodeAddress>, String> {
+    let PcodeCallPathStop::CallBoundary { source, .. } = &trace.stop else {
+        return Ok(None);
+    };
+    let Some(segment) = trace.segments.last() else {
+        return Ok(None);
+    };
+    if !matches!(&segment.path.stop, PcodePathStop::Call { source: path_source } if path_source == source)
+    {
+        return Ok(None);
+    }
+    let Some(snapshot) = snapshots
+        .iter()
+        .find(|snapshot| snapshot.selected_function.entry == segment.function_entry)
+    else {
+        return Ok(None);
+    };
+    let Some(site) = segment.path.instruction_visits.last() else {
+        return Ok(None);
+    };
+    let Ok((target, _)) = call_target(snapshot, source, site, &trace.final_state) else {
+        return Ok(None);
+    };
+    if snapshots
+        .iter()
+        .any(|snapshot| snapshot.selected_function.entry == target)
+        || !snapshot
+            .functions
+            .iter()
+            .any(|function| function.entry == target)
+    {
+        return Ok(None);
+    }
+    Ok(Some(target))
+}
+
+/// Follow direct and concretely resolved indirect, nonrecursive calls in a
+/// bounded set of snapshots. The first snapshot is the root. Unknown,
+/// mismatched, or missing call evidence stops explicitly. Shared register and RAM state follows raw
 /// P-code; no ABI clobbers or return values are invented.
 pub fn execute_concrete_call_path(
     snapshots: &[GhidraSnapshot],
@@ -244,14 +317,14 @@ pub fn execute_concrete_call_path(
                         reason: "CALL instruction was not visited".to_owned(),
                     };
                 };
-                let (target, continuation) = match call_target(snapshot, &source, &site) {
+                let (target, continuation) = match call_target(snapshot, &source, &site, &state) {
                     Ok(value) => value,
                     Err(reason) => break PcodeCallPathStop::CallBoundary { source, reason },
                 };
                 let Some(&callee) = index.get(&key(&target)?) else {
                     break PcodeCallPathStop::CallBoundary {
                         source,
-                        reason: "direct CALL callee snapshot is unavailable".to_owned(),
+                        reason: "CALL callee snapshot is unavailable".to_owned(),
                     };
                 };
                 if frames.len() >= max_call_depth {
@@ -460,6 +533,107 @@ mod tests {
             execute_concrete_call_path(&mixed, &input, 128, 16, 4)
                 .unwrap_err()
                 .contains("disagree")
+        );
+    }
+
+    #[test]
+    fn real_computed_call_uses_concrete_target_and_matching_ghidra_evidence() {
+        let digest = "9568944aec254be3cb78235667b0575d3104cd063101428abc4055dacb067582";
+        let mut snapshots = [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_root_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_leaf_v2.json"
+            ))
+            .as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, digest).unwrap())
+        .collect::<Vec<_>>();
+        let seed = super::super::parse_pcode_seed(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_seed_v1.json"
+            )),
+            &snapshots[0],
+        )
+        .unwrap();
+        let trace = execute_concrete_call_path(&snapshots, &seed, 128, 16, 4).unwrap();
+        assert_eq!(trace.calls.len(), 1);
+        assert_eq!(trace.calls[0].callee_entry.offset, "0x201174");
+        assert_eq!(trace.calls[0].return_address.offset, "0x20117e");
+        assert_eq!(trace.segments.len(), 3);
+        assert!(matches!(trace.stop, PcodeCallPathStop::Return { .. }));
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode(&super::super::PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x0".to_owned(),
+                    size: 8,
+                })
+                .unwrap(),
+            Some(7)
+        );
+
+        let missing = execute_concrete_call_path(&snapshots[..1], &seed, 128, 16, 4).unwrap();
+        assert!(matches!(
+            missing.stop,
+            PcodeCallPathStop::CallBoundary { ref reason, .. } if reason.contains("unavailable")
+        ));
+        assert_eq!(
+            unloaded_call_target(&snapshots[..1], &missing)
+                .unwrap()
+                .unwrap()
+                .offset,
+            "0x201174"
+        );
+        let mut unknown = PcodeConcreteState::default();
+        unknown
+            .write_varnode(
+                &super::super::PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x20".to_owned(),
+                    size: 8,
+                },
+                0x700000,
+            )
+            .unwrap();
+        unknown
+            .write_memory("ram", 0x700000, 8, 0xdeadbeef)
+            .unwrap();
+        let unknown = execute_concrete_call_path(&snapshots, &unknown, 128, 16, 4).unwrap();
+        assert!(matches!(
+            unknown.stop,
+            PcodeCallPathStop::PathBoundary {
+                stop: super::super::PcodePathStop::EffectBoundary { .. }
+            }
+        ));
+        assert!(unknown.calls.is_empty());
+        assert!(
+            unloaded_call_target(&snapshots, &unknown)
+                .unwrap()
+                .is_none()
+        );
+        snapshots[0].selected_function.call_targets[0].computed = false;
+        let source = snapshots[0].selected_function.instructions[0]
+            .pcode
+            .iter()
+            .find(|operation| operation.opcode == 8)
+            .unwrap();
+        assert!(
+            call_target(
+                &snapshots[0],
+                source,
+                &snapshots[0].selected_function.entry,
+                &trace.segments[0].path.final_state,
+            )
+            .unwrap_err()
+            .contains("disagrees")
         );
     }
 }

@@ -4,7 +4,7 @@ use super::{read_binary, read_bounded_json, write_new_or_identical};
 use hydir_ghidra_worker as ghidra_worker;
 use hydir_ir::pcode::{
     GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, execute_concrete_call_path,
-    parse_ghidra_snapshot, parse_pcode_seed,
+    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -174,6 +174,62 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         }
         snapshots.push(snapshot);
+    }
+    if !snapshots.is_empty() {
+        let root = snapshots[0].clone();
+        let seed = parse_pcode_seed(&read_bounded_json(seed, MAX_PCODE_SEED_BYTES)?, &root)?;
+        loop {
+            let trace = execute_concrete_call_path(
+                &snapshots,
+                &seed,
+                options.max_operations,
+                options.max_visits,
+                options.max_depth,
+            )?;
+            let Some(target) = unloaded_call_target(&snapshots, &trace)? else {
+                break;
+            };
+            let entry = super::parse_u64_auto(&target.offset, "computed call target")?;
+            if snapshots.len() >= options.max_functions {
+                if !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.starts_with("function collection limit reached before ")
+                        && diagnostic.ends_with(&format!("0x{entry:x}"))
+                }) {
+                    diagnostics.push(format!(
+                        "function collection limit reached before computed callee 0x{entry:x}"
+                    ));
+                }
+                break;
+            }
+            if !seen.insert(entry) {
+                break;
+            }
+            let output = scratch
+                .path()
+                .join(format!("computed-function-{}.json", snapshots.len()));
+            let snapshot = match ghidra_worker::analyze(Path::new(binary), Some(entry), &output) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "computed callee 0x{entry:x} export failed: {error}"
+                    ));
+                    break;
+                }
+            };
+            if snapshot.binary_sha256 != digest
+                || snapshot.selected_function.entry != target
+                || snapshot.program != root.program
+                || snapshot.address_spaces != root.address_spaces
+                || snapshot.functions != root.functions
+                || snapshot.flow_overrides_applied != root.flow_overrides_applied
+            {
+                diagnostics.push(format!(
+                    "computed callee 0x{entry:x} has inconsistent analysis identity"
+                ));
+                break;
+            }
+            snapshots.push(snapshot);
+        }
     }
     emit(&snapshots, seed, &options, diagnostics)
 }
