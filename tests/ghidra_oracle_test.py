@@ -52,7 +52,7 @@ class GhidraOracleTests(unittest.TestCase):
             ("zero", 0),
             ("high", 0xFEDCBA9876543210),
         ]
-        cls.branch_cases = [("taken", 1, 0), ("not_taken", 0, 1)]
+        cls.branch_cases = [("taken", 0, 0, 1), ("not_taken", 5, 1, 0)]
         command = [str(HEADLESS), str(projects), "HydirOracleTest", "-import", str(BINARY), "-scriptPath", str(scripts)]
         for label, rdi in cls.cases:
             command.extend([
@@ -61,12 +61,12 @@ class GhidraOracleTests(unittest.TestCase):
                 encoded("0x700000:8:0xdeadbeef"), encoded("RAX,RDI,RSP,RIP"),
                 encoded("0x700000:8"),
             ])
-        for label, zf, _ in cls.branch_cases:
+        for label, rsi, _, _ in cls.branch_cases:
             command.extend([
                 "-postScript", SCRIPT.name, str(cls.temp / f"branch-{label}.json"), str(BINARY),
-                "0x2013cf", "8", encoded(f"ZF=0x{zf:x};RAX=0x0;RSP=0x700000"),
+                "0x2013cf", "8", encoded(f"RDI=0x7;RSI=0x{rsi:x};RSP=0x700000"),
                 encoded("0x700000:8:0xdeadbeef"), encoded("RAX,ZF,RSP,RIP"),
-                encoded("0x700000:8"), "0x2013d9",
+                encoded("0x700000:8"),
             ])
         command.extend([
             "-postScript", SCRIPT.name, str(cls.temp / "call_boundary.json"), str(BINARY),
@@ -80,7 +80,7 @@ class GhidraOracleTests(unittest.TestCase):
         for label, _ in cls.cases:
             if not (cls.temp / f"{label}.json").is_file():
                 raise AssertionError(f"Ghidra did not write {label} result:\n{output[-8000:]}")
-        for label, _, _ in cls.branch_cases:
+        for label, _, _, _ in cls.branch_cases:
             if not (cls.temp / f"branch-{label}.json").is_file():
                 raise AssertionError(f"Ghidra did not write branch {label} result:\n{output[-8000:]}")
         if not (cls.temp / "call_boundary.json").is_file():
@@ -156,7 +156,7 @@ class GhidraOracleTests(unittest.TestCase):
     def test_both_real_conditional_branch_outcomes_match_rust_path(self):
         self.assertEqual(self.branch_snapshot["binary_sha256"], self.digest)
         self.assertEqual(self.branch_snapshot["selected_function"]["entry"]["offset"], "0x2013cf")
-        for label, zf, expected_rax in self.branch_cases:
+        for label, rsi, expected_rax, expected_zf in self.branch_cases:
             with self.subTest(label=label):
                 oracle = json.loads((self.temp / f"branch-{label}.json").read_text(encoding="utf-8"))
                 seed = {
@@ -164,13 +164,13 @@ class GhidraOracleTests(unittest.TestCase):
                     "binary_sha256": self.digest,
                     "entry": {"space": "ram", "offset": "0x2013cf"},
                     "registers": [
-                        {"offset": "0x206", "size": 1, "value": f"0x{zf:x}"},
-                        {"offset": "0x0", "size": 8, "value": "0x0"},
+                        {"offset": "0x38", "size": 8, "value": "0x7"},
+                        {"offset": "0x30", "size": 8, "value": f"0x{rsi:x}"},
                         {"offset": "0x20", "size": 8, "value": "0x700000"},
                     ],
                     "memory": [{"space": "ram", "byte_offset": "0x700000", "size": 8, "value": "0xdeadbeef"}],
                 }
-                trace = self.hydir_trace(seed, BRANCH_SNAPSHOT, f"branch-{label}", start="0x2013d9")
+                trace = self.hydir_trace(seed, BRANCH_SNAPSHOT, f"branch-{label}")
                 self.assertEqual(oracle["entry"], seed["entry"])
                 self.assertEqual(oracle["start"], trace["start"])
                 self.assertEqual(oracle["stop"]["kind"], "return")
@@ -181,6 +181,7 @@ class GhidraOracleTests(unittest.TestCase):
                 )
                 by_name = {item["name"]: item for item in oracle["registers"]}
                 self.assertEqual(int(by_name["RAX"]["value"], 16), expected_rax)
+                self.assertEqual(int(by_name["ZF"]["value"], 16), expected_zf)
                 for name in ("RAX", "ZF", "RSP"):
                     item = by_name[name]
                     self.assertEqual(
