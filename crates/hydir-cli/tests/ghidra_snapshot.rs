@@ -215,3 +215,57 @@ fn imports_snapshot_exported_by_headless_ghidra() {
             .contains("define i64 @hydir_read_varnode")
     );
 }
+
+#[test]
+fn concrete_trace_prefix_uses_binary_bound_seed_and_reports_boundary() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let snapshot_path = root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json");
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    let seed = serde_json::json!({
+        "schema_version": 1,
+        "binary_sha256": snapshot["binary_sha256"],
+        "entry": snapshot["selected_function"]["entry"],
+        "registers": [
+            {"offset": "0x38", "size": 8, "value": "0xf0f"},
+            {"offset": "0x30", "size": 8, "value": "0xff"}
+        ]
+    });
+    let seed_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(seed_file.path(), serde_json::to_vec(&seed).unwrap()).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+            .args(["ghidra-snapshot", "trace-prefix"])
+            .arg(root.join("demo/hydir-prism.elf"))
+            .arg(&snapshot_path)
+            .arg(seed_file.path())
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(trace["executed"].as_array().unwrap().len(), 7);
+    assert_eq!(trace["schema_version"], 2);
+    assert_eq!(trace["verification"], "not_run");
+    assert_eq!(trace["stop"]["kind"], "opaque_boundary");
+    assert_eq!(trace["stop"]["source"]["mnemonic"], "POPCOUNT");
+
+    let mut wrong = seed.clone();
+    wrong["binary_sha256"] = serde_json::json!("0".repeat(64));
+    std::fs::write(seed_file.path(), serde_json::to_vec(&wrong).unwrap()).unwrap();
+    let rejected = run();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("disagrees with snapshot"));
+
+    let mut overlapping = seed;
+    overlapping["registers"][1]["offset"] = serde_json::json!("0x39");
+    std::fs::write(seed_file.path(), serde_json::to_vec(&overlapping).unwrap()).unwrap();
+    let rejected = run();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("overlap"));
+}

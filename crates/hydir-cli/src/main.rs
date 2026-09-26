@@ -32,6 +32,7 @@ use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{MAX_GHIDRA_SNAPSHOT_BYTES, parse_ghidra_snapshot};
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod ghidra_trace;
 mod ghidra_worker;
 mod local;
 mod passes;
@@ -69,6 +70,7 @@ Usage:
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
+  hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
@@ -205,6 +207,47 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-prefix" => {
+            let mut max_operations = 4096usize;
+            let mut output_path = None;
+            let mut options = args[5..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--max-ops" => {
+                        max_operations = pair[1].parse()?;
+                        if max_operations > 262_144 {
+                            return Err(
+                                "P-code trace operation budget exceeds artifact limit".into()
+                            );
+                        }
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let initial = ghidra_trace::parse_seed(
+                &read_bounded_json(&args[4], ghidra_trace::MAX_SEED_BYTES)?,
+                &snapshot,
+            )?;
+            let trace = snapshot
+                .pcode_function_ir()?
+                .execute_exact_prefix(&initial, max_operations)?;
+            let bytes = serde_json::to_vec_pretty(&trace)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
         Some("ghidra-snapshot")
             if (args.len() == 8 || args.len() == 10 && args[8] == "--output")
                 && args[1] == "llvm-op"

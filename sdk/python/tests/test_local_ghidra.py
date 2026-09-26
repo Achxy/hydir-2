@@ -53,3 +53,17 @@ class LocalGhidraTests(unittest.TestCase):
             self.assertEqual(self.client.artifact("cfg", self.binary, self.snapshot)["cfg_completeness"], "incomplete")
         with self.assertRaises(ValueError):
             self.client.artifact("made-up", self.binary, self.snapshot)
+
+    def test_concrete_trace_forwards_seed_and_checks_identity(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        seed = Path(self.directory.name) / "seed.json"
+        seed.write_text("{}", encoding="utf-8")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "executed": [],
+        }).encode()) as run:
+            result = self.client.trace_prefix(self.binary, self.snapshot, seed, max_operations=3)
+        self.assertEqual(result["executed"], [])
+        self.assertEqual(run.call_args.args[1], "trace-prefix")
+        self.assertEqual(run.call_args.args[-2:], ("--max-ops", "3"))
+        with self.assertRaises(ValueError):
+            self.client.trace_prefix(self.binary, self.snapshot, seed, max_operations=-1)

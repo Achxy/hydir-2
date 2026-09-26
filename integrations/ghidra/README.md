@@ -22,6 +22,7 @@ cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapsho
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
+cargo run -p hydir-cli -- ghidra-snapshot trace-prefix .\demo\hydir-prism.elf .\snapshot.json .\seed.json --max-ops 4096 --output .\trace.json
 ```
 
 For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
@@ -79,6 +80,29 @@ still stops at the prefix boundary and does not represent a complete function.
 The concrete P-code executor can cross a RAM `LOAD` or `STORE` when the address,
 width, and required bytes are supplied in its state; unknown memory remains a
 reported boundary. Memory is not yet part of the standalone LLVM prefix.
+
+`trace-prefix` takes a binary-bound seed file. Register offsets and memory
+offsets are bytes; memory entries are grouped by Ghidra address-space name.
+The seed's function entry must match the selected snapshot function. For
+example, after copying the snapshot's digest and entry:
+
+```json
+{
+  "schema_version": 1,
+  "binary_sha256": "<64-character SHA-256 from snapshot>",
+  "entry": {"space": "ram", "offset": "0x2013cf"},
+  "registers": [
+    {"offset": "0x38", "size": 8, "value": "0xf0f"},
+    {"offset": "0x30", "size": 8, "value": "0xff"}
+  ],
+  "memory": []
+}
+```
+
+Each seed value must fit its declared 1..=8-byte width. Overlapping entries,
+unknown spaces, and mismatched binary or function identities are rejected.
+The trace records each executed operation, concrete memory access, final
+state, and exact stop reason. It does not claim whole-function equivalence.
 
 The JSON includes the SHA-256 of the supplied original binary and requires it
 to match Ghidra's recorded import hash. Addresses are objects
