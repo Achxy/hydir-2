@@ -2,7 +2,8 @@
 
 `HydIRSnapshot.java` runs as a Ghidra post-analysis script. It exports a program
 function index, one function's **raw instruction P-code**, analyzed flow edges,
-call targets, memory blocks, and defined symbols in Hydir snapshot schema v2.
+call targets, memory blocks, defined symbols, and source-tagged function
+prototype evidence in Hydir snapshot schema v2.
 These additional sections are optional so earlier v2 snapshots remain
 readable. It does not lift, simplify,
 or type the P-code. Those steps belong to
@@ -24,6 +25,7 @@ cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\sna
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot coverage .\demo\hydir-prism.elf .\snapshot.json --output .\coverage.json
+cargo run -p hydir-cli -- ghidra-snapshot slice .\demo\hydir-prism.elf .\snapshot.json --instruction 0 --op 0 --output .\slice.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-cfg .\demo\hydir-prism.elf .\snapshot.json --start 0x2013d9 --output .\cfg-llvm.json
@@ -84,6 +86,26 @@ evidence. Older v2 snapshots without these arrays still import. Metadata is
 evidence for analysis, not lifted machine semantics. The desktop P-code view
 lists the memory map and symbols; RAM entries link to the selected source
 address.
+Function entries may also carry bounded Ghidra signature, parameter, return
+type, calling convention, and type-kind evidence. The exporter omits default
+signatures, and old v2 snapshots without prototypes remain valid. Hydir keeps
+analysis-derived signatures as evidence. Imported or user-defined signatures
+become model prototypes only when every type maps unambiguously and the pinned
+Ghidra language/compiler convention maps to the ELF ABI. Ghidra 12.1.4 calls
+the default convention in its x86-64 gcc spec `__stdcall`, although that spec
+uses the System V AMD64 argument registers; the convention name alone is not
+an ABI proof.
+The checked-in `tests/fixtures/ghidra_prototype.elf` and its snapshot were
+produced from `tests/fixtures/ghidra_prototype.c` with Clang 22.1.8:
+
+```powershell
+clang -target x86_64-unknown-linux-gnu -g -O1 -fno-omit-frame-pointer -nostdlib -fuse-ld=lld '-Wl,-e,_start' '-Wl,--build-id=none' -o tests\fixtures\ghidra_prototype.elf tests\fixtures\ghidra_prototype.c
+```
+
+The ELF SHA-256 is `9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f`.
+`slice` follows a bounded backward chain of P-code value dependencies and
+reports constants, entry values, control merges, memory, and opaque effects as
+boundaries. It keeps source operation addresses and never marks a path proven.
 The CFG artifact joins instruction nodes to analyzed edges and keeps calls
 separate. Its completeness is explicitly `incomplete`, including when all
 visible edges have concrete targets.
