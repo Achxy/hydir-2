@@ -1241,8 +1241,13 @@ fn decode_program_function(
     )?;
     let mut recovered = initial;
     let mut targets = BTreeMap::<u64, Vec<u64>>::new();
+    let mut pending_sites = indirect_control_sites(&recovered);
     for _ in 0..MAX_INDIRECT_RECOVERY_PASSES {
-        let pass_targets = recover_indirect_target_map(bytes, spec, &recovered);
+        if pending_sites.is_empty() {
+            break;
+        }
+        let pass_targets = recover_indirect_target_map(bytes, spec, &recovered, &pending_sites);
+        pending_sites.clear();
         let mut changed = false;
         for (site, mut site_targets) in pass_targets {
             site_targets.sort_unstable();
@@ -1257,6 +1262,12 @@ fn decode_program_function(
         if !changed {
             break;
         }
+        let previous_addresses = recovered
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| instruction.address.value.0)
+            .collect::<BTreeSet<_>>();
         recovered = decode_function_with_targets(
             code,
             address,
@@ -1267,6 +1278,18 @@ fn decode_program_function(
             stop_entries,
             &targets,
         )?;
+        pending_sites = affected_indirect_control_sites(&recovered, &previous_addresses);
+    }
+    if let Some(site) = pending_sites.iter().next() {
+        recovered.structural_completeness = StructuralCompleteness::Partial;
+        recovered.diagnostics.push(IrDiagnostic {
+            code: "indirect_recovery_budget".to_owned(),
+            message: format!(
+                "indirect target rediscovery stopped at the {MAX_INDIRECT_RECOVERY_PASSES}-pass limit with unexamined changed sites"
+            ),
+            address: Some(location(address_space, *site)),
+            blocks_stable_operation: true,
+        });
     }
     if targets.is_empty() {
         return Ok(recovered);
@@ -1291,6 +1314,7 @@ fn recover_indirect_target_map(
     bytes: &[u8],
     spec: &ProgramSpec,
     machine: &MachineFunctionIr,
+    sites: &BTreeSet<u64>,
 ) -> BTreeMap<u64, Vec<u64>> {
     let mut recovered = BTreeMap::new();
     let mut instructions = machine
@@ -1300,6 +1324,9 @@ fn recover_indirect_target_map(
         .collect::<Vec<_>>();
     instructions.sort_by_key(|instruction| instruction.address);
     for (position, instruction) in instructions.iter().enumerate() {
+        if !sites.contains(&instruction.address.value.0) {
+            continue;
+        }
         if !matches!(
             instruction.effects.control,
             MachineControlEffect::IndirectBranch | MachineControlEffect::IndirectCall
@@ -1375,6 +1402,60 @@ fn recover_indirect_target_map(
         );
     }
     recovered
+}
+
+fn indirect_control_sites(machine: &MachineFunctionIr) -> BTreeSet<u64> {
+    machine
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.effects.control,
+                MachineControlEffect::IndirectBranch | MachineControlEffect::IndirectCall
+            )
+        })
+        .map(|instruction| instruction.address.value.0)
+        .collect()
+}
+
+fn affected_indirect_control_sites(
+    machine: &MachineFunctionIr,
+    previous_addresses: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut instructions = machine
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    instructions.sort_by_key(|instruction| instruction.address);
+    instructions
+        .iter()
+        .enumerate()
+        .filter(|(position, instruction)| {
+            if !matches!(
+                instruction.effects.control,
+                MachineControlEffect::IndirectBranch | MachineControlEffect::IndirectCall
+            ) {
+                return false;
+            }
+            let site = instruction.address.value.0;
+            let previous_window = previous_addresses
+                .range(..site)
+                .rev()
+                .take(16)
+                .copied()
+                .collect::<Vec<_>>();
+            let current_window = instructions[..*position]
+                .iter()
+                .rev()
+                .take(16)
+                .map(|prior| prior.address.value.0)
+                .collect::<Vec<_>>();
+            !previous_addresses.contains(&site) || current_window != previous_window
+        })
+        .map(|(_, instruction)| instruction.address.value.0)
+        .collect()
 }
 
 fn recover_register_constant_targets(
@@ -14274,6 +14355,101 @@ mod tests {
         assert!(c.contains("case UINT64_C(0x2807)"));
         assert!(c.contains("case UINT64_C(0x2808)"));
         assert!(c.contains("default:"));
+    }
+
+    #[test]
+    fn changed_indirect_sites_drive_bounded_cascade_recovery() {
+        let mut code = vec![0x90; 0x21];
+        code[..12].copy_from_slice(&[
+            0x48, 0xb8, 0x10, 0x30, 0, 0, 0, 0, 0, 0, // mov rax,0x3010
+            0xff, 0xe0, // jmp rax
+        ]);
+        code[0x10..0x1c].copy_from_slice(&[
+            0x48, 0xb8, 0x20, 0x30, 0, 0, 0, 0, 0, 0, // mov rax,0x3020
+            0xff, 0xe0, // jmp rax
+        ]);
+        code[0x20] = 0xc3;
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/stack.elf");
+        let spec = import_elf(binary).unwrap();
+        let recovered = decode_program_function(
+            &code,
+            0x3000,
+            0,
+            "d".repeat(64),
+            "cascade".to_owned(),
+            "cascade".to_owned(),
+            &BTreeSet::new(),
+            binary,
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.structural_completeness,
+            StructuralCompleteness::Complete
+        );
+        assert_eq!(
+            indirect_control_sites(&recovered),
+            BTreeSet::from([0x300a, 0x301a])
+        );
+        assert!(
+            recovered
+                .blocks
+                .iter()
+                .any(|block| block.address.value.0 == 0x3020)
+        );
+        assert!(recovered.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "bounded_indirect_targets"
+                && diagnostic.message.contains("2 in-function targets")
+        }));
+
+        // A newly decoded producer can affect an indirect site that was
+        // already visible; only that site's bounded evidence window is retried.
+        let prior = BTreeSet::from([0x3000, 0x300a, 0x301a]);
+        assert_eq!(
+            affected_indirect_control_sites(&recovered, &prior),
+            BTreeSet::from([0x301a])
+        );
+    }
+
+    #[test]
+    fn indirect_recovery_budget_keeps_new_sites_explicitly_partial() {
+        let base = 0x4000_u64;
+        let mut code = vec![0x90; (MAX_INDIRECT_RECOVERY_PASSES + 1) * 16 + 1];
+        for hop in 0..=MAX_INDIRECT_RECOVERY_PASSES {
+            let offset = hop * 16;
+            let target = (base + ((hop + 1) * 16) as u64).to_le_bytes();
+            code[offset..offset + 12].copy_from_slice(&[
+                0x48, 0xb8, target[0], target[1], target[2], target[3], target[4], target[5],
+                target[6], target[7], 0xff, 0xe0,
+            ]);
+        }
+        *code.last_mut().unwrap() = 0xc3;
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/stack.elf");
+        let spec = import_elf(binary).unwrap();
+        let recovered = decode_program_function(
+            &code,
+            base,
+            0,
+            "d".repeat(64),
+            "budget".to_owned(),
+            "budget".to_owned(),
+            &BTreeSet::new(),
+            binary,
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.structural_completeness,
+            StructuralCompleteness::Partial
+        );
+        assert!(recovered.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "indirect_recovery_budget"
+                && diagnostic.address
+                    == Some(location(
+                        0,
+                        base + (MAX_INDIRECT_RECOVERY_PASSES * 16 + 10) as u64,
+                    ))
+        }));
     }
 
     #[test]
