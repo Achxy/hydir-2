@@ -26,8 +26,9 @@ if _version_not_supported:
 
 
 class HydirV3Stub:
-    """Native whole-program analysis contract. v1 and v2 remain available for
-    compatibility; this service never requires an external decompiler.
+    """Native whole-program and Ghidra-backed analysis contract.
+    v1 and v2 remain available for compatibility. A caller can provide a
+    snapshot, or request automatic headless analysis of the uploaded binary.
     """
 
     def __init__(self, channel):
@@ -79,8 +80,9 @@ class HydirV3Stub:
 
 
 class HydirV3Servicer:
-    """Native whole-program analysis contract. v1 and v2 remain available for
-    compatibility; this service never requires an external decompiler.
+    """Native whole-program and Ghidra-backed analysis contract.
+    v1 and v2 remain available for compatibility. A caller can provide a
+    snapshot, or request automatic headless analysis of the uploaded binary.
     """
 
     def Discover(self, request, context):
@@ -183,8 +185,9 @@ def add_HydirV3Servicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class HydirV3:
-    """Native whole-program analysis contract. v1 and v2 remain available for
-    compatibility; this service never requires an external decompiler.
+    """Native whole-program and Ghidra-backed analysis contract.
+    v1 and v2 remain available for compatibility. A caller can provide a
+    snapshot, or request automatic headless analysis of the uploaded binary.
     """
 
     @staticmethod

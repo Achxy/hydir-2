@@ -208,6 +208,8 @@ class HydirClient:
         instruction_index: int | None = None,
         operation_index: int | None = None,
         input_index: int | None = None,
+        selected_function_entry: int | str | None = None,
+        automatic: bool = False,
     ) -> dict:
         """Analyze a Ghidra export bound to this project's uploaded binary.
 
@@ -215,6 +217,7 @@ class HydirClient:
         analysis in an isolated worker, and returns a versioned JSON artifact.
         """
         media_types = {
+            "snapshot": ("application/vnd.hydir.ghidra-snapshot+json;version=2", 2),
             "pcode": ("application/vnd.hydir.pcode-ir+json;version=1", 1),
             "semantics": ("application/vnd.hydir.pcode-semantic-ir+json;version=1", 1),
             "state": ("application/vnd.hydir.pcode-state-ir+json;version=1", 1),
@@ -249,6 +252,18 @@ class HydirClient:
             or any(character not in "0123456789abcdef" for character in start_address[2:])
         ):
             raise ValueError("Start address must be 0x plus 1..=16 lowercase hex digits")
+        if selected_function_entry is not None and not automatic:
+            raise ValueError("Selected function entry requires automatic Ghidra analysis")
+        if isinstance(selected_function_entry, int):
+            if not 0 <= selected_function_entry <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("Selected function entry must fit in 64 bits")
+            selected_function_entry = f"0x{selected_function_entry:x}"
+        if selected_function_entry is not None and (
+            not selected_function_entry.startswith("0x")
+            or not 1 <= len(selected_function_entry[2:]) <= 16
+            or any(character not in "0123456789abcdef" for character in selected_function_entry[2:])
+        ):
+            raise ValueError("Selected function entry must be 0x plus 1..=16 lowercase hex digits")
         if isinstance(snapshot, bytes):
             content = snapshot
         else:
@@ -256,14 +271,18 @@ class HydirClient:
             if path.stat().st_size > MAX_GHIDRA_SNAPSHOT_BYTES:
                 raise ValueError("Ghidra snapshot exceeds 16 MiB")
             content = path.read_bytes()
-        if not 1 <= len(content) <= MAX_GHIDRA_SNAPSHOT_BYTES:
+        if len(content) > MAX_GHIDRA_SNAPSHOT_BYTES or (not automatic and not content):
             raise ValueError("Ghidra snapshot must be 1..=16 MiB")
+        if automatic and content:
+            raise ValueError("Automatic Ghidra analysis does not accept a caller snapshot")
         request = proto_v3.GhidraSnapshotArtifactRequest(
             project_id=project_id,
             expected_revision=revision,
             snapshot_json=content,
             stage=stage,
             start_address=start_address or "",
+            selected_function_entry=selected_function_entry or "",
+            automatic=automatic,
         )
         if stage == "slice":
             request.instruction_index = instruction_index
@@ -281,6 +300,29 @@ class HydirClient:
         if stage == "slice" and artifact.get("path_proven") is not False:
             raise RuntimeError("P-code slice has an unsupported path-proof claim")
         return artifact
+
+    def analyze_ghidra_binary(
+        self,
+        project_id: str,
+        revision: int,
+        stage: str,
+        *,
+        selected_function_entry: int | str | None = None,
+        start_address: int | str | None = None,
+        instruction_index: int | None = None,
+        operation_index: int | None = None,
+        input_index: int | None = None,
+    ) -> dict:
+        """Analyze the project's uploaded ELF with managed headless Ghidra."""
+        return self.analyze_ghidra_snapshot(
+            project_id, revision, b"", stage,
+            selected_function_entry=selected_function_entry,
+            start_address=start_address,
+            instruction_index=instruction_index,
+            operation_index=operation_index,
+            input_index=input_index,
+            automatic=True,
+        )
 
     def start_program_analysis(
         self, project_id: str, revision: int, *, idempotency_key: str | None = None,

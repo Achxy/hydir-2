@@ -36,6 +36,9 @@ Rust semantic classification and LLVM for a narrow exact operation subset.
 Hydir caches the analyzed Ghidra project for later function selections. Its
 function state artifact is an ordered effect inventory; executable
 whole-function P-code lifting remains in progress.
+The v3 service and Python SDK can run the same managed worker on an uploaded
+ELF and return a validated snapshot, raw P-code, state effects, CFG LLVM, and
+bounded dependency slices.
 
 ## Quick start
 

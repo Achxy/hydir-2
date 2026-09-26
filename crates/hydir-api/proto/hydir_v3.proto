@@ -1,9 +1,9 @@
 syntax = "proto3";
 package hydir.v3;
 
-// Native whole-program and caller-supplied Ghidra snapshot analysis contract.
-// v1 and v2 remain available for compatibility. Snapshot analysis consumes
-// Ghidra export evidence; this RPC does not launch Ghidra headlessly.
+// Native whole-program and Ghidra-backed analysis contract.
+// v1 and v2 remain available for compatibility. A caller can provide a
+// snapshot, or request automatic headless analysis of the uploaded binary.
 service HydirV3 {
   rpc Discover (DiscoverRequest) returns (DiscoverReply);
   rpc StartProgramAnalysis (StartProgramAnalysisRequest) returns (JobReply);
@@ -29,6 +29,7 @@ message DiscoverReply {
   bool isolated_analysis_jobs = 10;
   bool analyst_fact_updates = 11;
   bool ghidra_snapshot_analysis = 12;
+  bool automatic_ghidra_analysis = 13;
 }
 
 message StartProgramAnalysisRequest {
@@ -84,13 +85,19 @@ message ArtifactReply {
   uint64 project_revision = 4;
 }
 
-// The caller supplies an exporter snapshot for the current project binary.
-// stage is pcode, semantics, state, cfg, coverage, llvm-cfg, or slice. Only
+// The caller supplies an exporter snapshot for the current project binary, or
+// sets automatic=true with empty snapshot_json to run the managed Ghidra
+// worker. This explicit flag keeps malformed legacy requests inert.
+// stage is snapshot, pcode, semantics, state, cfg, coverage, llvm-cfg, or slice. Only
 // llvm-cfg accepts start_address, a 0x-prefixed address in the selected function
 // space. Only slice accepts the operation selector. Both indices are required
 // for slice; input_index is optional and restricts the slice to one input.
 // The server validates the snapshot digest against the uploaded binary and
 // runs the bounded Rust analysis in its isolated worker process.
+// selected_function_entry applies only to automatic analysis and uses a
+// Ghidra RAM address (0x-prefixed lowercase hex). Empty selects the first
+// analyzed function. A selected entry is kept separate from llvm-cfg's
+// start_address, which selects a path inside that function.
 message GhidraSnapshotArtifactRequest {
   string project_id = 1;
   uint64 expected_revision = 2;
@@ -100,6 +107,8 @@ message GhidraSnapshotArtifactRequest {
   optional uint32 instruction_index = 6;
   optional uint32 operation_index = 7;
   optional uint32 input_index = 8;
+  string selected_function_entry = 9;
+  bool automatic = 10;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.
