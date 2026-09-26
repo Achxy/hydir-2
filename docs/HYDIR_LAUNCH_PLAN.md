@@ -35,7 +35,7 @@ The exporter and Rust snapshot validator now carry optional memory block and def
 
 The v3 service can now analyze a caller-supplied, digest-bound Ghidra snapshot for P-code, semantic, state, CFG, coverage, and bounded CFG LLVM artifacts through its isolated worker. The RPC checks project authorization and revision; it does not launch Ghidra or retain the raw snapshot as a project source. `hydirctl model import-ghidra` imports mapped function names as Ghidra evidence into AnalysisModel, preserves analyst names, and records disagreements. The exporter also carries optional bounded prototype/type-kind evidence. The model imports supported imported or user-defined prototypes only with unambiguous types and a verified x86-64 gcc ABI mapping; other signatures remain evidence. Ghidra structure fields, high P-code types, and broader ABI mapping remain open.
 The GUI applies the same conservative name import to its local model when it saves an automatically analyzed snapshot, leaving repeated imports at the current project revision.
-The Rust P-code core has a bounded backward value-dependency slice with explicit control, memory, opaque, and budget boundaries. Clicking a raw P-code operation in the GUI shows its source-linked slice; the CLI and local Python SDK emit the same artifact. Service access and broader dataflow remain open.
+The Rust P-code core has a bounded backward value-dependency slice with explicit control, memory, opaque, and budget boundaries. Clicking a raw P-code operation in the GUI shows its source-linked slice; the CLI, local Python SDK, and v3 service emit the same artifact. Broader dataflow remains open.
 
 ## Architecture and artifact contract
 

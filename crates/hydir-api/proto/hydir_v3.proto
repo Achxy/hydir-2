@@ -1,8 +1,9 @@
 syntax = "proto3";
 package hydir.v3;
 
-// Native whole-program analysis contract. v1 and v2 remain available for
-// compatibility; this service never requires an external decompiler.
+// Native whole-program and caller-supplied Ghidra snapshot analysis contract.
+// v1 and v2 remain available for compatibility. Snapshot analysis consumes
+// Ghidra export evidence; this RPC does not launch Ghidra headlessly.
 service HydirV3 {
   rpc Discover (DiscoverRequest) returns (DiscoverReply);
   rpc StartProgramAnalysis (StartProgramAnalysisRequest) returns (JobReply);
@@ -84,8 +85,10 @@ message ArtifactReply {
 }
 
 // The caller supplies an exporter snapshot for the current project binary.
-// stage is pcode, semantics, state, cfg, coverage, or llvm-cfg. Only llvm-cfg
-// accepts start_address, a 0x-prefixed address in the selected function space.
+// stage is pcode, semantics, state, cfg, coverage, llvm-cfg, or slice. Only
+// llvm-cfg accepts start_address, a 0x-prefixed address in the selected function
+// space. Only slice accepts the operation selector. Both indices are required
+// for slice; input_index is optional and restricts the slice to one input.
 // The server validates the snapshot digest against the uploaded binary and
 // runs the bounded Rust analysis in its isolated worker process.
 message GhidraSnapshotArtifactRequest {
@@ -94,6 +97,9 @@ message GhidraSnapshotArtifactRequest {
   bytes snapshot_json = 3;
   string stage = 4;
   string start_address = 5;
+  optional uint32 instruction_index = 6;
+  optional uint32 operation_index = 7;
+  optional uint32 input_index = 8;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.
