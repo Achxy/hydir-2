@@ -4,6 +4,10 @@ use hydir_core::{
     Address, AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec,
     annotation_address_in_spec, parse_annotation_address, validate_analyst_annotation,
 };
+use hydir_ir::pcode::{
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, parse_ghidra_snapshot,
+    validate_ghidra_snapshot,
+};
 use hydir_model::{
     AnalysisModel, MAX_MODEL_BYTES, init_model, parse_model, record_analyst_edits, validate_model,
 };
@@ -92,7 +96,22 @@ CREATE TABLE local_typed_c_cache (
     calls_json BLOB NOT NULL,
     PRIMARY KEY(project_id,binary_sha256,model_revision,analysis_version,options_sha256,entry_address_space,entry_value)
 );
-PRAGMA user_version=4;";
+CREATE TABLE local_ghidra_snapshots (
+    snapshot_id INTEGER PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    binary_sha256 TEXT NOT NULL,
+    created_revision INTEGER NOT NULL,
+    entry_space TEXT NOT NULL,
+    entry_offset TEXT NOT NULL,
+    ghidra_version TEXT NOT NULL,
+    snapshot_schema_version INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    UNIQUE(project_id,binary_sha256,entry_space,entry_offset,content_sha256)
+);
+CREATE INDEX local_ghidra_snapshots_function
+    ON local_ghidra_snapshots(project_id,binary_sha256,entry_space,entry_offset,snapshot_id);
+PRAGMA user_version=5;";
 
 const MIGRATE_V1_TO_V2: &str = "CREATE TABLE workbench_settings (
     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -137,6 +156,23 @@ const MIGRATE_V3_TO_V4: &str = "CREATE TABLE IF NOT EXISTS local_typed_c_cache (
     PRIMARY KEY(project_id,binary_sha256,model_revision,analysis_version,options_sha256,entry_address_space,entry_value)
 );
 PRAGMA user_version=4;";
+
+const MIGRATE_V4_TO_V5: &str = "CREATE TABLE IF NOT EXISTS local_ghidra_snapshots (
+    snapshot_id INTEGER PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES local_projects(id),
+    binary_sha256 TEXT NOT NULL,
+    created_revision INTEGER NOT NULL,
+    entry_space TEXT NOT NULL,
+    entry_offset TEXT NOT NULL,
+    ghidra_version TEXT NOT NULL,
+    snapshot_schema_version INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    UNIQUE(project_id,binary_sha256,entry_space,entry_offset,content_sha256)
+);
+CREATE INDEX IF NOT EXISTS local_ghidra_snapshots_function
+    ON local_ghidra_snapshots(project_id,binary_sha256,entry_space,entry_offset,snapshot_id);
+PRAGMA user_version=5;";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkbenchSettings {
@@ -304,13 +340,19 @@ impl LocalProjectStore {
                 tx.execute_batch(MIGRATE_V1_TO_V2).map_err(db_error)?;
                 tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?;
+                tx.execute_batch(MIGRATE_V4_TO_V5).map_err(db_error)?;
             }
             2 => {
                 tx.execute_batch(MIGRATE_V2_TO_V3).map_err(db_error)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?;
+                tx.execute_batch(MIGRATE_V4_TO_V5).map_err(db_error)?;
             }
-            3 => tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?,
-            4 => {}
+            3 => {
+                tx.execute_batch(MIGRATE_V3_TO_V4).map_err(db_error)?;
+                tx.execute_batch(MIGRATE_V4_TO_V5).map_err(db_error)?;
+            }
+            4 => tx.execute_batch(MIGRATE_V4_TO_V5).map_err(db_error)?,
+            5 => {}
             _ => {
                 return Err(
                     "Local project database schema is not supported by this build".to_owned(),
@@ -416,6 +458,88 @@ impl LocalProjectStore {
             revision: revision as u64,
             binary_sha256: spec.binary_sha256.clone(),
         })
+    }
+
+    /// Preserve a validated Ghidra function snapshot as append-only project
+    /// evidence. Repeated identical imports are idempotent; analyst revisions
+    /// and the original ELF are not changed.
+    pub fn save_ghidra_snapshot(
+        &mut self,
+        project: &LocalProject,
+        snapshot: &GhidraSnapshot,
+    ) -> Result<(), String> {
+        self.verify_current(project)?;
+        validate_ghidra_snapshot(snapshot, &project.binary_sha256)?;
+        let content = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+        if content.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+            return Err("Ghidra snapshot exceeds project artifact size limit".to_owned());
+        }
+        let content_sha256 = format!("{:x}", Sha256::digest(&content));
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let current: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT current_revision,binary_sha256 FROM local_projects WHERE id=?1 AND canonical_path=?2",
+                params![project.id, project.path.to_str().ok_or("Non-UTF-8 local project path")?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if current != Some((project.revision as i64, project.binary_sha256.clone())) {
+            return Err("Stale local project revision; reopen the ELF".to_owned());
+        }
+        tx.execute(
+            "INSERT INTO local_ghidra_snapshots(project_id,binary_sha256,created_revision,entry_space,entry_offset,ghidra_version,snapshot_schema_version,content_sha256,content) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(project_id,binary_sha256,entry_space,entry_offset,content_sha256) DO NOTHING",
+            params![
+                project.id,
+                project.binary_sha256,
+                project.revision as i64,
+                snapshot.selected_function.entry.space,
+                snapshot.selected_function.entry.offset,
+                snapshot.program.ghidra_version,
+                snapshot.schema_version as i64,
+                content_sha256,
+                content,
+            ],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(())
+    }
+
+    /// Read the latest stored snapshot for one selected function. The stored
+    /// bytes are hash checked and revalidated against the current ELF digest.
+    pub fn load_ghidra_snapshot(
+        &self,
+        project: &LocalProject,
+        entry: &PcodeAddress,
+    ) -> Result<Option<GhidraSnapshot>, String> {
+        self.verify_current(project)?;
+        let record: Option<(String, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT content_sha256,content FROM local_ghidra_snapshots WHERE project_id=?1 AND binary_sha256=?2 AND entry_space=?3 AND entry_offset=?4 ORDER BY snapshot_id DESC LIMIT 1",
+                params![project.id, project.binary_sha256, entry.space, entry.offset],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let Some((expected_hash, content)) = record else {
+            return Ok(None);
+        };
+        if content.is_empty() || content.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+            return Err("Stored Ghidra snapshot has an invalid size".to_owned());
+        }
+        if format!("{:x}", Sha256::digest(&content)) != expected_hash {
+            return Err("Stored Ghidra snapshot content hash does not match".to_owned());
+        }
+        let snapshot = parse_ghidra_snapshot(&content, &project.binary_sha256)?;
+        if snapshot.selected_function.entry != *entry {
+            return Err("Stored Ghidra snapshot function entry does not match".to_owned());
+        }
+        Ok(Some(snapshot))
     }
 
     pub fn list_annotations(
@@ -1045,7 +1169,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -1071,6 +1195,99 @@ mod tests {
         for thread in threads {
             assert_eq!(thread.join().unwrap(), WorkbenchSettings::default());
         }
+    }
+
+    #[test]
+    fn ghidra_snapshot_survives_v4_migration_and_rejects_corruption_or_stale_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demo/hydir-prism.elf");
+        let binary = directory.path().join("prism.elf");
+        let bytes = fs::read(fixture).unwrap();
+        fs::write(&binary, &bytes).unwrap();
+        let original_spec = spec(&bytes);
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        let project = store.open_binary(&binary, &original_spec).unwrap();
+        let settings = WorkbenchSettings {
+            recent_local_path: Some(binary.clone()),
+            ..WorkbenchSettings::default()
+        };
+        store.save_workbench_settings(&settings).unwrap();
+        // A v4 database has the existing project and settings but no snapshot
+        // table. Opening it must add the table without losing those records.
+        store
+            .conn
+            .execute_batch("DROP TABLE local_ghidra_snapshots; PRAGMA user_version=4;")
+            .unwrap();
+        drop(store);
+
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        assert_eq!(store.load_workbench_settings().unwrap(), settings);
+        let reopened = store.open_binary(&binary, &original_spec).unwrap();
+        assert_eq!(reopened.id, project.id);
+        assert_eq!(reopened.revision, project.revision);
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
+            )),
+            &original_spec.binary_sha256,
+        )
+        .unwrap();
+        assert!(
+            store
+                .load_ghidra_snapshot(&reopened, &snapshot.selected_function.entry)
+                .unwrap()
+                .is_none()
+        );
+        store.save_ghidra_snapshot(&reopened, &snapshot).unwrap();
+        store.save_ghidra_snapshot(&reopened, &snapshot).unwrap();
+        let row_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM local_ghidra_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 1);
+        drop(store);
+
+        let mut reopened_store = LocalProjectStore::open(&database).unwrap();
+        let reopened = reopened_store.open_binary(&binary, &original_spec).unwrap();
+        assert_eq!(
+            reopened_store
+                .load_ghidra_snapshot(&reopened, &snapshot.selected_function.entry)
+                .unwrap(),
+            Some(snapshot.clone())
+        );
+        reopened_store
+            .conn
+            .execute(
+                "UPDATE local_ghidra_snapshots SET content=?1",
+                [b"corrupt".as_slice()],
+            )
+            .unwrap();
+        assert!(
+            reopened_store
+                .load_ghidra_snapshot(&reopened, &snapshot.selected_function.entry)
+                .unwrap_err()
+                .contains("content hash")
+        );
+        fs::write(&binary, b"changed binary").unwrap();
+        assert!(
+            reopened_store
+                .load_ghidra_snapshot(&reopened, &snapshot.selected_function.entry)
+                .unwrap_err()
+                .contains("changed")
+        );
+        let changed = reopened_store
+            .open_binary(&binary, &spec(b"changed binary"))
+            .unwrap();
+        assert!(
+            reopened_store
+                .load_ghidra_snapshot(&changed, &snapshot.selected_function.entry)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1187,7 +1404,7 @@ mod tests {
 
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
         let store = LocalProjectStore::open(&database).unwrap();
-        store.conn.execute_batch("PRAGMA user_version=5;").unwrap();
+        store.conn.execute_batch("PRAGMA user_version=6;").unwrap();
         drop(store);
         assert!(
             LocalProjectStore::open(&database)

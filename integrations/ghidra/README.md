@@ -58,7 +58,12 @@ as exact operations and retains other operations as explicit opaque effects.
 The state artifact records ordered reads, writes, and possible effects for a
 selected function. The worker keeps an analyzed Ghidra project in Hydir's user
 cache and reuses it when another function is selected for the same binary and
-tool version.
+tool version. The desktop workbench also records each validated
+selected-function snapshot in its local project database. Identical results
+are deduplicated; saved content is hash checked and tied to the opened ELF
+digest. A project-save warning does not hide a successfully analyzed
+function. The database schema is v5; back up the database before opening it
+with an older Hydir build.
 The CFG artifact joins instruction nodes to analyzed edges and keeps calls
 separate. Its completeness is explicitly `incomplete`, including when all
 visible edges have concrete targets.

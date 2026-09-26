@@ -54,7 +54,9 @@ use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
     parse_patch_document,
 };
-use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings};
+use hydir_project::{
+    LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings, default_db_path,
+};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
@@ -203,7 +205,7 @@ enum Event {
     GhidraGraphLoaded(Result<GhidraGraph, String>),
     GhidraAnalyzed {
         binary_sha256: String,
-        result: Result<GhidraSnapshot, String>,
+        result: Result<(GhidraSnapshot, Option<String>), String>,
     },
     RemoteProjectCreated(String),
     Selected {
@@ -1626,7 +1628,7 @@ async fn patch_remote(
     Ok((reply.revision, spec, reply.binary_sha256))
 }
 
-fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
+fn bounded_read(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = fs::metadata(path).map_err(|e| format!("Cannot read binary metadata: {e}"))?;
     if metadata.len() > MAX_BINARY_BYTES as u64 {
         return Err("Binary exceeds the 64 MiB import limit.".to_owned());
@@ -1751,7 +1753,7 @@ fn run_ghidra_cli(
     binary: &Path,
     binary_sha256: &str,
     function: Option<&str>,
-) -> Result<GhidraSnapshot, String> {
+) -> Result<(GhidraSnapshot, Option<String>), String> {
     let snapshot_path = ghidra_snapshot_path(binary_sha256, function)?;
     {
         let mut command = Command::new(hydirctl_path());
@@ -1787,8 +1789,32 @@ fn run_ghidra_cli(
         }
         let bytes = fs::read(&snapshot_path)
             .map_err(|error| format!("Could not read Ghidra snapshot: {error}"))?;
-        parse_ghidra_snapshot(&bytes, binary_sha256)
+        let snapshot = parse_ghidra_snapshot(&bytes, binary_sha256)?;
+        let persistence_warning = (|| {
+            let database = default_db_path()?;
+            persist_ghidra_snapshot(&database, binary, binary_sha256, &snapshot)
+        })()
+        .err()
+        .map(|error| format!("Ghidra snapshot is available but project save failed: {error}"));
+        Ok((snapshot, persistence_warning))
     }
+}
+
+fn persist_ghidra_snapshot(
+    database: &Path,
+    binary: &Path,
+    binary_sha256: &str,
+    snapshot: &GhidraSnapshot,
+) -> Result<(), String> {
+    let original = bounded_read(binary)?;
+    let spec = import_elf(&original)
+        .map_err(|error| format!("Could not import ELF for local project: {error}"))?;
+    if spec.binary_sha256 != binary_sha256 {
+        return Err("Opened ELF changed during Ghidra analysis".to_owned());
+    }
+    let mut store = LocalProjectStore::open(database)?;
+    let project = store.open_binary(binary, &spec)?;
+    store.save_ghidra_snapshot(&project, snapshot)
 }
 
 fn pcode_varnode(varnode: &PcodeVarnode) -> String {
@@ -3411,7 +3437,7 @@ impl AnalystApp {
                         continue;
                     }
                     match result {
-                        Ok(snapshot) => {
+                        Ok((snapshot, persistence_warning)) => {
                             self.status = format!(
                                 "Ghidra analyzed {} functions; raw P-code is ready",
                                 snapshot.functions.len()
@@ -3470,7 +3496,10 @@ impl AnalystApp {
                             self.ghidra_path_trace = None;
                             self.ghidra_path_lines.clear();
                             self.ghidra_snapshot = Some(snapshot);
-                            self.failure = None;
+                            self.failure = persistence_warning.clone();
+                            if let Some(warning) = persistence_warning {
+                                self.history.push(warning);
+                            }
                         }
                         Err(error) => {
                             self.status = "Ghidra analysis failed".to_owned();
@@ -10245,8 +10274,8 @@ mod tests {
         ghidra_trace_lines, ghidra_trace_start, indexed_function_action, ir_slice,
         local_region_artifacts, native_function_excerpt, native_instruction_count,
         native_opaque_instruction_count, pcode_display_lines, pcode_state_lines,
-        preview_patch_local, resized_console_height, valid_bearer_token, validate_endpoint,
-        workbench_graph_layout,
+        persist_ghidra_snapshot, preview_patch_local, resized_console_height, valid_bearer_token,
+        validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -10257,7 +10286,10 @@ mod tests {
         decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
     };
     use hydir_execution::StopPoint;
-    use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect, parse_pcode_seed};
+    use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect, parse_ghidra_snapshot, parse_pcode_seed};
+    use hydir_project::LocalProjectStore;
+    use std::fs;
+    use std::path::Path;
     use std::sync::mpsc;
 
     #[test]
@@ -10318,6 +10350,36 @@ mod tests {
         let lines = ghidra_trace_lines(&trace);
         assert_eq!(lines[0].0, Some(0x2013d9));
         assert!(lines[0].1.contains("0x2013e2"));
+    }
+
+    #[test]
+    fn ghidra_analysis_snapshot_is_saved_to_local_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+
+        persist_ghidra_snapshot(&database, &binary, &spec.binary_sha256, &snapshot).unwrap();
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        let project = store.open_binary(Path::new(&binary), &spec).unwrap();
+        assert_eq!(
+            store
+                .load_ghidra_snapshot(&project, &snapshot.selected_function.entry)
+                .unwrap(),
+            Some(snapshot.clone())
+        );
+        assert!(
+            persist_ghidra_snapshot(&database, &binary, "wrong", &snapshot)
+                .unwrap_err()
+                .contains("changed")
+        );
     }
 
     #[test]

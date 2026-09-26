@@ -591,7 +591,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let count: i64 = reopened
             .conn
             .query_row("SELECT count(*) FROM local_typed_c_cache", [], |row| {
