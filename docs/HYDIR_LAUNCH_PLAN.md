@@ -50,6 +50,7 @@ Native ELF frontend -> existing MachineIR/StateIR path (retained)
 | --- | --- | --- |
 | 0. Contract | Freeze snapshot v1 and PcodeIR v1, with a small checked-in Ghidra-exported fixture | Deterministic round-trip; invalid digests, widths, varnodes, edges, and schema versions fail clearly |
 | 1. Project bridge | Extend the existing exporter to capture one function's raw P-code, instruction bytes, CFG, calls, and minimal project metadata; import it in Rust | GUI and headless exports of the same fixture have identical semantic sections; every P-code op has an address and order |
+| 1a. Optional Ghidra runner | Package a pinned Ghidra release, required JDK, and the exporter for headless use in a container | One documented command processes a copied project or imports a binary, writes a snapshot to a mounted output directory, and yields the same semantic section as GUI export |
 | 2. Semantic lift | Lower core integer, bitwise, comparison, extension, branch, memory, and call operations into explicit state/effects | Per-op and per-function tests at multiple optimization levels; unsupported operations appear as opaque effects |
 | 3. LLVM | Emit runnable LLVM for the exact supported subset and inspectable LLVM with explicit hooks for partial functions | `opt -verify` plus behavioral comparison against original function and a Ghidra P-code oracle on exact fixtures; failed comparison removes the exact claim |
 | 4. Framework API | Stable CLI, Python, and service access to snapshot, IR, provenance, diagnostics, and pass outputs | An external script imports a real project function, runs a def-use slice, exports LLVM, and maps the result to Ghidra addresses without private APIs |
@@ -60,9 +61,14 @@ Native ELF frontend -> existing MachineIR/StateIR path (retained)
 
 The test matrix starts with straight-line arithmetic, branches, loops, calls, stack/global memory, indirect flow, and at least one `CALLOTHER` case. Use stripped and DWARF-bearing builds at several optimization levels. Record coverage by opcode and artifact fidelity. LLVM verification alone is never a semantic test.
 
+### Optional container contract
+
+The container is a reproducible **headless Ghidra exporter**, not a dependency of Hydir's importer or analysis engine. Pin the official Ghidra release and JDK, verify the release checksum during the image build, retain bundled license notices, and record the exact versions in each snapshot. Run as a non-root user with bounded CPU, memory, and time; default to no network, a read-only input mount, writable scratch space, and a mounted output directory. For an existing local project, process an isolated copy after it is closed in the Ghidra GUI. The GUI script remains the path for an open project and its unsaved analyst work. Container packaging follows the snapshot contract so it can be tested against a real exporter.
+
 ## Design references and limits
 
-- Ghidra documents [instruction P-code](https://ghidra.re/ghidra_docs/api/ghidra/program/model/listing/Instruction.html), [P-code operations](https://ghidra.re/ghidra_docs/api/ghidra/program/model/pcode/PcodeOp.html), and [headless project analysis](https://ghidra.re/ghidra_docs/api/ghidra/app/util/headless/HeadlessAnalyzer.html). These support a project exporter without embedding Hydir in the Ghidra UI.
+- Ghidra documents [instruction P-code](https://ghidra.re/ghidra_docs/api/ghidra/program/model/listing/Instruction.html), [P-code operations](https://ghidra.re/ghidra_docs/api/ghidra/program/model/pcode/PcodeOp.html), and [headless project analysis](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/RuntimeScripts/support/analyzeHeadlessREADME.md). Headless analysis can process an existing project or import a new binary; Ghidra warns that a project already open in its GUI may not run headlessly.
+- Ghidra's [NOTICE](https://github.com/NationalSecurityAgency/ghidra/blob/master/NOTICE) describes its Apache 2.0 license and bundled third-party components. Container redistribution must carry the corresponding notices.
 - [Ghidrall](https://github.com/toor-de-force/Ghidrall) demonstrates P-code-to-LLVM translation and is a research reference. Its coverage and validation are not Hydir's correctness contract.
 - [Remill's explicit memory intrinsics](https://github.com/lifting-bits/remill/blob/master/docs/INTRINSICS.md) and [Anvill's specification-driven lift](https://github.com/lifting-bits/anvill) are useful design comparisons. Hydir still needs its own import, semantics, and tests.
 - [Goblin](https://github.com/m4b/goblin) parses object formats; it does not translate P-code. The existing `object`/`gimli` loader is adequate until a measured loader gap appears.
