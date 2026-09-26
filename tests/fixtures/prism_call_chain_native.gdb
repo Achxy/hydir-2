@@ -49,11 +49,12 @@ else:
     raise RuntimeError("native call path exceeded instruction budget")
 
 flags = int(gdb.parse_and_eval("$eflags"))
+# GDB renders a full-width x86-64 register with its signed type; compare bits.
 result = {
     "instruction_visits": ["0x%x" % pc for pc in visits],
     "return_pc": "0x%x" % int(gdb.parse_and_eval("$rip")),
     "stack_delta": int(gdb.parse_and_eval("$rsp")) - entry_rsp,
-    "registers": {name: int(gdb.parse_and_eval("$" + name))
+    "registers": {name: int(gdb.parse_and_eval("$" + name)) & ((1 << 64) - 1)
                   for name in ("rax", "rdi", "rsi")},
     "flags": {name: (flags >> bit) & 1 for name, bit in
               (("cf", 0), ("zf", 6), ("sf", 7), ("of", 11))},
