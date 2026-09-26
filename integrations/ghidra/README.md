@@ -20,6 +20,7 @@ cargo run -p hydir-cli -- ghidra-snapshot verify .\demo\hydir-prism.elf .\snapsh
 cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\snapshot.json --output .\semantic-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
+cargo run -p hydir-cli -- ghidra-snapshot coverage .\demo\hydir-prism.elf .\snapshot.json --output .\coverage.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-cfg .\demo\hydir-prism.elf .\snapshot.json --start 0x2013d9 --output .\cfg-llvm.json
@@ -68,6 +69,12 @@ with an older Hydir build.
 The CFG artifact joins instruction nodes to analyzed edges and keeps calls
 separate. Its completeness is explicitly `incomplete`, including when all
 visible edges have concrete targets.
+`coverage` inventories every raw P-code operation by opcode and distinguishes
+pure assignments modelled exactly under Hydir's P-code rules from opaque
+effects. Its bounded opaque-site list links source addresses to reasons. These
+counts do not establish equivalence to machine code. The same report is
+available from `LocalGhidra.artifact("coverage", ...)` and the desktop P-code
+view.
 `ghidra-snapshot llvm-op` emits LLVM for one selected exact operation. These
 artifacts are inspectable building blocks; they do not yet represent a complete
 function lift or establish whole-function equivalence. The raw

@@ -51,6 +51,11 @@ class LocalGhidraTests(unittest.TestCase):
             "cfg_completeness": "incomplete",
         }).encode()):
             self.assertEqual(self.client.artifact("cfg", self.binary, self.snapshot)["cfg_completeness"], "incomplete")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "schema_version": 1,
+            "opaque_effects": 2,
+        }).encode()):
+            self.assertEqual(self.client.artifact("coverage", self.binary, self.snapshot)["opaque_effects"], 2)
         with self.assertRaises(ValueError):
             self.client.artifact("made-up", self.binary, self.snapshot)
 

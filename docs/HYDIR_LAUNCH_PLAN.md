@@ -29,6 +29,8 @@ The local project database now stores validated Ghidra function snapshots as dig
 
 A bounded CFG-aware LLVM path emitter is available through the CLI, local Python SDK, and desktop P-code view. It has a known-byte state ABI, operation event IDs, source mapping, explicit stop codes, and a visit/operation budget. `opt -verify` and `lli` tests cover both outcomes of a real PRISM branch and a synthetic loop against Hydir's Rust path executor. Memory, calls, indirect flow, and unsupported operations still stop; neither these tests nor the artifact assert whole-function equivalence. Native differential replay and Ghidra-emulator comparison remain open.
 
+A versioned P-code coverage inventory now reports per-opcode counts and source-linked opaque sites in the CLI, SDK, and GUI. It measures Hydir's lowering of the imported P-code only; it does not measure completeness of Ghidra discovery or equivalence to the original binary.
+
 ## Architecture and artifact contract
 
 ```text

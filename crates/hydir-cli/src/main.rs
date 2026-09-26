@@ -69,6 +69,7 @@ Usage:
   hydirctl ghidra-snapshot semantics <binary> <snapshot.json> [--output <semantic-ir.json>]
   hydirctl ghidra-snapshot state <binary> <snapshot.json> [--output <state-ir.json>]
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
+  hydirctl ghidra-snapshot coverage <binary> <snapshot.json> [--output <coverage.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
@@ -414,6 +415,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         | "semantics"
                         | "state"
                         | "cfg"
+                        | "coverage"
                         | "llvm-prefix"
                         | "llvm-standalone"
                 ) =>
@@ -450,6 +452,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "semantics" => serde_json::to_vec_pretty(&ir.lower_semantics())?,
                     "state" => serde_json::to_vec_pretty(&ir.lower_state())?,
                     "cfg" => serde_json::to_vec_pretty(&snapshot.pcode_cfg_ir()?)?,
+                    "coverage" => serde_json::to_vec_pretty(&snapshot.pcode_coverage_report()?)?,
                     "llvm-prefix" => serde_json::to_vec_pretty(
                         &hydir_decompile::emit_pcode_linear_prefix_llvm(&snapshot)?,
                     )?,

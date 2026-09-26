@@ -41,9 +41,9 @@ use hydir_hlc::{
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeEffect, PcodePathDestination,
-    PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr, PcodeStateFunctionIr, PcodeVarnode,
-    parse_ghidra_snapshot, parse_pcode_seed,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeCoverageReport, PcodeEffect,
+    PcodePathDestination, PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr,
+    PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -3011,6 +3011,7 @@ struct AnalystApp {
     ghidra_graph: Option<GhidraGraph>,
     ghidra_snapshot: Option<GhidraSnapshot>,
     ghidra_semantics: Option<PcodeSemanticFunctionIr>,
+    ghidra_coverage: Option<PcodeCoverageReport>,
     ghidra_pcode_lines: Vec<(Option<u64>, String)>,
     ghidra_state_lines: Vec<(Option<u64>, String)>,
     ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
@@ -3141,6 +3142,7 @@ impl AnalystApp {
             ghidra_graph: None,
             ghidra_snapshot: None,
             ghidra_semantics: None,
+            ghidra_coverage: None,
             ghidra_pcode_lines: Vec::new(),
             ghidra_state_lines: Vec::new(),
             ghidra_exact_operations: Vec::new(),
@@ -3320,6 +3322,7 @@ impl AnalystApp {
                     self.disassembly_report = None;
                     self.ghidra_snapshot = None;
                     self.ghidra_semantics = None;
+                    self.ghidra_coverage = None;
                     self.ghidra_pcode_lines.clear();
                     self.ghidra_state_lines.clear();
                     self.ghidra_exact_operations.clear();
@@ -3446,6 +3449,7 @@ impl AnalystApp {
                                 snapshot.functions.len()
                             );
                             self.history.push(self.status.clone());
+                            self.ghidra_coverage = snapshot.pcode_coverage_report().ok();
                             self.ghidra_semantics = snapshot
                                 .pcode_function_ir()
                                 .ok()
@@ -5557,6 +5561,43 @@ impl AnalystApp {
             .size(11.0)
             .color(MUTED),
         );
+        if let Some(report) = &self.ghidra_coverage {
+            egui::CollapsingHeader::new(format!(
+                "P-code coverage: {} exact assignments / {} operations",
+                report.exact_assignments, report.operations
+            ))
+            .id_salt("ghidra_pcode_coverage")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Counts describe Hydir's P-code value lowering. They are not a machine-code equivalence claim.")
+                    .size(11.0).color(MUTED));
+                for row in &report.by_opcode {
+                    ui.label(RichText::new(format!(
+                        "{:>3} {:<18} {:>5} total · {:>5} exact · {:>5} opaque",
+                        row.opcode, row.mnemonic, row.operations,
+                        row.exact_assignments, row.opaque_effects
+                    )).monospace().size(11.0));
+                }
+                if report.omitted_opaque_sites > 0 {
+                    ui.label(RichText::new(format!("{} additional opaque sites omitted from this view", report.omitted_opaque_sites))
+                        .size(11.0).color(MUTED));
+                }
+                egui::ScrollArea::vertical().id_salt("ghidra_coverage_opaque_sites")
+                    .max_height(140.0)
+                    .show_rows(ui, 18.0, report.opaque_sites.len(), |ui, range| {
+                        for row in range {
+                            let site = &report.opaque_sites[row];
+                            let address = site.address.offset.strip_prefix("0x")
+                                .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                            let label = format!("{} #{} {}: {}", site.address.offset,
+                                site.sequence_index, site.mnemonic, site.reason);
+                            if ui.selectable_label(self.selected_address == address,
+                                RichText::new(label).monospace().size(11.0)).clicked() {
+                                    self.selected_address = address;
+                                }
+                        }
+                    });
+            });
+        }
         if let Some(semantics) = &self.ghidra_semantics {
             let exact = semantics
                 .instructions

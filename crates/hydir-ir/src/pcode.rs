@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub mod cfg;
+pub mod coverage;
 pub mod execution;
 pub mod seed;
 pub mod semantics;
@@ -14,6 +15,9 @@ pub mod state;
 pub use cfg::{
     PCODE_CFG_IR_VERSION, PcodeCfgCall, PcodeCfgCompleteness, PcodeCfgEdge, PcodeCfgFunctionIr,
     PcodeCfgNode,
+};
+pub use coverage::{
+    PCODE_COVERAGE_VERSION, PcodeCoverageReport, PcodeOpaqueSite, PcodeOpcodeCoverage,
 };
 pub use execution::{
     PCODE_EXECUTION_TRACE_VERSION, PCODE_PATH_TRACE_VERSION, PcodeConcreteMemoryAccess,
