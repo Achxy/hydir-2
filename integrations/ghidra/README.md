@@ -19,6 +19,7 @@ cargo run -p hydir-cli -- ghidra analyze .\demo\hydir-prism.elf --output .\snaps
 cargo run -p hydir-cli -- ghidra-snapshot verify .\demo\hydir-prism.elf .\snapshot.json
 cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\snapshot.json --output .\semantic-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
+cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
 ```
 
 For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
@@ -54,6 +55,9 @@ The state artifact records ordered reads, writes, and possible effects for a
 selected function. The worker keeps an analyzed Ghidra project in Hydir's user
 cache and reuses it when another function is selected for the same binary and
 tool version.
+The CFG artifact joins instruction nodes to analyzed edges and keeps calls
+separate. Its completeness is explicitly `incomplete`, including when all
+visible edges have concrete targets.
 `ghidra-snapshot llvm-op` emits LLVM for one selected exact operation. These
 artifacts are inspectable building blocks; they do not yet represent a complete
 function lift or establish whole-function equivalence. The raw

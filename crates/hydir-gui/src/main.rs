@@ -5402,6 +5402,16 @@ impl AnalystApp {
                 .size(11.0)
                 .color(MUTED),
         );
+        ui.label(
+            RichText::new(format!(
+                "Instruction CFG: {} nodes · {} analyzed edges · {} calls · incomplete",
+                snapshot.selected_function.instructions.len(),
+                snapshot.selected_function.flow_edges.len(),
+                snapshot.selected_function.call_targets.len()
+            ))
+            .size(11.0)
+            .color(MUTED),
+        );
         if let Some(semantics) = &self.ghidra_semantics {
             let exact = semantics
                 .instructions
