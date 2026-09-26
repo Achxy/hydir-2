@@ -514,6 +514,7 @@ version = "0.1.0"
 dependencies = [
  "hydir-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
