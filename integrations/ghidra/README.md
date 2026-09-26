@@ -68,6 +68,7 @@ cargo run -p hydir-cli -- ghidra-project get .\demo\hydir-prism.elf --function 0
 cargo run -p hydir-cli -- ghidra-snapshot verify .\demo\hydir-prism.elf .\snapshot.json
 cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\snapshot.json --output .\semantic-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
+cargo run -p hydir-cli -- ghidra-snapshot simplify .\demo\hydir-prism.elf .\snapshot.json --output .\simplification.json
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot coverage .\demo\hydir-prism.elf .\snapshot.json --output .\coverage.json
 cargo run -p hydir-cli -- ghidra-snapshot slice .\demo\hydir-prism.elf .\snapshot.json --instruction 0 --op 0 --output .\slice.json
