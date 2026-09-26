@@ -53,6 +53,10 @@ class PrismBitGateNativeTests(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="hydir-native-bit-gate-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.temp = Path(cls.temporary.name)
+        cls.native_binary = cls.temp / "hydir-prism.elf"
+        shutil.copyfile(BINARY, cls.native_binary)
+        cls.native_binary.chmod(0o700)
+        assert hashlib.sha256(cls.native_binary.read_bytes()).hexdigest() == cls.digest
 
     def test_snapshot_identifies_exact_elf_and_function(self):
         binary = BINARY.read_bytes()
@@ -98,7 +102,7 @@ class PrismBitGateNativeTests(unittest.TestCase):
                "HYDIR_NATIVE_RETURN": f"0x{self.return_address:x}",
                "HYDIR_NATIVE_RDI": f"0x{rdi:x}", "HYDIR_NATIVE_RSI": f"0x{rsi:x}"}
         result = subprocess.run(["gdb", "-nx", "-q", "--batch", "-x", str(GDB_SCRIPT),
-                                 str(BINARY)], cwd=ROOT, env=env, capture_output=True,
+                                 str(self.native_binary)], cwd=ROOT, env=env, capture_output=True,
                                 text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = [line.removeprefix("HYDIR_NATIVE_RESULT=") for line in result.stdout.splitlines()
