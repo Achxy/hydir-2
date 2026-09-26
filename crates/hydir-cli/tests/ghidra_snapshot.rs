@@ -88,4 +88,42 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     assert_eq!(ir["flow_overrides_applied"], true);
     assert_eq!(ir["instructions"].as_array().unwrap().len(), 5);
     assert_eq!(ir["instructions"][4]["pcode"][2]["mnemonic"], "RETURN");
+
+    let semantic = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "semantics"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_snapshot_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        semantic.status.success(),
+        "{}",
+        String::from_utf8_lossy(&semantic.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_slice(&semantic.stdout).unwrap();
+    let operations = state["instructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|instruction| instruction["operations"].as_array().unwrap());
+    let kinds = operations
+        .map(|operation| operation["effect"]["kind"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(kinds.iter().any(|kind| kind == "assign"));
+    assert!(kinds.iter().any(|kind| kind == "opaque"));
+    assert_eq!(state["semantic_fidelity"], "unknown");
+
+    let llvm = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-op"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_snapshot_v2.json"))
+        .args(["--instruction", "0x20137c", "--op", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        llvm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&llvm.stderr)
+    );
+    assert!(String::from_utf8_lossy(&llvm.stdout).contains("define i64 @hydir_pcode_exact"));
 }
