@@ -178,6 +178,27 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     assert_eq!(artifact["cfg_completeness"], "incomplete");
     assert_eq!(artifact["calls"].as_array().unwrap().len(), 1);
     assert_eq!(artifact["binary_sha256"], summary["binary_sha256"]);
+    let coverage = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "coverage"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        coverage.status.success(),
+        "{}",
+        String::from_utf8_lossy(&coverage.stderr)
+    );
+    let coverage: serde_json::Value = serde_json::from_slice(&coverage.stdout).unwrap();
+    assert_eq!(coverage["semantic_fidelity"], "unknown");
+    assert!(coverage["exact_assignments"].as_u64().unwrap() >= 7);
+    assert!(
+        coverage["opaque_sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|site| site["mnemonic"] == "POPCOUNT")
+    );
 
     let prefix = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
         .args(["ghidra-snapshot", "llvm-prefix"])
