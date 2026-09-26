@@ -12,6 +12,7 @@ on:
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
       - tests/fixtures/ghidra_prototype.elf
+      - tests/fixtures/ghidra_add_zero.S
   pull_request:
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
@@ -22,6 +23,7 @@ on:
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
       - tests/fixtures/ghidra_prototype.elf
+      - tests/fixtures/ghidra_add_zero.S
   workflow_dispatch:
 
 jobs:
@@ -59,6 +61,37 @@ jobs:
           assert high and high['source'] == 'ghidra_decompiler'
           assert high['status'] == 'complete' and high['operations']
           PY
+      - name: Rewrite one real Ghidra raw P-code operation
+        run: |
+          clang -nostdlib -no-pie tests/fixtures/ghidra_add_zero.S \
+            -o "$RUNNER_TEMP/ghidra-add-zero.elf"
+          entry="0x$(nm -g "$RUNNER_TEMP/ghidra-add-zero.elf" | awk '$3 == "hydir_add_zero" { print $1 }')"
+          test "$entry" != 0x
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            "$RUNNER_TEMP/ghidra-add-zero.elf" \
+            --output "$RUNNER_TEMP/ghidra-add-zero-snapshot.json" \
+            --function "$entry"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot simplify \
+            "$RUNNER_TEMP/ghidra-add-zero.elf" \
+            "$RUNNER_TEMP/ghidra-add-zero-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-add-zero-rewrite.json"
+          python3 - "$RUNNER_TEMP/ghidra-add-zero-rewrite.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert artifact['source'] == 'hydir_checked_pcode_simplification'
+          assert artifact['verification'] == 'not_run'
+          assert artifact['semantic_fidelity'] == 'unknown'
+          assert len(artifact['rewrites']) == 1
+          rewrite = artifact['rewrites'][0]
+          assert rewrite['rule'] == 'add_zero_to_copy'
+          assert rewrite['before']['mnemonic'] == 'INT_ADD'
+          assert rewrite['after']['mnemonic'] == 'COPY'
+          assert rewrite['source_address'] == rewrite['before']['source_address']
+          assert artifact['after']['source'] == artifact['source']
+          PY
       - name: Run the automatic v3 RPC against the same container worker
         run: |
           cargo test --locked -p hydir-server --bin hydird \
@@ -71,3 +104,5 @@ jobs:
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}/ghidra-snapshot.json
+            ${{ runner.temp }}/ghidra-add-zero-snapshot.json
+            ${{ runner.temp }}/ghidra-add-zero-rewrite.json
