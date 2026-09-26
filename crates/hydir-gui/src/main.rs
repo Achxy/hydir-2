@@ -41,9 +41,10 @@ use hydir_hlc::{
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeCoverageReport, PcodeEffect,
-    PcodePathDestination, PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr,
-    PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeBackwardSlice,
+    PcodeCoverageReport, PcodeEffect, PcodePathDestination, PcodePathEvent, PcodePathTrace,
+    PcodeSemanticFunctionIr, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -1862,6 +1863,91 @@ fn ghidra_trace_start(snapshot: &GhidraSnapshot, text: &str) -> Result<PcodeAddr
     })
 }
 
+/// Translate Ghidra's imported RAM image back to linked ELF virtual addresses.
+/// The GUI's shared selection uses linked addresses; P-code and trace inputs
+/// continue to use the addresses in the Ghidra snapshot.
+struct GhidraAddressMap {
+    ghidra_base: u64,
+    elf_base: u64,
+    mapped_ranges: Vec<(u64, u64)>,
+}
+
+impl GhidraAddressMap {
+    fn new(snapshot: &GhidraSnapshot, spec: &ProgramSpec) -> Option<Self> {
+        if snapshot.program.image_base.space != "ram" {
+            return None;
+        }
+        let ghidra_base = parse_ghidra_offset(&snapshot.program.image_base.offset)?;
+        let mapped_ranges: Vec<_> = spec
+            .mapped_segments
+            .iter()
+            .filter(|segment| segment.address_space == 0 && segment.memory_size > 0)
+            .filter_map(|segment| {
+                Some((
+                    segment.virtual_address.0,
+                    segment.virtual_address.0.checked_add(segment.memory_size)?,
+                ))
+            })
+            .collect();
+        let elf_base = mapped_ranges.iter().map(|(start, _)| *start).min()?;
+        Some(Self {
+            ghidra_base,
+            elf_base,
+            mapped_ranges,
+        })
+    }
+
+    fn contains_linked(&self, address: u64) -> bool {
+        self.mapped_ranges
+            .iter()
+            .any(|&(start, end)| start <= address && address < end)
+    }
+
+    fn to_linked(&self, space: &str, offset: &str) -> Option<u64> {
+        if space != "ram" {
+            return None;
+        }
+        self.to_linked_raw(parse_ghidra_offset(offset)?)
+    }
+
+    fn to_linked_raw(&self, address: u64) -> Option<u64> {
+        let linked = address
+            .checked_sub(self.ghidra_base)?
+            .checked_add(self.elf_base)?;
+        self.contains_linked(linked).then_some(linked)
+    }
+
+    fn to_ghidra(&self, linked: u64) -> Option<u64> {
+        if !self.contains_linked(linked) {
+            return None;
+        }
+        linked
+            .checked_sub(self.elf_base)?
+            .checked_add(self.ghidra_base)
+    }
+}
+
+fn parse_ghidra_offset(offset: &str) -> Option<u64> {
+    u64::from_str_radix(offset.strip_prefix("0x")?, 16).ok()
+}
+
+fn selected_ghidra_trace_address(
+    snapshot: &GhidraSnapshot,
+    address_map: Option<&GhidraAddressMap>,
+    selected: Option<u64>,
+) -> Option<u64> {
+    let address = address_map?.to_ghidra(selected?)?;
+    snapshot
+        .selected_function
+        .instructions
+        .iter()
+        .any(|instruction| {
+            instruction.address.space == "ram"
+                && parse_ghidra_offset(&instruction.address.offset) == Some(address)
+        })
+        .then_some(address)
+}
+
 fn ghidra_trace_lines(trace: &PcodePathTrace) -> Vec<(Option<u64>, String)> {
     let address = |source: &PcodeAddress| u64::from_str_radix(&source.offset[2..], 16).ok();
     trace
@@ -1989,6 +2075,26 @@ fn pcode_display_lines(
         }
     }
     lines
+}
+
+fn pcode_line_target(snapshot: &GhidraSnapshot, mut row: usize) -> Option<PcodeSliceTarget> {
+    for (instruction_index, instruction) in
+        snapshot.selected_function.instructions.iter().enumerate()
+    {
+        if row == 0 {
+            return None;
+        }
+        row -= 1;
+        if row < instruction.pcode.len() {
+            return Some(PcodeSliceTarget {
+                instruction_index: instruction_index as u32,
+                operation_index: row as u32,
+                input_index: None,
+            });
+        }
+        row -= instruction.pcode.len();
+    }
+    None
 }
 
 fn pcode_state_lines(state: &PcodeStateFunctionIr) -> Vec<(Option<u64>, String)> {
@@ -3028,6 +3134,7 @@ struct AnalystApp {
     ghidra_snapshot: Option<GhidraSnapshot>,
     ghidra_semantics: Option<PcodeSemanticFunctionIr>,
     ghidra_coverage: Option<PcodeCoverageReport>,
+    ghidra_slice: Option<Result<PcodeBackwardSlice, String>>,
     ghidra_pcode_lines: Vec<(Option<u64>, String)>,
     ghidra_state_lines: Vec<(Option<u64>, String)>,
     ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
@@ -3159,6 +3266,7 @@ impl AnalystApp {
             ghidra_snapshot: None,
             ghidra_semantics: None,
             ghidra_coverage: None,
+            ghidra_slice: None,
             ghidra_pcode_lines: Vec::new(),
             ghidra_state_lines: Vec::new(),
             ghidra_exact_operations: Vec::new(),
@@ -3340,6 +3448,7 @@ impl AnalystApp {
                     self.ghidra_semantics = None;
                     self.ghidra_coverage = None;
                     self.ghidra_pcode_lines.clear();
+                    self.ghidra_slice = None;
                     self.ghidra_state_lines.clear();
                     self.ghidra_exact_operations.clear();
                     self.ghidra_llvm_operation = None;
@@ -3460,6 +3569,7 @@ impl AnalystApp {
                     }
                     match result {
                         Ok((snapshot, persistence_warning)) => {
+                            self.ghidra_slice = None;
                             self.status = format!(
                                 "Ghidra analyzed {} functions; raw P-code is ready",
                                 snapshot.functions.len()
@@ -5551,6 +5661,10 @@ impl AnalystApp {
             );
             return;
         };
+        let address_map = self
+            .spec
+            .as_ref()
+            .and_then(|spec| GhidraAddressMap::new(snapshot, spec));
         ui.label(
             RichText::new(format!(
                 "Snapshot v{} · {} · {} · binary SHA-256 {}",
@@ -5597,11 +5711,9 @@ impl AnalystApp {
                     .show_rows(ui, 26.0, snapshot.memory_blocks.len(), |ui, range| {
                         for row in range {
                             let block = &snapshot.memory_blocks[row];
-                            let address = block
-                                .start
-                                .offset
-                                .strip_prefix("0x")
-                                .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                            let address = address_map.as_ref().and_then(|map| {
+                                map.to_linked(&block.start.space, &block.start.offset)
+                            });
                             let label = format!(
                                 "{} {}:{}..{} · {} bytes · {}{}{} · {}",
                                 block.name,
@@ -5620,9 +5732,9 @@ impl AnalystApp {
                             );
                             if ui
                                 .add_enabled(
-                                    block.start.space == "ram",
+                                    address.is_some(),
                                     egui::Button::selectable(
-                                        self.selected_address == address,
+                                        address.is_some() && self.selected_address == address,
                                         RichText::new(label).monospace().size(11.0),
                                     ),
                                 )
@@ -5651,11 +5763,9 @@ impl AnalystApp {
                         .show_rows(ui, 26.0, snapshot.symbols.len(), |ui, range| {
                             for row in range {
                                 let symbol = &snapshot.symbols[row];
-                                let address = symbol
-                                    .address
-                                    .offset
-                                    .strip_prefix("0x")
-                                    .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                                let address = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(&symbol.address.space, &symbol.address.offset)
+                                });
                                 let label = format!(
                                     "{}:{} {}::{} · {} · {}",
                                     symbol.address.space,
@@ -5667,9 +5777,9 @@ impl AnalystApp {
                                 );
                                 if ui
                                     .add_enabled(
-                                        symbol.address.space == "ram",
+                                        address.is_some(),
                                         egui::Button::selectable(
-                                            self.selected_address == address,
+                                            address.is_some() && self.selected_address == address,
                                             RichText::new(label).monospace().size(11.0),
                                         ),
                                     )
@@ -5706,13 +5816,14 @@ impl AnalystApp {
                     .show_rows(ui, 18.0, report.opaque_sites.len(), |ui, range| {
                         for row in range {
                             let site = &report.opaque_sites[row];
-                            let address = site.address.offset.strip_prefix("0x")
-                                .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                            let address = address_map.as_ref().and_then(|map| {
+                                map.to_linked(&site.address.space, &site.address.offset)
+                            });
                             let label = format!("{} #{} {}: {}", site.address.offset,
                                 site.sequence_index, site.mnemonic, site.reason);
-                            if ui.selectable_label(self.selected_address == address,
+                            if ui.selectable_label(address.is_some() && self.selected_address == address,
                                 RichText::new(label).monospace().size(11.0)).clicked() {
-                                    self.selected_address = address;
+                                    if address.is_some() { self.selected_address = address; }
                                 }
                         }
                     });
@@ -5778,9 +5889,11 @@ impl AnalystApp {
                     .show_rows(ui, 18.0, self.ghidra_state_lines.len(), |ui, range| {
                         for row in range {
                             let (address, line) = &self.ghidra_state_lines[row];
-                            if ui.selectable_label(self.selected_address == *address,
+                            let linked = address.and_then(|value| address_map.as_ref()
+                                .and_then(|map| map.to_linked_raw(value)));
+                            if ui.selectable_label(linked.is_some() && self.selected_address == linked,
                                 RichText::new(line).monospace().size(11.0)).clicked() {
-                                self.selected_address = *address;
+                                if linked.is_some() { self.selected_address = linked; }
                             }
                         }
                     });
@@ -5801,9 +5914,11 @@ impl AnalystApp {
                                 && let Some(operation) = instruction.operations.get(operation_index) {
                                 let label = format!("{}:{}  #{} {}", instruction.address.space,
                                     instruction.address.offset, operation_index, operation.source.mnemonic);
-                                if ui.selectable_label(self.selected_address == address,
+                                let linked = address.and_then(|value| address_map.as_ref()
+                                    .and_then(|map| map.to_linked_raw(value)));
+                                if ui.selectable_label(linked.is_some() && self.selected_address == linked,
                                     RichText::new(label).monospace().size(11.0)).clicked() {
-                                    selected_exact = Some((instruction_index, operation_index, address));
+                                    selected_exact = Some((instruction_index, operation_index, linked));
                                 }
                             }
                         }
@@ -5842,8 +5957,11 @@ impl AnalystApp {
                         self.ghidra_path_lines.clear();
                         self.ghidra_llvm_cfg = None;
                     }
-                    if let Some(address) = self.selected_address
-                        && ui.button("Use selected").clicked() {
+                    if let Some(address) = selected_ghidra_trace_address(
+                        snapshot,
+                        address_map.as_ref(),
+                        self.selected_address,
+                    ) && ui.button("Use selected").clicked() {
                             self.ghidra_trace_start = format!("0x{address:x}");
                             self.ghidra_path_trace = None;
                             self.ghidra_path_lines.clear();
@@ -5892,9 +6010,11 @@ impl AnalystApp {
                             .show_rows(ui, 18.0, self.ghidra_path_lines.len(), |ui, range| {
                                 for row in range {
                                     let (address, line) = &self.ghidra_path_lines[row];
-                                    if ui.selectable_label(self.selected_address == *address,
+                                    let linked = address.and_then(|value| address_map.as_ref()
+                                        .and_then(|map| map.to_linked_raw(value)));
+                                    if ui.selectable_label(linked.is_some() && self.selected_address == linked,
                                         RichText::new(line).monospace().size(11.0)).clicked() {
-                                            self.selected_address = *address;
+                                            if linked.is_some() { self.selected_address = linked; }
                                         }
                                 }
                             });
@@ -5951,12 +6071,13 @@ impl AnalystApp {
                             .show_rows(ui, 18.0, artifact.stop_sites.len(), |ui, range| {
                                 for row in range {
                                     let site = &artifact.stop_sites[row];
-                                    let address = site.address.offset.strip_prefix("0x")
-                                        .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                                    let address = address_map.as_ref().and_then(|map| {
+                                        map.to_linked(&site.address.space, &site.address.offset)
+                                    });
                                     let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
-                                    if ui.selectable_label(self.selected_address == address,
+                                    if ui.selectable_label(address.is_some() && self.selected_address == address,
                                         RichText::new(label).monospace().size(11.0)).clicked() {
-                                            self.selected_address = address;
+                                            if address.is_some() { self.selected_address = address; }
                                         }
                                 }
                             });
@@ -6002,6 +6123,9 @@ impl AnalystApp {
                         && !selected
                     {
                         requested = Some(function.entry.offset.clone());
+                        self.selected_address = address_map.as_ref().and_then(|map| {
+                            map.to_linked(&function.entry.space, &function.entry.offset)
+                        });
                     }
                 }
             });
@@ -6022,11 +6146,9 @@ impl AnalystApp {
                         |ui, range| {
                             for row in range {
                                 let call = &snapshot.selected_function.call_targets[row];
-                                let source = u64::from_str_radix(
-                                    call.call_site.offset.trim_start_matches("0x"),
-                                    16,
-                                )
-                                .ok();
+                                let source = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(&call.call_site.space, &call.call_site.offset)
+                                });
                                 let target = call
                                     .target
                                     .as_ref()
@@ -6035,7 +6157,7 @@ impl AnalystApp {
                                 ui.horizontal(|ui| {
                                     if ui
                                         .selectable_label(
-                                            self.selected_address == source,
+                                            source.is_some() && self.selected_address == source,
                                             format!(
                                                 "{}:{} → {target}{}",
                                                 call.call_site.space,
@@ -6045,7 +6167,9 @@ impl AnalystApp {
                                         )
                                         .clicked()
                                     {
-                                        self.selected_address = source;
+                                        if source.is_some() {
+                                            self.selected_address = source;
+                                        }
                                     }
                                     if let Some(target) = &call.target
                                         && snapshot
@@ -6055,6 +6179,10 @@ impl AnalystApp {
                                         && ui.button("Open target").clicked()
                                     {
                                         requested = Some(target.offset.clone());
+                                        self.selected_address =
+                                            address_map.as_ref().and_then(|map| {
+                                                map.to_linked(&target.space, &target.offset)
+                                            });
                                     }
                                 });
                             }
@@ -6079,11 +6207,9 @@ impl AnalystApp {
                         |ui, range| {
                             for row in range {
                                 let edge = &snapshot.selected_function.flow_edges[row];
-                                let source = u64::from_str_radix(
-                                    edge.source.offset.trim_start_matches("0x"),
-                                    16,
-                                )
-                                .ok();
+                                let source = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(&edge.source.space, &edge.source.offset)
+                                });
                                 let target = edge
                                     .target
                                     .as_ref()
@@ -6091,7 +6217,7 @@ impl AnalystApp {
                                     .unwrap_or_else(|| "unresolved".to_owned());
                                 if ui
                                     .selectable_label(
-                                        self.selected_address == source,
+                                        source.is_some() && self.selected_address == source,
                                         RichText::new(format!(
                                             "{}:{} → {target}  {:?}{}{}",
                                             edge.source.space,
@@ -6105,7 +6231,9 @@ impl AnalystApp {
                                     )
                                     .clicked()
                                 {
-                                    self.selected_address = source;
+                                    if source.is_some() {
+                                        self.selected_address = source;
+                                    }
                                 }
                             }
                         },
@@ -6117,6 +6245,50 @@ impl AnalystApp {
             .iter()
             .find(|function| function.entry == snapshot.selected_function.entry)
             .map_or("selected function", |function| function.name.as_str());
+        if let Some(prototype) = snapshot
+            .functions
+            .iter()
+            .find(|function| function.entry == snapshot.selected_function.entry)
+            .and_then(|function| function.prototype.as_ref())
+        {
+            egui::CollapsingHeader::new("Ghidra prototype evidence")
+                .id_salt("ghidra_prototype_evidence")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "signature source: {} · convention: {} · return: {} ({})",
+                            prototype.signature_source,
+                            prototype.calling_convention.as_deref().unwrap_or("unknown"),
+                            prototype.return_type.display_name,
+                            prototype.return_source
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    for parameter in prototype.parameters.iter().take(16) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {} ({})",
+                                parameter.name,
+                                parameter.data_type.display_name,
+                                parameter.source_type
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                    }
+                    if prototype.parameters.len() > 16 {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} more parameters in snapshot",
+                                prototype.parameters.len() - 16
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                    }
+                });
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(
@@ -6143,17 +6315,105 @@ impl AnalystApp {
             .show_rows(ui, 18.0, self.ghidra_pcode_lines.len(), |ui, range| {
                 for row in range {
                     let (address, line) = &self.ghidra_pcode_lines[row];
+                    let linked = address.and_then(|value| {
+                        address_map
+                            .as_ref()
+                            .and_then(|map| map.to_linked_raw(value))
+                    });
                     if ui
                         .selectable_label(
-                            self.selected_address == *address,
+                            linked.is_some() && self.selected_address == linked,
                             RichText::new(line).monospace().size(11.0),
                         )
                         .clicked()
                     {
-                        self.selected_address = *address;
+                        if linked.is_some() {
+                            self.selected_address = linked;
+                        }
+                        if let Some(target) = pcode_line_target(snapshot, row) {
+                            self.ghidra_slice = Some(snapshot.backward_pcode_slice(target));
+                        }
                     }
                 }
             });
+        if let Some(result) = &self.ghidra_slice {
+            egui::CollapsingHeader::new("Why this P-code value?")
+                .id_salt("ghidra_backward_slice")
+                .default_open(true)
+                .show(ui, |ui| match result {
+                    Ok(slice) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} source operations · {} unresolved boundaries · path proof: no",
+                                slice.steps.len(),
+                                slice.boundaries.len()
+                            ))
+                            .size(11.0)
+                            .color(ACCENT),
+                        );
+                        if ui.button("Copy slice JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(slice)
+                        {
+                            ui.ctx().copy_text(json);
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("ghidra_slice_steps")
+                            .max_height(160.0)
+                            .show_rows(ui, 19.0, slice.steps.len(), |ui, range| {
+                                for row in range {
+                                    let step = &slice.steps[row];
+                                    let address = address_map.as_ref().and_then(|map| {
+                                        map.to_linked(
+                                            &step.source.source_address.space,
+                                            &step.source.source_address.offset,
+                                        )
+                                    });
+                                    let label = format!(
+                                        "{} #{} {}",
+                                        step.source.source_address.offset,
+                                        step.site.operation_index,
+                                        step.source.mnemonic
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            address.is_some() && self.selected_address == address,
+                                            RichText::new(label).monospace().size(11.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        if address.is_some() {
+                                            self.selected_address = address;
+                                        }
+                                    }
+                                }
+                            });
+                        for boundary in slice.boundaries.iter().take(24) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:?}: {:?}",
+                                    boundary.kind, boundary.varnode
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                        if slice.boundaries.len() > 24 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} more boundaries in JSON",
+                                    slice.boundaries.len() - 24
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        ui.label(RichText::new(error).color(BAD));
+                    }
+                });
+        }
         if let Some(function) = requested
             && let (Some(binary), Some(spec)) =
                 (self.current_local_path.clone(), self.spec.as_ref())
@@ -10479,13 +10739,14 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
-        WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address, ghidra_seed_template,
-        ghidra_trace_lines, ghidra_trace_start, indexed_function_action, ir_slice,
-        local_region_artifacts, native_function_excerpt, native_instruction_count,
-        native_opaque_instruction_count, pcode_display_lines, pcode_state_lines,
-        persist_ghidra_snapshot, preview_patch_local, resized_console_height, valid_bearer_token,
-        validate_endpoint, workbench_graph_layout,
+        AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
+        NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
+        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, indexed_function_action,
+        ir_slice, local_region_artifacts, native_function_excerpt, native_instruction_count,
+        native_opaque_instruction_count, pcode_display_lines, pcode_line_target, pcode_state_lines,
+        persist_ghidra_snapshot, preview_patch_local, resized_console_height,
+        selected_ghidra_trace_address, valid_bearer_token, validate_endpoint,
+        workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -10501,6 +10762,53 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::mpsc;
+
+    #[test]
+    fn ghidra_address_map_rebases_pie_navigation_and_keeps_trace_va() {
+        let bytes = include_bytes!("../../../tests/fixtures/ghidra_prototype.elf");
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prototype_dwarf_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        let map = GhidraAddressMap::new(&snapshot, &spec).unwrap();
+        assert_eq!(map.ghidra_base, 0x100000);
+        assert_eq!(map.elf_base, 0);
+        assert_eq!(map.to_linked("ram", "0x101320"), Some(0x1320));
+        assert_eq!(map.to_linked("ram", "0x101323"), Some(0x1323));
+        assert_eq!(map.to_ghidra(0x1323), Some(0x101323));
+        assert_eq!(
+            selected_ghidra_trace_address(&snapshot, Some(&map), Some(0x1323)),
+            Some(0x101323)
+        );
+        assert_eq!(
+            ghidra_trace_start(&snapshot, "0x101323").unwrap().offset,
+            "0x101323"
+        );
+        assert_eq!(
+            selected_ghidra_trace_address(&snapshot, Some(&map), Some(0x1324)),
+            None
+        );
+        assert_eq!(map.to_linked("register", "0x101320"), None);
+        assert_eq!(map.to_linked("ram", "0xdeadbeef"), None);
+        assert_eq!(map.to_ghidra(0xdeadbeef), None);
+    }
+
+    #[test]
+    fn ghidra_address_map_keeps_exec_addresses() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prism_metadata_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        let map = GhidraAddressMap::new(&snapshot, &spec).unwrap();
+        assert_eq!(map.elf_base, map.ghidra_base);
+        assert_eq!(map.to_linked("ram", "0x20137c"), Some(0x20137c));
+        assert_eq!(map.to_ghidra(0x20137c), Some(0x20137c));
+    }
 
     #[test]
     fn ghidra_fixture_rows_keep_source_and_semantic_status() {
@@ -10575,6 +10883,14 @@ mod tests {
             &spec.binary_sha256,
         )
         .unwrap();
+        assert_eq!(pcode_line_target(&snapshot, 0), None);
+        assert_eq!(
+            pcode_line_target(&snapshot, 1).unwrap().instruction_index,
+            0
+        );
+        assert_eq!(pcode_line_target(&snapshot, 1).unwrap().operation_index, 0);
+        let first_instruction_rows = 1 + snapshot.selected_function.instructions[0].pcode.len();
+        assert_eq!(pcode_line_target(&snapshot, first_instruction_rows), None);
 
         persist_ghidra_snapshot(&database, &binary, &spec.binary_sha256, &snapshot).unwrap();
         let mut store = LocalProjectStore::open(&database).unwrap();
