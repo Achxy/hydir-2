@@ -227,6 +227,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut store = LocalProjectStore::open(&default_db_path()?)?;
             let project = store.open_binary(Path::new(&args[2]), &spec)?;
             store.save_ghidra_snapshot(&project, &snapshot)?;
+            let mut model = match store.load_model(&project)? {
+                Some(model) => model,
+                None => init_model(&binary)?,
+            };
+            let previous = model.clone();
+            import_ghidra_functions(&binary, &mut model, &snapshot)?;
+            let project = if model != previous {
+                let snapshot_json = serde_json::to_vec(&snapshot)?;
+                let key = format!(
+                    "ghidra-{:x}-r{}",
+                    sha2::Sha256::digest(snapshot_json),
+                    project.revision
+                );
+                store.save_model(&project, &model, &key)?
+            } else {
+                project
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
