@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 pub mod cfg;
 pub mod execution;
+pub mod seed;
 pub mod semantics;
 pub mod state;
 pub use cfg::{
@@ -20,6 +21,7 @@ pub use execution::{
     PcodeMemoryAccessKind, PcodeMemoryBoundaryKind, PcodePathBranchKind, PcodePathDestination,
     PcodePathEvent, PcodePathStop, PcodePathTrace,
 };
+pub use seed::{MAX_PCODE_SEED_BYTES, PCODE_SEED_VERSION, parse_pcode_seed};
 pub use semantics::{
     PCODE_SEMANTIC_IR_VERSION, PcodeEffect, PcodeExactOp, PcodeOpaqueClass,
     PcodeSemanticDiagnostic, PcodeSemanticFunctionIr, PcodeSemanticInstruction,

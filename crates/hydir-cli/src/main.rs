@@ -29,10 +29,11 @@ use hydir_execution::{
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
-use hydir_ir::pcode::{MAX_GHIDRA_SNAPSHOT_BYTES, parse_ghidra_snapshot};
+use hydir_ir::pcode::{
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, parse_ghidra_snapshot, parse_pcode_seed,
+};
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
-mod ghidra_trace;
 mod ghidra_worker;
 mod local;
 mod passes;
@@ -246,8 +247,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
                 &digest,
             )?;
-            let initial = ghidra_trace::parse_seed(
-                &read_bounded_json(&args[4], ghidra_trace::MAX_SEED_BYTES)?,
+            let initial = parse_pcode_seed(
+                &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
                 &snapshot,
             )?;
             let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
@@ -294,8 +295,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
                 &digest,
             )?;
-            let initial = ghidra_trace::parse_seed(
-                &read_bounded_json(&args[4], ghidra_trace::MAX_SEED_BYTES)?,
+            let initial = parse_pcode_seed(
+                &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
                 &snapshot,
             )?;
             let trace = snapshot
