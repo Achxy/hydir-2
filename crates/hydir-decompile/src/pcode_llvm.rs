@@ -40,7 +40,7 @@ pub struct PcodeLlvmSourceOperation {
     pub mnemonic: String,
 }
 
-fn pcode_offset(varnode: &PcodeVarnode) -> Result<u64, String> {
+pub(crate) fn pcode_offset(varnode: &PcodeVarnode) -> Result<u64, String> {
     let digits = varnode
         .offset
         .strip_prefix("0x")
@@ -53,7 +53,7 @@ fn pcode_offset(varnode: &PcodeVarnode) -> Result<u64, String> {
     Ok(offset)
 }
 
-fn pcode_space_id(space: &str) -> Result<u32, String> {
+pub(crate) fn pcode_space_id(space: &str) -> Result<u32, String> {
     match space {
         "register" => Ok(1),
         "unique" => Ok(2),

@@ -214,6 +214,29 @@ fn imports_snapshot_exported_by_headless_ghidra() {
             .unwrap()
             .contains("define i64 @hydir_read_varnode")
     );
+    let cfg_llvm = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json"))
+        .args(["--start", "0x2013d9"])
+        .output()
+        .unwrap();
+    assert!(
+        cfg_llvm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cfg_llvm.stderr)
+    );
+    let cfg_llvm: serde_json::Value = serde_json::from_slice(&cfg_llvm.stdout).unwrap();
+    assert_eq!(cfg_llvm["start"]["offset"], "0x2013d9");
+    assert_eq!(cfg_llvm["semantic_fidelity"], "unknown");
+    assert_eq!(cfg_llvm["verification"], "not_run");
+    assert!(
+        cfg_llvm["llvm_ir"]
+            .as_str()
+            .unwrap()
+            .contains("define i32 @hydir_pcode_cfg")
+    );
+    assert!(cfg_llvm["source_operations"].as_array().unwrap().len() > 7);
 }
 
 #[test]

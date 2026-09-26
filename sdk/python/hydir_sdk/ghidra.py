@@ -92,14 +92,36 @@ class LocalGhidra:
         binary: str | os.PathLike[str],
         snapshot: str | os.PathLike[str],
     ) -> dict[str, Any]:
-        if kind not in {"pcode", "semantics", "state", "cfg", "llvm-prefix", "llvm-standalone"}:
-            raise ValueError("artifact kind must be pcode, semantics, state, cfg, llvm-prefix, or llvm-standalone")
+        if kind not in {"pcode", "semantics", "state", "cfg", "llvm-prefix", "llvm-standalone", "llvm-cfg"}:
+            raise ValueError("artifact kind must be pcode, semantics, state, cfg, llvm-prefix, llvm-standalone, or llvm-cfg")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         self._snapshot(snapshot_path, self._digest(binary_path))
         data = json.loads(self._run("ghidra-snapshot", kind, str(binary_path), str(snapshot_path)))
         if not isinstance(data, dict) or data.get("binary_sha256") != self._digest(binary_path):
             raise RuntimeError("Hydir artifact belongs to another binary")
+        return data
+
+    def llvm_cfg(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        *,
+        start: int | None = None,
+    ) -> dict[str, Any]:
+        """Emit bounded CFG-aware LLVM with explicit stop status and provenance."""
+        if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("start must be a 64-bit address")
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        args = ["ghidra-snapshot", "llvm-cfg", str(binary_path), str(snapshot_path)]
+        if start is not None:
+            args.extend(["--start", hex(start)])
+        data = json.loads(self._run(*args))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir CFG LLVM artifact belongs to another binary")
         return data
 
     def llvm_operation(

@@ -28,9 +28,9 @@ use hydir_core::{
     overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_decompile::{
-    NativeCoverageReport, NativeDecompilation, PcodeStandalonePrefixArtifact,
-    decompile_function_at, decompile_symbol, discover_functions, emit_pcode_exact_operation_llvm,
-    emit_pcode_standalone_prefix_llvm, measure_native_coverage,
+    NativeCoverageReport, NativeDecompilation, PcodeCfgLlvmArtifact, PcodeStandalonePrefixArtifact,
+    decompile_function_at, decompile_symbol, discover_functions, emit_pcode_cfg_llvm,
+    emit_pcode_exact_operation_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
@@ -3016,6 +3016,7 @@ struct AnalystApp {
     ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
     ghidra_llvm_operation: Option<String>,
     ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
+    ghidra_llvm_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
     ghidra_trace_seed_json: String,
     ghidra_trace_start: String,
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
@@ -3145,6 +3146,7 @@ impl AnalystApp {
             ghidra_exact_operations: Vec::new(),
             ghidra_llvm_operation: None,
             ghidra_llvm_prefix: None,
+            ghidra_llvm_cfg: None,
             ghidra_trace_seed_json: String::new(),
             ghidra_trace_start: String::new(),
             ghidra_path_trace: None,
@@ -3323,6 +3325,7 @@ impl AnalystApp {
                     self.ghidra_exact_operations.clear();
                     self.ghidra_llvm_operation = None;
                     self.ghidra_llvm_prefix = None;
+                    self.ghidra_llvm_cfg = None;
                     self.ghidra_trace_seed_json.clear();
                     self.ghidra_trace_start.clear();
                     self.ghidra_path_trace = None;
@@ -3490,6 +3493,7 @@ impl AnalystApp {
                                 .unwrap_or_default();
                             self.ghidra_llvm_operation = None;
                             self.ghidra_llvm_prefix = None;
+                            self.ghidra_llvm_cfg = None;
                             self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
                             self.ghidra_trace_start =
                                 snapshot.selected_function.entry.offset.clone();
@@ -5675,12 +5679,14 @@ impl AnalystApp {
                     if ui.text_edit_singleline(&mut self.ghidra_trace_start).changed() {
                         self.ghidra_path_trace = None;
                         self.ghidra_path_lines.clear();
+                        self.ghidra_llvm_cfg = None;
                     }
                     if let Some(address) = self.selected_address
                         && ui.button("Use selected").clicked() {
                             self.ghidra_trace_start = format!("0x{address:x}");
                             self.ghidra_path_trace = None;
                             self.ghidra_path_lines.clear();
+                            self.ghidra_llvm_cfg = None;
                         }
                 });
                 ui.label(RichText::new("Seed JSON · offsets and values use 0x hexadecimal")
@@ -5756,6 +5762,49 @@ impl AnalystApp {
                         egui::ScrollArea::both().id_salt("ghidra_llvm_prefix_source")
                             .max_height(200.0).show(ui, |ui| {
                                 ui.label(RichText::new(&prefix.llvm_ir).monospace().size(11.0));
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("LLVM CFG path")
+            .id_salt("ghidra_llvm_cfg")
+            .show(ui, |ui| {
+                ui.label(RichText::new("A bounded runnable LLVM path from the selected instruction. Stops retain source addresses; memory, calls, and unsupported effects remain explicit boundaries.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Generate CFG LLVM").clicked() {
+                    self.ghidra_llvm_cfg = Some(ghidra_trace_start(snapshot, &self.ghidra_trace_start)
+                        .and_then(|start| emit_pcode_cfg_llvm(snapshot, Some(&start))));
+                }
+                match &self.ghidra_llvm_cfg {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!("{} source operations · {} state bytes · {} static stop sites · fidelity: {:?}",
+                            artifact.source_operations.len(), artifact.state_bytes,
+                            artifact.stop_sites.len(), artifact.semantic_fidelity))
+                            .size(11.0).color(ACCENT));
+                        egui::ScrollArea::vertical().id_salt("ghidra_llvm_cfg_stops")
+                            .max_height(130.0)
+                            .show_rows(ui, 18.0, artifact.stop_sites.len(), |ui, range| {
+                                for row in range {
+                                    let site = &artifact.stop_sites[row];
+                                    let address = site.address.offset.strip_prefix("0x")
+                                        .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                                    let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
+                                    if ui.selectable_label(self.selected_address == address,
+                                        RichText::new(label).monospace().size(11.0)).clicked() {
+                                            self.selected_address = address;
+                                        }
+                                }
+                            });
+                        if ui.button("Copy CFG LLVM").clicked() {
+                            ui.ctx().copy_text(artifact.llvm_ir.clone());
+                        }
+                        egui::ScrollArea::both().id_salt("ghidra_llvm_cfg_source")
+                            .max_height(200.0).show(ui, |ui| {
+                                ui.label(RichText::new(&artifact.llvm_ir).monospace().size(11.0));
                             });
                     }
                     Some(Err(error)) => {

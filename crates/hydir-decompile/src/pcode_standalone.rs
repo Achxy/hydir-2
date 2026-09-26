@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const PCODE_STANDALONE_PREFIX_VERSION: u32 = 1;
-const MAX_STATE_BYTES: usize = 65_536;
+pub(crate) const MAX_STATE_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PcodeStateByte {
@@ -34,7 +34,10 @@ pub struct PcodeStandalonePrefixArtifact {
     pub verification: VerificationStatus,
 }
 
-fn node_bytes(node: &PcodeVarnode, bytes: &mut BTreeSet<(String, u64)>) -> Result<(), String> {
+pub(crate) fn node_bytes(
+    node: &PcodeVarnode,
+    bytes: &mut BTreeSet<(String, u64)>,
+) -> Result<(), String> {
     if node.space == "const" {
         return Ok(());
     }
@@ -102,7 +105,7 @@ fn byte_helper(name: &str, byte_map: &[PcodeStateByte], store: bool) -> String {
     ir
 }
 
-fn helper_definitions(byte_map: &[PcodeStateByte]) -> String {
+pub(crate) fn helper_definitions(byte_map: &[PcodeStateByte]) -> String {
     let mut ir = String::from("declare void @llvm.trap()\n\n");
     ir.push_str(&byte_helper("hydir_load_byte", byte_map, false));
     ir.push_str(&byte_helper("hydir_store_byte", byte_map, true));

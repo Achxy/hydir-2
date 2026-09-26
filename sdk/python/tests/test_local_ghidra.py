@@ -54,6 +54,17 @@ class LocalGhidraTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.artifact("made-up", self.binary, self.snapshot)
 
+    def test_cfg_llvm_can_start_at_a_selected_instruction(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        artifact = {"binary_sha256": self.digest, "schema_version": 1, "stop_sites": []}
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
+            result = self.client.llvm_cfg(self.binary, self.snapshot, start=0x401000)
+        self.assertEqual(result["stop_sites"], [])
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg"))
+        self.assertEqual(run.call_args.args[-2:], ("--start", "0x401000"))
+        with self.assertRaises(ValueError):
+            self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
+
     def test_concrete_trace_forwards_seed_and_checks_identity(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         seed = Path(self.directory.name) / "seed.json"
