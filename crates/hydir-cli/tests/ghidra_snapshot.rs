@@ -113,6 +113,28 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     assert!(kinds.iter().any(|kind| kind == "opaque"));
     assert_eq!(state["semantic_fidelity"], "unknown");
 
+    let state_output = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "state"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_snapshot_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        state_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&state_output.stderr)
+    );
+    let state_ir: serde_json::Value = serde_json::from_slice(&state_output.stdout).unwrap();
+    assert_eq!(state_ir["semantic_fidelity"], "unknown");
+    assert_eq!(
+        state_ir["instructions"][0]["operations"][0]["accesses"][0]["kind"],
+        "read"
+    );
+    assert_eq!(
+        state_ir["instructions"][0]["operations"][0]["accesses"][1]["kind"],
+        "write"
+    );
+
     let llvm = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
         .args(["ghidra-snapshot", "llvm-op"])
         .arg(root.join("demo/hydir-prism.elf"))

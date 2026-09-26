@@ -19,6 +19,7 @@ from . import hydir_v3_pb2 as proto_v3
 from .hydir_pb2_grpc import HydirStub
 from .hydir_v2_pb2_grpc import HydirV2Stub
 from .hydir_v3_pb2_grpc import HydirV3Stub
+from .ghidra import LocalGhidra
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 

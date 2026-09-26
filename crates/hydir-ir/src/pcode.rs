@@ -7,10 +7,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub mod semantics;
+pub mod state;
 pub use semantics::{
     PCODE_SEMANTIC_IR_VERSION, PcodeEffect, PcodeExactOp, PcodeOpaqueClass,
     PcodeSemanticDiagnostic, PcodeSemanticFunctionIr, PcodeSemanticInstruction,
     PcodeSemanticOperation,
+};
+pub use state::{
+    PCODE_STATE_IR_VERSION, PcodeStateAccess, PcodeStateAccessKind, PcodeStateFunctionIr,
+    PcodeStateInstruction, PcodeStateOperation,
 };
 
 pub const GHIDRA_SNAPSHOT_VERSION: u32 = 2;

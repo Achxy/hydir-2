@@ -289,7 +289,7 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
     })
 }
 
-fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
+pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
     if let Some((operation, expected_mnemonic)) = exact_opcode(source.opcode) {
         if source.mnemonic != expected_mnemonic {
             return opaque(
