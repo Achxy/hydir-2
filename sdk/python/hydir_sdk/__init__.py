@@ -23,6 +23,7 @@ from .ghidra import LocalGhidra
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
+MAX_ANALYSIS_MODEL_BYTES = 16 * 1024 * 1024
 
 
 class HydirClient:
@@ -196,6 +197,59 @@ class HydirClient:
         if not isinstance(value, dict) or value.get("schema_version") != schema_version:
             raise RuntimeError("Native artifact schema version verification failed")
         return value
+
+    def get_analysis_model(self, project_id: str, revision: int) -> dict:
+        """Read the binary-bound AnalysisModel at a project revision."""
+        reply = self._call(
+            self._stub_v3.GetAnalysisModel,
+            proto_v3.AnalysisModelRequest(
+                project_id=project_id, expected_revision=revision,
+            ),
+        )
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.analysis-model+json;version=1",
+            schema_version=1,
+        )
+
+    def save_analysis_model(
+        self, project_id: str, revision: int, model: dict | bytes,
+        *, idempotency_key: str | None = None,
+    ):
+        """Save a complete model edit with an optimistic project revision check."""
+        if not isinstance(revision, int) or revision < 0:
+            raise ValueError("Project revision must be nonnegative")
+        if isinstance(model, dict):
+            raw = json.dumps(model, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        elif isinstance(model, bytes):
+            raw = model
+        else:
+            raise TypeError("Model must be a JSON object or UTF-8 JSON bytes")
+        if not 0 < len(raw) <= MAX_ANALYSIS_MODEL_BYTES:
+            raise ValueError("AnalysisModel exceeds the 16 MiB limit")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ValueError("Expected AnalysisModel v1 JSON object")
+        key = idempotency_key or str(uuid4())
+        if not 0 < len(key.encode("utf-8")) <= 128 or any(ord(ch) < 32 for ch in key):
+            raise ValueError("Idempotency key exceeds the supported bounds")
+        reply = self._call(
+            self._stub_v3.SaveAnalysisModel,
+            proto_v3.SaveAnalysisModelRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=key,
+                model_json=raw,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.revision != revision + 1
+            or len(reply.binary_sha256) != 64
+        ):
+            raise RuntimeError("Model revision or binary identity differs from request")
+        return reply
 
     def analyze_ghidra_snapshot(
         self,

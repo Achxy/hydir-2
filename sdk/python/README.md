@@ -39,6 +39,15 @@ MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
 artifacts. `get_program_artifact(...)` never executes the input and requires a
 FunctionIndex selector for function-scoped stages.
 
+`get_analysis_model(project_id, revision)` returns the current validated
+AnalysisModel v1 as JSON. Edit that document and call
+`save_analysis_model(project_id, revision, model, idempotency_key=...)` with
+the project revision you read. The model's own `revision` must increase by one.
+The server checks the binary digest and layout, retains machine evidence,
+persists the edit, and returns the new project revision. Later typed C and
+high-level CIR artifact requests use the saved model. Reuse the same
+idempotency key when retrying an uncertain save.
+
 `analyze_ghidra_snapshot(project_id, revision, snapshot, stage)` sends an
 exported Ghidra snapshot as bytes or a file path to the v3 service. The
 project must already contain the same binary. The server checks the snapshot

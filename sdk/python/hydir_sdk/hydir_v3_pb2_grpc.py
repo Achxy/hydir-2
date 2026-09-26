@@ -67,6 +67,16 @@ class HydirV3Stub:
                 request_serializer=hydir__v3__pb2.ProgramArtifactRequest.SerializeToString,
                 response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.GetAnalysisModel = channel.unary_unary(
+                '/hydir.v3.HydirV3/GetAnalysisModel',
+                request_serializer=hydir__v3__pb2.AnalysisModelRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
+        self.SaveAnalysisModel = channel.unary_unary(
+                '/hydir.v3.HydirV3/SaveAnalysisModel',
+                request_serializer=hydir__v3__pb2.SaveAnalysisModelRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.MutationReply.FromString,
+                _registered_method=True)
         self.AnalyzeGhidraSnapshot = channel.unary_unary(
                 '/hydir.v3.HydirV3/AnalyzeGhidraSnapshot',
                 request_serializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.SerializeToString,
@@ -121,6 +131,18 @@ class HydirV3Servicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetAnalysisModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SaveAnalysisModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def AnalyzeGhidraSnapshot(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -165,6 +187,16 @@ def add_HydirV3Servicer_to_server(servicer, server):
                     servicer.GetProgramArtifact,
                     request_deserializer=hydir__v3__pb2.ProgramArtifactRequest.FromString,
                     response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'GetAnalysisModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetAnalysisModel,
+                    request_deserializer=hydir__v3__pb2.AnalysisModelRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'SaveAnalysisModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.SaveAnalysisModel,
+                    request_deserializer=hydir__v3__pb2.SaveAnalysisModelRequest.FromString,
+                    response_serializer=hydir__v3__pb2.MutationReply.SerializeToString,
             ),
             'AnalyzeGhidraSnapshot': grpc.unary_unary_rpc_method_handler(
                     servicer.AnalyzeGhidraSnapshot,
@@ -342,6 +374,60 @@ class HydirV3:
             '/hydir.v3.HydirV3/GetProgramArtifact',
             hydir__v3__pb2.ProgramArtifactRequest.SerializeToString,
             hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetAnalysisModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/GetAnalysisModel',
+            hydir__v3__pb2.AnalysisModelRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SaveAnalysisModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/SaveAnalysisModel',
+            hydir__v3__pb2.SaveAnalysisModelRequest.SerializeToString,
+            hydir__v3__pb2.MutationReply.FromString,
             options,
             channel_credentials,
             insecure,

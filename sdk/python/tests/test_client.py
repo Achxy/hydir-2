@@ -144,6 +144,45 @@ class ClientBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(artifact["schema_version"], 3)
 
+    def test_v3_analysis_model_read_and_revisioned_save(self):
+        model = {"schema_version": 1, "binary_sha256": "a" * 64, "revision": 2}
+        content = json.dumps(model).encode("utf-8")
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def read_call(method, request):
+                self.assertIs(method, client._stub_v3.GetAnalysisModel)
+                requests.append(request)
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type="application/vnd.hydir.analysis-model+json;version=1",
+                    content=content,
+                    project_revision=4,
+                )
+
+            client._call = read_call
+            self.assertEqual(client.get_analysis_model("project", 4), model)
+            self.assertEqual(requests[0].expected_revision, 4)
+
+            def save_call(method, request):
+                self.assertIs(method, client._stub_v3.SaveAnalysisModel)
+                requests.append(request)
+                return proto_v3.MutationReply(
+                    project_id="project", revision=5, binary_sha256="a" * 64,
+                )
+
+            client._call = save_call
+            reply = client.save_analysis_model(
+                "project", 4, model, idempotency_key="edit-1",
+            )
+            self.assertEqual(reply.revision, 5)
+            self.assertEqual(requests[1].idempotency_key, "edit-1")
+            self.assertEqual(json.loads(requests[1].model_json), model)
+            with self.assertRaises(ValueError):
+                client.save_analysis_model("project", 4, {"schema_version": 2})
+            with self.assertRaises(ValueError):
+                client.save_analysis_model("project", 4, model, idempotency_key="\n")
+
     def test_v3_ghidra_snapshot_artifact_uses_revisioned_rpc_and_checks_reply(self):
         snapshot = Path(self.directory.name) / "snapshot.json"
         snapshot.write_bytes(b'{"schema_version":2}')
