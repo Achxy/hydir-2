@@ -102,6 +102,40 @@ class LocalGhidra:
             raise RuntimeError("Hydir artifact belongs to another binary")
         return data
 
+    def save_snapshot(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+    ) -> dict[str, Any]:
+        """Store a validated snapshot in Hydir's local project database."""
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        data = json.loads(self._run("ghidra-project", "save", str(binary_path), str(snapshot_path)))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Saved Ghidra project belongs to another binary")
+        return data
+
+    def saved_snapshot(
+        self,
+        binary: str | os.PathLike[str],
+        function: int,
+    ) -> dict[str, Any]:
+        """Reopen a saved selected-function snapshot without running Ghidra."""
+        if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("function entry must be a 64-bit address")
+        binary_path = Path(binary).resolve(strict=True)
+        digest = self._digest(binary_path)
+        data = json.loads(self._run(
+            "ghidra-project", "get", str(binary_path), "--function", hex(function)
+        ))
+        entry = data.get("selected_function", {}).get("entry", {}).get("offset") if isinstance(data, dict) else None
+        if (not isinstance(data, dict) or data.get("binary_sha256") != digest
+                or entry != hex(function)):
+            raise RuntimeError("Saved Ghidra snapshot belongs to another binary or function")
+        return data
+
     def llvm_cfg(
         self,
         binary: str | os.PathLike[str],

@@ -33,6 +33,7 @@ use hydir_ir::pcode::{
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
+use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod ghidra_worker;
 mod local;
@@ -64,6 +65,8 @@ Usage:
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
+  hydirctl ghidra-project save <elf> <snapshot.json>
+  hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
   hydirctl ghidra-snapshot pcode <binary> <snapshot.json> [--output <pcode-ir.json>]
   hydirctl ghidra-snapshot semantics <binary> <snapshot.json> [--output <semantic-ir.json>]
@@ -211,6 +214,50 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("ghidra-project") if args.len() == 4 && args[1] == "save" => {
+            let binary = read_binary(&args[2])?;
+            let spec = import_elf(&binary)?;
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &spec.binary_sha256,
+            )?;
+            let mut store = LocalProjectStore::open(&default_db_path()?)?;
+            let project = store.open_binary(Path::new(&args[2]), &spec)?;
+            store.save_ghidra_snapshot(&project, &snapshot)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "project_id": project.id,
+                    "revision": project.revision,
+                    "binary_sha256": project.binary_sha256,
+                    "selected_function": snapshot.selected_function.entry,
+                }))?
+            );
+        }
+        Some("ghidra-project")
+            if (args.len() == 5 || args.len() == 7 && args[5] == "--output")
+                && args[1] == "get"
+                && args[3] == "--function" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let spec = import_elf(&binary)?;
+            let address = parse_u64_auto(&args[4], "Ghidra function entry")?;
+            let entry = hydir_ir::pcode::PcodeAddress {
+                space: "ram".to_owned(),
+                offset: format!("0x{address:x}"),
+            };
+            let mut store = LocalProjectStore::open(&default_db_path()?)?;
+            let project = store.open_binary(Path::new(&args[2]), &spec)?;
+            let snapshot = store
+                .load_ghidra_snapshot(&project, &entry)?
+                .ok_or("No saved Ghidra snapshot for that binary and function")?;
+            let content = serde_json::to_vec_pretty(&snapshot)?;
+            if args.len() == 7 {
+                write_new_or_identical(&args[6], &content)?;
+            } else {
+                println!("{}", String::from_utf8(content)?);
+            }
+        }
         Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg" => {
             let mut start_address = None;
             let mut output_path = None;

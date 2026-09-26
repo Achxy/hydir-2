@@ -68,6 +68,60 @@ fn raw_pcode_snapshot_cli_binds_binary_and_emits_unclaimed_ir() {
 }
 
 #[test]
+fn ghidra_project_cli_reopens_a_saved_binary_bound_snapshot() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = tempfile::tempdir().unwrap();
+    let binary = directory.path().join("prism.elf");
+    let database = directory.path().join("analyst.sqlite");
+    let snapshot = root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json");
+    fs::copy(root.join("demo/hydir-prism.elf"), &binary).unwrap();
+
+    let save = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .env("HYDIR_LOCAL_DB", &database)
+        .args(["ghidra-project", "save"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(
+        save.status.success(),
+        "{}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&save.stdout).unwrap();
+    assert_eq!(saved["selected_function"]["offset"], "0x2013cf");
+
+    let get = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .env("HYDIR_LOCAL_DB", &database)
+        .args(["ghidra-project", "get"])
+        .arg(&binary)
+        .args(["--function", "0x2013cf"])
+        .output()
+        .unwrap();
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    let reopened: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(reopened["binary_sha256"], saved["binary_sha256"]);
+    assert_eq!(
+        reopened["selected_function"]["entry"],
+        saved["selected_function"]
+    );
+
+    fs::write(&binary, b"changed binary").unwrap();
+    let stale = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .env("HYDIR_LOCAL_DB", &database)
+        .args(["ghidra-project", "get"])
+        .arg(&binary)
+        .args(["--function", "0x2013cf"])
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+}
+
+#[test]
 fn imports_snapshot_exported_by_headless_ghidra() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let binary = root.join("demo/hydir-prism.elf");

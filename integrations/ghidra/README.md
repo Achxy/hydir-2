@@ -16,6 +16,8 @@ Windows development host because Docker is unavailable there.
 ```powershell
 $env:HYDIR_GHIDRA_HOME = 'C:\path\to\ghidra_12.1.4_PUBLIC' # optional local override
 cargo run -p hydir-cli -- ghidra analyze .\demo\hydir-prism.elf --output .\snapshot.json
+cargo run -p hydir-cli -- ghidra-project save .\demo\hydir-prism.elf .\snapshot.json
+cargo run -p hydir-cli -- ghidra-project get .\demo\hydir-prism.elf --function 0x2013cf --output .\saved-snapshot.json
 cargo run -p hydir-cli -- ghidra-snapshot verify .\demo\hydir-prism.elf .\snapshot.json
 cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\snapshot.json --output .\semantic-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
@@ -66,6 +68,10 @@ are deduplicated; saved content is hash checked and tied to the opened ELF
 digest. A project-save warning does not hide a successfully analyzed
 function. The database schema is v5; back up the database before opening it
 with an older Hydir build.
+The `ghidra-project save|get` commands and `LocalGhidra.save_snapshot` /
+`saved_snapshot` allow an external script to preserve and reopen the same
+validated snapshot without rerunning Ghidra. `HYDIR_LOCAL_DB` can point to an
+absolute alternate database path for isolated projects or tests.
 The CFG artifact joins instruction nodes to analyzed edges and keeps calls
 separate. Its completeness is explicitly `incomplete`, including when all
 visible edges have concrete targets.
