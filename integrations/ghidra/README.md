@@ -81,7 +81,9 @@ absolute alternate database path for isolated projects or tests.
 Schema v2 optionally carries analyzed memory block ranges and permissions,
 plus defined program and external symbols with source, type, and namespace
 evidence. Older v2 snapshots without these arrays still import. Metadata is
-evidence for analysis, not lifted machine semantics.
+evidence for analysis, not lifted machine semantics. The desktop P-code view
+lists the memory map and symbols; RAM entries link to the selected source
+address.
 The CFG artifact joins instruction nodes to analyzed edges and keeps calls
 separate. Its completeness is explicitly `incomplete`, including when all
 visible edges have concrete targets.
