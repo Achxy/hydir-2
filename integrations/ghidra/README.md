@@ -103,11 +103,19 @@ reported boundary. Memory is not yet part of the standalone LLVM prefix.
 
 `llvm-cfg` emits a runnable, bounded CFG path module for the selected function
 with an optional instruction start. Its compact `byte_map` indexes separate
-state and known-byte arrays. `@hydir_pcode_cfg` logs successful operation IDs
-and returns a numeric stop status for return, call, unknown input, unsupported
-memory, unresolved flow, or a budget. Source operations and static stop sites
-map back to Ghidra addresses. The module remains `semantic_fidelity: unknown`
-and `verification: not_run`; `opt` verification and fixture comparisons do not
+state and known-byte arrays. Artifact v2 adds one guest RAM window: the
+`guest_ram` and `guest_known` arrays contain `guest_len` bytes starting at
+`guest_base`, and `guest_space_id` is Ghidra's numeric RAM space ID. A known
+byte is `0xff`; the runtime accepts up to the artifact's
+`guest_ram_limit_bytes` (1 MiB minus mapped state bytes). The entry is
+`@hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram,
+ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count,
+i32 event_capacity, i32 max_steps)`. It logs successful operation IDs and
+returns a numeric stop status. Known RAM loads/stores can execute; unknown
+addresses or bytes, wrong spaces, out-of-range accesses, calls, and unresolved
+flow stop explicitly. Source operations and static stop sites map back to
+Ghidra addresses. The module remains `semantic_fidelity: unknown` and
+`verification: not_run`; `opt` verification and fixture comparisons do not
 prove arbitrary whole-function equivalence. The Python SDK exposes this as
 `LocalGhidra.llvm_cfg(...)`, and the desktop P-code view can generate and copy
 the same CFG LLVM.
