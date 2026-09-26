@@ -26,6 +26,7 @@ use hydir_execution::{
     parse_snapshot_resume_plan, probe_origin, validate_execution_snapshot, validate_input_spec,
     validate_origin_probe, validate_snapshot_bridge_result, validate_snapshot_resume_plan,
 };
+use hydir_ghidra_worker as ghidra_worker;
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
@@ -38,7 +39,6 @@ use hydir_model::{
 };
 use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
-mod ghidra_worker;
 mod local;
 mod passes;
 mod patch;

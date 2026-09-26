@@ -26,6 +26,7 @@ hydir-vm = { path = "../hydir-vm" }
 hydir-execution = { path = "../hydir-execution" }
 hydir-interchange = { path = "../hydir-interchange" }
 hydir-project = { path = "../hydir-project" }
+hydir-ghidra-worker = { path = "../hydir-ghidra-worker" }
 object.workspace = true
 iced-x86.workspace = true
 serde_json.workspace = true

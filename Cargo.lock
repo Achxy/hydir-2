@@ -2183,6 +2183,7 @@ dependencies = [
  "hydir-core",
  "hydir-decompile",
  "hydir-execution",
+ "hydir-ghidra-worker",
  "hydir-hlc",
  "hydir-interchange",
  "hydir-ir",
@@ -2235,6 +2236,18 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "object",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "hydir-ghidra-worker"
+version = "0.1.0"
+dependencies = [
+ "hydir-backend",
+ "hydir-ir",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2391,6 +2404,7 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-ghidra-worker",
  "hydir-hlc",
  "hydir-interchange",
  "hydir-ir",

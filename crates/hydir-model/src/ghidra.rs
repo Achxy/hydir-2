@@ -599,13 +599,25 @@ mod tests {
         let report = import_ghidra_functions(bytes, &mut edited, &snapshot).unwrap();
         assert_eq!(report.conflicting_prototypes, 1);
         assert_eq!(
-            edited.functions.iter().find(|function| function.entry == entry)
-                .unwrap().prototype.as_ref().unwrap().return_type,
-            TypeRef::Primitive { name: PrimitiveType::U64 }
+            edited
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .unwrap()
+                .prototype
+                .as_ref()
+                .unwrap()
+                .return_type,
+            TypeRef::Primitive {
+                name: PrimitiveType::U64
+            }
         );
-        assert!(edited.conflicts.iter().any(|conflict| {
-            conflict.subject == "function:0x20137c:prototype"
-        }));
+        assert!(
+            edited
+                .conflicts
+                .iter()
+                .any(|conflict| { conflict.subject == "function:0x20137c:prototype" })
+        );
 
         let function = snapshot
             .functions

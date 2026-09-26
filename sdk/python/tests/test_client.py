@@ -228,6 +228,34 @@ class ClientBoundaryTests(unittest.TestCase):
                     "project", 4, b"{}", "state", instruction_index=0,
                 )
 
+    def test_v3_automatic_ghidra_uses_uploaded_binary_and_selected_entry(self):
+        content = json.dumps({"schema_version": 1, "binary_sha256": "a" * 64}).encode()
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request):
+                self.assertIs(method, client._stub_v3.AnalyzeGhidraSnapshot)
+                requests.append(request)
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-ir+json;version=1",
+                    content=content, project_revision=4,
+                )
+            client._call = call
+            self.assertEqual(
+                client.analyze_ghidra_binary(
+                    "project", 4, "pcode", selected_function_entry=0x101320,
+                )["schema_version"],
+                1,
+            )
+            self.assertTrue(requests[0].automatic)
+            self.assertEqual(requests[0].snapshot_json, b"")
+            self.assertEqual(requests[0].selected_function_entry, "0x101320")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_binary(
+                    "project", 4, "pcode", selected_function_entry="0xGG",
+                )
+            self.assertEqual(len(requests), 1)
+
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):

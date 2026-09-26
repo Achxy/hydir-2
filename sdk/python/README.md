@@ -43,11 +43,17 @@ FunctionIndex selector for function-scoped stages.
 exported Ghidra snapshot as bytes or a file path to the v3 service. The
 project must already contain the same binary. The server checks the snapshot
 digest against that binary and runs a bounded worker. Supported stages are
-`pcode`, `semantics`, `state`, `cfg`, `coverage`, `llvm-cfg`, and `slice`. For
+`snapshot`, `pcode`, `semantics`, `state`, `cfg`, `coverage`, `llvm-cfg`, and `slice`. For
 `llvm-cfg`, pass `start_address=0x...` to select a CFG entry. For `slice`, pass
 `instruction_index` and `operation_index`, plus optional `input_index`. The SDK checks the
 artifact hash, media type, schema version, and project revision before
 returning JSON.
+`analyze_ghidra_binary(project_id, revision, "snapshot")` asks the service to
+run its managed Ghidra worker on the already uploaded ELF, returning the
+validated function index and selected function snapshot. Pass
+`selected_function_entry=0x...` for another Ghidra function, then request
+`pcode`, `state`, `llvm-cfg`, or `slice`. The explicit automatic flag prevents an
+empty legacy snapshot request from starting analysis.
 For local snapshots, `LocalGhidra.slice(binary, snapshot, instruction_index,
 operation_index, input_index=None)` returns a bounded backward P-code value
 slice with source operations and explicit unresolved boundaries.
