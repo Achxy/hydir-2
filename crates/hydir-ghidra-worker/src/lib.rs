@@ -149,6 +149,16 @@ fn validate_output(
     Ok(snapshot)
 }
 
+/// Recheck a persisted worker snapshot before using it as analysis input.
+/// This includes the pinned Ghidra version and requested function selector.
+pub fn validate_cached_snapshot(
+    bytes: &[u8],
+    binary_digest: &str,
+    selected_entry: Option<u64>,
+) -> Result<GhidraSnapshot, String> {
+    validate_output(bytes, binary_digest, selected_entry)
+}
+
 fn cache_key(binary_digest: &str, selected_entry: Option<u64>, mode: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"hydir-ghidra-worker-v1\0");
@@ -164,6 +174,19 @@ fn cache_key(binary_digest: &str, selected_entry: Option<u64>, mode: &str) -> St
     hash.update(b"\0");
     hash.update(format!("{selected_entry:?}").as_bytes());
     format!("{:x}", hash.finalize())
+}
+
+/// Identity of the managed analysis for one binary and function selector.
+/// Shared callers use this before launching Ghidra to locate a previously
+/// validated snapshot. Exporter, image, version, and execution mode are part
+/// of the identity, so changing any of them misses the old cache entry.
+pub fn analysis_cache_key(binary_digest: &str, selected_entry: Option<u64>) -> String {
+    let mode = if env::var_os("HYDIR_GHIDRA_HOME").is_some() {
+        "local-12.1.4"
+    } else {
+        "docker-12.1.4"
+    };
+    cache_key(binary_digest, selected_entry, mode)
 }
 
 fn cache_path(output: &Path) -> PathBuf {
@@ -591,7 +614,7 @@ pub fn analyze(
     } else {
         "docker-12.1.4"
     };
-    let key = cache_key(&binary_digest, selected_entry, mode);
+    let key = analysis_cache_key(&binary_digest, selected_entry);
     let _output_lock = lock_output(&output_abs)?;
     if let Some(snapshot) = try_cached(&output_abs, &binary_digest, selected_entry, &key) {
         return Ok(snapshot);

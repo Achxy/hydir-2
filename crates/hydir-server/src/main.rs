@@ -426,6 +426,21 @@ COMMIT;
 PRAGMA foreign_keys=ON;
 ";
 
+const GHIDRA_SNAPSHOT_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE ghidra_snapshots (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    binary_sha256 TEXT NOT NULL REFERENCES binaries(sha256),
+    worker_key TEXT NOT NULL,
+    created_revision INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    PRIMARY KEY(project_id,binary_sha256,worker_key)
+);
+PRAGMA user_version=11;
+COMMIT;
+";
+
 #[derive(Clone)]
 enum ContentStorage {
     Inline,
@@ -958,7 +973,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 10 {
+        if version > 11 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -990,6 +1005,9 @@ impl Store {
         }
         if version <= 9 {
             connection.execute_batch(S3_STORAGE_MIGRATION)?;
+        }
+        if version <= 10 {
+            connection.execute_batch(GHIDRA_SNAPSHOT_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -2156,6 +2174,71 @@ async fn automatic_ghidra_snapshot(
     .map_err(|error| {
         Status::failed_precondition(format!("automatic Ghidra analysis failed: {error}"))
     })
+}
+
+fn cached_ghidra_snapshot(
+    connection: &Connection,
+    project_id: &str,
+    binary_digest: &str,
+    worker_key: &str,
+    selected_entry: Option<u64>,
+) -> Result<Option<Vec<u8>>, Status> {
+    let row: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT content_sha256,content FROM ghidra_snapshots \
+             WHERE project_id=?1 AND binary_sha256=?2 AND worker_key=?3",
+            params![project_id, binary_digest, worker_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some((stored_digest, content)) = row else {
+        return Ok(None);
+    };
+    if content.is_empty()
+        || content.len() > MAX_GHIDRA_SNAPSHOT_BYTES
+        || sha256(&content) != stored_digest
+        || hydir_ghidra_worker::validate_cached_snapshot(&content, binary_digest, selected_entry)
+            .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(content))
+}
+
+fn save_ghidra_snapshot(
+    connection: &Connection,
+    project_id: &str,
+    binary_digest: &str,
+    revision: u64,
+    worker_key: &str,
+    selected_entry: Option<u64>,
+    content: &[u8],
+) -> Result<(), Status> {
+    if content.is_empty() || content.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+        return Err(Status::resource_exhausted(
+            "automatic Ghidra snapshot exceeds 16 MiB",
+        ));
+    }
+    hydir_ghidra_worker::validate_cached_snapshot(content, binary_digest, selected_entry)
+        .map_err(|error| Status::invalid_argument(format!("invalid Ghidra snapshot: {error}")))?;
+    connection
+        .execute(
+            "INSERT INTO ghidra_snapshots(project_id,binary_sha256,worker_key,created_revision,content_sha256,content) \
+             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(project_id,binary_sha256,worker_key) \
+             DO UPDATE SET created_revision=excluded.created_revision, \
+             content_sha256=excluded.content_sha256,content=excluded.content",
+            params![
+                project_id,
+                binary_digest,
+                worker_key,
+                revision as i64,
+                sha256(content),
+                content
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
 }
 
 fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
@@ -4121,10 +4204,39 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         })
         .map_err(|_| Status::internal("Ghidra artifact selector serialization failed"))?;
         let snapshot_json = if automatic {
-            let binary = self
-                .current_binary(&principal, &input.project_id, input.expected_revision)
-                .await?;
-            automatic_ghidra_snapshot(binary, selected_entry).await?
+            let worker_key =
+                hydir_ghidra_worker::analysis_cache_key(&project.binary_sha256, selected_entry);
+            let cached = {
+                let connection = self.connection()?;
+                cached_ghidra_snapshot(
+                    &connection,
+                    &input.project_id,
+                    &project.binary_sha256,
+                    &worker_key,
+                    selected_entry,
+                )?
+            };
+            if let Some(cached) = cached {
+                cached
+            } else {
+                let binary = self
+                    .current_binary(&principal, &input.project_id, input.expected_revision)
+                    .await?;
+                let produced = automatic_ghidra_snapshot(binary, selected_entry).await?;
+                {
+                    let connection = self.connection()?;
+                    save_ghidra_snapshot(
+                        &connection,
+                        &input.project_id,
+                        &project.binary_sha256,
+                        input.expected_revision,
+                        &worker_key,
+                        selected_entry,
+                        &produced,
+                    )?;
+                }
+                produced
+            }
         } else {
             input.snapshot_json
         };
@@ -4744,27 +4856,75 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires HYDIR_GHIDRA_HOME pointing to Ghidra 12.1.4 or Docker"]
     async fn automatic_ghidra_worker_exports_selected_real_elf() {
-        let binary = include_bytes!("../../../tests/fixtures/ghidra_prototype.elf");
-        let bytes = automatic_ghidra_snapshot(binary.to_vec(), Some(0x101320))
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("auto-ghidra-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Automatic Ghidra fixture".to_owned(),
+                    idempotency_key: "auto-ghidra-fixture".to_owned(),
+                },
+                &token,
+            ))
             .await
-            .unwrap();
-        let snapshot = parse_ghidra_snapshot(&bytes, &sha256(binary)).unwrap();
-        assert_eq!(snapshot.selected_function.entry.offset, "0x101320");
-        assert!(!snapshot.selected_function.instructions.is_empty());
-        assert!(!snapshot.functions.is_empty());
-        let selector = serde_json::to_string(&GhidraSnapshotArtifactSelector {
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../tests/fixtures/ghidra_prototype.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = api_v3::GhidraSnapshotArtifactRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            snapshot_json: Vec::new(),
             stage: "snapshot".to_owned(),
-            binary_sha256: sha256(binary),
             start_address: String::new(),
             instruction_index: None,
             operation_index: None,
             input_index: None,
-        })
-        .unwrap();
-        let artifact = ghidra_snapshot_artifact(&bytes, &selector).unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
-        assert_eq!(json["schema_version"], 2);
-        assert_eq!(json["selected_function"]["entry"]["offset"], "0x101320");
+            selected_function_entry: "0x101320".to_owned(),
+            automatic: true,
+        };
+        let result = HydirV3::analyze_ghidra_snapshot(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        let bytes = result.content;
+        let snapshot = parse_ghidra_snapshot(&bytes, &sha256(&binary)).unwrap();
+        assert_eq!(snapshot.selected_function.entry.offset, "0x101320");
+        assert!(!snapshot.selected_function.instructions.is_empty());
+        assert!(!snapshot.functions.is_empty());
+        let worker_key =
+            hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, Some(0x101320));
+        assert!(
+            cached_ghidra_snapshot(
+                &store.connection().unwrap(),
+                &project.project_id,
+                &uploaded.binary_sha256,
+                &worker_key,
+                Some(0x101320),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let replay = HydirV3::analyze_ghidra_snapshot(&store, authorized(request, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.sha256, result.sha256);
+        assert_eq!(replay.content, bytes);
     }
 
     #[test]
@@ -4915,13 +5075,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_ten_accepts_s3_metadata_and_preserves_foreign_keys() {
+    fn schema_eleven_accepts_s3_metadata_and_preserves_foreign_keys() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let connection = store.connection().unwrap();
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         connection
             .execute(
                 "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) VALUES(?1,x'','s3',?2,1)",
@@ -4934,6 +5094,79 @@ mod tests {
             })
             .unwrap();
         assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[test]
+    fn schema_ten_migrates_to_snapshot_cache_without_losing_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v10.sqlite");
+        let store = Store::open(&path).unwrap();
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO identities(principal,token_sha256) VALUES('owner','digest');
+                     INSERT INTO projects(id,owner,name,idempotency_key)
+                     VALUES('project','owner','existing','create-key');
+                     DROP TABLE ghidra_snapshots;
+                     PRAGMA user_version=10;",
+                )
+                .unwrap();
+        }
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let connection = reopened.connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        let name: String = connection
+            .query_row("SELECT name FROM projects WHERE id='project'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "existing");
+        let foreign_key_errors: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let binary = include_bytes!("../../../demo/hydir-prism.elf");
+        let snapshot = include_bytes!("../../../tests/fixtures/ghidra_prism_snapshot_v2.json");
+        let digest = sha256(binary);
+        connection
+            .execute(
+                "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) \
+                 VALUES(?1,?2,'inline','',?3)",
+                params![digest, binary.as_slice(), binary.len() as i64],
+            )
+            .unwrap();
+        let worker_key = hydir_ghidra_worker::analysis_cache_key(&digest, None);
+        save_ghidra_snapshot(
+            &connection,
+            "project",
+            &digest,
+            0,
+            &worker_key,
+            None,
+            snapshot,
+        )
+        .unwrap();
+        drop(connection);
+        drop(reopened);
+        let after_restart = Store::open(&path).unwrap();
+        assert_eq!(
+            cached_ghidra_snapshot(
+                &after_restart.connection().unwrap(),
+                "project",
+                &digest,
+                &worker_key,
+                None,
+            )
+            .unwrap(),
+            Some(snapshot.to_vec())
+        );
     }
 
     #[test]
@@ -5315,6 +5548,102 @@ mod tests {
             selected_function_entry: String::new(),
             automatic: false,
         };
+        let worker_key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, None);
+        {
+            let connection = store.connection().unwrap();
+            assert!(
+                cached_ghidra_snapshot(
+                    &connection,
+                    &project.project_id,
+                    &uploaded.binary_sha256,
+                    &worker_key,
+                    None,
+                )
+                .unwrap()
+                .is_none()
+            );
+            save_ghidra_snapshot(
+                &connection,
+                &project.project_id,
+                &uploaded.binary_sha256,
+                uploaded.revision,
+                &worker_key,
+                None,
+                &snapshot,
+            )
+            .unwrap();
+            assert_eq!(
+                cached_ghidra_snapshot(
+                    &connection,
+                    &project.project_id,
+                    &uploaded.binary_sha256,
+                    &worker_key,
+                    None,
+                )
+                .unwrap(),
+                Some(snapshot.clone())
+            );
+            assert!(
+                cached_ghidra_snapshot(
+                    &connection,
+                    &project.project_id,
+                    &"0".repeat(64),
+                    &worker_key,
+                    None,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                cached_ghidra_snapshot(
+                    &connection,
+                    &project.project_id,
+                    &uploaded.binary_sha256,
+                    &worker_key,
+                    Some(0xdead),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let automatic_request = api_v3::GhidraSnapshotArtifactRequest {
+            automatic: true,
+            ..request("snapshot", Vec::new())
+        };
+        let automatic_artifact =
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(automatic_request, &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            automatic_artifact.media_type,
+            ghidra_snapshot_artifact_media_type("snapshot").unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&automatic_artifact.content).unwrap()["selected_function"]
+                ["entry"]["offset"],
+            "0x20137c"
+        );
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE ghidra_snapshots SET content=x'7b7d' WHERE project_id=?1",
+                    params![project.project_id],
+                )
+                .unwrap();
+            assert!(
+                cached_ghidra_snapshot(
+                    &connection,
+                    &project.project_id,
+                    &uploaded.binary_sha256,
+                    &worker_key,
+                    None,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
         for stage in [
             "snapshot",
             "pcode",
@@ -6207,7 +6536,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=11;")
+            .execute_batch("PRAGMA user_version=12;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -6241,7 +6570,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let foreign_key_errors: i64 = store
             .connection()
             .unwrap()
