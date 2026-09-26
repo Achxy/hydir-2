@@ -23,6 +23,10 @@ jobs:
           .venv/bin/python -m pip install triton-library==1.0.0rc4
       - name: Rust tests
         run: cargo test --locked --workspace
+      - name: Exact PRISM bit-gate native differential
+        run: |
+          cargo build --locked -p hydir-cli --bin hydirctl
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_bit_gate_native_test.py -q
       - name: Native replay smoke
         run: python3 scripts/replay-smoke.py
       - name: Fuzz target build
