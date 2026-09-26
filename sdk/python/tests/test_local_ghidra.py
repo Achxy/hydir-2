@@ -67,3 +67,10 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[-2:], ("--max-ops", "3"))
         with self.assertRaises(ValueError):
             self.client.trace_prefix(self.binary, self.snapshot, seed, max_operations=-1)
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "events": [],
+        }).encode()) as run:
+            path = self.client.trace_path(self.binary, self.snapshot, seed, start=0x401000)
+        self.assertEqual(path["events"], [])
+        self.assertEqual(run.call_args.args[1], "trace-path")
+        self.assertEqual(run.call_args.args[-2:], ("--start", "0x401000"))

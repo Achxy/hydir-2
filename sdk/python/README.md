@@ -21,6 +21,8 @@ a runnable byte-state module for the supported straight-line prefix, with an
 explicit stop reason; it does not claim whole-function equivalence.
 `trace_prefix(binary, snapshot, seed, max_operations=4096)` runs the bounded
 concrete interpreter against a binary-bound JSON seed and returns its trace.
+`trace_path(...)` follows a bounded path through selected instructions and
+returns source-linked branch events and its explicit stop reason.
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,

@@ -23,6 +23,7 @@ cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
 cargo run -p hydir-cli -- ghidra-snapshot trace-prefix .\demo\hydir-prism.elf .\snapshot.json .\seed.json --max-ops 4096 --output .\trace.json
+cargo run -p hydir-cli -- ghidra-snapshot trace-path .\demo\hydir-prism.elf .\snapshot.json .\seed.json --start 0x2013d9 --max-ops 4096 --max-visits 1024 --output .\path.json
 ```
 
 For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
@@ -103,6 +104,11 @@ Each seed value must fit its declared 1..=8-byte width. Overlapping entries,
 unknown spaces, and mismatched binary or function identities are rejected.
 The trace records each executed operation, concrete memory access, final
 state, and exact stop reason. It does not claim whole-function equivalence.
+`trace-path` uses the same seed and follows one concrete route through the
+selected function's analyzed instructions. `--start` optionally selects an
+instruction in that function, which is useful when earlier instructions have
+unsupported effects. The path artifact records each instruction visit and
+branch event, and stops on unknown control, a call or return, or a budget.
 
 The JSON includes the SHA-256 of the supplied original binary and requires it
 to match Ghidra's recorded import hash. Addresses are objects

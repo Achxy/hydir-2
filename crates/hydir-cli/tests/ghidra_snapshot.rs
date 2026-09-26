@@ -269,3 +269,38 @@ fn concrete_trace_prefix_uses_binary_bound_seed_and_reports_boundary() {
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("overlap"));
 }
+
+#[test]
+fn concrete_path_cli_follows_real_ghidra_conditional_branch() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let snapshot_path = root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json");
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    let seed = serde_json::json!({
+        "schema_version": 1,
+        "binary_sha256": snapshot["binary_sha256"],
+        "entry": snapshot["selected_function"]["entry"],
+        "registers": [{"offset": "0x206", "size": 1, "value": "0x1"}]
+    });
+    let seed_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(seed_file.path(), serde_json::to_vec(&seed).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "trace-path"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(&snapshot_path)
+        .arg(seed_file.path())
+        .args(["--start", "0x2013d9", "--max-ops", "8", "--max-visits", "4"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(trace["start"]["offset"], "0x2013d9");
+    assert_eq!(trace["instruction_visits"][1]["offset"], "0x2013e2");
+    assert_eq!(trace["events"][0]["kind"], "branch");
+    assert_eq!(trace["events"][0]["taken"], true);
+    assert_eq!(trace["semantic_fidelity"], "unknown");
+}
