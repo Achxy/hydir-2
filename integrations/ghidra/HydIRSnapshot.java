@@ -11,7 +11,9 @@ import ghidra.program.model.data.AbstractFloatDataType;
 import ghidra.program.model.data.AbstractIntegerDataType;
 import ghidra.program.model.data.Array;
 import ghidra.program.model.data.BooleanDataType;
+import ghidra.program.model.data.Composite;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeComponent;
 import ghidra.program.model.data.Pointer;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.TypeDef;
@@ -56,6 +58,7 @@ public class HydIRSnapshot extends GhidraScript {
     private static final int MAX_PROTOTYPE_PARAMETERS = 256;
     private static final int MAX_PROTOTYPE_TEXT_BYTES = 4_096;
     private static final int MAX_PROTOTYPE_TYPE_DEPTH = 4;
+    private static final int MAX_PROTOTYPE_FIELDS = 128;
     private static final int MAX_INSTRUCTIONS = 16_384;
     private static final int MAX_PCODE_OPS = 262_144;
     private static final int MAX_HIGH_PCODE_OPS = 16_384;
@@ -297,6 +300,27 @@ public class HydIRSnapshot extends GhidraScript {
         else if (dataType instanceof Array) target = ((Array) dataType).getDataType();
         else if (dataType instanceof TypeDef) target = ((TypeDef) dataType).getDataType();
         boolean truncated = target != null && depth + 1 >= MAX_PROTOTYPE_TYPE_DEPTH;
+        DataTypeComponent[] components = null;
+        if (dataType instanceof Composite) {
+            Composite composite = (Composite) dataType;
+            if (depth + 1 >= MAX_PROTOTYPE_TYPE_DEPTH
+                    || composite.getNumDefinedComponents() > MAX_PROTOTYPE_FIELDS) {
+                truncated = true;
+            } else {
+                components = composite.getDefinedComponents();
+                for (DataTypeComponent component : components) {
+                    int offset = component.getOffset();
+                    int size = component.getLength();
+                    if (component.isBitFieldComponent() || component.getDataType() == null
+                            || offset < 0 || size < 0 || length < 0
+                            || (long) offset + size > length) {
+                        components = null;
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
         json.raw(",\"target_type\":");
         if (target == null || truncated) json.raw("null");
         else writeDataType(json, target, depth + 1);
@@ -309,6 +333,23 @@ public class HydIRSnapshot extends GhidraScript {
             json.raw(Integer.toString(count));
         } else {
             json.raw("null");
+        }
+        if (components != null && components.length > 0) {
+            json.raw(",\"fields\":[");
+            for (int i = 0; i < components.length; i++) {
+                DataTypeComponent component = components[i];
+                if (i != 0) json.raw(",");
+                json.raw("{\"offset_bytes\":" + component.getOffset());
+                json.raw(",\"size_bytes\":" + component.getLength());
+                json.raw(",\"name\":");
+                String name = component.getFieldName();
+                if (name == null) json.raw("null");
+                else json.quoted(prototypeText(name, "field name"));
+                json.raw(",\"data_type\":");
+                writeDataType(json, component.getDataType(), depth + 1);
+                json.raw("}");
+            }
+            json.raw("]");
         }
         json.raw(",\"detail_truncated\":" + truncated);
         json.raw("}");

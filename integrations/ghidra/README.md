@@ -11,6 +11,48 @@ These additional sections are optional so earlier v2 snapshots remain
 readable. The exporter does not lift, simplify, or type raw instruction P-code;
 those steps belong to
 Hydir's Rust core. `HydIRExport.java` remains the separate v1 graph exporter.
+The optional type evidence includes bounded defined struct and union components
+with byte offsets and sizes. Bitfields and oversized composites are marked
+truncated; field evidence is not an asserted Hydir source type.
+
+## Independent Ghidra execution oracle
+
+`HydIROracle.java` is a separate, bounded test oracle built on Ghidra 12.1.4's
+[`EmulatorHelper`](https://ghidra.re/ghidra_docs/api/ghidra/app/emulator/EmulatorHelper.html).
+It steps analyzed machine instructions through Ghidra's P-code emulator from
+explicit register and memory seeds, records source instruction addresses, and
+exports the watched final state with the original binary's SHA-256. It stops
+before calls and `CALLOTHER`, at the selected function boundary, on an emulator
+error, or at its 256-instruction cap. This is test tooling, not part of the
+snapshot exporter or the production worker image. The oracle does not execute
+the native ELF in an operating system and does not prove equivalence beyond
+the compared seeded paths.
+
+The focused `tests/ghidra_oracle_test.py` harness imports the real
+`demo/hydir-prism.elf` into headless Ghidra, executes two seeds through
+`hydir_stage_patch_portal`, and compares the Ghidra instruction path,
+`RAX`/`RDI`/`RSP`, return target, and stack bytes with Hydir's Rust
+`trace-path` result from `tests/fixtures/ghidra_prism_patch_portal_v2.json`.
+It also compares both outcomes of `hydir_stage_bit_gate`'s real `JZ` at
+`0x2013d9` against a fresh raw snapshot,
+`tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json`. Both emulators start at
+that branch with an explicit `ZF` seed and compare source visits, final
+registers, return target, and stack bytes. The preceding `TEST` instruction
+contains a `POPCOUNT` P-code op that Hydir currently leaves opaque, so this
+test does not claim exact execution of the whole function from entry. The
+harness also checks that a direct call stops before the call. Run it with:
+
+```powershell
+$env:HYDIR_GHIDRA_HOME = 'C:\path\to\ghidra_12.1.4_PUBLIC'
+python -m unittest -v tests/ghidra_oracle_test.py
+```
+
+The test skips when Ghidra is unavailable. Headless Ghidra splits punctuation
+in post-script arguments, so the harness encodes the four seed/watch lists as
+`h` followed by UTF-8 hex. The script accepts at most 64 entries per list,
+1–8-byte memory values, and 256 instruction steps. The fixture snapshot is
+from the same pinned binary, but the comparison executes a fresh Ghidra
+emulator session rather than replaying the snapshot as its oracle.
 
 Hydir normally launches headless Ghidra for the user. The default path builds
 and runs the pinned `Dockerfile.worker` image, including Ghidra 12.1.4 and JDK

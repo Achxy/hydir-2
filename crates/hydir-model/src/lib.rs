@@ -4,7 +4,7 @@
 use hydir_core::{
     Address, FactSource, Location, ProgramSpec, ScalarType, TypedModel, annotation_address_in_spec,
 };
-use hydir_ir::pcode::{GhidraDataTypeEvidence, PcodeVarnode};
+use hydir_ir::pcode::{GhidraDataTypeEvidence, GhidraDataTypeKind, PcodeVarnode};
 use hydir_loader::import_elf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -818,18 +818,37 @@ pub fn validate_structure(model: &AnalysisModel) -> Result<(), String> {
 }
 
 fn validate_high_type_hint(ty: &GhidraDataTypeEvidence, depth: usize) -> Result<(), String> {
-    if depth > 4
+    if depth >= 4
         || ty.display_name.is_empty()
         || ty.display_name.len() > 4096
         || ty.path.is_empty()
         || ty.path.len() > 4096
         || ty.size_bytes.is_some_and(|size| size > 1_048_576)
         || ty.element_count.is_some_and(|count| count > 1_000_000)
+        || ty.fields.len() > 128
+        || (!ty.fields.is_empty()
+            && !matches!(
+                ty.kind,
+                GhidraDataTypeKind::Struct | GhidraDataTypeKind::Union
+            ))
     {
         return Err("invalid Ghidra high-P-code type hint".to_owned());
     }
     if let Some(target) = &ty.target_type {
         validate_high_type_hint(target, depth + 1)?;
+    }
+    for field in &ty.fields {
+        if field.name.as_ref().is_some_and(|name| {
+            name.is_empty() || name.len() > 4096 || name.chars().any(char::is_control)
+        }) || ty.size_bytes.is_some_and(|size| {
+            field
+                .offset_bytes
+                .checked_add(field.size_bytes)
+                .is_none_or(|end| end > size)
+        }) {
+            return Err("invalid Ghidra high-P-code field hint".to_owned());
+        }
+        validate_high_type_hint(&field.data_type, depth + 1)?;
     }
     Ok(())
 }

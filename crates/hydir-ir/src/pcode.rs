@@ -50,6 +50,7 @@ const MAX_MEMORY_BLOCKS: usize = 4_096;
 const MAX_SYMBOLS: usize = 65_536;
 const MAX_PROTOTYPE_PARAMETERS: usize = 256;
 const MAX_PROTOTYPE_TYPE_DEPTH: usize = 4;
+const MAX_PROTOTYPE_FIELDS: usize = 128;
 const MAX_INSTRUCTIONS: usize = 16_384;
 const MAX_OPERATIONS: usize = 262_144;
 const MAX_HIGH_PCODE_OPERATIONS: usize = 16_384;
@@ -149,11 +150,24 @@ pub struct GhidraDataTypeEvidence {
     /// `None` means Ghidra reports an unsized type (length -1).
     pub size_bytes: Option<u32>,
     pub kind: GhidraDataTypeKind,
-    /// Bounded pointee, array element, or typedef base. This is identity
-    /// evidence; it does not include structure fields or prove a source type.
+    /// Bounded pointee, array element, or typedef base. These are Ghidra
+    /// observations and do not prove a source declaration.
     pub target_type: Option<Box<GhidraDataTypeEvidence>>,
     pub element_count: Option<u32>,
     pub detail_truncated: bool,
+    /// Defined composite components only; omitted in older v2 snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<GhidraFieldEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraFieldEvidence {
+    pub offset_bytes: u32,
+    pub size_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub data_type: GhidraDataTypeEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -388,19 +402,53 @@ fn validate_ghidra_data_type(
     {
         return Err("Ghidra type target requires pointer, array, or typedef".to_owned());
     }
+    if !data_type.fields.is_empty()
+        && !matches!(
+            data_type.kind,
+            GhidraDataTypeKind::Struct | GhidraDataTypeKind::Union
+        )
+    {
+        return Err("Ghidra type fields require a struct or union".to_owned());
+    }
+    if data_type.fields.len() > MAX_PROTOTYPE_FIELDS {
+        return Err("Ghidra composite exceeds field limit".to_owned());
+    }
     if data_type.detail_truncated && data_type.target_type.is_some() {
         return Err("Ghidra truncated type cannot contain a target".to_owned());
     }
     if data_type.detail_truncated
         && !matches!(
             data_type.kind,
-            GhidraDataTypeKind::Pointer | GhidraDataTypeKind::Array | GhidraDataTypeKind::Typedef
+            GhidraDataTypeKind::Pointer
+                | GhidraDataTypeKind::Array
+                | GhidraDataTypeKind::Typedef
+                | GhidraDataTypeKind::Struct
+                | GhidraDataTypeKind::Union
         )
     {
         return Err("Ghidra truncated type requires pointer, array, or typedef".to_owned());
     }
     if let Some(target) = &data_type.target_type {
         validate_ghidra_data_type(target, depth + 1)?;
+    }
+    let mut previous_offset = 0;
+    for field in &data_type.fields {
+        if field.offset_bytes < previous_offset
+            || field
+                .name
+                .as_ref()
+                .is_some_and(|name| bounded_text(name, "Ghidra field name", 4096).is_err())
+            || data_type.size_bytes.is_some_and(|size| {
+                field
+                    .offset_bytes
+                    .checked_add(field.size_bytes)
+                    .is_none_or(|end| end > size)
+            })
+        {
+            return Err("invalid Ghidra composite field layout evidence".to_owned());
+        }
+        previous_offset = field.offset_bytes;
+        validate_ghidra_data_type(&field.data_type, depth + 1)?;
     }
     Ok(())
 }
@@ -1266,6 +1314,7 @@ mod tests {
         assert_eq!(pointee.kind, GhidraDataTypeKind::Struct);
         assert_eq!(pointee.display_name, "Node");
         assert_eq!(pointee.size_bytes, Some(16));
+        assert!(pointee.fields.is_empty()); // older v2 snapshot remains readable
         assert_eq!(
             prototype.parameters[1].data_type.kind,
             GhidraDataTypeKind::Primitive
@@ -1280,6 +1329,46 @@ mod tests {
         ));
         let digest = "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f";
         let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
+        let walk = snapshot
+            .functions
+            .iter()
+            .find(|function| function.entry.offset == "0x101320")
+            .unwrap();
+        let layout = walk.prototype.as_ref().unwrap().parameters[0]
+            .data_type
+            .target_type
+            .as_ref()
+            .unwrap();
+        assert_eq!(layout.kind, GhidraDataTypeKind::Struct);
+        assert_eq!(layout.size_bytes, Some(16));
+        assert_eq!(layout.fields.len(), 2);
+        assert_eq!(layout.fields[0].name.as_deref(), Some("value"));
+        assert_eq!(
+            (layout.fields[0].offset_bytes, layout.fields[0].size_bytes),
+            (0, 4)
+        );
+        assert_eq!(layout.fields[1].name.as_deref(), Some("next"));
+        assert_eq!(
+            (layout.fields[1].offset_bytes, layout.fields[1].size_bytes),
+            (8, 8)
+        );
+        let mut invalid = snapshot.clone();
+        invalid
+            .functions
+            .iter_mut()
+            .find(|function| function.entry.offset == "0x101320")
+            .unwrap()
+            .prototype
+            .as_mut()
+            .unwrap()
+            .parameters[0]
+            .data_type
+            .target_type
+            .as_mut()
+            .unwrap()
+            .fields[1]
+            .offset_bytes = 16;
+        assert!(validate_ghidra_snapshot(&invalid, digest).is_err());
         let high = snapshot.selected_function.high_pcode.as_ref().unwrap();
         assert_eq!(high.source, "ghidra_decompiler");
         assert_eq!(high.status, GhidraHighPcodeStatus::Complete);

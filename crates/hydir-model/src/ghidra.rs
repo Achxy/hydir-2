@@ -684,6 +684,7 @@ mod tests {
             target_type: None,
             element_count: None,
             detail_truncated: false,
+            fields: Vec::new(),
         };
         function.prototype = Some(GhidraFunctionPrototype {
             signature_source: "IMPORTED".to_owned(),
@@ -858,6 +859,18 @@ mod tests {
             hint.ssa_id == 217
                 && hint.high_name.as_deref() == Some("node")
                 && hint.high_type.as_ref().unwrap().display_name == "Node *"
+                && hint
+                    .high_type
+                    .as_ref()
+                    .unwrap()
+                    .target_type
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.as_deref(), field.offset_bytes))
+                    .collect::<Vec<_>>()
+                    == vec![(Some("value"), 0), (Some("next"), 8)]
         }));
         assert!(model.types.is_empty());
         assert!(model.stack_objects.is_empty());
