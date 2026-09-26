@@ -118,3 +118,27 @@ class LocalGhidra:
             "ghidra-snapshot", "llvm-op", str(binary_path), str(snapshot_path),
             "--instruction", hex(instruction), "--op", str(operation),
         ).decode("utf-8")
+
+    def trace_prefix(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        max_operations: int = 4096,
+    ) -> dict[str, Any]:
+        """Run a bounded concrete prefix with a binary-bound seed JSON file."""
+        if not 0 <= max_operations <= 262144:
+            raise ValueError("P-code operation budget must be 0..262144")
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        data = json.loads(self._run(
+            "ghidra-snapshot", "trace-prefix", str(binary_path), str(snapshot_path),
+            str(seed_path), "--max-ops", str(max_operations),
+        ))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir trace belongs to another binary")
+        return data
