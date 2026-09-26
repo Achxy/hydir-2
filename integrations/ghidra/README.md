@@ -21,6 +21,7 @@ cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\sna
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
+cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
 ```
 
 For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
@@ -69,6 +70,15 @@ operation provenance and an explicit stop reason. Its external read, write,
 and unique-clear helpers follow the ABI recorded in the artifact. It requires
 explicit fallthrough evidence before crossing an instruction boundary and
 stops before memory, control, and unsupported effects.
+`llvm-standalone` packages that same exact prefix with Rust-generated LLVM
+definitions for those helpers and a compact byte map. Overlapping register and
+unique varnodes share bytes. A caller seeds a `state_bytes`-sized buffer from
+`byte_map` and invokes `@hydir_pcode_prefix(ptr)`; the return value is the
+number of executed P-code operations. The module can run under `lli`, but it
+still stops at the prefix boundary and does not represent a complete function.
+The concrete P-code executor can cross a RAM `LOAD` or `STORE` when the address,
+width, and required bytes are supplied in its state; unknown memory remains a
+reported boundary. Memory is not yet part of the standalone LLVM prefix.
 
 The JSON includes the SHA-256 of the supplied original binary and requires it
 to match Ghidra's recorded import hash. Addresses are objects

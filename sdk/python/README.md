@@ -12,11 +12,13 @@ state = client.artifact("state", "sample.elf", "snapshot.json")
 ```
 
 `analyze(..., function=0x...)` selects another function from the managed
-Ghidra project. `artifact` also accepts `pcode`, `semantics`, `cfg`, and
-`llvm-prefix`;
+Ghidra project. `artifact` also accepts `pcode`, `semantics`, `cfg`,
+`llvm-prefix`, and `llvm-standalone`;
 `llvm_operation` emits LLVM for one exact P-code operation. Artifacts are
 checked against the binary SHA-256, and a function-level state artifact is
-an effect inventory rather than an executable lift.
+an effect inventory rather than an executable lift. `llvm-standalone` provides
+a runnable byte-state module for the supported straight-line prefix, with an
+explicit stop reason; it does not claim whole-function equivalence.
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,
