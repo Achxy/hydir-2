@@ -71,6 +71,7 @@ Usage:
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
+  hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
@@ -209,6 +210,40 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg" => {
+            let mut start_address = None;
+            let mut output_path = None;
+            let mut options = args[4..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--start" if start_address.is_none() => {
+                        start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: format!("0x{address:x}"),
+            });
+            let artifact = hydir_decompile::emit_pcode_cfg_llvm(&snapshot, start.as_ref())?;
+            let bytes = serde_json::to_vec_pretty(&artifact)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-path" => {
             let mut max_operations = 4096usize;
             let mut max_visits = 1024usize;

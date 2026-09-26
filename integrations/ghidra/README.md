@@ -22,6 +22,7 @@ cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapsho
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
+cargo run -p hydir-cli -- ghidra-snapshot llvm-cfg .\demo\hydir-prism.elf .\snapshot.json --start 0x2013d9 --output .\cfg-llvm.json
 cargo run -p hydir-cli -- ghidra-snapshot trace-prefix .\demo\hydir-prism.elf .\snapshot.json .\seed.json --max-ops 4096 --output .\trace.json
 cargo run -p hydir-cli -- ghidra-snapshot trace-path .\demo\hydir-prism.elf .\snapshot.json .\seed.json --start 0x2013d9 --max-ops 4096 --max-visits 1024 --output .\path.json
 ```
@@ -86,6 +87,17 @@ still stops at the prefix boundary and does not represent a complete function.
 The concrete P-code executor can cross a RAM `LOAD` or `STORE` when the address,
 width, and required bytes are supplied in its state; unknown memory remains a
 reported boundary. Memory is not yet part of the standalone LLVM prefix.
+
+`llvm-cfg` emits a runnable, bounded CFG path module for the selected function
+with an optional instruction start. Its compact `byte_map` indexes separate
+state and known-byte arrays. `@hydir_pcode_cfg` logs successful operation IDs
+and returns a numeric stop status for return, call, unknown input, unsupported
+memory, unresolved flow, or a budget. Source operations and static stop sites
+map back to Ghidra addresses. The module remains `semantic_fidelity: unknown`
+and `verification: not_run`; `opt` verification and fixture comparisons do not
+prove arbitrary whole-function equivalence. The Python SDK exposes this as
+`LocalGhidra.llvm_cfg(...)`, and the desktop P-code view can generate and copy
+the same CFG LLVM.
 
 `trace-prefix` takes a binary-bound seed file. Register offsets and memory
 offsets are bytes; memory entries are grouped by Ghidra address-space name.
