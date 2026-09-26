@@ -5,10 +5,21 @@ import ghidra.app.script.GhidraScript;
 import ghidra.framework.Application;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.data.AbstractFloatDataType;
+import ghidra.program.model.data.AbstractIntegerDataType;
+import ghidra.program.model.data.Array;
+import ghidra.program.model.data.BooleanDataType;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.Pointer;
+import ghidra.program.model.data.Structure;
+import ghidra.program.model.data.TypeDef;
+import ghidra.program.model.data.Union;
+import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
@@ -16,6 +27,7 @@ import ghidra.program.model.symbol.FlowType;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.symbol.SourceType;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -34,6 +46,9 @@ public class HydIRSnapshot extends GhidraScript {
     private static final int MAX_ADDRESS_SPACES = 256;
     private static final int MAX_MEMORY_BLOCKS = 4_096;
     private static final int MAX_SYMBOLS = 65_536;
+    private static final int MAX_PROTOTYPE_PARAMETERS = 256;
+    private static final int MAX_PROTOTYPE_TEXT_BYTES = 4_096;
+    private static final int MAX_PROTOTYPE_TYPE_DEPTH = 4;
     private static final int MAX_INSTRUCTIONS = 16_384;
     private static final int MAX_PCODE_OPS = 262_144;
     private static final int MAX_OPS_PER_INSTRUCTION = 256;
@@ -217,6 +232,117 @@ public class HydIRSnapshot extends GhidraScript {
     private static String namespace(Symbol symbol) {
         Namespace parent = symbol.getParentNamespace();
         return parent == null ? "" : parent.getName(true);
+    }
+
+    private static String prototypeText(String text, String field) {
+        if (text == null || text.isEmpty()
+                || text.getBytes(StandardCharsets.UTF_8).length > MAX_PROTOTYPE_TEXT_BYTES) {
+            throw new IllegalStateException("Ghidra " + field + " is missing or exceeds "
+                + MAX_PROTOTYPE_TEXT_BYTES + " UTF-8 bytes");
+        }
+        for (int i = 0; i < text.length(); i++) {
+            if (Character.isISOControl(text.charAt(i))) {
+                throw new IllegalStateException("Ghidra " + field + " contains control characters");
+            }
+        }
+        return text;
+    }
+
+    private static String typeKind(DataType dataType) {
+        if (dataType instanceof Pointer) return "pointer";
+        if (dataType instanceof Array) return "array";
+        if (dataType instanceof Structure) return "struct";
+        if (dataType instanceof Union) return "union";
+        if (dataType instanceof ghidra.program.model.data.Enum) return "enum";
+        if (dataType instanceof TypeDef) return "typedef";
+        if (dataType instanceof AbstractIntegerDataType
+                || dataType instanceof AbstractFloatDataType
+                || dataType instanceof BooleanDataType
+                || dataType instanceof VoidDataType) return "primitive";
+        return "unknown";
+    }
+
+    private static void writeDataType(Json json, DataType dataType) {
+        writeDataType(json, dataType, 0);
+    }
+
+    private static void writeDataType(Json json, DataType dataType, int depth) {
+        if (dataType == null) {
+            throw new IllegalStateException("Ghidra returned a null prototype data type");
+        }
+        int length = dataType.getLength();
+        if (length < -1) {
+            throw new IllegalStateException("Ghidra returned an invalid prototype data type size");
+        }
+        json.raw("{\"display_name\":")
+            .quoted(prototypeText(dataType.getDisplayName(), "type display name"));
+        json.raw(",\"path\":")
+            .quoted(prototypeText(dataType.getPathName(), "type path"));
+        json.raw(",\"size_bytes\":");
+        if (length < 0) json.raw("null");
+        else json.raw(Integer.toString(length));
+        json.raw(",\"kind\":").quoted(typeKind(dataType));
+        DataType target = null;
+        if (dataType instanceof Pointer) target = ((Pointer) dataType).getDataType();
+        else if (dataType instanceof Array) target = ((Array) dataType).getDataType();
+        else if (dataType instanceof TypeDef) target = ((TypeDef) dataType).getDataType();
+        boolean truncated = target != null && depth + 1 >= MAX_PROTOTYPE_TYPE_DEPTH;
+        json.raw(",\"target_type\":");
+        if (target == null || truncated) json.raw("null");
+        else writeDataType(json, target, depth + 1);
+        json.raw(",\"element_count\":");
+        if (dataType instanceof Array) {
+            int count = ((Array) dataType).getNumElements();
+            if (count < 0) {
+                throw new IllegalStateException("Ghidra returned a negative array element count");
+            }
+            json.raw(Integer.toString(count));
+        } else {
+            json.raw("null");
+        }
+        json.raw(",\"detail_truncated\":" + truncated);
+        json.raw("}");
+    }
+
+    private static void writePrototype(Json json, Function function) {
+        SourceType signatureSource = function.getSignatureSource();
+        Parameter returned = function.getReturn();
+        Parameter[] parameters = function.getParameters();
+        if (signatureSource == null || returned == null || parameters == null) {
+            throw new IllegalStateException("Ghidra returned an incomplete function signature");
+        }
+        if (parameters.length > MAX_PROTOTYPE_PARAMETERS) {
+            throw new IllegalStateException("HydIR snapshot exceeds prototype parameter limit "
+                + MAX_PROTOTYPE_PARAMETERS);
+        }
+        boolean sourced = signatureSource != SourceType.DEFAULT
+            || returned.getSource() != SourceType.DEFAULT || function.hasVarArgs();
+        for (Parameter parameter : parameters) {
+            if (parameter.getSource() != SourceType.DEFAULT) sourced = true;
+        }
+        if (!sourced) return;
+
+        json.raw(",\"prototype\":{\"signature_source\":")
+            .quoted(signatureSource.name());
+        json.raw(",\"calling_convention\":");
+        String convention = function.getCallingConventionName();
+        if (convention == null || convention.isEmpty()) json.raw("null");
+        else json.quoted(prototypeText(convention, "calling convention"));
+        json.raw(",\"has_varargs\":" + function.hasVarArgs());
+        json.raw(",\"return_type\":");
+        writeDataType(json, function.getReturnType());
+        json.raw(",\"return_source\":").quoted(returned.getSource().name());
+        json.raw(",\"parameters\":[");
+        for (int i = 0; i < parameters.length; i++) {
+            Parameter parameter = parameters[i];
+            if (i != 0) json.raw(",");
+            json.raw("{\"name\":").quoted(prototypeText(parameter.getName(), "parameter name"));
+            json.raw(",\"data_type\":");
+            writeDataType(json, parameter.getFormalDataType());
+            json.raw(",\"source_type\":").quoted(parameter.getSource().name());
+            json.raw(",\"auto_parameter\":" + parameter.isAutoParameter() + "}");
+        }
+        json.raw("]}");
     }
 
     private Function selectFunction(List<Function> functions, String[] args) {
@@ -408,7 +534,9 @@ public class HydIRSnapshot extends GhidraScript {
             if (i != 0) json.raw(",");
             json.raw("{\"entry\":").address(function.getEntryPoint());
             json.raw(",\"name\":").quoted(function.getName());
-            json.raw(",\"size\":" + functionSizeBytes(function) + "}");
+            json.raw(",\"size\":" + functionSizeBytes(function));
+            writePrototype(json, function);
+            json.raw("}");
         }
         json.raw("],\"selected_function\":{\"entry\":").address(selected.getEntryPoint());
         json.raw(",\"instructions\":[");

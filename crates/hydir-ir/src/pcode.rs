@@ -11,6 +11,7 @@ pub mod coverage;
 pub mod execution;
 pub mod seed;
 pub mod semantics;
+pub mod slice;
 pub mod state;
 pub use cfg::{
     PCODE_CFG_IR_VERSION, PcodeCfgCall, PcodeCfgCompleteness, PcodeCfgEdge, PcodeCfgFunctionIr,
@@ -31,6 +32,11 @@ pub use semantics::{
     PcodeSemanticDiagnostic, PcodeSemanticFunctionIr, PcodeSemanticInstruction,
     PcodeSemanticOperation,
 };
+pub use slice::{
+    MAX_PCODE_SLICE_INSTRUCTIONS, MAX_PCODE_SLICE_OPERATIONS, MAX_PCODE_SLICE_PENDING_VALUES,
+    PCODE_SLICE_VERSION, PcodeBackwardSlice, PcodeSliceBoundary, PcodeSliceBoundaryKind,
+    PcodeSliceSite, PcodeSliceStep, PcodeSliceTarget,
+};
 pub use state::{
     PCODE_STATE_IR_VERSION, PcodeStateAccess, PcodeStateAccessKind, PcodeStateFunctionIr,
     PcodeStateInstruction, PcodeStateOperation,
@@ -42,6 +48,8 @@ pub const MAX_GHIDRA_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FUNCTIONS: usize = 65_536;
 const MAX_MEMORY_BLOCKS: usize = 4_096;
 const MAX_SYMBOLS: usize = 65_536;
+const MAX_PROTOTYPE_PARAMETERS: usize = 256;
+const MAX_PROTOTYPE_TYPE_DEPTH: usize = 4;
 const MAX_INSTRUCTIONS: usize = 16_384;
 const MAX_OPERATIONS: usize = 262_144;
 
@@ -113,6 +121,58 @@ pub struct GhidraFunctionIndexEntry {
     pub entry: PcodeAddress,
     pub name: String,
     pub size: u64,
+    /// Optional Ghidra signature evidence. Its source is retained because an
+    /// analysis-derived prototype is not a proven source declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prototype: Option<GhidraFunctionPrototype>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhidraDataTypeKind {
+    Primitive,
+    Pointer,
+    Array,
+    Struct,
+    Union,
+    Enum,
+    Typedef,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraDataTypeEvidence {
+    pub display_name: String,
+    pub path: String,
+    /// `None` means Ghidra reports an unsized type (length -1).
+    pub size_bytes: Option<u32>,
+    pub kind: GhidraDataTypeKind,
+    /// Bounded pointee, array element, or typedef base. This is identity
+    /// evidence; it does not include structure fields or prove a source type.
+    pub target_type: Option<Box<GhidraDataTypeEvidence>>,
+    pub element_count: Option<u32>,
+    pub detail_truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraParameterEvidence {
+    pub name: String,
+    pub data_type: GhidraDataTypeEvidence,
+    pub source_type: String,
+    pub auto_parameter: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraFunctionPrototype {
+    pub signature_source: String,
+    pub calling_convention: Option<String>,
+    pub has_varargs: bool,
+    pub return_type: GhidraDataTypeEvidence,
+    pub return_source: String,
+    pub parameters: Vec<GhidraParameterEvidence>,
 }
 
 /// An analyzed Ghidra memory range. `end` is inclusive and `size` is bytes.
@@ -234,6 +294,83 @@ fn bounded_text(value: &str, label: &str, max: usize) -> Result<(), String> {
         return Err(format!(
             "{label} must be nonempty, printable, and at most {max} bytes"
         ));
+    }
+    Ok(())
+}
+
+fn validate_ghidra_source(value: &str, label: &str) -> Result<(), String> {
+    if !matches!(
+        value,
+        "DEFAULT" | "ANALYSIS" | "AI" | "IMPORTED" | "USER_DEFINED"
+    ) {
+        return Err(format!("{label} is not a recognized Ghidra source type"));
+    }
+    Ok(())
+}
+
+fn validate_ghidra_data_type(
+    data_type: &GhidraDataTypeEvidence,
+    depth: usize,
+) -> Result<(), String> {
+    if depth >= MAX_PROTOTYPE_TYPE_DEPTH {
+        return Err("Ghidra prototype type exceeds nesting limit".to_owned());
+    }
+    bounded_text(&data_type.display_name, "Ghidra type display name", 4096)?;
+    bounded_text(&data_type.path, "Ghidra type path", 4096)?;
+    if data_type
+        .size_bytes
+        .is_some_and(|size| size > i32::MAX as u32)
+    {
+        return Err("Ghidra type size exceeds the supported limit".to_owned());
+    }
+    match (data_type.kind, data_type.element_count) {
+        (GhidraDataTypeKind::Array, None) => {
+            return Err("Ghidra array type requires an element count".to_owned());
+        }
+        (GhidraDataTypeKind::Array, Some(_)) | (_, None) => {}
+        (_, Some(_)) => return Err("Ghidra element count requires an array type".to_owned()),
+    }
+    if data_type.target_type.is_some()
+        && !matches!(
+            data_type.kind,
+            GhidraDataTypeKind::Pointer | GhidraDataTypeKind::Array | GhidraDataTypeKind::Typedef
+        )
+    {
+        return Err("Ghidra type target requires pointer, array, or typedef".to_owned());
+    }
+    if data_type.detail_truncated && data_type.target_type.is_some() {
+        return Err("Ghidra truncated type cannot contain a target".to_owned());
+    }
+    if data_type.detail_truncated
+        && !matches!(
+            data_type.kind,
+            GhidraDataTypeKind::Pointer | GhidraDataTypeKind::Array | GhidraDataTypeKind::Typedef
+        )
+    {
+        return Err("Ghidra truncated type requires pointer, array, or typedef".to_owned());
+    }
+    if let Some(target) = &data_type.target_type {
+        validate_ghidra_data_type(target, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn validate_ghidra_prototype(prototype: &GhidraFunctionPrototype) -> Result<(), String> {
+    validate_ghidra_source(&prototype.signature_source, "signature source")?;
+    validate_ghidra_source(&prototype.return_source, "return source")?;
+    if let Some(name) = &prototype.calling_convention {
+        bounded_text(name, "Ghidra calling convention", 256)?;
+    }
+    validate_ghidra_data_type(&prototype.return_type, 0)?;
+    if prototype.parameters.len() > MAX_PROTOTYPE_PARAMETERS {
+        return Err(format!(
+            "Ghidra prototype exceeds parameter limit {MAX_PROTOTYPE_PARAMETERS}"
+        ));
+    }
+    for parameter in &prototype.parameters {
+        bounded_text(&parameter.name, "Ghidra parameter name", 4096)?;
+        validate_ghidra_data_type(&parameter.data_type, 0)?;
+        validate_ghidra_source(&parameter.source_type, "parameter source")?;
     }
     Ok(())
 }
@@ -422,6 +559,9 @@ pub fn validate_ghidra_snapshot(
         bounded_text(&function.name, "function name", 4096)?;
         if function.size == 0 {
             return Err("Ghidra function size must be nonzero".to_owned());
+        }
+        if let Some(prototype) = &function.prototype {
+            validate_ghidra_prototype(prototype)?;
         }
         if !entries.insert((function.entry.space.clone(), key.1)) {
             return Err("duplicate Ghidra function entry".to_owned());
@@ -775,6 +915,118 @@ mod tests {
     }
 
     #[test]
+    fn optional_prototype_keeps_source_evidence_and_rejects_unbounded_inputs() {
+        let legacy =
+            parse_ghidra_snapshot(&serde_json::to_vec(&fixture()).unwrap(), &"a".repeat(64))
+                .unwrap();
+        assert!(legacy.functions[0].prototype.is_none());
+
+        let mut value = fixture();
+        value["functions"][0]["prototype"] = json!({
+            "signature_source": "ANALYSIS",
+            "calling_convention": "__cdecl",
+            "has_varargs": false,
+            "return_type": {"display_name": "int", "path": "/int", "size_bytes": 4,
+                "kind": "primitive", "target_type": null, "element_count": null,
+                "detail_truncated": false},
+            "return_source": "ANALYSIS",
+            "parameters": [{
+                "name": "context",
+                "data_type": {"display_name": "Context *", "path": "/Context *", "size_bytes": 8,
+                    "kind": "pointer", "target_type": {"display_name": "Context",
+                        "path": "/Context", "size_bytes": 16, "kind": "struct",
+                        "target_type": null, "element_count": null,
+                        "detail_truncated": false}, "element_count": null,
+                    "detail_truncated": false},
+                "source_type": "USER_DEFINED",
+                "auto_parameter": false
+            }]
+        });
+        let snapshot =
+            parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &"a".repeat(64)).unwrap();
+        let prototype = snapshot.functions[0].prototype.as_ref().unwrap();
+        assert_eq!(prototype.signature_source, "ANALYSIS");
+        assert_eq!(prototype.parameters[0].source_type, "USER_DEFINED");
+        assert_eq!(
+            prototype.parameters[0].data_type.kind,
+            GhidraDataTypeKind::Pointer
+        );
+        assert_eq!(
+            prototype.parameters[0]
+                .data_type
+                .target_type
+                .as_ref()
+                .unwrap()
+                .kind,
+            GhidraDataTypeKind::Struct
+        );
+        let round_trip = serde_json::to_vec(&snapshot).unwrap();
+        assert_eq!(
+            parse_ghidra_snapshot(&round_trip, &"a".repeat(64)).unwrap(),
+            snapshot
+        );
+
+        let mut array = value.clone();
+        array["functions"][0]["prototype"]["parameters"][0]["data_type"]["kind"] = json!("array");
+        array["functions"][0]["prototype"]["parameters"][0]["data_type"]["element_count"] =
+            json!(4);
+        array["functions"][0]["prototype"]["signature_source"] = json!("AI");
+        let parsed_array =
+            parse_ghidra_snapshot(&serde_json::to_vec(&array).unwrap(), &"a".repeat(64)).unwrap();
+        assert_eq!(
+            parsed_array.functions[0]
+                .prototype
+                .as_ref()
+                .unwrap()
+                .parameters[0]
+                .data_type
+                .kind,
+            GhidraDataTypeKind::Array
+        );
+
+        let mut unknown_source = value.clone();
+        unknown_source["functions"][0]["prototype"]["signature_source"] = json!("TRUSTED");
+        assert!(
+            parse_ghidra_snapshot(
+                &serde_json::to_vec(&unknown_source).unwrap(),
+                &"a".repeat(64)
+            )
+            .unwrap_err()
+            .contains("signature source")
+        );
+
+        let mut too_many = value.clone();
+        too_many["functions"][0]["prototype"]["parameters"] = json!(vec![
+                value["functions"][0]["prototype"]["parameters"][0]
+                    .clone();
+                257
+            ]);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&too_many).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("parameter limit")
+        );
+
+        let mut bad_type = value;
+        bad_type["functions"][0]["prototype"]["return_type"]["path"] =
+            json!("/".to_owned() + &"x".repeat(4096));
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&bad_type).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("type path")
+        );
+
+        let mut wrong_shape = fixture();
+        wrong_shape["functions"][0]["prototype"] = serde_json::to_value(prototype).unwrap();
+        wrong_shape["functions"][0]["prototype"]["return_type"]["element_count"] = json!(2);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&wrong_shape).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("element count requires")
+        );
+    }
+
+    #[test]
     fn real_ghidra_metadata_fixture_keeps_layout_and_symbol_provenance() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -800,6 +1052,42 @@ mod tests {
         assert_eq!(decision.address.offset, "0x20137c");
         assert_eq!(decision.source_type, "IMPORTED");
         assert_eq!(decision.symbol_type, "Function");
+    }
+
+    #[test]
+    fn real_ghidra_dwarf_fixture_keeps_imported_pointer_prototype() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prototype_dwarf_v2.json"
+        ));
+        let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let digest = value["binary_sha256"].as_str().unwrap();
+        let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
+        let walk = snapshot
+            .functions
+            .iter()
+            .find(|function| function.name == "walk")
+            .unwrap();
+        let prototype = walk.prototype.as_ref().unwrap();
+        assert_eq!(prototype.signature_source, "IMPORTED");
+        assert_eq!(prototype.parameters.len(), 2);
+        assert_eq!(prototype.parameters[0].name, "node");
+        assert_eq!(
+            prototype.parameters[0].data_type.kind,
+            GhidraDataTypeKind::Pointer
+        );
+        let pointee = prototype.parameters[0]
+            .data_type
+            .target_type
+            .as_ref()
+            .unwrap();
+        assert_eq!(pointee.kind, GhidraDataTypeKind::Struct);
+        assert_eq!(pointee.display_name, "Node");
+        assert_eq!(pointee.size_bytes, Some(16));
+        assert_eq!(
+            prototype.parameters[1].data_type.kind,
+            GhidraDataTypeKind::Primitive
+        );
     }
 
     #[test]
