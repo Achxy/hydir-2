@@ -79,6 +79,40 @@ fn ghidra_function_index_imports_into_analysis_model() {
 }
 
 #[test]
+fn pcode_slice_cli_reports_bounded_source_linked_dependencies() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("demo/hydir-prism.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "slice"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .args(["--instruction", "0", "--op", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let slice: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(slice["schema_version"], 1);
+    assert_eq!(slice["target"]["instruction_index"], 0);
+    assert_eq!(slice["path_proven"], false);
+    assert!(!slice["steps"].as_array().unwrap().is_empty());
+    assert!(slice["steps"][0]["source"]["source_address"]["offset"].is_string());
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "slice"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .args(["--instruction", "999999", "--op", "0"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}
+
+#[test]
 fn raw_pcode_snapshot_cli_binds_binary_and_emits_unclaimed_ir() {
     let directory = tempfile::tempdir().unwrap();
     let binary = directory.path().join("sample.bin");

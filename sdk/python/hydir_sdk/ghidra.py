@@ -158,6 +158,34 @@ class LocalGhidra:
             raise RuntimeError("Hydir CFG LLVM artifact belongs to another binary")
         return data
 
+    def slice(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        instruction_index: int,
+        operation_index: int,
+        *,
+        input_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Explain a P-code input through bounded, source-linked dependencies."""
+        for label, index in (("instruction", instruction_index), ("operation", operation_index),
+                             ("input", input_index)):
+            if index is not None and (not isinstance(index, int) or not 0 <= index <= 0xFFFFFFFF):
+                raise ValueError(f"{label} index must be a 32-bit unsigned integer")
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        args = ["ghidra-snapshot", "slice", str(binary_path), str(snapshot_path),
+                "--instruction", str(instruction_index), "--op", str(operation_index)]
+        if input_index is not None:
+            args.extend(["--input", str(input_index)])
+        data = json.loads(self._run(*args))
+        if (not isinstance(data, dict) or data.get("binary_sha256") != digest
+                or data.get("schema_version") != 1 or data.get("path_proven") is not False):
+            raise RuntimeError("Hydir P-code slice identity or fidelity is invalid")
+        return data
+
     def llvm_operation(
         self,
         binary: str | os.PathLike[str],
