@@ -68,6 +68,7 @@ Usage:
   hydirctl ghidra-snapshot state <binary> <snapshot.json> [--output <state-ir.json>]
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
+  hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
@@ -269,7 +270,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
                 && matches!(
                     args[1].as_str(),
-                    "verify" | "pcode" | "semantics" | "state" | "cfg" | "llvm-prefix"
+                    "verify"
+                        | "pcode"
+                        | "semantics"
+                        | "state"
+                        | "cfg"
+                        | "llvm-prefix"
+                        | "llvm-standalone"
                 ) =>
         {
             if args[1] == "verify" && args.len() != 4 {
@@ -306,6 +313,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "cfg" => serde_json::to_vec_pretty(&snapshot.pcode_cfg_ir()?)?,
                     "llvm-prefix" => serde_json::to_vec_pretty(
                         &hydir_decompile::emit_pcode_linear_prefix_llvm(&snapshot)?,
+                    )?,
+                    "llvm-standalone" => serde_json::to_vec_pretty(
+                        &hydir_decompile::emit_pcode_standalone_prefix_llvm(&snapshot)?,
                     )?,
                     _ => serde_json::to_vec_pretty(&ir)?,
                 };

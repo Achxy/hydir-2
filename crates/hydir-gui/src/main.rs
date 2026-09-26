@@ -28,9 +28,9 @@ use hydir_core::{
     overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_decompile::{
-    NativeCoverageReport, NativeDecompilation, PcodeLlvmPrefixArtifact, decompile_function_at,
-    decompile_symbol, discover_functions, emit_pcode_exact_operation_llvm,
-    emit_pcode_linear_prefix_llvm, measure_native_coverage,
+    NativeCoverageReport, NativeDecompilation, PcodeStandalonePrefixArtifact,
+    decompile_function_at, decompile_symbol, discover_functions, emit_pcode_exact_operation_llvm,
+    emit_pcode_standalone_prefix_llvm, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
@@ -2899,7 +2899,7 @@ struct AnalystApp {
     ghidra_state_lines: Vec<(Option<u64>, String)>,
     ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
     ghidra_llvm_operation: Option<String>,
-    ghidra_llvm_prefix: Option<Result<PcodeLlvmPrefixArtifact, String>>,
+    ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
     ghidra_busy: bool,
     pending_ghidra: Option<(PathBuf, String)>,
     symbol: Option<String>,
@@ -5532,14 +5532,14 @@ impl AnalystApp {
         egui::CollapsingHeader::new("LLVM exact prefix")
             .id_salt("ghidra_llvm_prefix")
             .show(ui, |ui| {
-                ui.label(RichText::new("A bounded state transition fragment. It stops at the first opaque effect or uncertain flow and requires the documented state helpers.")
+                ui.label(RichText::new("A bounded runnable state transition fragment. It stops at the first opaque effect or uncertain flow; the artifact maps Ghidra varnode bytes into a compact state buffer.")
                     .size(11.0).color(MUTED));
-                if self.ghidra_llvm_prefix.is_none() && ui.button("Generate LLVM prefix").clicked() {
-                    self.ghidra_llvm_prefix = Some(emit_pcode_linear_prefix_llvm(snapshot));
+                if self.ghidra_llvm_prefix.is_none() && ui.button("Generate runnable LLVM prefix").clicked() {
+                    self.ghidra_llvm_prefix = Some(emit_pcode_standalone_prefix_llvm(snapshot));
                 }
                 match &self.ghidra_llvm_prefix {
                     Some(Ok(prefix)) => {
-                        ui.label(RichText::new(format!("{} exact operations · stop: {}", prefix.emitted_operations, prefix.stop_reason))
+                        ui.label(RichText::new(format!("{} exact operations · {} state bytes · stop: {}", prefix.emitted_operations, prefix.state_bytes, prefix.stop_reason))
                             .size(11.0).color(ACCENT));
                         if ui.button("Copy LLVM prefix").clicked() {
                             ui.ctx().copy_text(prefix.llvm_ir.clone());

@@ -194,4 +194,24 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     assert_eq!(prefix["emitted_operations"], 7);
     assert_eq!(prefix["verification"], "not_run");
     assert!(prefix["stop_reason"].as_str().unwrap().contains("POPCOUNT"));
+    let standalone = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-standalone"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        standalone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&standalone.stderr)
+    );
+    let standalone: serde_json::Value = serde_json::from_slice(&standalone.stdout).unwrap();
+    assert_eq!(standalone["emitted_operations"], 7);
+    assert!(standalone["state_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        standalone["llvm_ir"]
+            .as_str()
+            .unwrap()
+            .contains("define i64 @hydir_read_varnode")
+    );
 }
