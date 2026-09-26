@@ -205,6 +205,9 @@ class HydirClient:
         stage: str,
         *,
         start_address: int | str | None = None,
+        instruction_index: int | None = None,
+        operation_index: int | None = None,
+        input_index: int | None = None,
     ) -> dict:
         """Analyze a Ghidra export bound to this project's uploaded binary.
 
@@ -218,11 +221,24 @@ class HydirClient:
             "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
             "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
+            "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
         if stage not in media_types:
             raise ValueError("Unsupported Ghidra snapshot artifact stage")
         if start_address is not None and stage != "llvm-cfg":
             raise ValueError("Start address is supported only for llvm-cfg")
+        if stage == "slice":
+            if instruction_index is None or operation_index is None:
+                raise ValueError("Slice requires instruction and operation indices")
+            for label, index in (("instruction", instruction_index),
+                                 ("operation", operation_index), ("input", input_index)):
+                if index is not None and (
+                    not isinstance(index, int) or not 0 <= index <= 0xFFFFFFFF
+                ):
+                    raise ValueError(f"{label} index must be a 32-bit unsigned integer")
+        elif any(index is not None for index in
+                 (instruction_index, operation_index, input_index)):
+            raise ValueError("Operation indices are supported only for slice")
         if isinstance(start_address, int):
             if not 0 <= start_address <= 0xFFFFFFFFFFFFFFFF:
                 raise ValueError("Start address must fit in 64 bits")
@@ -242,23 +258,29 @@ class HydirClient:
             content = path.read_bytes()
         if not 1 <= len(content) <= MAX_GHIDRA_SNAPSHOT_BYTES:
             raise ValueError("Ghidra snapshot must be 1..=16 MiB")
-        reply = self._call(
-            self._stub_v3.AnalyzeGhidraSnapshot,
-            proto_v3.GhidraSnapshotArtifactRequest(
-                project_id=project_id,
-                expected_revision=revision,
-                snapshot_json=content,
-                stage=stage,
-                start_address=start_address or "",
-            ),
+        request = proto_v3.GhidraSnapshotArtifactRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            snapshot_json=content,
+            stage=stage,
+            start_address=start_address or "",
         )
+        if stage == "slice":
+            request.instruction_index = instruction_index
+            request.operation_index = operation_index
+            if input_index is not None:
+                request.input_index = input_index
+        reply = self._call(self._stub_v3.AnalyzeGhidraSnapshot, request)
         expected_media_type, schema_version = media_types[stage]
-        return self._checked_json_artifact(
+        artifact = self._checked_json_artifact(
             reply,
             revision=revision,
             media_type=expected_media_type,
             schema_version=schema_version,
         )
+        if stage == "slice" and artifact.get("path_proven") is not False:
+            raise RuntimeError("P-code slice has an unsupported path-proof claim")
+        return artifact
 
     def start_program_analysis(
         self, project_id: str, revision: int, *, idempotency_key: str | None = None,

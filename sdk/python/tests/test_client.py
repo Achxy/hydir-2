@@ -198,6 +198,36 @@ class ClientBoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.analyze_ghidra_snapshot("project", 4, oversized, "pcode")
 
+    def test_v3_ghidra_slice_preserves_zero_index_presence_and_fidelity(self):
+        content = json.dumps({
+            "schema_version": 1, "binary_sha256": "a" * 64,
+            "path_proven": False, "steps": [], "boundaries": [],
+        }).encode()
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(_method, request):
+                requests.append(request)
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-slice+json;version=1",
+                    content=content, project_revision=4,
+                )
+            client._call = call
+            result = client.analyze_ghidra_snapshot(
+                "project", 4, b"{}", "slice",
+                instruction_index=0, operation_index=0, input_index=0,
+            )
+            self.assertIs(result["path_proven"], False)
+            self.assertTrue(requests[0].HasField("instruction_index"))
+            self.assertTrue(requests[0].HasField("operation_index"))
+            self.assertTrue(requests[0].HasField("input_index"))
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, b"{}", "slice")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, b"{}", "state", instruction_index=0,
+                )
+
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):

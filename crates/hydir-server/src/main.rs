@@ -33,7 +33,9 @@ use hydir_decompile::{
     lower_state_ir, measure_native_coverage,
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
-use hydir_ir::pcode::{MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, parse_ghidra_snapshot};
+use hydir_ir::pcode::{
+    MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeSliceTarget, parse_ghidra_snapshot,
+};
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
     STATE_FUNCTION_IR_VERSION,
@@ -2043,6 +2045,12 @@ struct GhidraSnapshotArtifactSelector {
     binary_sha256: String,
     #[serde(default)]
     start_address: String,
+    #[serde(default)]
+    instruction_index: Option<u32>,
+    #[serde(default)]
+    operation_index: Option<u32>,
+    #[serde(default)]
+    input_index: Option<u32>,
 }
 
 fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
@@ -2053,8 +2061,32 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
         "coverage" => Some("application/vnd.hydir.pcode-coverage+json;version=1"),
         "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
+        "slice" => Some("application/vnd.hydir.pcode-slice+json;version=1"),
         _ => None,
     }
+}
+
+fn validate_ghidra_slice_target(
+    stage: &str,
+    instruction_index: Option<u32>,
+    operation_index: Option<u32>,
+    input_index: Option<u32>,
+) -> Result<Option<PcodeSliceTarget>, String> {
+    if stage != "slice" {
+        if instruction_index.is_some() || operation_index.is_some() || input_index.is_some() {
+            return Err("operation selector is supported only for slice".to_owned());
+        }
+        return Ok(None);
+    }
+    let instruction_index =
+        instruction_index.ok_or("slice requires instruction_index and operation_index")?;
+    let operation_index =
+        operation_index.ok_or("slice requires instruction_index and operation_index")?;
+    Ok(Some(PcodeSliceTarget {
+        instruction_index,
+        operation_index,
+        input_index,
+    }))
 }
 
 fn validate_ghidra_start_address(stage: &str, address: &str) -> Result<(), String> {
@@ -2084,6 +2116,12 @@ fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>
     ghidra_snapshot_artifact_media_type(&selector.stage)
         .ok_or_else(|| "unsupported Ghidra artifact stage".to_owned())?;
     validate_ghidra_start_address(&selector.stage, &selector.start_address)?;
+    let slice_target = validate_ghidra_slice_target(
+        &selector.stage,
+        selector.instruction_index,
+        selector.operation_index,
+        selector.input_index,
+    )?;
     let snapshot = parse_ghidra_snapshot(bytes, &selector.binary_sha256)?;
     let raw = snapshot.pcode_function_ir()?;
     let content = match selector.stage.as_str() {
@@ -2092,6 +2130,10 @@ fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>
         "state" => serde_json::to_vec(&raw.lower_state()),
         "cfg" => serde_json::to_vec(&snapshot.pcode_cfg_ir()?),
         "coverage" => serde_json::to_vec(&snapshot.pcode_coverage_report()?),
+        "slice" => serde_json::to_vec(
+            &snapshot
+                .backward_pcode_slice(slice_target.expect("slice selector validated above"))?,
+        ),
         "llvm-cfg" => {
             let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
                 space: snapshot.selected_function.entry.space.clone(),
@@ -3987,6 +4029,13 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             .ok_or_else(|| Status::invalid_argument("unsupported Ghidra artifact stage"))?;
         validate_ghidra_start_address(&input.stage, &input.start_address)
             .map_err(Status::invalid_argument)?;
+        validate_ghidra_slice_target(
+            &input.stage,
+            input.instruction_index,
+            input.operation_index,
+            input.input_index,
+        )
+        .map_err(Status::invalid_argument)?;
         if input.snapshot_json.is_empty() || input.snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
             return Err(Status::resource_exhausted(
                 "Ghidra snapshot must be 1..=16 MiB",
@@ -4005,6 +4054,9 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             stage: input.stage,
             binary_sha256: project.binary_sha256.clone(),
             start_address: input.start_address,
+            instruction_index: input.instruction_index,
+            operation_index: input.operation_index,
+            input_index: input.input_index,
         })
         .map_err(|_| Status::internal("Ghidra artifact selector serialization failed"))?;
         let content = run_worker(
@@ -5166,11 +5218,26 @@ mod tests {
             snapshot_json: bytes,
             stage: stage.to_owned(),
             start_address: String::new(),
+            instruction_index: None,
+            operation_index: None,
+            input_index: None,
         };
-        for stage in ["pcode", "semantics", "state", "cfg", "coverage", "llvm-cfg"] {
+        for stage in [
+            "pcode",
+            "semantics",
+            "state",
+            "cfg",
+            "coverage",
+            "llvm-cfg",
+            "slice",
+        ] {
             let mut stage_request = request(stage, snapshot.clone());
             if stage == "llvm-cfg" {
                 stage_request.start_address = "0x20137c".to_owned();
+            } else if stage == "slice" {
+                stage_request.instruction_index = Some(1);
+                stage_request.operation_index = Some(9);
+                stage_request.input_index = Some(0);
             }
             let artifact =
                 HydirV3::analyze_ghidra_snapshot(&store, authorized(stage_request, &token))
@@ -5189,7 +5256,13 @@ mod tests {
                 json["schema_version"],
                 if stage == "llvm-cfg" { 2 } else { 1 }
             );
-            if stage != "cfg" {
+            if stage == "slice" {
+                assert_eq!(json["target"]["instruction_index"], 1);
+                assert_eq!(json["target"]["operation_index"], 9);
+                assert_eq!(json["target"]["input_index"], 0);
+                assert_eq!(json["steps"][0]["source"]["mnemonic"], "INT_EQUAL");
+                assert_eq!(json["path_proven"], false);
+            } else if stage != "cfg" {
                 assert_eq!(json["semantic_fidelity"], "unknown");
                 assert_eq!(json["verification"], "not_run");
             } else {
@@ -5242,6 +5315,38 @@ mod tests {
         };
         assert_eq!(
             HydirV3::analyze_ghidra_snapshot(&store, authorized(invalid_start, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let missing_slice_target = request("slice", snapshot.clone());
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(missing_slice_target, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let wrong_stage_target = api_v3::GhidraSnapshotArtifactRequest {
+            instruction_index: Some(0),
+            operation_index: Some(0),
+            ..request("cfg", snapshot.clone())
+        };
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(wrong_stage_target, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let out_of_range_slice = api_v3::GhidraSnapshotArtifactRequest {
+            instruction_index: Some(999),
+            operation_index: Some(0),
+            ..request("slice", snapshot.clone())
+        };
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(out_of_range_slice, &token))
                 .await
                 .unwrap_err()
                 .code(),
