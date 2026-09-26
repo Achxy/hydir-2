@@ -27,6 +27,8 @@ jobs:
         run: |
           cargo build --locked -p hydir-cli --bin hydirctl
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_bit_gate_native_test.py -q
+      - name: Checked scalar patch and native replay
+        run: bash scripts/demo-patch.sh
       - name: Native replay smoke
         run: python3 scripts/replay-smoke.py
       - name: Fuzz target build
