@@ -41,10 +41,10 @@ use hydir_hlc::{
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::pcode::{
-    GhidraHighVarnodeEvidence, GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress,
-    PcodeBackwardSlice, PcodeCoverageReport, PcodeEffect, PcodePathDestination, PcodePathEvent,
-    PcodePathTrace, PcodeSemanticFunctionIr, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
-    parse_ghidra_snapshot, parse_pcode_seed,
+    GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
+    MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeBackwardSlice, PcodeCoverageReport, PcodeEffect,
+    PcodePathDestination, PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr,
+    PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -1850,6 +1850,60 @@ fn high_pcode_varnode(node: &GhidraHighVarnodeEvidence) -> String {
         .map(|data_type| data_type.display_name.as_str())
         .unwrap_or("?");
     format!("{name}:{data_type}#{}", node.ssa_id)
+}
+
+fn ghidra_composite_evidence(snapshot: &GhidraSnapshot) -> Vec<GhidraDataTypeEvidence> {
+    fn collect(
+        ty: &GhidraDataTypeEvidence,
+        depth: usize,
+        layouts: &mut std::collections::BTreeMap<String, GhidraDataTypeEvidence>,
+    ) {
+        if depth >= 4 {
+            return;
+        }
+        if matches!(
+            ty.kind,
+            GhidraDataTypeKind::Struct | GhidraDataTypeKind::Union
+        ) {
+            layouts
+                .entry(ty.path.clone())
+                .and_modify(|existing| {
+                    if ty.fields.len() > existing.fields.len() {
+                        *existing = ty.clone();
+                    }
+                })
+                .or_insert_with(|| ty.clone());
+        }
+        if let Some(target) = &ty.target_type {
+            collect(target, depth + 1, layouts);
+        }
+        for field in &ty.fields {
+            collect(&field.data_type, depth + 1, layouts);
+        }
+    }
+
+    let mut layouts = std::collections::BTreeMap::new();
+    if let Some(prototype) = snapshot
+        .functions
+        .iter()
+        .find(|function| function.entry == snapshot.selected_function.entry)
+        .and_then(|function| function.prototype.as_ref())
+    {
+        collect(&prototype.return_type, 0, &mut layouts);
+        for parameter in &prototype.parameters {
+            collect(&parameter.data_type, 0, &mut layouts);
+        }
+    }
+    if let Some(high) = &snapshot.selected_function.high_pcode {
+        for operation in high.operations.iter().take(1024) {
+            for node in operation.output.iter().chain(operation.inputs.iter()) {
+                if let Some(ty) = &node.high_type {
+                    collect(ty, 0, &mut layouts);
+                }
+            }
+        }
+    }
+    layouts.into_values().collect()
 }
 
 fn ghidra_seed_template(snapshot: &GhidraSnapshot) -> String {
@@ -6300,6 +6354,66 @@ impl AnalystApp {
                             .size(11.0)
                             .color(MUTED),
                         );
+                    }
+                });
+        }
+        let layouts = ghidra_composite_evidence(snapshot);
+        if !layouts.is_empty() {
+            egui::CollapsingHeader::new("Ghidra composite layout evidence")
+                .id_salt("ghidra_composite_layout_evidence")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Ghidra byte layouts from the prototype and up to 1,024 SSA operations; not asserted source types")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    for layout in layouts.iter().take(16) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {} · {} bytes{}",
+                                match layout.kind {
+                                    GhidraDataTypeKind::Struct => "struct",
+                                    _ => "union",
+                                },
+                                layout.display_name,
+                                layout
+                                    .size_bytes
+                                    .map_or("?".to_owned(), |size| size.to_string()),
+                                if layout.detail_truncated {
+                                    " · truncated"
+                                } else {
+                                    ""
+                                }
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                        for field in layout.fields.iter().take(32) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  +0x{:x}  {:>2} B  {}: {}",
+                                    field.offset_bytes,
+                                    field.size_bytes,
+                                    field.name.as_deref().unwrap_or("<unnamed>"),
+                                    field.data_type.display_name
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                        if layout.fields.len() > 32 {
+                            ui.label(format!(
+                                "  {} more fields in snapshot",
+                                layout.fields.len() - 32
+                            ));
+                        }
+                    }
+                    if layouts.len() > 16 {
+                        ui.label(format!(
+                            "{} more composites in snapshot",
+                            layouts.len() - 16
+                        ));
                     }
                 });
         }
@@ -10816,12 +10930,12 @@ mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
         NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
-        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
-        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
-        native_instruction_count, native_opaque_instruction_count, pcode_display_lines,
-        pcode_line_target, pcode_state_lines, persist_ghidra_snapshot, preview_patch_local,
-        resized_console_height, selected_ghidra_trace_address, valid_bearer_token,
-        validate_endpoint, workbench_graph_layout,
+        ghidra_composite_evidence, ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start,
+        high_pcode_varnode, indexed_function_action, ir_slice, local_region_artifacts,
+        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
+        pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
+        preview_patch_local, resized_console_height, selected_ghidra_trace_address,
+        valid_bearer_token, validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -10855,6 +10969,14 @@ mod tests {
         assert_eq!(map.to_ghidra(0x1323), Some(0x101323));
         let high = snapshot.selected_function.high_pcode.as_ref().unwrap();
         assert_eq!(high.operations.len(), 17);
+        let layouts = ghidra_composite_evidence(&snapshot);
+        let node = layouts
+            .iter()
+            .find(|layout| layout.display_name == "Node")
+            .unwrap();
+        assert_eq!(node.fields.len(), 2);
+        assert_eq!(node.fields[0].offset_bytes, 0);
+        assert_eq!(node.fields[1].offset_bytes, 8);
         assert_eq!(
             high_pcode_varnode(high.operations[0].output.as_ref().unwrap()),
             "?:bool#10"
