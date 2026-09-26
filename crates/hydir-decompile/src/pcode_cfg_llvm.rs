@@ -4,12 +4,16 @@
 
 use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_space_id};
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
-use hydir_ir::pcode::{GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeVarnode};
+use hydir_ir::pcode::{
+    GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeOperation,
+    PcodeVarnode,
+};
 use hydir_ir::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PCODE_CFG_LLVM_VERSION: u32 = 1;
+pub const PCODE_CFG_LLVM_VERSION: u32 = 2;
+pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
 const MAX_CFG_INSTRUCTIONS: usize = 4096;
 const MAX_CFG_OPERATIONS: usize = 4096;
 const MAX_RUNTIME_STEPS: u32 = 262_144;
@@ -33,6 +37,14 @@ pub enum PcodeCfgLlvmStatus {
     InvalidArguments = 12,
     VisitBudget = 13,
     InvalidOperation = 14,
+    MemoryUnknownAlias = 15,
+    MemoryUnknownBytes = 16,
+    MemoryOutOfBounds = 17,
+    MemoryAddressOverflow = 18,
+    MemorySpaceMismatch = 19,
+    MemoryUnsupportedLayout = 20,
+    MemoryNonRamSpace = 21,
+    MemoryUnknownSpace = 22,
 }
 
 impl PcodeCfgLlvmStatus {
@@ -68,6 +80,7 @@ pub struct PcodeCfgLlvmArtifact {
     pub source_operations: Vec<PcodeCfgLlvmSourceOperation>,
     pub stop_sites: Vec<PcodeCfgLlvmStopSite>,
     pub state_bytes: usize,
+    pub guest_ram_limit_bytes: u64,
     pub byte_map: Vec<PcodeStateByte>,
     pub state_abi: String,
     pub llvm_ir: String,
@@ -163,6 +176,14 @@ fn stop_label(status: PcodeCfgLlvmStatus) -> &'static str {
         PcodeCfgLlvmStatus::InvalidArguments => "stop_invalid_args",
         PcodeCfgLlvmStatus::VisitBudget => "stop_visit_budget",
         PcodeCfgLlvmStatus::InvalidOperation => "stop_invalid_op",
+        PcodeCfgLlvmStatus::MemoryUnknownAlias => "stop_memory_alias",
+        PcodeCfgLlvmStatus::MemoryUnknownBytes => "stop_memory_bytes",
+        PcodeCfgLlvmStatus::MemoryOutOfBounds => "stop_memory_bounds",
+        PcodeCfgLlvmStatus::MemoryAddressOverflow => "stop_memory_overflow",
+        PcodeCfgLlvmStatus::MemorySpaceMismatch => "stop_memory_space",
+        PcodeCfgLlvmStatus::MemoryUnsupportedLayout => "stop_memory_layout",
+        PcodeCfgLlvmStatus::MemoryNonRamSpace => "stop_memory_nonram",
+        PcodeCfgLlvmStatus::MemoryUnknownSpace => "stop_memory_unknown_space",
     }
 }
 
@@ -193,7 +214,13 @@ fn known_check(
     Ok(Some(format!("%{stem}_ok")))
 }
 
-fn emit_known_guard(checks: &[String], stem: &str, body: &mut String, next: &str) {
+fn emit_known_guard(
+    checks: &[String],
+    stem: &str,
+    body: &mut String,
+    next: &str,
+    missing_status: PcodeCfgLlvmStatus,
+) {
     if checks.is_empty() {
         body.push_str(&format!("  br label %{next}\n"));
         return;
@@ -206,8 +233,222 @@ fn emit_known_guard(checks: &[String], stem: &str, body: &mut String, next: &str
     }
     body.push_str(&format!(
         "  br i1 {combined}, label %{next}, label %{}\n",
-        stop_label(PcodeCfgLlvmStatus::UnknownInput)
+        stop_label(missing_status)
     ));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryKind {
+    Load,
+    Store,
+}
+
+struct MemoryLayout<'a> {
+    kind: MemoryKind,
+    space: &'a GhidraAddressSpace,
+    pointer: &'a PcodeVarnode,
+    value: &'a PcodeVarnode,
+    width: u32,
+}
+
+fn memory_layout<'a>(
+    source: &'a PcodeOperation,
+    spaces: &'a [GhidraAddressSpace],
+) -> Result<MemoryLayout<'a>, (PcodeCfgLlvmStatus, String)> {
+    let invalid = |reason: &str| {
+        (
+            PcodeCfgLlvmStatus::MemoryUnsupportedLayout,
+            reason.to_owned(),
+        )
+    };
+    let kind = match (source.opcode, source.mnemonic.as_str()) {
+        (2, "LOAD") if source.inputs.len() == 2 && source.output.is_some() => MemoryKind::Load,
+        (3, "STORE") if source.inputs.len() == 3 && source.output.is_none() => MemoryKind::Store,
+        _ => {
+            return Err(invalid(
+                "LOAD/STORE opcode, mnemonic, arity or output is invalid",
+            ));
+        }
+    };
+    let id_node = &source.inputs[0];
+    if id_node.space != "const" || !(1..=8).contains(&id_node.size) {
+        return Err(invalid("memory space ID must be a 1..=8 byte constant"));
+    }
+    let id = offset(&id_node.offset).map_err(|reason| invalid(&reason))?;
+    let mask = if id_node.size == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (id_node.size * 8)) - 1
+    };
+    if id > mask {
+        return Err(invalid("memory space ID exceeds its varnode width"));
+    }
+    let space = spaces
+        .iter()
+        .find(|space| u64::try_from(space.id).ok() == Some(id))
+        .ok_or((
+            PcodeCfgLlvmStatus::MemoryUnknownSpace,
+            format!("no Ghidra address space has ID {id}"),
+        ))?;
+    if space.space_type != 1 || matches!(space.name.as_str(), "const" | "register" | "unique") {
+        return Err((
+            PcodeCfgLlvmStatus::MemoryNonRamSpace,
+            format!("{} is not a Ghidra RAM space", space.name),
+        ));
+    }
+    let pointer = &source.inputs[1];
+    if !(1..=8).contains(&space.pointer_size)
+        || pointer.size != space.pointer_size
+        || !matches!(pointer.space.as_str(), "register" | "unique" | "const")
+    {
+        return Err(invalid(
+            "pointer varnode differs from RAM space pointer width",
+        ));
+    }
+    let value = match kind {
+        MemoryKind::Load => source.output.as_ref().expect("LOAD output checked above"),
+        MemoryKind::Store => &source.inputs[2],
+    };
+    if !matches!(value.space.as_str(), "register" | "unique" | "const")
+        || kind == MemoryKind::Load && value.space == "const"
+        || !(1..=8).contains(&value.size)
+        || space.addressable_unit_size == 0
+    {
+        return Err(invalid("memory value width or state space is unsupported"));
+    }
+    Ok(MemoryLayout {
+        kind,
+        space,
+        pointer,
+        value,
+        width: value.size,
+    })
+}
+
+fn emit_memory_operation(
+    layout: &MemoryLayout<'_>,
+    id: usize,
+    body: &mut String,
+    next_label: &str,
+) -> Result<(), String> {
+    let space_id = layout.space.id;
+    body.push_str(&format!(
+        "  %space_match_{id} = icmp eq i32 %guest_space_id, {space_id}\n  br i1 %space_match_{id}, label %memory_pointer_{id}, label %stop_memory_space\nmemory_pointer_{id}:\n"
+    ));
+    if let Some(check) = known_check(layout.pointer, &format!("pointer_{id}"), body)? {
+        body.push_str(&format!(
+            "  br i1 {check}, label %memory_address_{id}, label %stop_memory_alias\n"
+        ));
+    } else {
+        body.push_str(&format!("  br label %memory_address_{id}\n"));
+    }
+    body.push_str(&format!("memory_address_{id}:\n"));
+    let pointer = if layout.pointer.space == "const" {
+        let bits = layout.pointer.size * 8;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        format!("{}", offset(&layout.pointer.offset)? & mask)
+    } else {
+        let name = format!("%pointer_value_{id}");
+        body.push_str(&format!(
+            "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+            pcode_space_id(&layout.pointer.space)?,
+            pcode_offset(layout.pointer)?,
+            layout.pointer.size
+        ));
+        name
+    };
+    let unit = layout.space.addressable_unit_size;
+    let last = layout.width - 1;
+    body.push_str(&format!(
+        "  %scaled_{id} = call {{ i64, i1 }} @llvm.umul.with.overflow.i64(i64 {pointer}, i64 {unit})\n  %byte_address_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 0\n  %scale_overflow_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 1\n  %last_{id} = call {{ i64, i1 }} @llvm.uadd.with.overflow.i64(i64 %byte_address_{id}, i64 {last})\n  %end_overflow_{id} = extractvalue {{ i64, i1 }} %last_{id}, 1\n  %address_overflow_{id} = or i1 %scale_overflow_{id}, %end_overflow_{id}\n  br i1 %address_overflow_{id}, label %stop_memory_overflow, label %memory_bounds_{id}\nmemory_bounds_{id}:\n  %below_base_{id} = icmp ult i64 %byte_address_{id}, %guest_base\n  %relative_{id} = sub i64 %byte_address_{id}, %guest_base\n  %enough_{id} = icmp uge i64 %guest_len, {}\n  %last_start_{id} = sub i64 %guest_len, {}\n  %inside_{id} = icmp ule i64 %relative_{id}, %last_start_{id}\n  %room_{id} = and i1 %enough_{id}, %inside_{id}\n  %not_below_{id} = xor i1 %below_base_{id}, true\n  %in_bounds_{id} = and i1 %room_{id}, %not_below_{id}\n  br i1 %in_bounds_{id}, label %memory_value_{id}, label %stop_memory_bounds\nmemory_value_{id}:\n",
+        layout.width, layout.width
+    ));
+    match layout.kind {
+        MemoryKind::Load => {
+            let mut known_checks = Vec::new();
+            for byte in 0..layout.width {
+                body.push_str(&format!(
+                    "  %relative_{id}_{byte} = add i64 %relative_{id}, {byte}\n  %guest_known_ptr_{id}_{byte} = getelementptr i8, ptr %guest_known, i64 %relative_{id}_{byte}\n  %guest_known_byte_{id}_{byte} = load i8, ptr %guest_known_ptr_{id}_{byte}\n  %guest_byte_ok_{id}_{byte} = icmp eq i8 %guest_known_byte_{id}_{byte}, -1\n"
+                ));
+                known_checks.push(format!("%guest_byte_ok_{id}_{byte}"));
+            }
+            emit_known_guard(
+                &known_checks,
+                &format!("guest_{id}"),
+                body,
+                &format!("memory_load_{id}"),
+                PcodeCfgLlvmStatus::MemoryUnknownBytes,
+            );
+            body.push_str(&format!("memory_load_{id}:\n"));
+            let mut previous = None::<String>;
+            for byte in 0..layout.width {
+                body.push_str(&format!(
+                    "  %guest_ptr_{id}_{byte} = getelementptr i8, ptr %guest_ram, i64 %relative_{id}_{byte}\n  %guest_byte_{id}_{byte} = load i8, ptr %guest_ptr_{id}_{byte}\n  %guest_wide_{id}_{byte} = zext i8 %guest_byte_{id}_{byte} to i64\n  %guest_part_{id}_{byte} = shl i64 %guest_wide_{id}_{byte}, {}\n",
+                    byte * 8
+                ));
+                let part = format!("%guest_part_{id}_{byte}");
+                if let Some(previous_value) = previous {
+                    let name = format!("%guest_acc_{id}_{byte}");
+                    body.push_str(&format!("  {name} = or i64 {previous_value}, {part}\n"));
+                    previous = Some(name);
+                } else {
+                    previous = Some(part);
+                }
+            }
+            let result = previous.expect("memory width checked nonzero");
+            let output_space = pcode_space_id(&layout.value.space)?;
+            let output_offset = pcode_offset(layout.value)?;
+            body.push_str(&format!(
+                "  call void @hydir_write_varnode(ptr %state, i32 {output_space}, i64 {output_offset}, i32 {}, i64 {result})\n  call void @hydir_write_varnode(ptr %known, i32 {output_space}, i64 {output_offset}, i32 {}, i64 -1)\n",
+                layout.width, layout.width
+            ));
+        }
+        MemoryKind::Store => {
+            let data = layout.value;
+            if let Some(check) = known_check(data, &format!("store_data_{id}"), body)? {
+                body.push_str(&format!(
+                    "  br i1 {check}, label %memory_store_{id}, label %stop_unknown\n"
+                ));
+            } else {
+                body.push_str(&format!("  br label %memory_store_{id}\n"));
+            }
+            body.push_str(&format!("memory_store_{id}:\n"));
+            let value =
+                if data.space == "const" {
+                    let bits = data.size * 8;
+                    let mask = if bits == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bits) - 1
+                    };
+                    format!("{}", offset(&data.offset)? & mask)
+                } else {
+                    let name = format!("%store_value_{id}");
+                    body.push_str(&format!(
+                    "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                    pcode_space_id(&data.space)?, pcode_offset(data)?, data.size
+                ));
+                    name
+                };
+            for byte in 0..layout.width {
+                body.push_str(&format!(
+                    "  %store_shifted_{id}_{byte} = lshr i64 {value}, {}\n  %store_byte_{id}_{byte} = trunc i64 %store_shifted_{id}_{byte} to i8\n  %store_relative_{id}_{byte} = add i64 %relative_{id}, {byte}\n  %store_guest_ptr_{id}_{byte} = getelementptr i8, ptr %guest_ram, i64 %store_relative_{id}_{byte}\n  store i8 %store_byte_{id}_{byte}, ptr %store_guest_ptr_{id}_{byte}\n  %store_known_ptr_{id}_{byte} = getelementptr i8, ptr %guest_known, i64 %store_relative_{id}_{byte}\n  store i8 -1, ptr %store_known_ptr_{id}_{byte}\n",
+                    byte * 8
+                ));
+            }
+        }
+    }
+    body.push_str(&log_event(
+        id,
+        &format!("%count_{id}"),
+        "memory",
+        next_label,
+    ));
+    Ok(())
 }
 
 /// Emit a self-contained LLVM module for one bounded concrete CFG path.
@@ -278,6 +519,11 @@ pub fn emit_pcode_cfg_llvm(
                 )
             {
                 node_bytes(&operation.source.inputs[1], &mut byte_keys)?;
+            } else if matches!(operation.source.opcode, 2 | 3)
+                && let Ok(layout) = memory_layout(&operation.source, &semantic.address_spaces)
+            {
+                node_bytes(layout.pointer, &mut byte_keys)?;
+                node_bytes(layout.value, &mut byte_keys)?;
             }
         }
     }
@@ -297,16 +543,28 @@ pub fn emit_pcode_cfg_llvm(
     let mut sources = Vec::new();
     let mut sites = Vec::new();
     let mut helper_ir = String::new();
-    let mut body = String::from(
-        "define i32 @hydir_pcode_cfg(ptr %state, ptr %known, ptr %events, ptr %event_count, i32 %event_capacity, i32 %max_steps) {\n\
+    // Reserve every mapped state byte against the Rust executor's combined
+    // one-MiB known-state limit, even if the caller marks all of them known.
+    let guest_ram_limit = PCODE_CFG_GUEST_RAM_MAX_BYTES - byte_map.len() as u64;
+    let mut body = format!(
+        "define i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 %guest_space_id, ptr %guest_ram, ptr %guest_known, i64 %guest_base, i64 %guest_len, ptr %events, ptr %event_count, i32 %event_capacity, i32 %max_steps) {{\n\
          entry:\n  %bad_state = icmp eq ptr %state, null\n  %bad_known = icmp eq ptr %known, null\n\
+           %bad_guest_ram = icmp eq ptr %guest_ram, null\n  %bad_guest_known = icmp eq ptr %guest_known, null\n\
            %bad_events = icmp eq ptr %events, null\n  %bad_count = icmp eq ptr %event_count, null\n\
            %bad_a = or i1 %bad_state, %bad_known\n  %bad_b = or i1 %bad_events, %bad_count\n\
-           %bad_ptr = or i1 %bad_a, %bad_b\n  %too_many = icmp ugt i32 %max_steps, 262144\n\
+           %bad_c = or i1 %bad_guest_ram, %bad_guest_known\n  %bad_d = or i1 %bad_a, %bad_b\n\
+           %bad_ptr = or i1 %bad_c, %bad_d\n  %too_many = icmp ugt i32 %max_steps, 262144\n\
            %small_log = icmp ult i32 %event_capacity, %max_steps\n\
            %negative_capacity = icmp slt i32 %event_capacity, 0\n\
            %bad_capacity = or i1 %small_log, %negative_capacity\n\
-           %bad_bounds = or i1 %too_many, %bad_capacity\n\
+           %bad_steps = or i1 %too_many, %bad_capacity\n\
+           %guest_too_large = icmp ugt i64 %guest_len, {guest_ram_limit}\n\
+           %guest_empty = icmp eq i64 %guest_len, 0\n  %guest_tail_raw = sub i64 %guest_len, 1\n\
+           %guest_tail = select i1 %guest_empty, i64 0, i64 %guest_tail_raw\n\
+           %max_guest_base = sub i64 -1, %guest_tail\n\
+           %guest_base_overflow = icmp ugt i64 %guest_base, %max_guest_base\n\
+           %bad_guest_range = or i1 %guest_too_large, %guest_base_overflow\n\
+           %bad_bounds = or i1 %bad_steps, %bad_guest_range\n\
            %bad_args = or i1 %bad_ptr, %bad_bounds\n\
            br i1 %bad_args, label %stop_invalid_args, label %initialize\n\
          initialize:\n  store i32 0, ptr %event_count\n  %visit_counter = alloca i32\n\
@@ -398,6 +656,7 @@ pub fn emit_pcode_cfg_llvm(
                             &format!("cond_{id}"),
                             &mut body,
                             &format!("condition_{id}"),
+                            PcodeCfgLlvmStatus::UnknownInput,
                         );
                         body.push_str(&format!("condition_{id}:\n"));
                         let value = if condition.space == "const" {
@@ -463,16 +722,64 @@ pub fn emit_pcode_cfg_llvm(
                     );
                     body.push_str(&branch_to_stop(status));
                 }
-                2 | 3 => {
-                    stop_site(
-                        &mut sites,
-                        &source.source_address,
-                        Some(operation_index),
-                        PcodeCfgLlvmStatus::UnsupportedMemory,
-                        format!("{} memory effect is not lowered", source.mnemonic),
-                    );
-                    body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::UnsupportedMemory));
-                }
+                2 | 3 => match memory_layout(source, &semantic.address_spaces) {
+                    Ok(layout) => {
+                        for (status, reason) in [
+                            (
+                                PcodeCfgLlvmStatus::MemorySpaceMismatch,
+                                "guest RAM binding does not match P-code space ID",
+                            ),
+                            (
+                                PcodeCfgLlvmStatus::MemoryUnknownAlias,
+                                "pointer varnode bytes are unknown",
+                            ),
+                            (
+                                PcodeCfgLlvmStatus::MemoryAddressOverflow,
+                                "scaled memory address overflows u64",
+                            ),
+                            (
+                                PcodeCfgLlvmStatus::MemoryOutOfBounds,
+                                "memory access is outside guest RAM window",
+                            ),
+                        ] {
+                            stop_site(
+                                &mut sites,
+                                &source.source_address,
+                                Some(operation_index),
+                                status,
+                                reason,
+                            );
+                        }
+                        if layout.kind == MemoryKind::Load {
+                            stop_site(
+                                &mut sites,
+                                &source.source_address,
+                                Some(operation_index),
+                                PcodeCfgLlvmStatus::MemoryUnknownBytes,
+                                "loaded guest RAM bytes are unknown",
+                            );
+                        } else {
+                            stop_site(
+                                &mut sites,
+                                &source.source_address,
+                                Some(operation_index),
+                                PcodeCfgLlvmStatus::UnknownInput,
+                                "STORE data varnode bytes are unknown",
+                            );
+                        }
+                        emit_memory_operation(&layout, id, &mut body, &next_label)?;
+                    }
+                    Err((status, reason)) => {
+                        stop_site(
+                            &mut sites,
+                            &source.source_address,
+                            Some(operation_index),
+                            status,
+                            reason,
+                        );
+                        body.push_str(&branch_to_stop(status));
+                    }
+                },
                 _ => {
                     let helper = if matches!(operation.effect, PcodeEffect::Assign { .. }) {
                         emit_pcode_exact_operation_llvm(operation)
@@ -503,6 +810,7 @@ pub fn emit_pcode_cfg_llvm(
                                 &format!("input_{id}"),
                                 &mut body,
                                 &format!("value_{id}"),
+                                PcodeCfgLlvmStatus::UnknownInput,
                             );
                             body.push_str(&format!("value_{id}:\n"));
                             let mut arguments = Vec::new();
@@ -631,6 +939,14 @@ pub fn emit_pcode_cfg_llvm(
         PcodeCfgLlvmStatus::InvalidArguments,
         PcodeCfgLlvmStatus::VisitBudget,
         PcodeCfgLlvmStatus::InvalidOperation,
+        PcodeCfgLlvmStatus::MemoryUnknownAlias,
+        PcodeCfgLlvmStatus::MemoryUnknownBytes,
+        PcodeCfgLlvmStatus::MemoryOutOfBounds,
+        PcodeCfgLlvmStatus::MemoryAddressOverflow,
+        PcodeCfgLlvmStatus::MemorySpaceMismatch,
+        PcodeCfgLlvmStatus::MemoryUnsupportedLayout,
+        PcodeCfgLlvmStatus::MemoryNonRamSpace,
+        PcodeCfgLlvmStatus::MemoryUnknownSpace,
     ] {
         body.push_str(&format!(
             "{}:\n  ret i32 {}\n",
@@ -641,6 +957,8 @@ pub fn emit_pcode_cfg_llvm(
     body.push_str("}\n");
     let mut llvm_ir =
         String::from("; Hydir raw P-code concrete CFG path; equivalence unverified.\n\n");
+    llvm_ir.push_str("declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n");
+    llvm_ir.push_str("declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n\n");
     llvm_ir.push_str(&helper_definitions(&byte_map));
     llvm_ir.push('\n');
     llvm_ir.push_str(&helper_ir);
@@ -655,8 +973,11 @@ pub fn emit_pcode_cfg_llvm(
         source_operations: sources,
         stop_sites: sites,
         state_bytes: byte_map.len(),
+        guest_ram_limit_bytes: guest_ram_limit,
         byte_map,
-        state_abi: "hydir-pcode-cfg-state-v1: state and known i8 arrays indexed by byte_map; 0xff=known,0x00=unknown; events i32 operation IDs; event_count initialized by callee; max_steps <=262144; return PcodeCfgLlvmStatus code".into(),
+        state_abi: format!(
+            "hydir-pcode-cfg-state-v2: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram, ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; state/known use byte_map; guest arrays hold guest_len bytes in guest_space_id from guest_base byte offset; known byte 0xff, unknown 0x00; event_count initialized by callee after argument validation; event_capacity>=max_steps; guest_len<={guest_ram_limit}; max_steps<=262144; arrays must be separate and allocated to their declared lengths"
+        ),
         llvm_ir,
         semantic_fidelity: SemanticFidelity::Unknown,
         verification: VerificationStatus::NotRun,
@@ -681,6 +1002,50 @@ mod tests {
             "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
         )
         .unwrap()
+    }
+
+    fn calls_fixture() -> GhidraSnapshot {
+        parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prism_calls_flow_v2.json"
+            )),
+            "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
+        )
+        .unwrap()
+    }
+
+    fn register(offset: &str, size: u32) -> PcodeVarnode {
+        PcodeVarnode {
+            space: "register".into(),
+            offset: offset.into(),
+            size,
+        }
+    }
+
+    fn source_event_ids(
+        artifact: &PcodeCfgLlvmArtifact,
+        trace: &hydir_ir::pcode::PcodePathTrace,
+    ) -> Vec<usize> {
+        trace
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                PcodePathEvent::Effect { operation } => Some(&operation.source),
+                PcodePathEvent::Branch { source, .. } => Some(source),
+                PcodePathEvent::Fallthrough { .. } => None,
+            })
+            .map(|source| {
+                artifact
+                    .source_operations
+                    .iter()
+                    .position(|candidate| {
+                        candidate.address == source.source_address
+                            && candidate.operation_index == source.sequence_index as usize
+                    })
+                    .unwrap()
+            })
+            .collect()
     }
 
     fn verify(llvm: &str) {
@@ -708,9 +1073,43 @@ mod tests {
         );
     }
 
+    struct GuestTestMemory {
+        space_id: i32,
+        base: u64,
+        bytes: Vec<Option<u8>>,
+        expected: Vec<(usize, u8, bool)>,
+        expected_state: Vec<(String, String, u8, bool)>,
+    }
+
     fn run_lli(
         artifact: &PcodeCfgLlvmArtifact,
         seed: &PcodeConcreteState,
+        max_steps: u32,
+        expected_status: PcodeCfgLlvmStatus,
+        expected_events: &[usize],
+        expected_rax_low: Option<u8>,
+    ) {
+        run_lli_with_guest(
+            artifact,
+            seed,
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0,
+                bytes: Vec::new(),
+                expected: Vec::new(),
+                expected_state: Vec::new(),
+            },
+            max_steps,
+            expected_status,
+            expected_events,
+            expected_rax_low,
+        );
+    }
+
+    fn run_lli_with_guest(
+        artifact: &PcodeCfgLlvmArtifact,
+        seed: &PcodeConcreteState,
+        guest: &GuestTestMemory,
         max_steps: u32,
         expected_status: PcodeCfgLlvmStatus,
         expected_events: &[usize],
@@ -720,12 +1119,17 @@ mod tests {
             return;
         }
         let state_size = artifact.state_bytes.max(1);
+        let guest_size = guest.bytes.len().max(1);
         let event_capacity = max_steps.max(1);
         let mut main = format!(
             "define i32 @main() {{\nentry:\n  %state_array = alloca [{state_size} x i8]\n\
                %state = getelementptr [{state_size} x i8], ptr %state_array, i64 0, i64 0\n\
                %known_array = alloca [{state_size} x i8]\n\
                %known = getelementptr [{state_size} x i8], ptr %known_array, i64 0, i64 0\n\
+               %guest_array = alloca [{guest_size} x i8]\n\
+               %guest = getelementptr [{guest_size} x i8], ptr %guest_array, i64 0, i64 0\n\
+               %guest_known_array = alloca [{guest_size} x i8]\n\
+               %guest_mask = getelementptr [{guest_size} x i8], ptr %guest_known_array, i64 0, i64 0\n\
                %events_array = alloca [{event_capacity} x i32]\n\
                %events = getelementptr [{event_capacity} x i32], ptr %events_array, i64 0, i64 0\n\
                %event_count = alloca i32\n"
@@ -751,12 +1155,23 @@ mod tests {
                 byte.index
             ));
         }
+        for index in 0..guest_size {
+            let known = guest.bytes.get(index).copied().flatten();
+            main.push_str(&format!(
+                "  %guest_s_{index} = getelementptr i8, ptr %guest, i64 {index}\n  store i8 {}, ptr %guest_s_{index}\n  %guest_k_{index} = getelementptr i8, ptr %guest_mask, i64 {index}\n  store i8 {}, ptr %guest_k_{index}\n",
+                known.unwrap_or(0),
+                if known.is_some() { 255 } else { 0 }
+            ));
+        }
         main.push_str(&format!(
-            "  %status = call i32 @hydir_pcode_cfg(ptr %state, ptr %known, ptr %events, ptr %event_count, i32 {event_capacity}, i32 {max_steps})\n\
+            "  %status = call i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 {}, ptr %guest, ptr %guest_mask, i64 {}, i64 {}, ptr %events, ptr %event_count, i32 {event_capacity}, i32 {max_steps})\n\
                %count = load i32, ptr %event_count\n\
                %status_ok = icmp eq i32 %status, {}\n\
                %count_ok = icmp eq i32 %count, {}\n\
                %ok_initial = and i1 %status_ok, %count_ok\n",
+            guest.space_id,
+            guest.base,
+            guest.bytes.len(),
             expected_status.code(),
             expected_events.len()
         ));
@@ -783,6 +1198,26 @@ mod tests {
                    %ok_rax = and i1 {previous}, %rax_ok\n"
             ));
             previous = "%ok_rax".to_owned();
+        }
+        for (check, (index, value, known)) in guest.expected.iter().enumerate() {
+            main.push_str(&format!(
+                "  %guest_result_ptr_{check} = getelementptr i8, ptr %guest, i64 {index}\n  %guest_result_{check} = load i8, ptr %guest_result_ptr_{check}\n  %guest_value_ok_{check} = icmp eq i8 %guest_result_{check}, {value}\n  %guest_known_ptr_{check} = getelementptr i8, ptr %guest_mask, i64 {index}\n  %guest_known_result_{check} = load i8, ptr %guest_known_ptr_{check}\n  %guest_known_ok_{check} = icmp eq i8 %guest_known_result_{check}, {}\n  %guest_ok_{check} = and i1 %guest_value_ok_{check}, %guest_known_ok_{check}\n  %ok_guest_{check} = and i1 {previous}, %guest_ok_{check}\n",
+                if *known { 255 } else { 0 }
+            ));
+            previous = format!("%ok_guest_{check}");
+        }
+        for (check, (space, offset, value, known)) in guest.expected_state.iter().enumerate() {
+            let index = artifact
+                .byte_map
+                .iter()
+                .find(|byte| &byte.space == space && &byte.offset == offset)
+                .unwrap()
+                .index;
+            main.push_str(&format!(
+                "  %state_result_ptr_{check} = getelementptr i8, ptr %state, i64 {index}\n  %state_result_{check} = load i8, ptr %state_result_ptr_{check}\n  %state_value_ok_{check} = icmp eq i8 %state_result_{check}, {value}\n  %state_known_ptr_{check} = getelementptr i8, ptr %known, i64 {index}\n  %state_known_result_{check} = load i8, ptr %state_known_ptr_{check}\n  %state_known_ok_{check} = icmp eq i8 %state_known_result_{check}, {}\n  %state_ok_{check} = and i1 %state_value_ok_{check}, %state_known_ok_{check}\n  %ok_state_{check} = and i1 {previous}, %state_ok_{check}\n",
+                if *known { 255 } else { 0 }
+            ));
+            previous = format!("%ok_state_{check}");
         }
         main.push_str(&format!(
             "  %failed = xor i1 {previous}, true\n  %result = zext i1 %failed to i32\n  ret i32 %result\n}}\n"
@@ -812,7 +1247,7 @@ mod tests {
             artifact
                 .stop_sites
                 .iter()
-                .any(|site| site.status == PcodeCfgLlvmStatus::UnsupportedMemory)
+                .any(|site| site.status == PcodeCfgLlvmStatus::MemoryUnknownAlias)
         );
         verify(&artifact.llvm_ir);
         run_lli(
@@ -881,7 +1316,7 @@ mod tests {
                 &artifact,
                 &seed,
                 8,
-                PcodeCfgLlvmStatus::UnsupportedMemory,
+                PcodeCfgLlvmStatus::MemoryUnknownAlias,
                 &events,
                 Some(expected_rax as u8),
             );
@@ -1007,6 +1442,300 @@ mod tests {
             PcodeCfgLlvmStatus::UnresolvedFlow,
             &[0],
             Some(1),
+        );
+    }
+
+    #[test]
+    fn real_ghidra_store_and_load_match_rust_concrete_paths() {
+        let snapshot = calls_fixture();
+        let store_start = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x2013ad".into(),
+        };
+        let store_artifact = emit_pcode_cfg_llvm(&snapshot, Some(&store_start)).unwrap();
+        assert_eq!(
+            store_artifact.guest_ram_limit_bytes,
+            PCODE_CFG_GUEST_RAM_MAX_BYTES - store_artifact.state_bytes as u64
+        );
+        assert!(store_artifact.llvm_ir.contains(&format!(
+            "%guest_len, {}",
+            store_artifact.guest_ram_limit_bytes
+        )));
+        verify(&store_artifact.llvm_ir);
+        let mut store_seed = PcodeConcreteState::default();
+        store_seed
+            .write_varnode(&register("0x20", 8), 0x1008)
+            .unwrap();
+        let store_rust = snapshot
+            .execute_concrete_path(&store_seed, Some(&store_start), 8, 4)
+            .unwrap();
+        assert!(matches!(store_rust.stop, PcodePathStop::Call { .. }));
+        assert_eq!(
+            store_rust
+                .final_state
+                .read_memory("ram", 0x1000, 8)
+                .unwrap(),
+            Some(0x2013b2)
+        );
+        let store_events = source_event_ids(&store_artifact, &store_rust);
+        assert_eq!(store_events.len(), 2);
+        let written = 0x2013b2u64.to_le_bytes();
+        run_lli_with_guest(
+            &store_artifact,
+            &store_seed,
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0x1000,
+                bytes: vec![None; 8],
+                expected: written
+                    .iter()
+                    .enumerate()
+                    .map(|(i, byte)| (i, *byte, true))
+                    .collect(),
+                expected_state: vec![("register".into(), "0x20".into(), 0x00, true)],
+            },
+            8,
+            PcodeCfgLlvmStatus::Call,
+            &store_events,
+            None,
+        );
+
+        let load_start = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x2013b6".into(),
+        };
+        let load_artifact = emit_pcode_cfg_llvm(&snapshot, Some(&load_start)).unwrap();
+        verify(&load_artifact.llvm_ir);
+        let mut load_seed = PcodeConcreteState::default();
+        load_seed
+            .write_varnode(&register("0x20", 8), 0x1000)
+            .unwrap();
+        let value = 0x1122_3344_5566_7788u64;
+        load_seed.write_memory("ram", 0x1000, 8, value).unwrap();
+        let load_rust = snapshot
+            .execute_concrete_path(&load_seed, Some(&load_start), 8, 4)
+            .unwrap();
+        assert!(matches!(load_rust.stop, PcodePathStop::Return { .. }));
+        assert_eq!(
+            load_rust
+                .final_state
+                .read_varnode(&register("0x288", 8))
+                .unwrap(),
+            Some(value)
+        );
+        let load_events = source_event_ids(&load_artifact, &load_rust);
+        assert_eq!(load_events.len(), 2);
+        run_lli_with_guest(
+            &load_artifact,
+            &load_seed,
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0x1000,
+                bytes: value.to_le_bytes().into_iter().map(Some).collect(),
+                expected: Vec::new(),
+                expected_state: value
+                    .to_le_bytes()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, byte)| ("register".into(), format!("0x{:x}", 0x288 + i), *byte, true))
+                    .collect(),
+            },
+            8,
+            PcodeCfgLlvmStatus::Return,
+            &load_events,
+            None,
+        );
+    }
+
+    #[test]
+    fn guest_ram_boundaries_stop_before_memory_effects() {
+        let snapshot = calls_fixture();
+        let start = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x2013b6".into(),
+        };
+        let artifact = emit_pcode_cfg_llvm(&snapshot, Some(&start)).unwrap();
+        verify(&artifact.llvm_ir);
+        let known_ram = GuestTestMemory {
+            space_id: 433,
+            base: 0x1000,
+            bytes: vec![Some(0x42); 8],
+            expected: Vec::new(),
+            expected_state: Vec::new(),
+        };
+        run_lli_with_guest(
+            &artifact,
+            &PcodeConcreteState::default(),
+            &known_ram,
+            8,
+            PcodeCfgLlvmStatus::MemoryUnknownAlias,
+            &[],
+            None,
+        );
+
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&register("0x20", 8), 0x1000).unwrap();
+        let mut partial_ram = vec![Some(0x42); 8];
+        partial_ram[3] = None;
+        let unknown_ram = GuestTestMemory {
+            bytes: partial_ram,
+            ..known_ram
+        };
+        run_lli_with_guest(
+            &artifact,
+            &seed,
+            &unknown_ram,
+            8,
+            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+            &[],
+            None,
+        );
+        let short_ram = GuestTestMemory {
+            bytes: vec![Some(0x42); 4],
+            ..unknown_ram
+        };
+        run_lli_with_guest(
+            &artifact,
+            &seed,
+            &short_ram,
+            8,
+            PcodeCfgLlvmStatus::MemoryOutOfBounds,
+            &[],
+            None,
+        );
+        let wrong_space = GuestTestMemory {
+            space_id: 42,
+            bytes: vec![Some(0x42); 8],
+            ..short_ram
+        };
+        run_lli_with_guest(
+            &artifact,
+            &seed,
+            &wrong_space,
+            8,
+            PcodeCfgLlvmStatus::MemorySpaceMismatch,
+            &[],
+            None,
+        );
+        seed.write_varnode(&register("0x20", 8), u64::MAX).unwrap();
+        let right_space = GuestTestMemory {
+            space_id: 433,
+            ..wrong_space
+        };
+        run_lli_with_guest(
+            &artifact,
+            &seed,
+            &right_space,
+            8,
+            PcodeCfgLlvmStatus::MemoryAddressOverflow,
+            &[],
+            None,
+        );
+
+        let mut non_ram = snapshot.clone();
+        non_ram.selected_function.instructions[3].pcode[0].inputs[0].offset = "0x35".into();
+        let non_ram_artifact = emit_pcode_cfg_llvm(&non_ram, Some(&start)).unwrap();
+        verify(&non_ram_artifact.llvm_ir);
+        assert!(
+            non_ram_artifact
+                .stop_sites
+                .iter()
+                .any(|site| site.status == PcodeCfgLlvmStatus::MemoryNonRamSpace)
+        );
+        run_lli_with_guest(
+            &non_ram_artifact,
+            &seed,
+            &right_space,
+            8,
+            PcodeCfgLlvmStatus::MemoryNonRamSpace,
+            &[],
+            None,
+        );
+    }
+
+    #[test]
+    fn addressable_unit_scaling_and_unknown_store_data_match_rust() {
+        let mut snapshot = calls_fixture();
+        snapshot
+            .address_spaces
+            .iter_mut()
+            .find(|space| space.name == "ram")
+            .unwrap()
+            .addressable_unit_size = 2;
+        let load_start = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x2013b6".into(),
+        };
+        let artifact = emit_pcode_cfg_llvm(&snapshot, Some(&load_start)).unwrap();
+        verify(&artifact.llvm_ir);
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&register("0x20", 8), 0x800).unwrap();
+        let value = 0x0102_0304_0506_0708u64;
+        seed.write_memory("ram", 0x1000, 8, value).unwrap();
+        let rust = snapshot
+            .execute_concrete_path(&seed, Some(&load_start), 8, 4)
+            .unwrap();
+        assert!(matches!(rust.stop, PcodePathStop::Return { .. }));
+        assert_eq!(
+            rust.final_state
+                .read_varnode(&register("0x288", 8))
+                .unwrap(),
+            Some(value)
+        );
+        let events = source_event_ids(&artifact, &rust);
+        run_lli_with_guest(
+            &artifact,
+            &seed,
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0x1000,
+                bytes: value.to_le_bytes().into_iter().map(Some).collect(),
+                expected: Vec::new(),
+                expected_state: vec![("register".into(), "0x288".into(), 0x08, true)],
+            },
+            8,
+            PcodeCfgLlvmStatus::Return,
+            &events,
+            None,
+        );
+
+        let mut store_snapshot = calls_fixture();
+        store_snapshot.selected_function.instructions[1].pcode[1].inputs[2] = register("0x0", 8);
+        let store_start = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x2013ad".into(),
+        };
+        let store_artifact = emit_pcode_cfg_llvm(&store_snapshot, Some(&store_start)).unwrap();
+        verify(&store_artifact.llvm_ir);
+        let mut store_seed = PcodeConcreteState::default();
+        store_seed
+            .write_varnode(&register("0x20", 8), 0x1008)
+            .unwrap();
+        let store_rust = store_snapshot
+            .execute_concrete_path(&store_seed, Some(&store_start), 8, 4)
+            .unwrap();
+        assert!(matches!(
+            store_rust.stop,
+            PcodePathStop::EffectBoundary {
+                boundary: hydir_ir::pcode::PcodeExecutionStop::MissingInput { input_index: 2, .. }
+            }
+        ));
+        let events = source_event_ids(&store_artifact, &store_rust);
+        assert_eq!(events.len(), 1);
+        run_lli_with_guest(
+            &store_artifact,
+            &store_seed,
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0x1000,
+                bytes: vec![None; 8],
+                expected: Vec::new(),
+                expected_state: Vec::new(),
+            },
+            8,
+            PcodeCfgLlvmStatus::UnknownInput,
+            &events,
+            None,
         );
     }
 }
