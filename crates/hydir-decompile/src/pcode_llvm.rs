@@ -255,6 +255,25 @@ pub fn emit_pcode_exact_operation_llvm(
     let mut body = String::new();
     let value = match kind {
         PcodeExactOp::Copy => operands[0].clone(),
+        PcodeExactOp::TwosComplement | PcodeExactOp::BitwiseNegate => {
+            let (instruction, first) = if kind == PcodeExactOp::TwosComplement {
+                ("sub", "0")
+            } else {
+                ("xor", "-1")
+            };
+            body.push_str(&format!(
+                "  %result = {instruction} {result_type} {first}, {}\n",
+                operands[0]
+            ));
+            "%result".to_owned()
+        }
+        PcodeExactOp::BooleanNegate => {
+            body.push_str(&format!(
+                "  %comparison = icmp eq i8 {}, 0\n  %result = zext i1 %comparison to i8\n",
+                operands[0]
+            ));
+            "%result".to_owned()
+        }
         PcodeExactOp::PopCount => {
             // A fixed 64-bit SWAR count avoids an external intrinsic
             // declaration in each independently emitted helper. The source
@@ -307,12 +326,14 @@ pub fn emit_pcode_exact_operation_llvm(
         }
         PcodeExactOp::Add
         | PcodeExactOp::Sub
+        | PcodeExactOp::Multiply
         | PcodeExactOp::Xor
         | PcodeExactOp::And
         | PcodeExactOp::Or => {
             let instruction = match kind {
                 PcodeExactOp::Add => "add",
                 PcodeExactOp::Sub => "sub",
+                PcodeExactOp::Multiply => "mul",
                 PcodeExactOp::Xor => "xor",
                 PcodeExactOp::And => "and",
                 PcodeExactOp::Or => "or",
@@ -473,12 +494,16 @@ mod tests {
             18 => PcodeExactOp::SignExtend,
             19 => PcodeExactOp::Add,
             20 => PcodeExactOp::Sub,
+            24 => PcodeExactOp::TwosComplement,
+            25 => PcodeExactOp::BitwiseNegate,
             26 => PcodeExactOp::Xor,
             27 => PcodeExactOp::And,
             28 => PcodeExactOp::Or,
             29 => PcodeExactOp::ShiftLeft,
             30 => PcodeExactOp::LogicalShiftRight,
             31 => PcodeExactOp::ArithmeticShiftRight,
+            32 => PcodeExactOp::Multiply,
+            37 => PcodeExactOp::BooleanNegate,
             72 => PcodeExactOp::PopCount,
             _ => panic!("unexpected opcode"),
         };
@@ -552,12 +577,16 @@ mod tests {
             (18, "INT_SEXT", 8, vec![1]),
             (19, "INT_ADD", 1, vec![1, 1]),
             (20, "INT_SUB", 1, vec![1, 1]),
+            (24, "INT_2COMP", 1, vec![1]),
+            (25, "INT_NEGATE", 1, vec![1]),
             (26, "INT_XOR", 1, vec![1, 1]),
             (27, "INT_AND", 1, vec![1, 1]),
             (28, "INT_OR", 1, vec![1, 1]),
             (29, "INT_LEFT", 1, vec![1, 8]),
             (30, "INT_RIGHT", 1, vec![1, 8]),
             (31, "INT_SRIGHT", 1, vec![1, 8]),
+            (32, "INT_MULT", 1, vec![1, 1]),
+            (37, "BOOL_NEGATE", 1, vec![1]),
             (72, "POPCOUNT", 1, vec![8]),
             (72, "POPCOUNT", 8, vec![1]),
         ] {
@@ -624,6 +653,8 @@ mod tests {
             (18, "INT_SEXT", 8, &[1], &[0x80]),
             (19, "INT_ADD", 1, &[1, 1], &[0xff, 2]),
             (20, "INT_SUB", 1, &[1, 1], &[0, 1]),
+            (24, "INT_2COMP", 1, &[1], &[0x80]),
+            (25, "INT_NEGATE", 1, &[1], &[0x80]),
             (26, "INT_XOR", 1, &[1, 1], &[0xf0, 0x0f]),
             (27, "INT_AND", 1, &[1, 1], &[0xf0, 0x0f]),
             (28, "INT_OR", 1, &[1, 1], &[0xf0, 0x0f]),
@@ -631,6 +662,9 @@ mod tests {
             (30, "INT_RIGHT", 1, &[1, 8], &[0x80, 2]),
             (31, "INT_SRIGHT", 1, &[1, 8], &[0x80, 2]),
             (31, "INT_SRIGHT", 1, &[1, 8], &[0x7f, 8]),
+            (32, "INT_MULT", 1, &[1, 1], &[0x80, 3]),
+            (37, "BOOL_NEGATE", 1, &[1], &[0]),
+            (37, "BOOL_NEGATE", 1, &[1], &[1]),
             (29, "INT_LEFT", 1, &[1, 8], &[3, 0x100]),
             (72, "POPCOUNT", 1, &[8], &[u64::MAX]),
             (72, "POPCOUNT", 8, &[1], &[0x81]),

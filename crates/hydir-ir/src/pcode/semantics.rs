@@ -21,6 +21,8 @@ pub enum PcodeExactOp {
     Copy,
     Add,
     Sub,
+    TwosComplement,
+    BitwiseNegate,
     Xor,
     And,
     Or,
@@ -35,6 +37,8 @@ pub enum PcodeExactOp {
     ShiftLeft,
     LogicalShiftRight,
     ArithmeticShiftRight,
+    Multiply,
+    BooleanNegate,
     PopCount,
 }
 
@@ -213,9 +217,13 @@ impl PcodeSemanticOperation {
             PcodeExactOp::SignExtend => signed(values[0], widths[0]) as u64,
             PcodeExactOp::Add => values[0].wrapping_add(values[1]),
             PcodeExactOp::Sub => values[0].wrapping_sub(values[1]),
+            PcodeExactOp::TwosComplement => values[0].wrapping_neg(),
+            PcodeExactOp::BitwiseNegate => !values[0],
             PcodeExactOp::Xor => values[0] ^ values[1],
             PcodeExactOp::And => values[0] & values[1],
             PcodeExactOp::Or => values[0] | values[1],
+            PcodeExactOp::Multiply => values[0].wrapping_mul(values[1]),
+            PcodeExactOp::BooleanNegate => u64::from(values[0] == 0),
             PcodeExactOp::Equal => u64::from(values[0] == values[1]),
             PcodeExactOp::NotEqual => u64::from(values[0] != values[1]),
             PcodeExactOp::UnsignedLess => u64::from(values[0] < values[1]),
@@ -281,12 +289,16 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         18 => (Op::SignExtend, "INT_SEXT"),
         19 => (Op::Add, "INT_ADD"),
         20 => (Op::Sub, "INT_SUB"),
+        24 => (Op::TwosComplement, "INT_2COMP"),
+        25 => (Op::BitwiseNegate, "INT_NEGATE"),
         26 => (Op::Xor, "INT_XOR"),
         27 => (Op::And, "INT_AND"),
         28 => (Op::Or, "INT_OR"),
         29 => (Op::ShiftLeft, "INT_LEFT"),
         30 => (Op::LogicalShiftRight, "INT_RIGHT"),
         31 => (Op::ArithmeticShiftRight, "INT_SRIGHT"),
+        32 => (Op::Multiply, "INT_MULT"),
+        37 => (Op::BooleanNegate, "BOOL_NEGATE"),
         72 => (Op::PopCount, "POPCOUNT"),
         _ => return None,
     })
@@ -356,6 +368,10 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
         let sizes = source.inputs.iter().map(|v| v.size).collect::<Vec<_>>();
         let valid = match operation {
             PcodeExactOp::Copy => sizes.as_slice() == [output.size],
+            PcodeExactOp::TwosComplement | PcodeExactOp::BitwiseNegate => {
+                sizes.as_slice() == [output.size]
+            }
+            PcodeExactOp::BooleanNegate => output.size == 1 && sizes.as_slice() == [1],
             // Ghidra permits independent input and output widths. Within our
             // 64-bit bound the count (0..=64) fits even a one-byte output.
             PcodeExactOp::PopCount => sizes.len() == 1,
@@ -530,6 +546,41 @@ mod tests {
         );
         assert_eq!(signed_right.evaluate_exact(&[0x7f, 64]).unwrap(), Some(0));
         assert_eq!(signed_right.evaluate_exact(&[0x80, 1]).unwrap(), Some(0xc0));
+    }
+
+    #[test]
+    fn unary_multiply_and_boolean_operations_are_width_checked() {
+        for (opcode, mnemonic, output, inputs, values, expected) in [
+            (24, "INT_2COMP", 1, vec![1], vec![0x80], 0x80),
+            (25, "INT_NEGATE", 1, vec![1], vec![0x80], 0x7f),
+            (32, "INT_MULT", 1, vec![1, 1], vec![0x80, 3], 0x80),
+            (
+                32,
+                "INT_MULT",
+                8,
+                vec![8, 8],
+                vec![u64::MAX, 2],
+                u64::MAX - 1,
+            ),
+            (37, "BOOL_NEGATE", 1, vec![1], vec![0], 1),
+            (37, "BOOL_NEGATE", 1, vec![1], vec![1], 0),
+        ] {
+            let operation = lowered(op(opcode, mnemonic, Some(output), &inputs));
+            assert!(matches!(operation.effect, PcodeEffect::Assign { .. }));
+            assert_eq!(operation.evaluate_exact(&values).unwrap(), Some(expected));
+        }
+        for source in [
+            op(24, "INT_2COMP", Some(2), &[1]),
+            op(25, "INT_NEGATE", Some(1), &[1, 1]),
+            op(32, "INT_MULT", Some(1), &[1, 2]),
+            op(37, "BOOL_NEGATE", Some(2), &[1]),
+            op(37, "BOOL_NEGATE", Some(1), &[2]),
+        ] {
+            assert!(matches!(
+                lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+        }
     }
 
     #[test]
