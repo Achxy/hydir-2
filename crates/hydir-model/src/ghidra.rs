@@ -3,13 +3,13 @@
 
 use super::{
     AnalysisModel, MAX_HIGH_PCODE_HINT_BYTES, MAX_HIGH_PCODE_HINTS, ModelConflict, ModelEvidence,
-    ModelFunction, ModelHighPcodeHint, ModelParameter, ModelPrototype, ModelSource, PrimitiveType,
-    TypeDefinitionKind, TypeRef, valid_identifier, validate_model,
+    ModelField, ModelFunction, ModelHighPcodeHint, ModelParameter, ModelPrototype, ModelSource,
+    PrimitiveType, TypeDefinitionKind, TypeRef, valid_identifier, validate_model,
 };
 use hydir_core::{Address, Location, annotation_address_in_spec};
 use hydir_ir::pcode::{
-    GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraFunctionPrototype, GhidraHighPcodeStatus,
-    GhidraHighVarnodeEvidence, GhidraSnapshot, validate_ghidra_snapshot,
+    GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraFieldEvidence, GhidraFunctionPrototype,
+    GhidraHighPcodeStatus, GhidraHighVarnodeEvidence, GhidraSnapshot, validate_ghidra_snapshot,
 };
 use hydir_loader::import_elf;
 use serde::{Deserialize, Serialize};
@@ -213,6 +213,164 @@ fn model_prototype(
     })
 }
 
+// A type reached through an imported signature can refine an existing, uniquely
+// identified struct. Decompiler high types remain hints and never take this path.
+fn imported_struct_fields(
+    evidence: &GhidraDataTypeEvidence,
+    model: &mut AnalysisModel,
+    site: Location,
+    depth: usize,
+) {
+    if evidence.detail_truncated || depth > 8 {
+        return;
+    }
+    if matches!(
+        evidence.kind,
+        GhidraDataTypeKind::Pointer | GhidraDataTypeKind::Array | GhidraDataTypeKind::Typedef
+    ) {
+        if let Some(target) = evidence.target_type.as_deref() {
+            imported_struct_fields(target, model, site, depth + 1);
+        }
+        return;
+    }
+    if evidence.kind != GhidraDataTypeKind::Struct
+        || evidence.fields.is_empty()
+        || evidence.fields.len() > 64
+    {
+        return;
+    }
+    let Some((TypeRef::Named { id }, _)) = model_type(evidence, model, 0) else {
+        return;
+    };
+    let Some(index) = model
+        .types
+        .iter()
+        .position(|definition| definition.id == id)
+    else {
+        return;
+    };
+    if model.types[index].size_is_lower_bound {
+        return;
+    }
+    let size = model.types[index].size_bytes;
+    let mut proposed = Vec::with_capacity(evidence.fields.len());
+    let mut names = BTreeSet::new();
+    let mut previous_end = 0;
+    for field in &evidence.fields {
+        let Some(name) = field.name.as_ref().filter(|name| valid_identifier(name)) else {
+            return;
+        };
+        let offset = u64::from(field.offset_bytes);
+        let field_size = u64::from(field.size_bytes);
+        let Some(end) = offset.checked_add(field_size) else {
+            return;
+        };
+        if !names.insert(name.clone()) || field_size == 0 || offset < previous_end || end > size {
+            return;
+        }
+        previous_end = end;
+        if let Some((ty, Some(type_size))) = model_type(&field.data_type, model, 0)
+            && type_size == field_size
+        {
+            proposed.push((name.clone(), offset, field_size, ty, field));
+        }
+    }
+    let mut spans = {
+        let defs = model
+            .types
+            .iter()
+            .map(|definition| (definition.id.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let TypeDefinitionKind::Struct { fields } = &model.types[index].kind else {
+            return;
+        };
+        fields
+            .iter()
+            .map(|field| {
+                let size = super::type_size(&field.ty, &defs, &mut BTreeSet::new(), 0)
+                    .ok()
+                    .flatten()?;
+                Some((
+                    field.name.clone(),
+                    field.offset_bytes,
+                    field.offset_bytes.checked_add(size)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    let Some(mut spans) = spans.take() else {
+        return;
+    };
+    let definition = &mut model.types[index];
+    let TypeDefinitionKind::Struct { fields } = &mut definition.kind else {
+        return;
+    };
+    for (name, offset, field_size, ty, source) in proposed {
+        let detail = imported_field_detail(source, &id);
+        let field_evidence = ModelEvidence {
+            source: ModelSource::GhidraAnalysis,
+            detail,
+            site: Some(site),
+        };
+        if let Some(existing_index) = spans.iter().position(|(old_name, start, end)| {
+            old_name == &name || *start < offset + field_size && offset < *end
+        }) {
+            let existing = &mut fields[existing_index];
+            if existing.name == name && existing.offset_bytes == offset && existing.ty == ty {
+                if !existing.evidence.contains(&field_evidence) && existing.evidence.len() < 256 {
+                    existing.evidence.push(field_evidence);
+                }
+            } else {
+                let mut evidence = existing
+                    .evidence
+                    .iter()
+                    .take(255)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                evidence.push(field_evidence);
+                let conflict = ModelConflict {
+                    subject: format!("type:{id}:field:{offset}"),
+                    detail: bounded_detail(format!(
+                        "retained model field {:?} at {} with type {:?}; Ghidra reports {:?} at {} with type {:?}",
+                        existing.name, existing.offset_bytes, existing.ty, name, offset, ty
+                    )),
+                    evidence,
+                };
+                if !model.conflicts.contains(&conflict) {
+                    model.conflicts.push(conflict);
+                }
+            }
+        } else if fields.len() < super::MAX_FIELDS {
+            fields.push(ModelField {
+                name: name.clone(),
+                offset_bytes: offset,
+                ty,
+                evidence: vec![field_evidence],
+            });
+            spans.push((name, offset, offset + field_size));
+        }
+    }
+    fields.sort_by_key(|field| field.offset_bytes);
+}
+
+fn imported_field_detail(field: &GhidraFieldEvidence, id: &str) -> String {
+    bounded_detail(format!(
+        "Ghidra imported struct {id} field {:?} at {} ({} bytes; type {:?})",
+        field.name, field.offset_bytes, field.size_bytes, field.data_type.display_name
+    ))
+}
+
+fn bounded_detail(mut detail: String) -> String {
+    if detail.len() > 4096 {
+        let mut end = 4096;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
 fn prototype_evidence(prototype: &GhidraFunctionPrototype, location: Location) -> ModelEvidence {
     let detail = serde_json::to_string(prototype)
         .ok()
@@ -372,6 +530,26 @@ pub fn import_ghidra_functions(
             .prototype
             .as_ref()
             .and_then(|prototype| model_prototype(prototype, &candidate, snapshot));
+        if mapped_prototype.is_some() {
+            if let Some(prototype) = &function.prototype
+                && matches!(
+                    prototype.signature_source.as_str(),
+                    "IMPORTED" | "USER_DEFINED"
+                )
+            {
+                if matches!(
+                    prototype.return_source.as_str(),
+                    "IMPORTED" | "USER_DEFINED"
+                ) {
+                    imported_struct_fields(&prototype.return_type, &mut candidate, location, 0);
+                }
+                for parameter in &prototype.parameters {
+                    if matches!(parameter.source_type.as_str(), "IMPORTED" | "USER_DEFINED") {
+                        imported_struct_fields(&parameter.data_type, &mut candidate, location, 0);
+                    }
+                }
+            }
+        }
         if function.prototype.is_some() && mapped_prototype.is_none() {
             unresolved_prototypes += 1;
         }
@@ -826,6 +1004,172 @@ mod tests {
                 name: PrimitiveType::I32
             }
         );
+    }
+
+    #[test]
+    fn imported_struct_field_refines_existing_type_and_preserves_conflict() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prototype.elf"
+        ));
+        let digest = "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f";
+        let mut snapshot = parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prototype_dwarf_v2.json"
+            )),
+            digest,
+        )
+        .unwrap();
+        let high = parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prototype_high_v2.json"
+            )),
+            digest,
+        )
+        .unwrap();
+        let node_pointer = high
+            .selected_function
+            .high_pcode
+            .as_ref()
+            .unwrap()
+            .operations
+            .iter()
+            .flat_map(|operation| operation.output.iter().chain(&operation.inputs))
+            .find(|node| node.ssa_id == 217 && node.high_name.as_deref() == Some("node"))
+            .unwrap()
+            .high_type
+            .clone()
+            .unwrap();
+        assert_eq!(node_pointer.target_type.as_ref().unwrap().fields.len(), 2);
+        snapshot
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "walk")
+            .unwrap()
+            .prototype
+            .as_mut()
+            .unwrap()
+            .parameters[0]
+            .data_type = node_pointer;
+
+        let mut model = init_model(bytes).unwrap();
+        import_dwarf(bytes, &mut model).unwrap();
+        let definition = model
+            .types
+            .iter_mut()
+            .find(|definition| definition.name.starts_with("Node_dwarf_"))
+            .unwrap();
+        let id = definition.id.clone();
+        let TypeDefinitionKind::Struct { fields } = &mut definition.kind else {
+            panic!("Node must be a struct");
+        };
+        fields.clear();
+        validate_model(bytes, &model).unwrap();
+        let empty = model.clone();
+
+        import_ghidra_functions(bytes, &mut model, &snapshot).unwrap();
+        let TypeDefinitionKind::Struct { fields } = &model
+            .types
+            .iter()
+            .find(|definition| definition.id == id)
+            .unwrap()
+            .kind
+        else {
+            unreachable!();
+        };
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "value");
+        assert_eq!(fields[0].offset_bytes, 0);
+        assert_eq!(
+            fields[0].ty,
+            TypeRef::Primitive {
+                name: PrimitiveType::I32
+            }
+        );
+        assert_eq!(fields[0].evidence[0].source, ModelSource::GhidraAnalysis);
+        let imported = model.clone();
+        import_ghidra_functions(bytes, &mut model, &snapshot).unwrap();
+        assert_eq!(model, imported);
+
+        let mut overlapping_snapshot = snapshot.clone();
+        overlapping_snapshot
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "walk")
+            .unwrap()
+            .prototype
+            .as_mut()
+            .unwrap()
+            .parameters[0]
+            .data_type
+            .target_type
+            .as_mut()
+            .unwrap()
+            .fields[1]
+            .offset_bytes = 0;
+        let mut ambiguous = empty.clone();
+        import_ghidra_functions(bytes, &mut ambiguous, &overlapping_snapshot).unwrap();
+        let TypeDefinitionKind::Struct { fields } = &ambiguous
+            .types
+            .iter()
+            .find(|definition| definition.id == id)
+            .unwrap()
+            .kind
+        else {
+            unreachable!();
+        };
+        assert!(fields.is_empty());
+
+        let mut conflicting = empty;
+        let TypeDefinitionKind::Struct { fields } = &mut conflicting
+            .types
+            .iter_mut()
+            .find(|definition| definition.id == id)
+            .unwrap()
+            .kind
+        else {
+            unreachable!();
+        };
+        fields.push(ModelField {
+            name: "value".to_owned(),
+            offset_bytes: 0,
+            ty: TypeRef::Primitive {
+                name: PrimitiveType::U32,
+            },
+            evidence: vec![ModelEvidence {
+                source: ModelSource::AnalystAssertion,
+                detail: "analyst field type".to_owned(),
+                site: None,
+            }],
+        });
+        import_ghidra_functions(bytes, &mut conflicting, &snapshot).unwrap();
+        let TypeDefinitionKind::Struct { fields } = &conflicting
+            .types
+            .iter()
+            .find(|definition| definition.id == id)
+            .unwrap()
+            .kind
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            fields[0].ty,
+            TypeRef::Primitive {
+                name: PrimitiveType::U32
+            }
+        );
+        assert!(conflicting.conflicts.iter().any(|conflict| {
+            conflict.subject == format!("type:{id}:field:0")
+                && conflict
+                    .evidence
+                    .iter()
+                    .any(|item| item.source == ModelSource::GhidraAnalysis)
+        }));
+        let first_conflict = conflicting.clone();
+        import_ghidra_functions(bytes, &mut conflicting, &snapshot).unwrap();
+        assert_eq!(conflicting, first_conflict);
     }
 
     #[test]
