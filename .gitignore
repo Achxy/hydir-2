@@ -2,6 +2,8 @@
 /fuzz/target/
 /fuzz/artifacts/
 /docs/*
+!/docs/HYDIR_LAUNCH_PLAN.md
+!/docs/HYDIR_CTF_WORKFLOW_PLAN.md
 !/docs/NATIVE_DECOMPILER.md
 !/docs/adr/
 /docs/adr/*
@@ -10,6 +12,7 @@
 !/docs/adr/0017-opaque-machine-effects.md
 !/docs/adr/0018-native-compatibility-boundary.md
 !/docs/adr/0019-llvm-is-an-export-format.md
+!/docs/adr/0020-ghidra-projects-primary-frontend.md
 *.swp
 .DS_Store
 __pycache__/
