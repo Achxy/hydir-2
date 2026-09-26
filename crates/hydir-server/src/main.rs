@@ -6607,7 +6607,7 @@ mod tests {
                     project_id: project.project_id.clone(),
                     expected_revision: saved.revision,
                     stage: "high_level_cfg_cir".to_owned(),
-                    function_selector: selector,
+                    function_selector: selector.clone(),
                 },
                 &token,
             ),
@@ -6617,6 +6617,27 @@ mod tests {
         .into_inner();
         let high_json: serde_json::Value = serde_json::from_slice(&high.content).unwrap();
         assert_eq!(high_json["model_revision"], edit.revision);
+        let typed = HydirV3::get_program_artifact(
+            &store,
+            authorized(
+                api_v3::ProgramArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: saved.revision,
+                    stage: "typed_c".to_owned(),
+                    function_selector: selector,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(typed.media_type, "text/x-c;view=typed");
+        assert!(
+            String::from_utf8(typed.content)
+                .unwrap()
+                .contains("analyst_renamed_function(")
+        );
         assert_eq!(
             HydirV3::get_analysis_model(
                 &store,
