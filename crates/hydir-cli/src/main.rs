@@ -258,6 +258,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "functions": snapshot.functions.len(),
                     "selected_function": snapshot.selected_function.entry,
                     "instructions": snapshot.selected_function.instructions.len(),
+                    "flow_edges": snapshot.selected_function.flow_edges.len(),
+                    "call_targets": snapshot.selected_function.call_targets.len(),
                 }))?
             );
         }
@@ -287,6 +289,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         "selected_function": ir.entry,
                         "instructions": ir.instructions.len(),
                         "pcode_operations": ir.instructions.iter().map(|instruction| instruction.pcode.len()).sum::<usize>(),
+                        "flow_edges": snapshot.selected_function.flow_edges.len(),
+                        "call_targets": snapshot.selected_function.call_targets.len(),
                         "semantic_fidelity": ir.semantic_fidelity,
                     }))?
                 );

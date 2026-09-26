@@ -28,7 +28,8 @@ shows the path on a 16-byte function.
 
 The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
 GUI the entry point for automatic Ghidra analysis. Opening a local ELF now starts
-a headless worker and imports a bounded raw P-code snapshot into Hydir. The
+a headless worker and imports a bounded raw P-code snapshot with flow and call
+evidence into Hydir. The
 default worker provisions a pinned container image; developers can set
 `HYDIR_GHIDRA_HOME` to use a local Ghidra 12.1.4 installation. Hydir also exposes
 Rust semantic classification and LLVM for a narrow exact operation subset.

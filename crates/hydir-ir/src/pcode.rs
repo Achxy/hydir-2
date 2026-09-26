@@ -95,11 +95,49 @@ pub struct GhidraFunctionIndexEntry {
     pub size: u64,
 }
 
+/// Ghidra's analyzed instruction flow, including overrides and references.
+/// A missing target is an unresolved flow, not a proven absent edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhidraFlowKind {
+    Fallthrough,
+    Branch,
+    Call,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraFlowEdge {
+    pub source: PcodeAddress,
+    pub target: Option<PcodeAddress>,
+    pub kind: GhidraFlowKind,
+    pub conditional: bool,
+    pub computed: bool,
+}
+
+/// Call evidence from Ghidra instruction flow; indirect calls may have both
+/// known candidate targets and an unresolved target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraCallTarget {
+    pub call_site: PcodeAddress,
+    pub target: Option<PcodeAddress>,
+    pub conditional: bool,
+    pub computed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GhidraSelectedFunction {
     pub entry: PcodeAddress,
     pub instructions: Vec<PcodeInstruction>,
+    /// Optional in v2; legacy snapshots without this evidence remain readable.
+    #[serde(default)]
+    pub flow_edges: Vec<GhidraFlowEdge>,
+    /// Optional in v2; derived from Ghidra's analyzed call flows.
+    #[serde(default)]
+    pub call_targets: Vec<GhidraCallTarget>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -272,6 +310,7 @@ pub fn validate_ghidra_snapshot(
         ));
     }
     let mut previous_instruction = None;
+    let mut instruction_addresses = BTreeSet::new();
     let mut operation_count = 0usize;
     for instruction in instructions {
         let address = offset(&instruction.address)?;
@@ -285,6 +324,7 @@ pub fn validate_ghidra_snapshot(
             return Err("Ghidra instructions must be strictly sorted by address".to_owned());
         }
         previous_instruction = Some(address);
+        instruction_addresses.insert((instruction.address.space.clone(), address));
         bounded_text(&instruction.mnemonic, "instruction mnemonic", 128)?;
         for bytes in [&instruction.bytes, &instruction.parsed_bytes] {
             if bytes.is_empty()
@@ -334,6 +374,60 @@ pub fn validate_ghidra_snapshot(
                     return Err("P-code input references an unknown address space".to_owned());
                 }
             }
+        }
+    }
+    if snapshot.selected_function.flow_edges.len() > MAX_OPERATIONS
+        || snapshot.selected_function.call_targets.len() > MAX_OPERATIONS
+    {
+        return Err("Ghidra flow or call evidence exceeds limit".to_owned());
+    }
+    let mut flow_keys = BTreeSet::new();
+    for edge in &snapshot.selected_function.flow_edges {
+        let source = (edge.source.space.clone(), offset(&edge.source)?);
+        if !instruction_addresses.contains(&source) {
+            return Err("Ghidra flow source is not a selected instruction".to_owned());
+        }
+        let target = match &edge.target {
+            Some(target) => {
+                let value = (target.space.clone(), offset(target)?);
+                if !space_names.contains(value.0.as_str()) {
+                    return Err("Ghidra flow target references an unknown address space".to_owned());
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        if edge.kind == GhidraFlowKind::Fallthrough && (edge.conditional || edge.computed) {
+            return Err("Ghidra fallthrough cannot be conditional or computed".to_owned());
+        }
+        if !flow_keys.insert((source, target, edge.kind, edge.conditional, edge.computed)) {
+            return Err("duplicate Ghidra flow edge".to_owned());
+        }
+    }
+    let mut call_keys = BTreeSet::new();
+    for call in &snapshot.selected_function.call_targets {
+        let source = (call.call_site.space.clone(), offset(&call.call_site)?);
+        if !instruction_addresses.contains(&source) {
+            return Err("Ghidra call site is not a selected instruction".to_owned());
+        }
+        let target = match &call.target {
+            Some(target) => {
+                let value = (target.space.clone(), offset(target)?);
+                if !space_names.contains(value.0.as_str()) {
+                    return Err("Ghidra call target references an unknown address space".to_owned());
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let key = (source, target, call.conditional, call.computed);
+        if !call_keys.insert(key.clone()) {
+            return Err("duplicate Ghidra call target".to_owned());
+        }
+        if !flow_keys.is_empty()
+            && !flow_keys.contains(&(key.0, key.1, GhidraFlowKind::Call, key.2, key.3))
+        {
+            return Err("Ghidra call target has no matching call flow edge".to_owned());
         }
     }
     Ok(())
@@ -422,5 +516,91 @@ mod tests {
                 .unwrap_err()
                 .contains("sequence")
         );
+    }
+
+    #[test]
+    fn optional_flow_and_call_evidence_is_validated_without_bumping_v2() {
+        let mut value = fixture();
+        let source = json!({"space": "ram", "offset": "0x401000"});
+        let target = json!({"space": "ram", "offset": "0x402000"});
+        value["selected_function"]["flow_edges"] = json!([{
+            "source": source, "target": target, "kind": "call",
+            "conditional": false, "computed": false
+        }]);
+        value["selected_function"]["call_targets"] = json!([{
+            "call_site": source, "target": target,
+            "conditional": false, "computed": false
+        }]);
+        let snapshot =
+            parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &"a".repeat(64)).unwrap();
+        assert_eq!(snapshot.schema_version, GHIDRA_SNAPSHOT_VERSION);
+        assert_eq!(snapshot.selected_function.flow_edges.len(), 1);
+        assert_eq!(snapshot.selected_function.call_targets.len(), 1);
+
+        let mut bad_source = value.clone();
+        bad_source["selected_function"]["flow_edges"][0]["source"]["offset"] = json!("0x401001");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&bad_source).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("flow source")
+        );
+
+        let mut bad_target = value.clone();
+        bad_target["selected_function"]["call_targets"][0]["target"]["space"] = json!("unknown");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&bad_target).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("call target")
+        );
+
+        let mut mismatch = value.clone();
+        mismatch["selected_function"]["call_targets"][0]["computed"] = json!(true);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&mismatch).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("matching call flow")
+        );
+
+        let mut duplicate = value.clone();
+        let edge = duplicate["selected_function"]["flow_edges"][0].clone();
+        duplicate["selected_function"]["flow_edges"] = json!([edge.clone(), edge]);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&duplicate).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("duplicate Ghidra flow")
+        );
+    }
+
+    #[test]
+    fn real_ghidra_call_fixture_keeps_call_and_fallthrough_separate() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prism_calls_flow_v2.json"
+        ));
+        let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
+        let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
+        assert_eq!(snapshot.selected_function.entry.offset, "0x2013a9");
+        let calls = &snapshot.selected_function.call_targets;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_site.offset, "0x2013ad");
+        assert_eq!(calls[0].target.as_ref().unwrap().offset, "0x2013a2");
+        assert!(!calls[0].computed);
+        let edges = &snapshot.selected_function.flow_edges;
+        assert!(edges.iter().any(|edge| {
+            edge.source.offset == "0x2013ad"
+                && edge.kind == GhidraFlowKind::Call
+                && edge
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.offset == "0x2013a2")
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.source.offset == "0x2013ad"
+                && edge.kind == GhidraFlowKind::Fallthrough
+                && edge
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.offset == "0x2013b2")
+        }));
     }
 }

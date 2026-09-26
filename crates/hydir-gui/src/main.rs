@@ -29,7 +29,7 @@ use hydir_core::{
 };
 use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, decompile_function_at, decompile_symbol,
-    discover_functions, measure_native_coverage,
+    discover_functions, emit_pcode_exact_operation_llvm, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
@@ -40,8 +40,8 @@ use hydir_hlc::{
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeEffect, PcodeSemanticFunctionIr, PcodeVarnode,
-    parse_ghidra_snapshot,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeEffect, PcodeSemanticFunctionIr,
+    PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -1858,6 +1858,52 @@ fn pcode_display_lines(
     lines
 }
 
+fn pcode_state_lines(state: &PcodeStateFunctionIr) -> Vec<(Option<u64>, String)> {
+    let mut lines = Vec::new();
+    for instruction in &state.instructions {
+        let address =
+            u64::from_str_radix(instruction.address.offset.trim_start_matches("0x"), 16).ok();
+        for (index, operation) in instruction.operations.iter().enumerate() {
+            let accesses = operation
+                .accesses
+                .iter()
+                .map(|access| {
+                    let ordinal = access
+                        .input_index
+                        .map_or(String::new(), |index| format!("{index}:"));
+                    format!(
+                        "{:?} {ordinal}{}:{}[{}]",
+                        access.kind,
+                        access.varnode.space,
+                        access.varnode.offset,
+                        access.varnode.size
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            let effect = match &operation.effect {
+                PcodeEffect::Assign { operation, .. } => format!("{operation:?}"),
+                PcodeEffect::Opaque { class, .. } => format!("opaque {class:?}"),
+            };
+            lines.push((
+                address,
+                format!(
+                    "{}:{} #{index} {:<20} {accesses}{}",
+                    instruction.address.space,
+                    instruction.address.offset,
+                    effect,
+                    if operation.may_clobber_unlisted_state {
+                        "  possible unlisted state clobber"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+    }
+    lines
+}
+
 fn run_triton_cli(path: &Path, symbol: &str) -> Result<serde_json::Value, String> {
     let path_text = path.display().to_string();
     let output = Command::new(hydirctl_path())
@@ -2849,6 +2895,9 @@ struct AnalystApp {
     ghidra_snapshot: Option<GhidraSnapshot>,
     ghidra_semantics: Option<PcodeSemanticFunctionIr>,
     ghidra_pcode_lines: Vec<(Option<u64>, String)>,
+    ghidra_state_lines: Vec<(Option<u64>, String)>,
+    ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
+    ghidra_llvm_operation: Option<String>,
     ghidra_busy: bool,
     pending_ghidra: Option<(PathBuf, String)>,
     symbol: Option<String>,
@@ -2970,6 +3019,9 @@ impl AnalystApp {
             ghidra_snapshot: None,
             ghidra_semantics: None,
             ghidra_pcode_lines: Vec::new(),
+            ghidra_state_lines: Vec::new(),
+            ghidra_exact_operations: Vec::new(),
+            ghidra_llvm_operation: None,
             ghidra_busy: false,
             pending_ghidra: None,
             symbol: None,
@@ -3140,6 +3192,9 @@ impl AnalystApp {
                     self.ghidra_snapshot = None;
                     self.ghidra_semantics = None;
                     self.ghidra_pcode_lines.clear();
+                    self.ghidra_state_lines.clear();
+                    self.ghidra_exact_operations.clear();
+                    self.ghidra_llvm_operation = None;
                     self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
@@ -3262,6 +3317,46 @@ impl AnalystApp {
                                 .map(|source| source.lower_semantics());
                             self.ghidra_pcode_lines =
                                 pcode_display_lines(&snapshot, self.ghidra_semantics.as_ref());
+                            self.ghidra_state_lines = self
+                                .ghidra_semantics
+                                .as_ref()
+                                .map(|semantic| pcode_state_lines(&semantic.lower_state()))
+                                .unwrap_or_default();
+                            self.ghidra_exact_operations = self
+                                .ghidra_semantics
+                                .as_ref()
+                                .map(|semantic| {
+                                    semantic
+                                        .instructions
+                                        .iter()
+                                        .enumerate()
+                                        .flat_map(|(instruction_index, instruction)| {
+                                            instruction
+                                                .operations
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, operation)| {
+                                                    matches!(
+                                                        operation.effect,
+                                                        PcodeEffect::Assign { .. }
+                                                    )
+                                                })
+                                                .map(move |(operation_index, _)| {
+                                                    let address = u64::from_str_radix(
+                                                        instruction
+                                                            .address
+                                                            .offset
+                                                            .trim_start_matches("0x"),
+                                                        16,
+                                                    )
+                                                    .ok();
+                                                    (instruction_index, operation_index, address)
+                                                })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            self.ghidra_llvm_operation = None;
                             self.ghidra_snapshot = Some(snapshot);
                             self.failure = None;
                         }
@@ -5353,6 +5448,72 @@ impl AnalystApp {
                     });
             }
         }
+        egui::CollapsingHeader::new(format!("Ordered state effects ({})", self.ghidra_state_lines.len()))
+            .id_salt("ghidra_ordered_state")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Reads and writes follow source P-code order. Possible effects and unlisted clobbers remain explicit.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Copy state effects").clicked() {
+                    ui.ctx().copy_text(self.ghidra_state_lines.iter()
+                        .map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n"));
+                }
+                egui::ScrollArea::both().id_salt("ghidra_ordered_state_rows")
+                    .max_height(180.0)
+                    .show_rows(ui, 18.0, self.ghidra_state_lines.len(), |ui, range| {
+                        for row in range {
+                            let (address, line) = &self.ghidra_state_lines[row];
+                            if ui.selectable_label(self.selected_address == *address,
+                                RichText::new(line).monospace().size(11.0)).clicked() {
+                                self.selected_address = *address;
+                            }
+                        }
+                    });
+            });
+        let mut selected_exact = None;
+        egui::CollapsingHeader::new(format!("LLVM for exact operations ({})", self.ghidra_exact_operations.len()))
+            .id_salt("ghidra_exact_llvm")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Each selection emits one P-code value operation. This is not a whole-function lift.")
+                    .size(11.0).color(MUTED));
+                egui::ScrollArea::vertical().id_salt("ghidra_exact_llvm_rows")
+                    .max_height(120.0)
+                    .show_rows(ui, 18.0, self.ghidra_exact_operations.len(), |ui, range| {
+                        for row in range {
+                            let (instruction_index, operation_index, address) = self.ghidra_exact_operations[row];
+                            if let Some(semantic) = self.ghidra_semantics.as_ref()
+                                && let Some(instruction) = semantic.instructions.get(instruction_index)
+                                && let Some(operation) = instruction.operations.get(operation_index) {
+                                let label = format!("{}:{}  #{} {}", instruction.address.space,
+                                    instruction.address.offset, operation_index, operation.source.mnemonic);
+                                if ui.selectable_label(self.selected_address == address,
+                                    RichText::new(label).monospace().size(11.0)).clicked() {
+                                    selected_exact = Some((instruction_index, operation_index, address));
+                                }
+                            }
+                        }
+                    });
+                if let Some(llvm) = &self.ghidra_llvm_operation {
+                    if ui.button("Copy LLVM operation").clicked() {
+                        ui.ctx().copy_text(llvm.clone());
+                    }
+                    egui::ScrollArea::both().id_salt("ghidra_exact_llvm_source")
+                        .max_height(180.0).show(ui, |ui| {
+                            ui.label(RichText::new(llvm).monospace().size(11.0));
+                        });
+                }
+            });
+        if let Some((instruction_index, operation_index, address)) = selected_exact {
+            self.selected_address = address;
+            self.ghidra_llvm_operation = self
+                .ghidra_semantics
+                .as_ref()
+                .and_then(|semantic| semantic.instructions.get(instruction_index))
+                .and_then(|instruction| instruction.operations.get(operation_index))
+                .map(|operation| {
+                    emit_pcode_exact_operation_llvm(operation)
+                        .unwrap_or_else(|error| format!("LLVM emission failed: {error}"))
+                });
+        }
         ui.separator();
         ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
         let mut requested = None;
@@ -5384,6 +5545,113 @@ impl AnalystApp {
                     }
                 }
             });
+        if !snapshot.selected_function.call_targets.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Calls ({})",
+                snapshot.selected_function.call_targets.len()
+            ))
+            .id_salt("ghidra_call_targets")
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_call_rows")
+                    .max_height(120.0)
+                    .show_rows(
+                        ui,
+                        22.0,
+                        snapshot.selected_function.call_targets.len(),
+                        |ui, range| {
+                            for row in range {
+                                let call = &snapshot.selected_function.call_targets[row];
+                                let source = u64::from_str_radix(
+                                    call.call_site.offset.trim_start_matches("0x"),
+                                    16,
+                                )
+                                .ok();
+                                let target = call
+                                    .target
+                                    .as_ref()
+                                    .map(|address| format!("{}:{}", address.space, address.offset))
+                                    .unwrap_or_else(|| "unresolved target".to_owned());
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_address == source,
+                                            format!(
+                                                "{}:{} → {target}{}",
+                                                call.call_site.space,
+                                                call.call_site.offset,
+                                                if call.computed { " (computed)" } else { "" }
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_address = source;
+                                    }
+                                    if let Some(target) = &call.target
+                                        && snapshot
+                                            .functions
+                                            .iter()
+                                            .any(|function| function.entry == *target)
+                                        && ui.button("Open target").clicked()
+                                    {
+                                        requested = Some(target.offset.clone());
+                                    }
+                                });
+                            }
+                        },
+                    );
+            });
+        }
+        if !snapshot.selected_function.flow_edges.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Analyzed flow edges ({})",
+                snapshot.selected_function.flow_edges.len()
+            ))
+            .id_salt("ghidra_flow_edges")
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_flow_rows")
+                    .max_height(120.0)
+                    .show_rows(
+                        ui,
+                        18.0,
+                        snapshot.selected_function.flow_edges.len(),
+                        |ui, range| {
+                            for row in range {
+                                let edge = &snapshot.selected_function.flow_edges[row];
+                                let source = u64::from_str_radix(
+                                    edge.source.offset.trim_start_matches("0x"),
+                                    16,
+                                )
+                                .ok();
+                                let target = edge
+                                    .target
+                                    .as_ref()
+                                    .map(|address| format!("{}:{}", address.space, address.offset))
+                                    .unwrap_or_else(|| "unresolved".to_owned());
+                                if ui
+                                    .selectable_label(
+                                        self.selected_address == source,
+                                        RichText::new(format!(
+                                            "{}:{} → {target}  {:?}{}{}",
+                                            edge.source.space,
+                                            edge.source.offset,
+                                            edge.kind,
+                                            if edge.conditional { " conditional" } else { "" },
+                                            if edge.computed { " computed" } else { "" }
+                                        ))
+                                        .monospace()
+                                        .size(11.0),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_address = source;
+                                }
+                            }
+                        },
+                    );
+            });
+        }
         let selected_name = snapshot
             .functions
             .iter()
@@ -9754,8 +10022,9 @@ mod tests {
         AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
         WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address, indexed_function_action,
         ir_slice, local_region_artifacts, native_function_excerpt, native_instruction_count,
-        native_opaque_instruction_count, pcode_display_lines, preview_patch_local,
-        resized_console_height, valid_bearer_token, validate_endpoint, workbench_graph_layout,
+        native_opaque_instruction_count, pcode_display_lines, pcode_state_lines,
+        preview_patch_local, resized_console_height, valid_bearer_token, validate_endpoint,
+        workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -9784,6 +10053,18 @@ mod tests {
         );
         assert!(lines.iter().any(|(_, line)| line.contains("[exact ")));
         assert!(lines.iter().any(|(_, line)| line.contains("[opaque:")));
+        let state_lines = pcode_state_lines(&semantics.lower_state());
+        assert!(
+            state_lines
+                .iter()
+                .any(|(address, line)| *address == Some(0x20137c)
+                    && line.contains("Read 0:register:"))
+        );
+        assert!(
+            state_lines
+                .iter()
+                .any(|(_, line)| line.contains("MayWrite"))
+        );
         assert!(
             semantics
                 .instructions
