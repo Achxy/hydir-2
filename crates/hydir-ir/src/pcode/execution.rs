@@ -1,4 +1,4 @@
-//! Concrete execution of a bounded, ordered prefix of supported raw P-code.
+//! Concrete execution of a bounded raw P-code prefix or one selected path.
 //!
 //! Varnodes are byte ranges in named address spaces, as described in Ghidra's
 //! P-Code Reference Manual (https://ghidra.re/ghidra_docs/languages/html/pcoderef.html).
@@ -9,15 +9,16 @@
 //! appear as P-code operations; this executor does not invent it. Unique-space
 //! temporaries are cleared at each machine-instruction boundary.
 //!
-//! The trace follows the listed instruction order only until the first opaque
-//! or unavailable effect. It does not prove a CFG path, a complete function,
-//! or equivalence with the original machine instructions.
+//! The prefix trace follows listed instruction order. The path trace follows
+//! raw branch targets and analyzed fallthrough edges. Both stop at the first
+//! opaque or unavailable effect. Neither proves a complete function or
+//! equivalence with the original machine instructions.
 
 use super::semantics::lower_operation;
 use super::{
-    GhidraAddressSpace, PCODE_SEMANTIC_IR_VERSION, PcodeAddress, PcodeEffect, PcodeFunctionIr,
-    PcodeOpaqueClass, PcodeOperation, PcodeSemanticFunctionIr, PcodeSemanticOperation,
-    PcodeVarnode, hex_u64,
+    GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PCODE_SEMANTIC_IR_VERSION, PcodeAddress,
+    PcodeEffect, PcodeFunctionIr, PcodeOpaqueClass, PcodeOperation, PcodeSemanticFunctionIr,
+    PcodeSemanticOperation, PcodeVarnode, hex_u64, validate_ghidra_snapshot,
 };
 use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -172,6 +173,21 @@ fn checked_range(node: &PcodeVarnode) -> Result<u64, String> {
     Ok(offset)
 }
 
+/// Ghidra stores a P-code-relative branch displacement in the constant
+/// varnode's offset, masked to its declared width by PcodeEmit. Interpret that
+/// width as signed before adding it to the current operation index.
+fn signed_relative_pcode_offset(node: &PcodeVarnode) -> Result<i64, String> {
+    if node.space != "const" || !(1..=8).contains(&node.size) {
+        return Err("relative P-code target requires a 1..=8 byte constant".to_owned());
+    }
+    let raw = hex_u64(&node.offset)?;
+    let shift = 64 - node.size * 8;
+    if raw > (u64::MAX >> shift) {
+        return Err("relative P-code target exceeds its declared width".to_owned());
+    }
+    Ok(((raw << shift) as i64) >> shift)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PcodeMemoryAccessKind {
@@ -253,6 +269,112 @@ pub struct PcodeExecutionTrace {
     pub executed: Vec<PcodeExecutedOperation>,
     pub final_state: PcodeConcreteState,
     pub stop: PcodeExecutionStop,
+    pub semantic_fidelity: SemanticFidelity,
+    pub verification: VerificationStatus,
+}
+
+pub const PCODE_PATH_TRACE_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PcodePathBranchKind {
+    Branch,
+    ConditionalBranch,
+    IndirectBranch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PcodePathDestination {
+    /// A constant-space branch target or a conditional branch's next op.
+    IntraInstruction {
+        instruction: PcodeAddress,
+        sequence_index: u32,
+    },
+    Instruction {
+        address: PcodeAddress,
+    },
+    /// The condition was false at the end of this instruction; the next loop
+    /// iteration must resolve its analyzed fallthrough edge.
+    FallthroughPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PcodePathEvent {
+    Effect {
+        operation: PcodeExecutedOperation,
+    },
+    Branch {
+        source: PcodeOperation,
+        branch_kind: PcodePathBranchKind,
+        taken: Option<bool>,
+        destination: PcodePathDestination,
+    },
+    Fallthrough {
+        source: PcodeAddress,
+        target: PcodeAddress,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PcodePathStop {
+    Call {
+        source: PcodeOperation,
+    },
+    Return {
+        source: PcodeOperation,
+    },
+    UnknownCondition {
+        source: PcodeOperation,
+        varnode: PcodeVarnode,
+    },
+    UnknownIndirectTarget {
+        source: PcodeOperation,
+        varnode: PcodeVarnode,
+    },
+    MalformedTarget {
+        source: PcodeOperation,
+        reason: String,
+    },
+    TargetNotSelected {
+        source: PcodeOperation,
+        target: PcodeAddress,
+    },
+    FallthroughTargetNotSelected {
+        source: PcodeAddress,
+        target: PcodeAddress,
+    },
+    UnresolvedFallthrough {
+        source: PcodeAddress,
+    },
+    AmbiguousFallthrough {
+        source: PcodeAddress,
+    },
+    EffectBoundary {
+        boundary: PcodeExecutionStop,
+    },
+    OperationBudget {
+        next: PcodeOperation,
+    },
+    VisitBudget {
+        next_instruction: PcodeAddress,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodePathTrace {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub start: PcodeAddress,
+    /// Each machine-instruction entry is recorded, including revisits.
+    pub instruction_visits: Vec<PcodeAddress>,
+    /// Effects and control transitions in concrete execution order.
+    pub events: Vec<PcodePathEvent>,
+    pub final_state: PcodeConcreteState,
+    pub stop: PcodePathStop,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
 }
@@ -543,31 +665,90 @@ impl PcodeSemanticFunctionIr {
             }),
         })
     }
-}
 
-impl PcodeFunctionIr {
-    /// Execute an ordered exact prefix from raw P-code. The state is cloned;
-    /// the caller's seed is never partially mutated on an opaque boundary.
-    pub fn execute_exact_prefix(
+    fn execute_effect_operation(
         &self,
-        initial_state: &PcodeConcreteState,
-        max_operations: usize,
-    ) -> Result<PcodeExecutionTrace, String> {
-        self.lower_semantics()
-            .execute_exact_prefix(initial_state, max_operations)
+        operation: &PcodeSemanticOperation,
+        state: &mut PcodeConcreteState,
+    ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
+        let source = &operation.source;
+        if source.inputs.len() > 256 || lower_operation(source) != operation.effect {
+            return Err(Box::new(PcodeExecutionStop::InvalidOperation {
+                source: source.clone(),
+                reason: "exact operation disagrees with bounded raw P-code semantics".to_owned(),
+            }));
+        }
+        if let PcodeEffect::Opaque { class, .. } = &operation.effect {
+            if matches!(
+                class,
+                PcodeOpaqueClass::MemoryRead | PcodeOpaqueClass::MemoryWrite
+            ) {
+                return self.execute_memory_operation(operation, state);
+            }
+            return Err(Box::new(PcodeExecutionStop::OpaqueBoundary {
+                source: source.clone(),
+                effect: operation.effect.clone(),
+            }));
+        }
+        let mut input_values = Vec::with_capacity(source.inputs.len());
+        for (index, varnode) in source.inputs.iter().enumerate() {
+            match state.read_varnode(varnode) {
+                Ok(Some(value)) => input_values.push(value),
+                Ok(None) => {
+                    return Err(Box::new(PcodeExecutionStop::MissingInput {
+                        source: source.clone(),
+                        input_index: index as u32,
+                        varnode: varnode.clone(),
+                    }));
+                }
+                Err(reason) => {
+                    return Err(Box::new(PcodeExecutionStop::InvalidOperation {
+                        source: source.clone(),
+                        reason,
+                    }));
+                }
+            }
+        }
+        let value = match operation.evaluate_exact(&input_values) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return Err(Box::new(PcodeExecutionStop::InvalidOperation {
+                    source: source.clone(),
+                    reason: "exact operation returned no concrete result".to_owned(),
+                }));
+            }
+            Err(reason) => {
+                return Err(Box::new(PcodeExecutionStop::InvalidOperation {
+                    source: source.clone(),
+                    reason,
+                }));
+            }
+        };
+        let Some(output) = &source.output else {
+            return Err(Box::new(PcodeExecutionStop::InvalidOperation {
+                source: source.clone(),
+                reason: "exact operation has no output varnode".to_owned(),
+            }));
+        };
+        state.write_varnode(output, value).map_err(|reason| {
+            Box::new(PcodeExecutionStop::InvalidOperation {
+                source: source.clone(),
+                reason,
+            })
+        })?;
+        Ok(PcodeExecutedOperation {
+            source: source.clone(),
+            input_values,
+            output_value: Some(value),
+            memory_access: None,
+        })
     }
-}
 
-impl PcodeSemanticFunctionIr {
-    /// Execute individually validated exact operations and concrete RAM
-    /// LOAD/STORE effects. Unknown memory aliases, unknown bytes, control,
-    /// unsupported, invalid, and unavailable-input operations stop before
-    /// changing state.
-    pub fn execute_exact_prefix(
+    fn validate_execution_setup(
         &self,
         initial_state: &PcodeConcreteState,
         max_operations: usize,
-    ) -> Result<PcodeExecutionTrace, String> {
+    ) -> Result<(), String> {
         if self.schema_version != PCODE_SEMANTIC_IR_VERSION
             || self.source != "ghidra_raw_pcode"
             || !self.flow_overrides_applied
@@ -605,6 +786,394 @@ impl PcodeSemanticFunctionIr {
         if initial_state.known_byte_count() > MAX_KNOWN_STATE_BYTES {
             return Err("initial concrete P-code state exceeds byte limit".to_owned());
         }
+        Ok(())
+    }
+}
+
+impl GhidraSnapshot {
+    /// Execute one concrete path through the selected function's raw P-code.
+    /// Direct targets come from the P-code operation; analyzed fallthrough
+    /// edges are required when execution reaches the end of an instruction.
+    /// This is a bounded trace of seeded state, never a completeness or
+    /// machine-code equivalence claim.
+    pub fn execute_concrete_path(
+        &self,
+        initial_state: &PcodeConcreteState,
+        start: Option<&PcodeAddress>,
+        max_operations: usize,
+        max_instruction_visits: usize,
+    ) -> Result<PcodePathTrace, String> {
+        validate_ghidra_snapshot(self, &self.binary_sha256)?;
+        if max_instruction_visits > super::MAX_OPERATIONS {
+            return Err("P-code path visit budget exceeds artifact limit".to_owned());
+        }
+        let semantic = self.pcode_function_ir()?.lower_semantics();
+        semantic.validate_execution_setup(initial_state, max_operations)?;
+
+        let mut instruction_index = BTreeMap::new();
+        for (index, instruction) in semantic.instructions.iter().enumerate() {
+            let key = (
+                instruction.address.space.clone(),
+                hex_u64(&instruction.address.offset)?,
+            );
+            instruction_index.insert(key, index);
+        }
+        let start = start.unwrap_or(&self.selected_function.entry).clone();
+        let start_key = (start.space.clone(), hex_u64(&start.offset)?);
+        let Some(mut current_instruction) = instruction_index.get(&start_key).copied() else {
+            return Err("P-code path start is not a selected instruction".to_owned());
+        };
+
+        let mut fallthroughs =
+            vec![Vec::<Option<PcodeAddress>>::new(); semantic.instructions.len()];
+        for edge in &self.selected_function.flow_edges {
+            if edge.kind == GhidraFlowKind::Fallthrough {
+                let key = (edge.source.space.clone(), hex_u64(&edge.source.offset)?);
+                let source_index = instruction_index[&key];
+                fallthroughs[source_index].push(edge.target.clone());
+            }
+        }
+
+        let mut final_state = initial_state.clone();
+        let mut events = Vec::new();
+        let mut instruction_visits = Vec::new();
+        let mut operation_count = 0usize;
+        let mut current_operation = 0usize;
+        let mut entering_instruction = true;
+        let stop = 'path: loop {
+            let instruction = &semantic.instructions[current_instruction];
+            if entering_instruction {
+                if instruction_visits.len() >= max_instruction_visits {
+                    break PcodePathStop::VisitBudget {
+                        next_instruction: instruction.address.clone(),
+                    };
+                }
+                instruction_visits.push(instruction.address.clone());
+                final_state.clear_unique();
+                entering_instruction = false;
+            }
+            if current_operation == instruction.operations.len() {
+                let target = match fallthroughs[current_instruction].as_slice() {
+                    [] | [None] => {
+                        break PcodePathStop::UnresolvedFallthrough {
+                            source: instruction.address.clone(),
+                        };
+                    }
+                    [Some(target)] => target,
+                    _ => {
+                        break PcodePathStop::AmbiguousFallthrough {
+                            source: instruction.address.clone(),
+                        };
+                    }
+                };
+                let key = (target.space.clone(), hex_u64(&target.offset)?);
+                let Some(next_instruction) = instruction_index.get(&key).copied() else {
+                    break PcodePathStop::FallthroughTargetNotSelected {
+                        source: instruction.address.clone(),
+                        target: target.clone(),
+                    };
+                };
+                events.push(PcodePathEvent::Fallthrough {
+                    source: instruction.address.clone(),
+                    target: target.clone(),
+                });
+                current_instruction = next_instruction;
+                current_operation = 0;
+                entering_instruction = true;
+                continue;
+            }
+
+            let operation = &instruction.operations[current_operation];
+            let source = &operation.source;
+            if operation_count >= max_operations {
+                break PcodePathStop::OperationBudget {
+                    next: source.clone(),
+                };
+            }
+            match source.opcode {
+                4 | 5 => {
+                    let conditional = source.opcode == 5;
+                    let mnemonic = if conditional { "CBRANCH" } else { "BRANCH" };
+                    if source.mnemonic != mnemonic
+                        || source.output.is_some()
+                        || source.inputs.len() != if conditional { 2 } else { 1 }
+                    {
+                        break PcodePathStop::MalformedTarget {
+                            source: source.clone(),
+                            reason: "invalid direct branch opcode, mnemonic, output or arity"
+                                .to_owned(),
+                        };
+                    }
+                    let taken = if conditional {
+                        let condition = &source.inputs[1];
+                        if condition.size != 1 {
+                            break PcodePathStop::MalformedTarget {
+                                source: source.clone(),
+                                reason: "CBRANCH condition must be one byte".to_owned(),
+                            };
+                        }
+                        match final_state.read_varnode(condition) {
+                            Ok(Some(value)) => value != 0,
+                            Ok(None) => {
+                                break PcodePathStop::UnknownCondition {
+                                    source: source.clone(),
+                                    varnode: condition.clone(),
+                                };
+                            }
+                            Err(reason) => {
+                                break PcodePathStop::MalformedTarget {
+                                    source: source.clone(),
+                                    reason,
+                                };
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    if !taken {
+                        let destination = if current_operation + 1 < instruction.operations.len() {
+                            PcodePathDestination::IntraInstruction {
+                                instruction: instruction.address.clone(),
+                                sequence_index: (current_operation + 1) as u32,
+                            }
+                        } else {
+                            PcodePathDestination::FallthroughPending
+                        };
+                        events.push(PcodePathEvent::Branch {
+                            source: source.clone(),
+                            branch_kind: PcodePathBranchKind::ConditionalBranch,
+                            taken: Some(false),
+                            destination,
+                        });
+                        operation_count += 1;
+                        current_operation += 1;
+                        continue;
+                    }
+                    let target_node = &source.inputs[0];
+                    let (destination, next_instruction, next_operation, next_is_entry) =
+                        if target_node.space == "const" {
+                            // The encoded constant is a signed displacement
+                            // in this instruction's P-code operation list.
+                            let delta = match signed_relative_pcode_offset(target_node) {
+                                Ok(value) => value,
+                                Err(reason) => {
+                                    break PcodePathStop::MalformedTarget {
+                                        source: source.clone(),
+                                        reason,
+                                    };
+                                }
+                            };
+                            let Some(target_index) = (current_operation as i64).checked_add(delta)
+                            else {
+                                break PcodePathStop::MalformedTarget {
+                                    source: source.clone(),
+                                    reason: "relative P-code branch index overflows".to_owned(),
+                                };
+                            };
+                            if target_index < 0
+                                || target_index as usize >= instruction.operations.len()
+                            {
+                                break PcodePathStop::MalformedTarget {
+                                    source: source.clone(),
+                                    reason:
+                                        "relative P-code branch target is outside its instruction"
+                                            .to_owned(),
+                                };
+                            }
+                            (
+                                PcodePathDestination::IntraInstruction {
+                                    instruction: instruction.address.clone(),
+                                    sequence_index: target_index as u32,
+                                },
+                                current_instruction,
+                                target_index as usize,
+                                false,
+                            )
+                        } else {
+                            let target = PcodeAddress {
+                                space: target_node.space.clone(),
+                                offset: target_node.offset.clone(),
+                            };
+                            let key = (target.space.clone(), hex_u64(&target.offset)?);
+                            let Some(next_instruction) = instruction_index.get(&key).copied()
+                            else {
+                                break PcodePathStop::TargetNotSelected {
+                                    source: source.clone(),
+                                    target,
+                                };
+                            };
+                            (
+                                PcodePathDestination::Instruction { address: target },
+                                next_instruction,
+                                0,
+                                true,
+                            )
+                        };
+                    events.push(PcodePathEvent::Branch {
+                        source: source.clone(),
+                        branch_kind: if conditional {
+                            PcodePathBranchKind::ConditionalBranch
+                        } else {
+                            PcodePathBranchKind::Branch
+                        },
+                        taken: conditional.then_some(true),
+                        destination,
+                    });
+                    operation_count += 1;
+                    current_instruction = next_instruction;
+                    current_operation = next_operation;
+                    entering_instruction = next_is_entry;
+                }
+                6 => {
+                    if source.mnemonic != "BRANCHIND"
+                        || source.output.is_some()
+                        || source.inputs.len() != 1
+                    {
+                        break PcodePathStop::MalformedTarget {
+                            source: source.clone(),
+                            reason: "invalid indirect branch opcode, mnemonic, output or arity"
+                                .to_owned(),
+                        };
+                    }
+                    let pointer = &source.inputs[0];
+                    let Some(space) = semantic
+                        .address_spaces
+                        .iter()
+                        .find(|space| space.name == instruction.address.space)
+                    else {
+                        break PcodePathStop::MalformedTarget {
+                            source: source.clone(),
+                            reason: "branch instruction address space is unknown".to_owned(),
+                        };
+                    };
+                    if space.pointer_size == 0
+                        || space.pointer_size > 8
+                        || pointer.size != space.pointer_size
+                    {
+                        break PcodePathStop::MalformedTarget {
+                            source: source.clone(),
+                            reason:
+                                "BRANCHIND input width differs from address-space pointer width"
+                                    .to_owned(),
+                        };
+                    }
+                    let value = match final_state.read_varnode(pointer) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            break PcodePathStop::UnknownIndirectTarget {
+                                source: source.clone(),
+                                varnode: pointer.clone(),
+                            };
+                        }
+                        Err(reason) => {
+                            break PcodePathStop::MalformedTarget {
+                                source: source.clone(),
+                                reason,
+                            };
+                        }
+                    };
+                    let target = PcodeAddress {
+                        space: instruction.address.space.clone(),
+                        offset: format!("0x{value:x}"),
+                    };
+                    let key = (target.space.clone(), value);
+                    let Some(next_instruction) = instruction_index.get(&key).copied() else {
+                        break PcodePathStop::TargetNotSelected {
+                            source: source.clone(),
+                            target,
+                        };
+                    };
+                    events.push(PcodePathEvent::Branch {
+                        source: source.clone(),
+                        branch_kind: PcodePathBranchKind::IndirectBranch,
+                        taken: None,
+                        destination: PcodePathDestination::Instruction { address: target },
+                    });
+                    operation_count += 1;
+                    current_instruction = next_instruction;
+                    current_operation = 0;
+                    entering_instruction = true;
+                }
+                7 | 8 | 10 => {
+                    let mnemonic = match source.opcode {
+                        7 => "CALL",
+                        8 => "CALLIND",
+                        _ => "RETURN",
+                    };
+                    if source.mnemonic != mnemonic
+                        || source.output.is_some()
+                        || source.inputs.len() != 1
+                    {
+                        break PcodePathStop::MalformedTarget {
+                            source: source.clone(),
+                            reason: "invalid call or return opcode, mnemonic, output or arity"
+                                .to_owned(),
+                        };
+                    }
+                    break if source.opcode == 10 {
+                        PcodePathStop::Return {
+                            source: source.clone(),
+                        }
+                    } else {
+                        PcodePathStop::Call {
+                            source: source.clone(),
+                        }
+                    };
+                }
+                _ => match semantic.execute_effect_operation(operation, &mut final_state) {
+                    Ok(executed) => {
+                        events.push(PcodePathEvent::Effect {
+                            operation: executed,
+                        });
+                        operation_count += 1;
+                        current_operation += 1;
+                    }
+                    Err(boundary) => {
+                        break 'path PcodePathStop::EffectBoundary {
+                            boundary: *boundary,
+                        };
+                    }
+                },
+            }
+        };
+        Ok(PcodePathTrace {
+            schema_version: PCODE_PATH_TRACE_VERSION,
+            binary_sha256: self.binary_sha256.clone(),
+            start,
+            instruction_visits,
+            events,
+            final_state,
+            stop,
+            semantic_fidelity: SemanticFidelity::Unknown,
+            verification: VerificationStatus::NotRun,
+        })
+    }
+}
+
+impl PcodeFunctionIr {
+    /// Execute an ordered exact prefix from raw P-code. The state is cloned;
+    /// the caller's seed is never partially mutated on an opaque boundary.
+    pub fn execute_exact_prefix(
+        &self,
+        initial_state: &PcodeConcreteState,
+        max_operations: usize,
+    ) -> Result<PcodeExecutionTrace, String> {
+        self.lower_semantics()
+            .execute_exact_prefix(initial_state, max_operations)
+    }
+}
+
+impl PcodeSemanticFunctionIr {
+    /// Execute individually validated exact operations and concrete RAM
+    /// LOAD/STORE effects. Unknown memory aliases, unknown bytes, control,
+    /// unsupported, invalid, and unavailable-input operations stop before
+    /// changing state.
+    pub fn execute_exact_prefix(
+        &self,
+        initial_state: &PcodeConcreteState,
+        max_operations: usize,
+    ) -> Result<PcodeExecutionTrace, String> {
+        self.validate_execution_setup(initial_state, max_operations)?;
         let mut final_state = initial_state.clone();
         let mut executed = Vec::new();
         let mut stop = PcodeExecutionStop::EndOfListedInstructions;
@@ -618,94 +1187,13 @@ impl PcodeSemanticFunctionIr {
                     };
                     break 'instructions;
                 }
-                if source.inputs.len() > 256 || lower_operation(source) != operation.effect {
-                    stop = PcodeExecutionStop::InvalidOperation {
-                        source: source.clone(),
-                        reason: "exact operation disagrees with bounded raw P-code semantics"
-                            .to_owned(),
-                    };
-                    break 'instructions;
-                }
-                if let PcodeEffect::Opaque { class, .. } = &operation.effect {
-                    if matches!(
-                        class,
-                        PcodeOpaqueClass::MemoryRead | PcodeOpaqueClass::MemoryWrite
-                    ) {
-                        match self.execute_memory_operation(operation, &mut final_state) {
-                            Ok(step) => {
-                                executed.push(step);
-                                continue;
-                            }
-                            Err(boundary) => {
-                                stop = *boundary;
-                                break 'instructions;
-                            }
-                        }
-                    }
-                    stop = PcodeExecutionStop::OpaqueBoundary {
-                        source: source.clone(),
-                        effect: operation.effect.clone(),
-                    };
-                    break 'instructions;
-                }
-                let mut input_values = Vec::with_capacity(source.inputs.len());
-                for (index, varnode) in source.inputs.iter().enumerate() {
-                    match final_state.read_varnode(varnode) {
-                        Ok(Some(value)) => input_values.push(value),
-                        Ok(None) => {
-                            stop = PcodeExecutionStop::MissingInput {
-                                source: source.clone(),
-                                input_index: index as u32,
-                                varnode: varnode.clone(),
-                            };
-                            break 'instructions;
-                        }
-                        Err(reason) => {
-                            stop = PcodeExecutionStop::InvalidOperation {
-                                source: source.clone(),
-                                reason,
-                            };
-                            break 'instructions;
-                        }
-                    }
-                }
-                let value = match operation.evaluate_exact(&input_values) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => {
-                        stop = PcodeExecutionStop::InvalidOperation {
-                            source: source.clone(),
-                            reason: "exact operation returned no concrete result".to_owned(),
-                        };
+                match self.execute_effect_operation(operation, &mut final_state) {
+                    Ok(step) => executed.push(step),
+                    Err(boundary) => {
+                        stop = *boundary;
                         break 'instructions;
                     }
-                    Err(reason) => {
-                        stop = PcodeExecutionStop::InvalidOperation {
-                            source: source.clone(),
-                            reason,
-                        };
-                        break 'instructions;
-                    }
-                };
-                let Some(output) = &source.output else {
-                    stop = PcodeExecutionStop::InvalidOperation {
-                        source: source.clone(),
-                        reason: "exact operation has no output varnode".to_owned(),
-                    };
-                    break 'instructions;
-                };
-                if let Err(reason) = final_state.write_varnode(output, value) {
-                    stop = PcodeExecutionStop::InvalidOperation {
-                        source: source.clone(),
-                        reason,
-                    };
-                    break 'instructions;
                 }
-                executed.push(PcodeExecutedOperation {
-                    source: source.clone(),
-                    input_values,
-                    output_value: Some(value),
-                    memory_access: None,
-                });
             }
         }
         Ok(PcodeExecutionTrace {
@@ -794,6 +1282,333 @@ mod tests {
             .unwrap()
             .pcode_function_ir()
             .unwrap()
+    }
+
+    fn real_branch_snapshot() -> GhidraSnapshot {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
+        ));
+        parse_ghidra_snapshot(
+            bytes,
+            "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
+        )
+        .unwrap()
+    }
+
+    fn single_instruction_snapshot(mut pcode: Vec<PcodeOperation>) -> GhidraSnapshot {
+        let mut snapshot = real_branch_snapshot();
+        let instruction = &mut snapshot.selected_function.instructions[0];
+        for (index, operation) in pcode.iter_mut().enumerate() {
+            operation.sequence_index = index as u32;
+            operation.sequence_time = index as i32;
+            operation.source_address = instruction.address.clone();
+        }
+        instruction.pcode = pcode;
+        snapshot.selected_function.instructions.truncate(1);
+        snapshot.selected_function.flow_edges.clear();
+        snapshot
+    }
+
+    #[test]
+    fn real_ghidra_conditional_branch_takes_both_concrete_paths() {
+        let snapshot = real_branch_snapshot();
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&node("register", "0x0", 8), 0).unwrap();
+        seed.write_varnode(&node("register", "0x20", 8), 0x1000)
+            .unwrap();
+        seed.write_memory("ram", 0x1000, 8, 0xdead).unwrap();
+        let branch = address("0x2013d9");
+
+        seed.write_varnode(&node("register", "0x206", 1), 1)
+            .unwrap();
+        let taken = snapshot
+            .execute_concrete_path(&seed, Some(&branch), 16, 8)
+            .unwrap();
+        assert_eq!(
+            taken.instruction_visits,
+            vec![branch.clone(), address("0x2013e2")]
+        );
+        assert!(matches!(taken.stop, PcodePathStop::Return { .. }));
+        assert!(matches!(
+            taken.events[0],
+            PcodePathEvent::Branch {
+                taken: Some(true),
+                branch_kind: PcodePathBranchKind::ConditionalBranch,
+                ..
+            }
+        ));
+        assert_eq!(
+            taken
+                .final_state
+                .read_varnode(&node("register", "0x0", 8))
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(taken.semantic_fidelity, SemanticFidelity::Unknown);
+
+        seed.write_varnode(&node("register", "0x206", 1), 0)
+            .unwrap();
+        let not_taken = snapshot
+            .execute_concrete_path(&seed, Some(&branch), 16, 8)
+            .unwrap();
+        assert_eq!(
+            not_taken.instruction_visits,
+            vec![branch, address("0x2013db"), address("0x2013e2")]
+        );
+        assert!(matches!(not_taken.stop, PcodePathStop::Return { .. }));
+        assert!(matches!(
+            not_taken.events[0],
+            PcodePathEvent::Branch {
+                taken: Some(false),
+                ..
+            }
+        ));
+        assert_eq!(
+            not_taken
+                .final_state
+                .read_varnode(&node("register", "0x0", 8))
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn path_stops_at_unknown_condition_or_effect_before_control() {
+        let snapshot = real_branch_snapshot();
+        let branch = snapshot
+            .execute_concrete_path(
+                &PcodeConcreteState::default(),
+                Some(&address("0x2013d9")),
+                8,
+                8,
+            )
+            .unwrap();
+        assert!(matches!(
+            branch.stop,
+            PcodePathStop::UnknownCondition { .. }
+        ));
+        assert!(branch.events.is_empty());
+
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&node("register", "0x38", 8), 5).unwrap();
+        seed.write_varnode(&node("register", "0x30", 8), 1).unwrap();
+        let entry = snapshot.execute_concrete_path(&seed, None, 32, 8).unwrap();
+        assert!(matches!(
+            entry.stop,
+            PcodePathStop::EffectBoundary {
+                boundary: PcodeExecutionStop::OpaqueBoundary { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn relative_pcode_branch_uses_signed_intra_instruction_index() {
+        let snapshot = single_instruction_snapshot(vec![
+            operation(4, "BRANCH", 0, None, vec![node("const", "0x2", 8)]),
+            operation(
+                1,
+                "COPY",
+                1,
+                Some(node("register", "0x0", 8)),
+                vec![node("const", "0x0", 8)],
+            ),
+            operation(
+                1,
+                "COPY",
+                2,
+                Some(node("register", "0x0", 8)),
+                vec![node("const", "0x2a", 8)],
+            ),
+            operation(10, "RETURN", 3, None, vec![node("register", "0x0", 8)]),
+        ]);
+        let trace = snapshot
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 8, 2)
+            .unwrap();
+        assert!(matches!(trace.stop, PcodePathStop::Return { .. }));
+        assert_eq!(trace.instruction_visits.len(), 1);
+        assert_eq!(trace.events.len(), 2);
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode(&node("register", "0x0", 8))
+                .unwrap(),
+            Some(42)
+        );
+        assert!(matches!(
+            trace.events[0],
+            PcodePathEvent::Branch {
+                destination: PcodePathDestination::IntraInstruction {
+                    sequence_index: 2,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let narrow_negative = single_instruction_snapshot(vec![
+            operation(4, "BRANCH", 0, None, vec![node("const", "0x2", 1)]),
+            operation(10, "RETURN", 1, None, vec![node("register", "0x0", 8)]),
+            operation(4, "BRANCH", 2, None, vec![node("const", "0xff", 1)]),
+        ]);
+        let back = narrow_negative
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 8, 1)
+            .unwrap();
+        assert!(matches!(back.stop, PcodePathStop::Return { .. }));
+        assert!(matches!(
+            back.events[1],
+            PcodePathEvent::Branch {
+                destination: PcodePathDestination::IntraInstruction {
+                    sequence_index: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut overwide = narrow_negative.clone();
+        overwide.selected_function.instructions[0].pcode[2].inputs[0].offset = "0x1ff".to_owned();
+        let rejected = overwide
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 8, 1)
+            .unwrap();
+        assert!(matches!(
+            rejected.stop,
+            PcodePathStop::MalformedTarget { .. }
+        ));
+
+        let loop_snapshot = single_instruction_snapshot(vec![
+            operation(
+                1,
+                "COPY",
+                0,
+                Some(node("register", "0x0", 8)),
+                vec![node("const", "0x1", 8)],
+            ),
+            operation(
+                4,
+                "BRANCH",
+                1,
+                None,
+                vec![node("const", "0xffffffffffffffff", 8)],
+            ),
+        ]);
+        let bounded = loop_snapshot
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 5, 1)
+            .unwrap();
+        assert!(matches!(
+            bounded.stop,
+            PcodePathStop::OperationBudget { .. }
+        ));
+        assert_eq!(bounded.instruction_visits.len(), 1);
+        assert_eq!(bounded.events.len(), 5);
+    }
+
+    #[test]
+    fn unresolved_targets_and_visit_budget_are_explicit() {
+        let malformed = single_instruction_snapshot(vec![operation(
+            4,
+            "BRANCH",
+            0,
+            None,
+            vec![node("const", "0x63", 8)],
+        )]);
+        let trace = malformed
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 4, 4)
+            .unwrap();
+        assert!(matches!(trace.stop, PcodePathStop::MalformedTarget { .. }));
+
+        let indirect = single_instruction_snapshot(vec![operation(
+            6,
+            "BRANCHIND",
+            0,
+            None,
+            vec![node("register", "0x0", 8)],
+        )]);
+        let unknown = indirect
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 4, 4)
+            .unwrap();
+        assert!(matches!(
+            unknown.stop,
+            PcodePathStop::UnknownIndirectTarget { .. }
+        ));
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&node("register", "0x0", 8), 0x2013d9)
+            .unwrap();
+        let outside = indirect.execute_concrete_path(&seed, None, 4, 4).unwrap();
+        assert!(matches!(
+            outside.stop,
+            PcodePathStop::TargetNotSelected { .. }
+        ));
+        seed.write_varnode(&node("register", "0x0", 8), 0x2013cf)
+            .unwrap();
+        let indirect_loop = indirect.execute_concrete_path(&seed, None, 8, 2).unwrap();
+        assert!(matches!(
+            indirect_loop.stop,
+            PcodePathStop::VisitBudget { .. }
+        ));
+        assert!(matches!(
+            indirect_loop.events[0],
+            PcodePathEvent::Branch {
+                branch_kind: PcodePathBranchKind::IndirectBranch,
+                ..
+            }
+        ));
+
+        let wrong_width = single_instruction_snapshot(vec![operation(
+            6,
+            "BRANCHIND",
+            0,
+            None,
+            vec![node("register", "0x0", 4)],
+        )]);
+        let mismatch = wrong_width
+            .execute_concrete_path(&seed, None, 4, 4)
+            .unwrap();
+        assert!(matches!(
+            mismatch.stop,
+            PcodePathStop::MalformedTarget { .. }
+        ));
+
+        let self_loop = single_instruction_snapshot(vec![operation(
+            4,
+            "BRANCH",
+            0,
+            None,
+            vec![node("ram", "0x2013cf", 8)],
+        )]);
+        let visits = self_loop
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 8, 2)
+            .unwrap();
+        assert!(matches!(visits.stop, PcodePathStop::VisitBudget { .. }));
+        assert_eq!(visits.instruction_visits.len(), 2);
+
+        let no_flow = single_instruction_snapshot(vec![operation(
+            1,
+            "COPY",
+            0,
+            Some(node("register", "0x0", 8)),
+            vec![node("const", "0x1", 8)],
+        )]);
+        let end = no_flow
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 4, 4)
+            .unwrap();
+        assert!(matches!(
+            end.stop,
+            PcodePathStop::UnresolvedFallthrough { .. }
+        ));
+
+        let call = single_instruction_snapshot(vec![operation(
+            7,
+            "CALL",
+            0,
+            None,
+            vec![node("ram", "0x2013d9", 8)],
+        )]);
+        let call_trace = call
+            .execute_concrete_path(&PcodeConcreteState::default(), None, 4, 4)
+            .unwrap();
+        assert!(matches!(call_trace.stop, PcodePathStop::Call { .. }));
+        assert!(call_trace.events.is_empty());
     }
 
     #[test]

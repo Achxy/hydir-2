@@ -15,9 +15,10 @@ pub use cfg::{
     PcodeCfgNode,
 };
 pub use execution::{
-    PCODE_EXECUTION_TRACE_VERSION, PcodeConcreteMemoryAccess, PcodeConcreteState,
-    PcodeExecutedOperation, PcodeExecutionStop, PcodeExecutionTrace, PcodeMemoryAccessKind,
-    PcodeMemoryBoundaryKind,
+    PCODE_EXECUTION_TRACE_VERSION, PCODE_PATH_TRACE_VERSION, PcodeConcreteMemoryAccess,
+    PcodeConcreteState, PcodeExecutedOperation, PcodeExecutionStop, PcodeExecutionTrace,
+    PcodeMemoryAccessKind, PcodeMemoryBoundaryKind, PcodePathBranchKind, PcodePathDestination,
+    PcodePathEvent, PcodePathStop, PcodePathTrace,
 };
 pub use semantics::{
     PCODE_SEMANTIC_IR_VERSION, PcodeEffect, PcodeExactOp, PcodeOpaqueClass,
