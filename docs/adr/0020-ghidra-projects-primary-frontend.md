@@ -22,6 +22,12 @@ establish semantic equivalence. Hydir's existing desktop GUI is the primary
 workbench and orchestrates analysis; CLI, SDK, and API clients share the same
 framework. The Ghidra extension supports expert project exchange.
 
+Hydir owns snapshot parsing, P-code semantics, IR lowering, LLVM emission,
+analyses, transformations, and patch/rebuild logic in Rust. The Ghidra worker
+uses a thin Java exporter for access to Ghidra project APIs. Patchestry can be
+used for research and fixture comparisons, but is not a Hydir backend or
+runtime dependency.
+
 This decision supersedes the CTF-centered product and release framing in the
 historical workflow proposal. CTF and VM cases remain useful tests and later
 applications of the framework.
