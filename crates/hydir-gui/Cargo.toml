@@ -15,6 +15,7 @@ hydir-c = { path = "../hydir-c" }
 hydir-analysis = { path = "../hydir-analysis" }
 hydir-decompile = { path = "../hydir-decompile" }
 hydir-execution = { path = "../hydir-execution" }
+hydir-ghidra-worker = { path = "../hydir-ghidra-worker" }
 hydir-ir = { path = "../hydir-ir" }
 hydir-core = { path = "../hydir-core" }
 hydir-project = { path = "../hydir-project" }

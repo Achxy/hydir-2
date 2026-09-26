@@ -36,6 +36,7 @@ use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
     validate_analysis_recipe,
 };
+use hydir_ghidra_worker::{GhidraRuntimeStatus, runtime_status};
 use hydir_hlc::{
     HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
@@ -70,7 +71,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread,
     time::Duration,
 };
@@ -93,6 +94,49 @@ const PINNED_CLANG: &str = "/usr/bin/clang-14";
 
 fn resized_console_height(current: f32, drag_delta_y: f32, maximum: f32) -> f32 {
     (current - drag_delta_y).clamp(CONSOLE_MIN_HEIGHT, maximum)
+}
+
+fn probe_ghidra_runtime(ctx: &egui::Context) -> Receiver<GhidraRuntimeStatus> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let repaint = ctx.clone();
+    thread::spawn(move || {
+        let _ = sender.send(runtime_status());
+        repaint.request_repaint();
+    });
+    receiver
+}
+
+fn ghidra_readiness_copy(status: &GhidraRuntimeStatus) -> (&'static str, &'static str) {
+    match (
+        status.mode,
+        status.runtime_ready,
+        status.worker_image_cached,
+    ) {
+        ("local", true, _) => (
+            "Local Ghidra executable found",
+            "Ready to analyze. HydIR checks the version and snapshot during analysis.",
+        ),
+        ("local", false, _) => (
+            "Local Ghidra executable missing",
+            "Correct HYDIR_GHIDRA_HOME to the Ghidra installation directory, then restart HydIR.",
+        ),
+        ("docker", true, Some(true)) => (
+            "Docker ready · worker image cached",
+            "Ready to analyze a local ELF.",
+        ),
+        ("docker", true, _) => (
+            "Docker ready · worker image needed",
+            "Analyze a local ELF to build the pinned worker image on first use.",
+        ),
+        ("docker", false, _) => (
+            "Docker engine unavailable",
+            "Start Docker and refresh, or set HYDIR_GHIDRA_HOME to a local Ghidra installation and restart HydIR.",
+        ),
+        _ => (
+            "Ghidra runtime unavailable",
+            "Check the Ghidra runtime setup, then refresh.",
+        ),
+    }
 }
 
 enum Task {
@@ -3214,6 +3258,8 @@ struct AnalystApp {
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
     ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_busy: bool,
+    ghidra_runtime_status: Option<GhidraRuntimeStatus>,
+    ghidra_runtime_probe: Option<Receiver<GhidraRuntimeStatus>>,
     pending_ghidra: Option<(PathBuf, String)>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
@@ -3346,6 +3392,8 @@ impl AnalystApp {
             ghidra_path_trace: None,
             ghidra_path_lines: Vec::new(),
             ghidra_busy: false,
+            ghidra_runtime_status: None,
+            ghidra_runtime_probe: Some(probe_ghidra_runtime(ctx)),
             pending_ghidra: None,
             symbol: None,
             cfg: None,
@@ -3433,6 +3481,16 @@ impl AnalystApp {
     }
 
     fn poll(&mut self) {
+        if let Some(probe) = &self.ghidra_runtime_probe {
+            match probe.try_recv() {
+                Ok(status) => {
+                    self.ghidra_runtime_status = Some(status);
+                    self.ghidra_runtime_probe = None;
+                }
+                Err(TryRecvError::Disconnected) => self.ghidra_runtime_probe = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         while let Ok(event) = self.events.try_recv() {
             if !matches!(&event, Event::GhidraAnalyzed { .. }) {
                 self.busy = false;
@@ -4689,6 +4747,34 @@ impl AnalystApp {
                         .size(11.0)
                         .color(MUTED),
                 );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SETUP").size(10.0).strong().color(MUTED));
+                    if ui
+                        .add_enabled(
+                            self.ghidra_runtime_probe.is_none(),
+                            egui::Button::new("Refresh"),
+                        )
+                        .clicked()
+                    {
+                        self.ghidra_runtime_status = None;
+                        self.ghidra_runtime_probe = Some(probe_ghidra_runtime(ui.ctx()));
+                    }
+                });
+                if let Some(status) = &self.ghidra_runtime_status {
+                    let (headline, action) = ghidra_readiness_copy(status);
+                    ui.label(
+                        RichText::new(format!("{headline} · Ghidra {}", status.pinned_version))
+                            .size(11.0)
+                            .strong()
+                            .color(if status.runtime_ready { GOOD } else { BAD }),
+                    );
+                    ui.label(RichText::new(&status.detail).size(11.0).color(MUTED));
+                    ui.label(RichText::new(action).size(11.0).color(MUTED));
+                } else if self.ghidra_runtime_probe.is_some() {
+                    ui.label(RichText::new("Checking Ghidra runtime…").size(11.0).color(MUTED));
+                } else {
+                    ui.label(RichText::new("Could not check Ghidra runtime. Refresh to retry.").size(11.0).color(BAD));
+                }
                 let analyze = ui.add_enabled(
                     !self.busy
                         && !self.ghidra_busy
@@ -10930,12 +11016,13 @@ mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
         NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
-        ghidra_composite_evidence, ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start,
-        high_pcode_varnode, indexed_function_action, ir_slice, local_region_artifacts,
-        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
-        pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
-        preview_patch_local, resized_console_height, selected_ghidra_trace_address,
-        valid_bearer_token, validate_endpoint, workbench_graph_layout,
+        ghidra_composite_evidence, ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines,
+        ghidra_trace_start, high_pcode_varnode, indexed_function_action, ir_slice,
+        local_region_artifacts, native_function_excerpt, native_instruction_count,
+        native_opaque_instruction_count, pcode_display_lines, pcode_line_target, pcode_state_lines,
+        persist_ghidra_snapshot, preview_patch_local, resized_console_height,
+        selected_ghidra_trace_address, valid_bearer_token, validate_endpoint,
+        workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{import_elf, lift_symbol};
@@ -10946,11 +11033,48 @@ mod tests {
         decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
     };
     use hydir_execution::StopPoint;
+    use hydir_ghidra_worker::GhidraRuntimeStatus;
     use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect, parse_ghidra_snapshot, parse_pcode_seed};
     use hydir_project::LocalProjectStore;
     use std::fs;
     use std::path::Path;
     use std::sync::mpsc;
+
+    #[test]
+    fn ghidra_setup_explains_ready_and_missing_runtimes() {
+        let mut status = GhidraRuntimeStatus {
+            mode: "local",
+            pinned_version: "12.1.4",
+            runtime_ready: false,
+            worker_image_cached: None,
+            detail: "missing local executable".to_owned(),
+        };
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("missing"));
+        assert!(action.contains("HYDIR_GHIDRA_HOME"));
+
+        status.runtime_ready = true;
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("found"));
+        assert!(action.contains("checks the version"));
+
+        status.mode = "docker";
+        status.runtime_ready = false;
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("unavailable"));
+        assert!(action.contains("Start Docker"));
+
+        status.runtime_ready = true;
+        status.worker_image_cached = Some(false);
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("image needed"));
+        assert!(action.contains("first use"));
+
+        status.worker_image_cached = Some(true);
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("image cached"));
+        assert!(action.contains("Ready"));
+    }
 
     #[test]
     fn ghidra_address_map_rebases_pie_navigation_and_keeps_trace_va() {
