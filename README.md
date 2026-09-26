@@ -26,10 +26,11 @@ C. The desktop app, CLI, Python SDK, and authenticated service share the native
 core. The checked-in [`hydir_max2` walkthrough](https://hydir.wiki/articles/max2)
 shows the path on a 16-byte function.
 
-The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes Hydir a separate
-framework that will consume analyzed Ghidra projects and P-code. That project
-bridge is planned, not implemented; today's Ghidra integration exports and
-views function/CFG/call-graph facts and provides a thin remote client.
+The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
+GUI the entry point for automatic, containerized Ghidra analysis of a binary.
+Hydir will ingest the resulting P-code and project facts. That automatic bridge
+is planned, not implemented; today's Ghidra integration exports and views
+function/CFG/call-graph facts and provides a thin remote client.
 
 ## Quick start
 
