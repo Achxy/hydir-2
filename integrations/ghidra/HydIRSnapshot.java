@@ -1,0 +1,352 @@
+// Hydir's thin Ghidra front end. All P-code validation and lifting lives in Rust.
+// Run after analysis with: -postScript HydIRSnapshot.java <output.json> <binary> [entry-hex]
+
+import ghidra.app.script.GhidraScript;
+import ghidra.framework.Application;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.Varnode;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+
+public class HydIRSnapshot extends GhidraScript {
+    // A snapshot is one function plus the program index. Exceeding a cap fails the
+    // export; it never produces a plausible-looking partial analysis.
+    private static final int MAX_FUNCTIONS = 65_536;
+    private static final int MAX_ADDRESS_SPACES = 256;
+    private static final int MAX_INSTRUCTIONS = 16_384;
+    private static final int MAX_PCODE_OPS = 262_144;
+    private static final int MAX_OPS_PER_INSTRUCTION = 256;
+    private static final int MAX_INPUTS_PER_OP = 256;
+    private static final int MAX_INSTRUCTION_BYTES = 32;
+    private static final int MAX_JSON_CHARS = 16 * 1024 * 1024;
+    private static final int MAX_JSON_BYTES = 16 * 1024 * 1024;
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
+
+    private static final class Json {
+        private final StringBuilder value = new StringBuilder();
+
+        Json raw(String text) {
+            if (text.length() > MAX_JSON_CHARS - value.length()) {
+                throw new IllegalStateException("HydIR snapshot exceeds JSON character limit");
+            }
+            value.append(text);
+            return this;
+        }
+
+        Json quoted(String text) {
+            if (text == null) {
+                throw new IllegalArgumentException("Ghidra returned a null metadata string");
+            }
+            raw("\"");
+            for (int i = 0; i < text.length(); i++) {
+                char ch = text.charAt(i);
+                switch (ch) {
+                    case '\"': raw("\\\""); break;
+                    case '\\': raw("\\\\"); break;
+                    case '\b': raw("\\b"); break;
+                    case '\f': raw("\\f"); break;
+                    case '\n': raw("\\n"); break;
+                    case '\r': raw("\\r"); break;
+                    case '\t': raw("\\t"); break;
+                    default:
+                        // Escape all UTF-16 surrogate code units, including malformed
+                        // unpaired ones, so the output remains valid ASCII JSON.
+                        if (ch < 0x20 || ch >= 0x7f) {
+                            raw(String.format("\\u%04x", (int) ch));
+                        } else {
+                            raw(String.valueOf(ch));
+                        }
+                }
+            }
+            return raw("\"");
+        }
+
+        Json address(Address address) {
+            if (address == null) {
+                throw new IllegalArgumentException("Ghidra returned a null address");
+            }
+            raw("{\"space\":").quoted(address.getAddressSpace().getName());
+            raw(",\"offset\":").quoted(hex(address.getOffset()));
+            return raw("}");
+        }
+
+        Json varnode(Varnode node) {
+            if (node == null) {
+                return raw("null");
+            }
+            if (node.getSize() <= 0) {
+                throw new IllegalStateException("Ghidra returned a nonpositive varnode size");
+            }
+            raw("{\"space\":").quoted(node.getAddress().getAddressSpace().getName());
+            raw(",\"offset\":").quoted(hex(node.getOffset()));
+            return raw(",\"size\":" + node.getSize() + "}");
+        }
+
+        byte[] bytes() {
+            byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
+            if (bytes.length > MAX_JSON_BYTES) {
+                throw new IllegalStateException("HydIR snapshot exceeds JSON byte limit");
+            }
+            return bytes;
+        }
+    }
+
+    private static String hex(long value) {
+        return "0x" + Long.toUnsignedString(value, 16);
+    }
+
+    private static String hex(byte[] bytes) {
+        char[] chars = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            int value = bytes[i] & 0xff;
+            chars[i * 2] = HEX[value >>> 4];
+            chars[i * 2 + 1] = HEX[value & 0xf];
+        }
+        return new String(chars);
+    }
+
+    private static String sha256(Path path) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = Files.newInputStream(path)) {
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                digest.update(buffer, 0, count);
+            }
+        }
+        return hex(digest.digest());
+    }
+
+    private static long functionSizeBytes(Function function) {
+        long addresses = function.getBody().getNumAddresses();
+        int unit = function.getEntryPoint().getAddressSpace().getAddressableUnitSize();
+        if (unit <= 0 || addresses > Long.MAX_VALUE / unit) {
+            throw new IllegalStateException("Function size overflow at " + function.getEntryPoint());
+        }
+        return addresses * unit;
+    }
+
+    private Function selectFunction(List<Function> functions, String[] args) {
+        if (args.length == 2) {
+            for (Function function : functions) {
+                if (function.getBody().getNumAddresses() > 0) {
+                    return function;
+                }
+            }
+            throw new IllegalStateException("No function with an analyzed body is available");
+        }
+        if (!args[2].matches("0[xX][0-9a-fA-F]{1,16}")) {
+            throw new IllegalArgumentException("Function entry must be a 0x-prefixed hexadecimal offset");
+        }
+        long offset = Long.parseUnsignedLong(args[2].substring(2), 16);
+        Function selected = null;
+        for (Function function : functions) {
+            if (function.getEntryPoint().getOffset() == offset) {
+                if (selected != null) {
+                    throw new IllegalArgumentException("Function entry is ambiguous across address spaces: " + args[2]);
+                }
+                selected = function;
+            }
+        }
+        if (selected == null) {
+            throw new IllegalArgumentException("Function entry not found: " + args[2]);
+        }
+        return selected;
+    }
+
+    private static void writeAtomically(Path output, byte[] bytes) throws Exception {
+        Path absolute = output.toAbsolutePath();
+        Path parent = absolute.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Path temporary = Files.createTempFile(parent, ".hydir-snapshot-", ".json.tmp");
+        try {
+            Files.write(temporary, bytes);
+            try {
+                Files.move(temporary, absolute, StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                Files.move(temporary, absolute, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 2 && args.length != 3) {
+            throw new IllegalArgumentException(
+                "Usage: HydIRSnapshot.java <output.json> <original-binary-path> [function-entry-hex]");
+        }
+        Path binary = Path.of(args[1]);
+        if (!Files.isRegularFile(binary)) {
+            throw new IllegalArgumentException("Original binary is not a regular file: " + binary);
+        }
+        Path output = Path.of(args[0]);
+        if (Files.exists(output) && Files.isSameFile(output, binary)) {
+            throw new IllegalArgumentException("Snapshot output must not replace the original binary");
+        }
+        String digest = sha256(binary);
+        String importedDigest = currentProgram.getExecutableSHA256();
+        if (importedDigest == null || importedDigest.isBlank()) {
+            throw new IllegalStateException("Ghidra project has no recorded original binary SHA-256");
+        }
+        if (!importedDigest.equalsIgnoreCase(digest)) {
+            throw new IllegalStateException("Original binary SHA-256 does not match the Ghidra project");
+        }
+
+        List<Function> functions = new ArrayList<>();
+        FunctionIterator iterator = currentProgram.getFunctionManager().getFunctions(true);
+        while (iterator.hasNext()) {
+            monitor.checkCancelled();
+            if (functions.size() >= MAX_FUNCTIONS) {
+                throw new IllegalStateException("HydIR snapshot exceeds function limit " + MAX_FUNCTIONS);
+            }
+            functions.add(iterator.next());
+        }
+        functions.sort(Comparator.comparing(Function::getEntryPoint));
+        if (functions.isEmpty()) {
+            throw new IllegalStateException("Ghidra found no functions; run analysis before exporting");
+        }
+        Function selected = selectFunction(functions, args);
+
+        Json json = new Json();
+        json.raw("{\"schema_version\":2,\"source\":\"ghidra\","
+            + "\"flow_overrides_applied\":true,\"binary_sha256\":")
+            .quoted(digest);
+        json.raw(",\"program\":{\"name\":").quoted(currentProgram.getName());
+        json.raw(",\"ghidra_version\":").quoted(Application.getApplicationVersion());
+        json.raw(",\"language_id\":").quoted(currentProgram.getLanguageID().toString());
+        json.raw(",\"compiler_spec_id\":")
+            .quoted(currentProgram.getCompilerSpec().getCompilerSpecID().toString());
+        json.raw(",\"image_base\":").address(currentProgram.getImageBase());
+        json.raw("},\"address_spaces\":[");
+        AddressSpace[] spaces = currentProgram.getAddressFactory().getAllAddressSpaces();
+        if (spaces.length > MAX_ADDRESS_SPACES) {
+            throw new IllegalStateException("HydIR snapshot exceeds address-space limit "
+                + MAX_ADDRESS_SPACES);
+        }
+        Arrays.sort(spaces, Comparator.comparing(AddressSpace::getName)
+            .thenComparingInt(AddressSpace::getSpaceID));
+        for (int i = 0; i < spaces.length; i++) {
+            AddressSpace space = spaces[i];
+            if (i != 0) json.raw(",");
+            json.raw("{\"name\":").quoted(space.getName());
+            json.raw(",\"id\":" + space.getSpaceID());
+            json.raw(",\"type\":" + space.getType());
+            json.raw(",\"addressable_unit_size\":" + space.getAddressableUnitSize());
+            json.raw(",\"pointer_size\":" + space.getPointerSize() + "}");
+        }
+        json.raw("],\"functions\":[");
+        for (int i = 0; i < functions.size(); i++) {
+            monitor.checkCancelled();
+            Function function = functions.get(i);
+            if (i != 0) json.raw(",");
+            json.raw("{\"entry\":").address(function.getEntryPoint());
+            json.raw(",\"name\":").quoted(function.getName());
+            json.raw(",\"size\":" + functionSizeBytes(function) + "}");
+        }
+        json.raw("],\"selected_function\":{\"entry\":").address(selected.getEntryPoint());
+        json.raw(",\"instructions\":[");
+
+        InstructionIterator instructions = currentProgram.getListing().getInstructions(selected.getBody(), true);
+        int instructionCount = 0;
+        int totalOps = 0;
+        while (instructions.hasNext()) {
+            monitor.checkCancelled();
+            if (instructionCount >= MAX_INSTRUCTIONS) {
+                throw new IllegalStateException("HydIR snapshot exceeds instruction limit " + MAX_INSTRUCTIONS);
+            }
+            Instruction instruction = instructions.next();
+            // Raw instruction P-code with Ghidra's analyzed flow overrides.
+            // This is distinct from decompiler high P-code.
+            PcodeOp[] ops = instruction.getPcode(true);
+            if (ops == null) {
+                throw new IllegalStateException("Ghidra returned null P-code at " + instruction.getAddress());
+            }
+            if (ops.length > MAX_OPS_PER_INSTRUCTION) {
+                throw new IllegalStateException("Instruction exceeds P-code op limit at "
+                    + instruction.getAddress());
+            }
+            if (ops.length > MAX_PCODE_OPS - totalOps) {
+                throw new IllegalStateException("HydIR snapshot exceeds P-code op limit " + MAX_PCODE_OPS);
+            }
+            byte[] bytes = instruction.getBytes();
+            byte[] parsedBytes = instruction.getParsedBytes();
+            if (bytes.length == 0 || bytes.length > MAX_INSTRUCTION_BYTES
+                    || parsedBytes.length == 0 || parsedBytes.length > MAX_INSTRUCTION_BYTES) {
+                throw new IllegalStateException("Instruction byte length is outside HydIR limits at "
+                    + instruction.getAddress());
+            }
+            if (instructionCount++ != 0) json.raw(",");
+            json.raw("{\"address\":").address(instruction.getAddress());
+            json.raw(",\"bytes\":").quoted(hex(bytes));
+            json.raw(",\"parsed_bytes\":").quoted(hex(parsedBytes));
+            json.raw(",\"mnemonic\":").quoted(instruction.getMnemonicString());
+            json.raw(",\"pcode\":[");
+            for (int i = 0; i < ops.length; i++) {
+                PcodeOp op = ops[i];
+                if (i != 0) json.raw(",");
+                json.raw("{\"mnemonic\":").quoted(op.getMnemonic());
+                json.raw(",\"opcode\":" + op.getOpcode());
+                json.raw(",\"sequence_index\":" + i);
+                json.raw(",\"sequence_time\":" + op.getSeqnum().getTime());
+                json.raw(",\"source_address\":").address(op.getSeqnum().getTarget());
+                String useropName = null;
+                if (op.getOpcode() == PcodeOp.CALLOTHER && op.getNumInputs() > 0) {
+                    Varnode id = op.getInput(0);
+                    if (id != null && id.isConstant()
+                            && Long.compareUnsigned(id.getOffset(), Integer.MAX_VALUE) <= 0) {
+                        useropName = currentProgram.getLanguage()
+                            .getUserDefinedOpName((int) id.getOffset());
+                    }
+                }
+                json.raw(",\"userop_name\":");
+                if (useropName == null) json.raw("null");
+                else json.quoted(useropName);
+                json.raw(",\"output\":").varnode(op.getOutput());
+                json.raw(",\"inputs\":[");
+                if (op.getNumInputs() > MAX_INPUTS_PER_OP) {
+                    throw new IllegalStateException("P-code op exceeds input limit at "
+                        + instruction.getAddress());
+                }
+                for (int j = 0; j < op.getNumInputs(); j++) {
+                    if (j != 0) json.raw(",");
+                    Varnode input = op.getInput(j);
+                    if (input == null) {
+                        throw new IllegalStateException("Null P-code input at " + instruction.getAddress());
+                    }
+                    json.varnode(input);
+                }
+                json.raw("]}");
+            }
+            json.raw("]}");
+            totalOps += ops.length;
+        }
+        if (instructionCount == 0) {
+            throw new IllegalStateException("Selected function has no analyzed instructions: "
+                + selected.getEntryPoint());
+        }
+        json.raw("]}}\n");
+        writeAtomically(output, json.bytes());
+        println("HydIR snapshot written to " + output.toAbsolutePath()
+            + " (" + instructionCount + " instructions, " + totalOps + " raw P-code ops)");
+    }
+}
