@@ -40,7 +40,10 @@ use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
     STATE_FUNCTION_IR_VERSION,
 };
-use hydir_model::{import_dwarf, infer_model, init_model};
+use hydir_model::{
+    AnalysisModel, MAX_MODEL_BYTES, import_dwarf, infer_model, init_model, parse_model,
+    record_analyst_edits, validate_model,
+};
 use hydir_patch::{
     MAX_PATCH_BYTES, compile_patch_binary, parse_patch_bundle_json, parse_patch_document,
     parse_patch_json, patch_binary,
@@ -438,6 +441,29 @@ CREATE TABLE ghidra_snapshots (
     PRIMARY KEY(project_id,binary_sha256,worker_key)
 );
 PRAGMA user_version=11;
+COMMIT;
+";
+
+const ANALYSIS_MODEL_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE analysis_models (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    binary_sha256 TEXT NOT NULL REFERENCES binaries(sha256),
+    created_revision INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    content BLOB NOT NULL,
+    PRIMARY KEY(project_id,created_revision)
+);
+CREATE INDEX analysis_models_latest ON analysis_models(project_id,binary_sha256,created_revision DESC);
+CREATE TABLE analysis_model_requests (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    idempotency_key TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    new_revision INTEGER NOT NULL,
+    PRIMARY KEY(project_id,idempotency_key)
+);
+PRAGMA user_version=12;
 COMMIT;
 ";
 
@@ -973,7 +999,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON;")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 11 {
+        if version > 12 {
             return Err("database schema is newer than this hydird build".into());
         }
         if version == 0 {
@@ -1008,6 +1034,9 @@ impl Store {
         }
         if version <= 10 {
             connection.execute_batch(GHIDRA_SNAPSHOT_MIGRATION)?;
+        }
+        if version <= 11 {
+            connection.execute_batch(ANALYSIS_MODEL_MIGRATION)?;
         }
         connection.execute_batch("BEGIN IMMEDIATE;
           INSERT INTO job_events(job_id,state,message) SELECT id,'interrupted','server restarted before completion'
@@ -2318,6 +2347,250 @@ fn automatic_analysis_model(bytes: &[u8]) -> Result<hydir_model::AnalysisModel, 
     Ok(model)
 }
 
+fn native_model_envelope(model: &[u8], binary: &[u8]) -> Result<Vec<u8>, Status> {
+    if model.len() > MAX_MODEL_BYTES || binary.len() > MAX_BINARY_BYTES {
+        return Err(Status::resource_exhausted(
+            "model or binary exceeds worker input limit",
+        ));
+    }
+    let length =
+        u32::try_from(model.len()).map_err(|_| Status::resource_exhausted("model too large"))?;
+    let mut envelope = Vec::with_capacity(4 + model.len() + binary.len());
+    envelope.extend_from_slice(&length.to_le_bytes());
+    envelope.extend_from_slice(model);
+    envelope.extend_from_slice(binary);
+    Ok(envelope)
+}
+
+fn saved_analysis_model(
+    connection: &Connection,
+    project_id: &str,
+    binary_sha256: &str,
+    revision: u64,
+) -> Result<Option<Vec<u8>>, Status> {
+    let row: Option<(String, Vec<u8>)> = connection.query_row(
+        "SELECT content_sha256,content FROM analysis_models WHERE project_id=?1 AND binary_sha256=?2 AND created_revision<=?3 ORDER BY created_revision DESC LIMIT 1",
+        params![project_id, binary_sha256, revision as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(internal)?;
+    match row {
+        Some((digest, content))
+            if digest == sha256(&content) && content.len() <= MAX_MODEL_BYTES =>
+        {
+            Ok(Some(content))
+        }
+        Some(_) => Err(Status::data_loss(
+            "saved analysis model failed integrity check",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn analysis_model_replay(
+    connection: &Connection,
+    project_id: &str,
+    key: &str,
+    expected: i64,
+    request_digest: &str,
+) -> Result<Option<(u64, String)>, Status> {
+    let prior: Option<(i64, String, i64, String)> = connection.query_row(
+        "SELECT m.expected_revision,m.request_sha256,m.new_revision,r.binary_sha256 FROM analysis_model_requests m JOIN project_revisions r ON r.project_id=m.project_id AND r.revision=m.new_revision WHERE m.project_id=?1 AND m.idempotency_key=?2",
+        params![project_id, key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional().map_err(internal)?;
+    match prior {
+        Some((prior_expected, prior_digest, revision, binary_sha256))
+            if prior_expected == expected && prior_digest == request_digest =>
+        {
+            Ok(Some((revision as u64, binary_sha256)))
+        }
+        Some(_) => Err(Status::already_exists(
+            "idempotency key was used with a different model edit",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn model_machine_evidence(model: &AnalysisModel) -> Result<HashSet<Vec<u8>>, Status> {
+    let mut evidence = HashSet::new();
+    let mut add = |items: &[hydir_model::ModelEvidence]| -> Result<(), Status> {
+        for item in items {
+            if item.source != hydir_model::ModelSource::AnalystAssertion {
+                evidence.insert(
+                    serde_json::to_vec(item)
+                        .map_err(|_| Status::internal("model evidence serialization failed"))?,
+                );
+            }
+        }
+        Ok(())
+    };
+    for definition in &model.types {
+        add(&definition.evidence)?;
+        if let hydir_model::TypeDefinitionKind::Struct { fields }
+        | hydir_model::TypeDefinitionKind::Union { fields } = &definition.kind
+        {
+            for field in fields {
+                add(&field.evidence)?;
+            }
+        }
+    }
+    for function in &model.functions {
+        add(&function.evidence)?;
+    }
+    for object in &model.stack_objects {
+        add(&object.evidence)?;
+    }
+    for conflict in &model.conflicts {
+        add(&conflict.evidence)?;
+    }
+    Ok(evidence)
+}
+
+fn validate_model_edit(
+    previous: &AnalysisModel,
+    candidate: &mut AnalysisModel,
+    binary: &[u8],
+) -> Result<(), Status> {
+    let next = previous
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| Status::out_of_range("model revision overflow"))?;
+    if candidate.revision != next {
+        return Err(Status::aborted("stale analysis model revision"));
+    }
+    if !model_machine_evidence(candidate)?.is_subset(&model_machine_evidence(previous)?) {
+        return Err(Status::invalid_argument(
+            "analyst edit cannot introduce machine evidence",
+        ));
+    }
+    let previous_hints = previous
+        .high_pcode_hints
+        .iter()
+        .map(|hint| serde_json::to_vec(hint))
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|_| Status::internal("model hint serialization failed"))?;
+    for hint in &candidate.high_pcode_hints {
+        let encoded = serde_json::to_vec(hint)
+            .map_err(|_| Status::internal("model hint serialization failed"))?;
+        if !previous_hints.contains(&encoded) {
+            return Err(Status::invalid_argument(
+                "analyst edit cannot introduce Ghidra observations",
+            ));
+        }
+    }
+    // Analyst edits cannot remove machine observations by deleting their rows.
+    if previous
+        .types
+        .iter()
+        .any(|old| !candidate.types.iter().any(|new| new.id == old.id))
+        || previous
+            .functions
+            .iter()
+            .any(|old| !candidate.functions.iter().any(|new| new.entry == old.entry))
+        || previous.stack_objects.iter().any(|old| {
+            !candidate.stack_objects.iter().any(|new| {
+                new.function_entry == old.function_entry
+                    && new.entry_rsp_offset == old.entry_rsp_offset
+            })
+        })
+    {
+        return Err(Status::invalid_argument(
+            "model edit removes an existing observed row",
+        ));
+    }
+    for old in &previous.types {
+        let new = candidate
+            .types
+            .iter()
+            .find(|new| new.id == old.id)
+            .expect("type checked above");
+        if let (
+            hydir_model::TypeDefinitionKind::Struct { fields: old_fields }
+            | hydir_model::TypeDefinitionKind::Union { fields: old_fields },
+            hydir_model::TypeDefinitionKind::Struct { fields: new_fields }
+            | hydir_model::TypeDefinitionKind::Union { fields: new_fields },
+        ) = (&old.kind, &new.kind)
+        {
+            if old_fields.iter().any(|old_field| {
+                !new_fields
+                    .iter()
+                    .any(|new_field| new_field.offset_bytes == old_field.offset_bytes)
+            }) {
+                return Err(Status::invalid_argument(
+                    "model edit removes an existing field",
+                ));
+            }
+        }
+    }
+    for conflict in &previous.conflicts {
+        if !candidate.conflicts.contains(conflict) {
+            candidate.conflicts.push(conflict.clone());
+        }
+    }
+    record_analyst_edits(previous, candidate).map_err(Status::invalid_argument)?;
+    validate_model(binary, candidate).map_err(Status::invalid_argument)
+}
+
+fn native_artifact_with_model(
+    bytes: &[u8],
+    selector_json: &str,
+    saved_model: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let selector: NativeArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid selector: {error}"))?;
+    if selector.stage.len() > 32
+        || selector.stage.chars().any(char::is_control)
+        || selector.function.len() > 256
+        || selector.function.chars().any(char::is_control)
+    {
+        return Err("native artifact selector fields exceed their bounds".to_owned());
+    }
+    native_artifact_media_type(&selector.stage)
+        .ok_or_else(|| format!("unsupported native artifact stage {:?}", selector.stage))?;
+    let model = match saved_model {
+        Some(raw) => {
+            let model = parse_model(raw)?;
+            validate_model(bytes, &model)?;
+            Some(model)
+        }
+        None => None,
+    };
+    if selector.stage == "analysis_model" {
+        return match model {
+            Some(model) => serde_json::to_vec(&model).map_err(|error| error.to_string()),
+            None => serde_json::to_vec(&automatic_analysis_model(bytes)?)
+                .map_err(|error| error.to_string()),
+        };
+    }
+    if !matches!(
+        selector.stage.as_str(),
+        "high_level_cir" | "high_level_cfg_cir" | "typed_c"
+    ) || model.is_none()
+    {
+        return native_artifact(bytes, selector_json);
+    }
+    let model = model.expect("saved model checked above");
+    let entry = native_function_entry(bytes, &selector.function)?;
+    let machine = lift_machine_function_at(bytes, entry)?;
+    let state = lower_state_ir(&machine)?;
+    let function = lower_function_ir(&machine, &state)?;
+    if selector.stage == "high_level_cfg_cir" {
+        let high = lower_high_level_cfg_cir(&machine, &function, &model)?;
+        return serde_json::to_vec(&high).map_err(|error| error.to_string());
+    }
+    match lower_high_level_cir(&machine, &function, &model) {
+        Ok(high) if selector.stage == "typed_c" => {
+            emit_typed_c(&high, &model).map(String::into_bytes)
+        }
+        Ok(high) => serde_json::to_vec(&high).map_err(|error| error.to_string()),
+        Err(_) if selector.stage == "typed_c" => {
+            let high = lower_high_level_cfg_cir(&machine, &function, &model)?;
+            emit_typed_cfg_c(&high, &model).map(String::into_bytes)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn native_function_entry(bytes: &[u8], selector: &str) -> Result<Location, String> {
     if selector.is_empty() {
         return Err("function-scoped native artifact requires a function selector".to_owned());
@@ -2429,6 +2702,27 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
     match (action, symbol) {
         ("native-analysis", None) => native_analysis_bundle(bytes),
         ("native-artifact", Some(selector)) => native_artifact(bytes, selector),
+        ("native-artifact-model", Some(selector)) => {
+            let length = u32::from_le_bytes(
+                bytes
+                    .get(..4)
+                    .ok_or("model envelope is truncated")?
+                    .try_into()
+                    .map_err(|_| "model envelope length is invalid")?,
+            ) as usize;
+            if length == 0 || length > MAX_MODEL_BYTES {
+                return Err("model envelope exceeds 16 MiB".to_owned());
+            }
+            let end = 4usize
+                .checked_add(length)
+                .ok_or("model envelope length overflow")?;
+            let model = bytes.get(4..end).ok_or("model envelope is truncated")?;
+            let binary = bytes.get(end..).ok_or("model envelope lacks binary")?;
+            if binary.is_empty() || binary.len() > MAX_BINARY_BYTES {
+                return Err("model envelope binary exceeds 64 MiB".to_owned());
+            }
+            native_artifact_with_model(binary, selector, Some(model))
+        }
         ("ghidra-snapshot-artifact", Some(selector)) => ghidra_snapshot_artifact(bytes, selector),
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
@@ -2672,11 +2966,19 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
 
 fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut bytes = Vec::new();
+    let limit = if matches!(
+        arguments.first().map(String::as_str),
+        Some("native-artifact-model")
+    ) {
+        MAX_BINARY_BYTES + MAX_MODEL_BYTES + 4
+    } else {
+        MAX_BINARY_BYTES
+    };
     std::io::stdin()
-        .take((MAX_BINARY_BYTES + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.is_empty() || bytes.len() > MAX_BINARY_BYTES {
-        return Err("worker input must be 1..=64 MiB".into());
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err("worker input exceeds its action limit".into());
     }
     let result = match arguments {
         [action] => worker_operation(action, None, &bytes),
@@ -3887,6 +4189,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             analyst_fact_updates: true,
             ghidra_snapshot_analysis: true,
             automatic_ghidra_analysis: true,
+            revisioned_analysis_model_edits: true,
         }))
     }
 
@@ -4129,12 +4432,35 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         let binary = self
             .current_binary(&principal, &input.project_id, input.expected_revision)
             .await?;
+        let saved_model = if matches!(
+            input.stage.as_str(),
+            "analysis_model" | "high_level_cir" | "high_level_cfg_cir" | "typed_c"
+        ) {
+            saved_analysis_model(
+                &*self.connection()?,
+                &input.project_id,
+                &sha256(&binary),
+                input.expected_revision,
+            )?
+        } else {
+            None
+        };
         let selector = serde_json::to_string(&NativeArtifactSelector {
             stage: input.stage,
             function: input.function_selector,
         })
         .map_err(|_| Status::internal("native artifact selector serialization failed"))?;
-        let content = run_worker("native-artifact", Some(&selector), binary).await?;
+        let content = match saved_model {
+            Some(model) => {
+                run_worker(
+                    "native-artifact-model",
+                    Some(&selector),
+                    native_model_envelope(&model, &binary)?,
+                )
+                .await?
+            }
+            None => run_worker("native-artifact", Some(&selector), binary).await?,
+        };
         let digest = self
             .store_artifact(
                 &input.project_id,
@@ -4148,6 +4474,151 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             media_type: media_type.to_owned(),
             content,
             project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn get_analysis_model(
+        &self,
+        request: Request<api_v3::AnalysisModelRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        let metadata = request.metadata().clone();
+        let input = request.into_inner();
+        let mut artifact = Request::new(api_v3::ProgramArtifactRequest {
+            project_id: input.project_id,
+            expected_revision: input.expected_revision,
+            stage: "analysis_model".to_owned(),
+            function_selector: String::new(),
+        });
+        *artifact.metadata_mut() = metadata;
+        <Store as api_v3::hydir_v3_server::HydirV3>::get_program_artifact(self, artifact).await
+    }
+
+    async fn save_analysis_model(
+        &self,
+        request: Request<api_v3::SaveAnalysisModelRequest>,
+    ) -> Result<Response<api_v3::MutationReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "model idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        if input.model_json.is_empty() || input.model_json.len() > MAX_MODEL_BYTES {
+            return Err(Status::resource_exhausted(
+                "analysis model must be 1..=16 MiB",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        let next = expected
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("project revision overflow"))?;
+        let request_digest = sha256(
+            &serde_json::to_vec(&(input.expected_revision, &input.model_json))
+                .map_err(|_| Status::internal("model request serialization failed"))?,
+        );
+        self.project(&principal, &input.project_id)?;
+        if let Some((revision, binary_sha256)) = analysis_model_replay(
+            &*self.connection()?,
+            &input.project_id,
+            &input.idempotency_key,
+            expected,
+            &request_digest,
+        )? {
+            return Ok(Response::new(api_v3::MutationReply {
+                project_id: input.project_id,
+                revision,
+                binary_sha256,
+            }));
+        }
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let binary_sha256 = sha256(&binary);
+        let prior = saved_analysis_model(
+            &*self.connection()?,
+            &input.project_id,
+            &binary_sha256,
+            input.expected_revision,
+        )?;
+        let prior = match prior {
+            Some(content) => content,
+            None => {
+                run_worker(
+                    "native-artifact",
+                    Some(
+                        &serde_json::to_string(&NativeArtifactSelector {
+                            stage: "analysis_model".to_owned(),
+                            function: String::new(),
+                        })
+                        .map_err(|_| Status::internal("model selector serialization failed"))?,
+                    ),
+                    binary.clone(),
+                )
+                .await?
+            }
+        };
+        let previous = parse_model(&prior).map_err(Status::data_loss)?;
+        validate_model(&binary, &previous).map_err(Status::data_loss)?;
+        // Deserialize before provenance repair: an editor may omit existing
+        // machine evidence, which record_analyst_edits restores below.
+        let mut candidate: AnalysisModel =
+            serde_json::from_slice(&input.model_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid analysis model JSON: {error}"))
+            })?;
+        validate_model_edit(&previous, &mut candidate, &binary)?;
+        let content = serde_json::to_vec(&candidate)
+            .map_err(|_| Status::internal("model serialization failed"))?;
+        if content.len() > MAX_MODEL_BYTES {
+            return Err(Status::resource_exhausted("edited model exceeds 16 MiB"));
+        }
+        let digest = sha256(&content);
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(internal)?;
+        require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Analyst)?;
+        if let Some((revision, binary_sha256)) = analysis_model_replay(
+            &tx,
+            &input.project_id,
+            &input.idempotency_key,
+            expected,
+            &request_digest,
+        )? {
+            return Ok(Response::new(api_v3::MutationReply {
+                project_id: input.project_id,
+                revision,
+                binary_sha256,
+            }));
+        }
+        let current: Option<(i64, String)> = tx.query_row(
+            "SELECT p.current_revision,r.binary_sha256 FROM projects p JOIN project_revisions r ON r.project_id=p.id AND r.revision=p.current_revision WHERE p.id=?1",
+            params![input.project_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(internal)?;
+        if current != Some((expected, binary_sha256.clone())) {
+            return Err(Status::aborted("stale project revision"));
+        }
+        tx.execute(
+            "INSERT INTO project_revisions(project_id,revision,binary_sha256) VALUES(?1,?2,?3)",
+            params![input.project_id, next, binary_sha256],
+        )
+        .map_err(internal)?;
+        tx.execute("INSERT INTO analysis_models(project_id,binary_sha256,created_revision,content_sha256,content) VALUES(?1,?2,?3,?4,?5)", params![input.project_id, binary_sha256, next, digest, content]).map_err(internal)?;
+        tx.execute("INSERT INTO analysis_model_requests(project_id,idempotency_key,expected_revision,request_sha256,new_revision) VALUES(?1,?2,?3,?4,?5)", params![input.project_id, input.idempotency_key, expected, request_digest, next]).map_err(internal)?;
+        tx.execute(
+            "UPDATE projects SET current_revision=?1 WHERE id=?2",
+            params![next, input.project_id],
+        )
+        .map_err(internal)?;
+        tx.execute("INSERT INTO audit_events(principal,action,project_id,details_json) VALUES(?1,'save_analysis_model',?2,?3)", params![principal, input.project_id, json!({"model_revision": candidate.revision, "content_sha256": digest}).to_string()]).map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(Response::new(api_v3::MutationReply {
+            project_id: input.project_id,
+            revision: next as u64,
+            binary_sha256,
         }))
     }
 
@@ -5081,7 +5552,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         connection
             .execute(
                 "INSERT INTO binaries(sha256,content,storage_kind,storage_key,content_size) VALUES(?1,x'','s3',?2,1)",
@@ -5108,6 +5579,8 @@ mod tests {
                     "INSERT INTO identities(principal,token_sha256) VALUES('owner','digest');
                      INSERT INTO projects(id,owner,name,idempotency_key)
                      VALUES('project','owner','existing','create-key');
+                     DROP TABLE analysis_model_requests;
+                     DROP TABLE analysis_models;
                      DROP TABLE ghidra_snapshots;
                      PRAGMA user_version=10;",
                 )
@@ -5119,7 +5592,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let name: String = connection
             .query_row("SELECT name FROM projects WHERE id='project'", [], |row| {
                 row.get(0)
@@ -6008,6 +6481,287 @@ mod tests {
         assert_eq!(mutation.binary_sha256, uploaded.binary_sha256);
     }
 
+    #[tokio::test]
+    async fn v3_analysis_model_edits_survive_restart_and_feed_typed_artifacts() {
+        use api_v3::hydir_v3_server::HydirV3;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite");
+        let store = Store::open(&path).unwrap();
+        let token = store.create_identity("model-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "editable model".to_owned(),
+                    idempotency_key: "editable-model".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let model_request = |revision| api_v3::AnalysisModelRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: revision,
+        };
+        let baseline = HydirV3::get_analysis_model(
+            &store,
+            authorized(model_request(uploaded.revision), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut edit = parse_model(&baseline.content).unwrap();
+        assert!(!edit.functions.is_empty());
+        let original_evidence = edit.functions[0].evidence.clone();
+        edit.functions[0].name = "analyst_renamed_function".to_owned();
+        edit.functions[0].evidence.clear();
+        edit.revision += 1;
+        let input = api_v3::SaveAnalysisModelRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: "rename-once".to_owned(),
+            model_json: serde_json::to_vec(&edit).unwrap(),
+        };
+        let saved = HydirV3::save_analysis_model(&store, authorized(input.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(saved.revision, uploaded.revision + 1);
+        assert_eq!(
+            HydirV3::save_analysis_model(&store, authorized(input.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner()
+                .revision,
+            saved.revision
+        );
+        let mut conflicting = input.clone();
+        conflicting.model_json.push(b' ');
+        assert_eq!(
+            HydirV3::save_analysis_model(&store, authorized(conflicting, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::AlreadyExists
+        );
+        let current =
+            HydirV3::get_analysis_model(&store, authorized(model_request(saved.revision), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        let current_model = parse_model(&current.content).unwrap();
+        assert_eq!(current_model.revision, edit.revision);
+        assert_eq!(current_model.functions[0].name, "analyst_renamed_function");
+        assert!(
+            original_evidence
+                .iter()
+                .all(|evidence| current_model.functions[0].evidence.contains(evidence))
+        );
+        assert!(
+            current_model.functions[0]
+                .evidence
+                .iter()
+                .any(|evidence| evidence.source == hydir_model::ModelSource::AnalystAssertion)
+        );
+        let index = HydirV3::get_program_artifact(
+            &store,
+            authorized(
+                api_v3::ProgramArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: saved.revision,
+                    stage: "function_index".to_owned(),
+                    function_selector: String::new(),
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let index: hydir_ir::FunctionIndex = serde_json::from_slice(&index.content).unwrap();
+        let selector = index
+            .functions
+            .iter()
+            .find(|row| row.name.as_deref() == Some("hydir_max2"))
+            .unwrap()
+            .id
+            .clone();
+        let high = HydirV3::get_program_artifact(
+            &store,
+            authorized(
+                api_v3::ProgramArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: saved.revision,
+                    stage: "high_level_cfg_cir".to_owned(),
+                    function_selector: selector,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let high_json: serde_json::Value = serde_json::from_slice(&high.content).unwrap();
+        assert_eq!(high_json["model_revision"], edit.revision);
+        assert_eq!(
+            HydirV3::get_analysis_model(
+                &store,
+                authorized(model_request(uploaded.revision), &token)
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::Aborted
+        );
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let after_restart = HydirV3::get_analysis_model(
+            &reopened,
+            authorized(model_request(saved.revision), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(after_restart.content, current.content);
+        let saved_rows: i64 = reopened
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM analysis_models", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(saved_rows, 1);
+        let replacement = include_bytes!("../../../demo/hydir-prism.elf").to_vec();
+        let replacement_digest = sha256(&replacement);
+        let uploaded_later = reopened
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: saved.revision,
+                    content_sha256: replacement_digest.clone(),
+                    content: replacement,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(uploaded_later.binary_sha256, replacement_digest);
+        let replay_after_upload =
+            HydirV3::save_analysis_model(&reopened, authorized(input, &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(replay_after_upload.revision, saved.revision);
+        assert_eq!(replay_after_upload.binary_sha256, uploaded.binary_sha256);
+    }
+
+    #[tokio::test]
+    async fn v3_analysis_model_rejects_wrong_digest_and_removed_observations() {
+        use api_v3::hydir_v3_server::HydirV3;
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("model-reject").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "model reject".to_owned(),
+                    idempotency_key: "reject-model".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../fuzz/corpus/elf_import/max2.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let baseline = HydirV3::get_analysis_model(
+            &store,
+            authorized(
+                api_v3::AnalysisModelRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: uploaded.revision,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut model = parse_model(&baseline.content).unwrap();
+        model.revision += 1;
+        model.binary_sha256 = "0".repeat(64);
+        let request = |model: &AnalysisModel, key: &str| api_v3::SaveAnalysisModelRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: key.to_owned(),
+            model_json: serde_json::to_vec(model).unwrap(),
+        };
+        assert_eq!(
+            HydirV3::save_analysis_model(
+                &store,
+                authorized(request(&model, "wrong-digest"), &token)
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        model.binary_sha256 = uploaded.binary_sha256.clone();
+        model.functions[0]
+            .evidence
+            .push(hydir_model::ModelEvidence {
+                source: hydir_model::ModelSource::Dwarf,
+                detail: "forged machine evidence".to_owned(),
+                site: None,
+            });
+        assert_eq!(
+            HydirV3::save_analysis_model(
+                &store,
+                authorized(request(&model, "forged-evidence"), &token)
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        model.functions[0].evidence.pop();
+        model.functions.clear();
+        assert_eq!(
+            HydirV3::save_analysis_model(
+                &store,
+                authorized(request(&model, "removed-facts"), &token)
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
     #[test]
     fn v3_typed_artifact_stages_emit_versioned_model_ir_and_c() {
         use std::process::Command;
@@ -6536,7 +7290,7 @@ mod tests {
         drop(Store::open(&path).unwrap());
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=12;")
+            .execute_batch("PRAGMA user_version=13;")
             .unwrap();
         let error = Store::open(&path).err().unwrap().to_string();
         assert!(error.contains("newer"));
@@ -6570,7 +7324,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let foreign_key_errors: i64 = store
             .connection()
             .unwrap()

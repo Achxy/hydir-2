@@ -11,6 +11,8 @@ service HydirV3 {
   rpc CancelAnalysisJob (JobRequest) returns (JobReply);
   rpc StreamAnalysisEvents (JobEventRequest) returns (stream JobEvent);
   rpc GetProgramArtifact (ProgramArtifactRequest) returns (ArtifactReply);
+  rpc GetAnalysisModel (AnalysisModelRequest) returns (ArtifactReply);
+  rpc SaveAnalysisModel (SaveAnalysisModelRequest) returns (MutationReply);
   rpc AnalyzeGhidraSnapshot (GhidraSnapshotArtifactRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
@@ -30,6 +32,23 @@ message DiscoverReply {
   bool analyst_fact_updates = 11;
   bool ghidra_snapshot_analysis = 12;
   bool automatic_ghidra_analysis = 13;
+  bool revisioned_analysis_model_edits = 14;
+}
+
+// Returns the newest saved model for the current binary, or an inferred v1
+// model when no analyst edit has been saved yet.
+message AnalysisModelRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+}
+
+// model_json is the full AnalysisModel v1 document. Its model revision must be
+// one greater than the model returned at expected_revision.
+message SaveAnalysisModelRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+  bytes model_json = 4;
 }
 
 message StartProgramAnalysisRequest {
