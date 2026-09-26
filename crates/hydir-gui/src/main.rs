@@ -41,8 +41,9 @@ use hydir_hlc::{
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
 };
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeEffect, PcodeSemanticFunctionIr,
-    PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, PcodeEffect, PcodePathDestination,
+    PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr, PcodeStateFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -1794,6 +1795,95 @@ fn pcode_varnode(varnode: &PcodeVarnode) -> String {
     format!("{}:{}[{}]", varnode.space, varnode.offset, varnode.size)
 }
 
+fn ghidra_seed_template(snapshot: &GhidraSnapshot) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "binary_sha256": snapshot.binary_sha256,
+        "entry": snapshot.selected_function.entry,
+        "registers": [],
+        "memory": []
+    }))
+    .unwrap_or_default()
+}
+
+fn ghidra_trace_start(snapshot: &GhidraSnapshot, text: &str) -> Result<PcodeAddress, String> {
+    let digits = text
+        .trim()
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("trace start must be a 0x-prefixed instruction address")?;
+    let offset = u64::from_str_radix(digits, 16)
+        .map_err(|_| "trace start exceeds a 64-bit address".to_owned())?;
+    Ok(PcodeAddress {
+        space: snapshot.selected_function.entry.space.clone(),
+        offset: format!("0x{offset:x}"),
+    })
+}
+
+fn ghidra_trace_lines(trace: &PcodePathTrace) -> Vec<(Option<u64>, String)> {
+    let address = |source: &PcodeAddress| u64::from_str_radix(&source.offset[2..], 16).ok();
+    trace
+        .events
+        .iter()
+        .map(|event| match event {
+            PcodePathEvent::Effect { operation } => {
+                let source = &operation.source;
+                let detail = operation
+                    .memory_access
+                    .as_ref()
+                    .map(|access| {
+                        format!(
+                            " · {:?} {}:0x{:x}[{}] = 0x{:x}",
+                            access.kind,
+                            access.space,
+                            access.byte_offset,
+                            access.width_bytes,
+                            access.value
+                        )
+                    })
+                    .unwrap_or_default();
+                (
+                    address(&source.source_address),
+                    format!(
+                        "{} #{} {}{}",
+                        source.source_address.offset,
+                        source.sequence_index,
+                        source.mnemonic,
+                        detail
+                    ),
+                )
+            }
+            PcodePathEvent::Branch {
+                source,
+                branch_kind,
+                taken,
+                destination,
+            } => {
+                let target = match destination {
+                    PcodePathDestination::IntraInstruction {
+                        instruction,
+                        sequence_index,
+                    } => format!("{} #{sequence_index}", instruction.offset),
+                    PcodePathDestination::Instruction { address } => address.offset.clone(),
+                    PcodePathDestination::FallthroughPending => "analyzed fallthrough".to_owned(),
+                };
+                let decision = taken.map_or(String::new(), |value| format!(" ({value})"));
+                (
+                    address(&source.source_address),
+                    format!(
+                        "{} #{} {:?}{decision} → {target}",
+                        source.source_address.offset, source.sequence_index, branch_kind
+                    ),
+                )
+            }
+            PcodePathEvent::Fallthrough { source, target } => (
+                address(source),
+                format!("{} fallthrough → {}", source.offset, target.offset),
+            ),
+        })
+        .collect()
+}
+
 fn pcode_display_lines(
     snapshot: &GhidraSnapshot,
     semantics: Option<&PcodeSemanticFunctionIr>,
@@ -2900,6 +2990,10 @@ struct AnalystApp {
     ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
     ghidra_llvm_operation: Option<String>,
     ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
+    ghidra_trace_seed_json: String,
+    ghidra_trace_start: String,
+    ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
+    ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_busy: bool,
     pending_ghidra: Option<(PathBuf, String)>,
     symbol: Option<String>,
@@ -3025,6 +3119,10 @@ impl AnalystApp {
             ghidra_exact_operations: Vec::new(),
             ghidra_llvm_operation: None,
             ghidra_llvm_prefix: None,
+            ghidra_trace_seed_json: String::new(),
+            ghidra_trace_start: String::new(),
+            ghidra_path_trace: None,
+            ghidra_path_lines: Vec::new(),
             ghidra_busy: false,
             pending_ghidra: None,
             symbol: None,
@@ -3199,6 +3297,10 @@ impl AnalystApp {
                     self.ghidra_exact_operations.clear();
                     self.ghidra_llvm_operation = None;
                     self.ghidra_llvm_prefix = None;
+                    self.ghidra_trace_seed_json.clear();
+                    self.ghidra_trace_start.clear();
+                    self.ghidra_path_trace = None;
+                    self.ghidra_path_lines.clear();
                     self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
@@ -3362,6 +3464,11 @@ impl AnalystApp {
                                 .unwrap_or_default();
                             self.ghidra_llvm_operation = None;
                             self.ghidra_llvm_prefix = None;
+                            self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
+                            self.ghidra_trace_start =
+                                snapshot.selected_function.entry.offset.clone();
+                            self.ghidra_path_trace = None;
+                            self.ghidra_path_lines.clear();
                             self.ghidra_snapshot = Some(snapshot);
                             self.failure = None;
                         }
@@ -5529,6 +5636,79 @@ impl AnalystApp {
                         .unwrap_or_else(|error| format!("LLVM emission failed: {error}"))
                 });
         }
+        egui::CollapsingHeader::new("Concrete path trace")
+            .id_salt("ghidra_concrete_path")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Seed known register or RAM bytes, then follow one bounded path. Unknown values and unsupported effects stop explicitly; the trace is not a whole-function proof.")
+                    .size(11.0).color(MUTED));
+                ui.horizontal(|ui| {
+                    ui.label("Start instruction");
+                    if ui.text_edit_singleline(&mut self.ghidra_trace_start).changed() {
+                        self.ghidra_path_trace = None;
+                        self.ghidra_path_lines.clear();
+                    }
+                    if let Some(address) = self.selected_address
+                        && ui.button("Use selected").clicked() {
+                            self.ghidra_trace_start = format!("0x{address:x}");
+                            self.ghidra_path_trace = None;
+                            self.ghidra_path_lines.clear();
+                        }
+                });
+                ui.label(RichText::new("Seed JSON · offsets and values use 0x hexadecimal")
+                    .size(11.0).color(MUTED));
+                if ui.add(egui::TextEdit::multiline(&mut self.ghidra_trace_seed_json)
+                    .code_editor().desired_rows(8).desired_width(f32::INFINITY)).changed() {
+                        self.ghidra_path_trace = None;
+                        self.ghidra_path_lines.clear();
+                    }
+                if ui.button("Trace path").clicked() {
+                    let result: Result<PcodePathTrace, String> = (|| {
+                        let initial = parse_pcode_seed(
+                            self.ghidra_trace_seed_json.as_bytes(), snapshot)?;
+                        let start = ghidra_trace_start(snapshot, &self.ghidra_trace_start)?;
+                        snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024)
+                    })();
+                    self.ghidra_path_lines = result
+                        .as_ref()
+                        .map(ghidra_trace_lines)
+                        .unwrap_or_default();
+                    self.ghidra_path_trace = Some(result);
+                }
+                match &self.ghidra_path_trace {
+                    Some(Ok(trace)) => {
+                        let stop = serde_json::to_value(&trace.stop).unwrap_or_default();
+                        let kind = stop.get("kind").and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        ui.label(RichText::new(format!("{} instruction visits · {} events · stop: {kind}",
+                            trace.instruction_visits.len(), trace.events.len()))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy trace JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(trace) {
+                                ui.ctx().copy_text(json);
+                            }
+                        egui::CollapsingHeader::new("Stop detail")
+                            .id_salt("ghidra_trace_stop_detail")
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(stop.to_string()).monospace().size(11.0));
+                            });
+                        egui::ScrollArea::vertical().id_salt("ghidra_trace_events")
+                            .max_height(180.0)
+                            .show_rows(ui, 18.0, self.ghidra_path_lines.len(), |ui, range| {
+                                for row in range {
+                                    let (address, line) = &self.ghidra_path_lines[row];
+                                    if ui.selectable_label(self.selected_address == *address,
+                                        RichText::new(line).monospace().size(11.0)).clicked() {
+                                            self.selected_address = *address;
+                                        }
+                                }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
         egui::CollapsingHeader::new("LLVM exact prefix")
             .id_salt("ghidra_llvm_prefix")
             .show(ui, |ui| {
@@ -10061,8 +10241,9 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
-        WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address, indexed_function_action,
-        ir_slice, local_region_artifacts, native_function_excerpt, native_instruction_count,
+        WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address, ghidra_seed_template,
+        ghidra_trace_lines, ghidra_trace_start, indexed_function_action, ir_slice,
+        local_region_artifacts, native_function_excerpt, native_instruction_count,
         native_opaque_instruction_count, pcode_display_lines, pcode_state_lines,
         preview_patch_local, resized_console_height, valid_bearer_token, validate_endpoint,
         workbench_graph_layout,
@@ -10076,7 +10257,7 @@ mod tests {
         decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
     };
     use hydir_execution::StopPoint;
-    use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect};
+    use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect, parse_pcode_seed};
     use std::sync::mpsc;
 
     #[test]
@@ -10113,6 +10294,30 @@ mod tests {
                 .flat_map(|instruction| &instruction.operations)
                 .any(|operation| matches!(operation.effect, PcodeEffect::Opaque { .. }))
         );
+    }
+
+    #[test]
+    fn ghidra_path_trace_rows_link_back_to_real_branch_instruction() {
+        let snapshot: GhidraSnapshot = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
+        ))
+        .unwrap();
+        let mut seed: serde_json::Value =
+            serde_json::from_str(&ghidra_seed_template(&snapshot)).unwrap();
+        assert_eq!(seed["binary_sha256"], snapshot.binary_sha256);
+        assert_eq!(
+            seed["entry"],
+            serde_json::json!(snapshot.selected_function.entry)
+        );
+        seed["registers"] = serde_json::json!([{"offset": "0x206", "size": 1, "value": "0x1"}]);
+        let state = parse_pcode_seed(&serde_json::to_vec(&seed).unwrap(), &snapshot).unwrap();
+        let start = ghidra_trace_start(&snapshot, "0x2013d9").unwrap();
+        let trace = snapshot
+            .execute_concrete_path(&state, Some(&start), 8, 4)
+            .unwrap();
+        let lines = ghidra_trace_lines(&trace);
+        assert_eq!(lines[0].0, Some(0x2013d9));
+        assert!(lines[0].1.contains("0x2013e2"));
     }
 
     #[test]

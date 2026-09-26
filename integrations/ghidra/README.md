@@ -109,6 +109,10 @@ selected function's analyzed instructions. `--start` optionally selects an
 instruction in that function, which is useful when earlier instructions have
 unsupported effects. The path artifact records each instruction visit and
 branch event, and stops on unknown control, a call or return, or a budget.
+The desktop workbench's **Concrete path trace** panel creates a seed template
+for the selected function, accepts register and RAM values in that format,
+and links trace events back to their source instructions. The GUI and CLI use
+the same `hydir_ir::pcode::parse_pcode_seed` validation.
 
 The JSON includes the SHA-256 of the supplied original binary and requires it
 to match Ghidra's recorded import hash. Addresses are objects
