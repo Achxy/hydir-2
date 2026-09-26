@@ -5,7 +5,205 @@
 //! constant varnodes are embedded. The function can therefore be checked or
 //! differentially executed without implying whole-function equivalence.
 
-use hydir_ir::pcode::{PcodeEffect, PcodeExactOp, PcodeSemanticOperation};
+use hydir_ir::pcode::{
+    GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeExactOp,
+    PcodeSemanticOperation, PcodeVarnode,
+};
+use hydir_ir::{SemanticFidelity, VerificationStatus};
+use serde::{Deserialize, Serialize};
+
+pub const PCODE_LLVM_PREFIX_VERSION: u32 = 1;
+const MAX_PREFIX_OPERATIONS: usize = 4096;
+
+/// An inspectable state transition prefix, stopping before the first effect
+/// or flow that this emitter cannot preserve. It is not a complete function.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PcodeLlvmPrefixArtifact {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub entry: PcodeAddress,
+    pub emitted_operations: usize,
+    pub source_operations: Vec<PcodeLlvmSourceOperation>,
+    pub stop_reason: String,
+    pub stopped_at: Option<PcodeAddress>,
+    pub state_abi: String,
+    pub llvm_ir: String,
+    pub semantic_fidelity: SemanticFidelity,
+    pub verification: VerificationStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PcodeLlvmSourceOperation {
+    pub address: PcodeAddress,
+    pub instruction_index: usize,
+    pub operation_index: usize,
+    pub mnemonic: String,
+}
+
+fn pcode_offset(varnode: &PcodeVarnode) -> Result<u64, String> {
+    let digits = varnode
+        .offset
+        .strip_prefix("0x")
+        .ok_or("P-code offset requires 0x prefix")?;
+    let offset =
+        u64::from_str_radix(digits, 16).map_err(|_| "invalid P-code varnode offset".to_owned())?;
+    offset
+        .checked_add(u64::from(varnode.size - 1))
+        .ok_or("P-code varnode byte range overflows u64")?;
+    Ok(offset)
+}
+
+fn pcode_space_id(space: &str) -> Result<u32, String> {
+    match space {
+        "register" => Ok(1),
+        "unique" => Ok(2),
+        _ => Err(format!(
+            "exact P-code operation uses unsupported state space {space}"
+        )),
+    }
+}
+
+/// Emit a straight-line prefix from a validated Ghidra snapshot. The state
+/// helpers are external: read returns a zero-extended little-endian varnode;
+/// write replaces exactly that byte range, including overlapping aliases.
+/// IDs 1 and 2 designate Ghidra register and unique spaces respectively.
+/// The unique space is cleared at each instruction boundary. Guest memory and
+/// control effects stop emission before they occur.
+pub fn emit_pcode_linear_prefix_llvm(
+    snapshot: &GhidraSnapshot,
+) -> Result<PcodeLlvmPrefixArtifact, String> {
+    let cfg = snapshot.pcode_cfg_ir()?;
+    let first = cfg
+        .nodes
+        .first()
+        .ok_or("Ghidra selected function has no CFG nodes")?;
+    if first.address != cfg.state.entry {
+        return Err("selected function entry differs from first instruction".to_owned());
+    }
+    let mut helpers = String::new();
+    let mut body = String::new();
+    let mut sources = Vec::new();
+    let mut stop_reason =
+        "end of selected instruction list; return and later effects unverified".to_owned();
+    let mut stopped_at = None;
+    'instructions: for (instruction_index, instruction) in cfg.state.instructions.iter().enumerate()
+    {
+        if instruction_index > 0 {
+            let previous = &cfg.nodes[instruction_index - 1];
+            let linear = previous.outgoing_calls.is_empty()
+                && !previous.has_unresolved_control
+                && previous.outgoing_edges.len() == 1
+                && cfg.edges[previous.outgoing_edges[0] as usize].target_node
+                    == Some(instruction_index as u32)
+                && cfg.edges[previous.outgoing_edges[0] as usize].evidence.kind
+                    == GhidraFlowKind::Fallthrough;
+            if !linear {
+                stop_reason = "next instruction lacks a sole proven fallthrough edge".to_owned();
+                stopped_at = Some(instruction.address.clone());
+                break;
+            }
+        }
+        body.push_str("  call void @hydir_clear_unique(ptr %state)\n");
+        for (operation_index, state_operation) in instruction.operations.iter().enumerate() {
+            if sources.len() >= MAX_PREFIX_OPERATIONS {
+                stop_reason =
+                    format!("P-code LLVM prefix exceeds {MAX_PREFIX_OPERATIONS} operations");
+                stopped_at = Some(instruction.address.clone());
+                break 'instructions;
+            }
+            if !matches!(state_operation.effect, PcodeEffect::Assign { .. }) {
+                stop_reason = format!("opaque {} effect", state_operation.source.mnemonic);
+                stopped_at = Some(instruction.address.clone());
+                break 'instructions;
+            }
+            let operation = PcodeSemanticOperation {
+                source: state_operation.source.clone(),
+                effect: state_operation.effect.clone(),
+            };
+            let helper_name = format!("hydir_exact_{}", sources.len());
+            let helper = emit_pcode_exact_operation_llvm(&operation)?.replacen(
+                "@hydir_pcode_exact(",
+                &format!("@{helper_name}("),
+                1,
+            );
+            helpers.push_str(&helper);
+            helpers.push('\n');
+            let mut arguments = Vec::new();
+            for (input_index, input) in operation.source.inputs.iter().enumerate() {
+                if input.space == "const" {
+                    continue;
+                }
+                let space_id = pcode_space_id(&input.space)?;
+                let bits = input.size * 8;
+                let raw_name = format!("%op{}_in{}_raw", sources.len(), input_index);
+                body.push_str(&format!(
+                    "  {raw_name} = call i64 @hydir_read_varnode(ptr %state, i32 {space_id}, i64 {}, i32 {})\n",
+                    pcode_offset(input)?, input.size
+                ));
+                let typed_name = if bits == 64 {
+                    raw_name
+                } else {
+                    let name = format!("%op{}_in{}", sources.len(), input_index);
+                    body.push_str(&format!("  {name} = trunc i64 {raw_name} to i{bits}\n"));
+                    name
+                };
+                arguments.push(format!("i{bits} {typed_name}"));
+            }
+            let output = operation
+                .source
+                .output
+                .as_ref()
+                .ok_or("exact P-code operation lacks output")?;
+            let result_bits = output.size * 8;
+            let result_name = format!("%op{}_result", sources.len());
+            body.push_str(&format!(
+                "  {result_name} = call i{result_bits} @{helper_name}({})\n",
+                arguments.join(", ")
+            ));
+            let raw_result = if result_bits == 64 {
+                result_name
+            } else {
+                let name = format!("%op{}_result_raw", sources.len());
+                body.push_str(&format!(
+                    "  {name} = zext i{result_bits} {result_name} to i64\n"
+                ));
+                name
+            };
+            body.push_str(&format!(
+                "  call void @hydir_write_varnode(ptr %state, i32 {}, i64 {}, i32 {}, i64 {raw_result})\n",
+                pcode_space_id(&output.space)?, pcode_offset(output)?, output.size
+            ));
+            sources.push(PcodeLlvmSourceOperation {
+                address: instruction.address.clone(),
+                instruction_index,
+                operation_index,
+                mnemonic: operation.source.mnemonic,
+            });
+        }
+    }
+    let ir = format!(
+        "; Hydir P-code linear prefix, not a whole-function equivalence claim.\n\
+         ; state ABI: space 1=register, 2=unique; byte offsets, little-endian widths.\n\
+         declare i64 @hydir_read_varnode(ptr, i32, i64, i32)\n\
+         declare void @hydir_write_varnode(ptr, i32, i64, i32, i64)\n\n\
+         declare void @hydir_clear_unique(ptr)\n\n\
+         {helpers}define i32 @hydir_pcode_prefix(ptr %state) {{\nentry:\n{body}  ret i32 {}\n}}\n",
+        sources.len()
+    );
+    Ok(PcodeLlvmPrefixArtifact {
+        schema_version: PCODE_LLVM_PREFIX_VERSION,
+        binary_sha256: snapshot.binary_sha256.clone(),
+        entry: cfg.state.entry,
+        emitted_operations: sources.len(),
+        source_operations: sources,
+        stop_reason,
+        stopped_at,
+        state_abi: "hydir-pcode-state-v1: opaque pointer; helper spaces 1=register,2=unique; byte offsets; little-endian exact-width reads/writes; clear unique at instruction start".to_owned(),
+        llvm_ir: ir,
+        semantic_fidelity: SemanticFidelity::Unknown,
+        verification: VerificationStatus::NotRun,
+    })
+}
 
 /// Emit a verifier-clean LLVM function for one exact operation (up to 64 bits).
 /// The function is named `hydir_pcode_exact` and has an integer return type
@@ -406,5 +604,28 @@ mod tests {
                 assert_eq!(actual, expected, "{mnemonic} {values:?}");
             }
         }
+    }
+
+    #[test]
+    fn real_ghidra_prefix_stops_before_opaque_flag_effect_and_verifies() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
+        ));
+        let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
+        let snapshot = hydir_ir::pcode::parse_ghidra_snapshot(bytes, digest).unwrap();
+        let artifact = emit_pcode_linear_prefix_llvm(&snapshot).unwrap();
+        assert_eq!(artifact.binary_sha256, digest);
+        assert_eq!(artifact.emitted_operations, 7);
+        assert_eq!(artifact.stopped_at.as_ref().unwrap().offset, "0x2013d6");
+        assert!(artifact.stop_reason.contains("opaque POPCOUNT"));
+        assert_eq!(artifact.semantic_fidelity, SemanticFidelity::Unknown);
+        assert_eq!(artifact.verification, VerificationStatus::NotRun);
+        assert_eq!(artifact.source_operations[0].address.offset, "0x2013cf");
+        assert!(artifact.llvm_ir.contains("@hydir_read_varnode"));
+        let _ = run_opt(
+            &artifact.llvm_ir,
+            &["-passes=verify", "-disable-output", "-"],
+        );
     }
 }

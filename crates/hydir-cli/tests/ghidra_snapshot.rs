@@ -178,4 +178,20 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     assert_eq!(artifact["cfg_completeness"], "incomplete");
     assert_eq!(artifact["calls"].as_array().unwrap().len(), 1);
     assert_eq!(artifact["binary_sha256"], summary["binary_sha256"]);
+
+    let prefix = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-prefix"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_bit_prefix_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        prefix.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prefix.stderr)
+    );
+    let prefix: serde_json::Value = serde_json::from_slice(&prefix.stdout).unwrap();
+    assert_eq!(prefix["emitted_operations"], 7);
+    assert_eq!(prefix["verification"], "not_run");
+    assert!(prefix["stop_reason"].as_str().unwrap().contains("POPCOUNT"));
 }
