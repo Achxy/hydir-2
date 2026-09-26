@@ -39,6 +39,15 @@ MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
 artifacts. `get_program_artifact(...)` never executes the input and requires a
 FunctionIndex selector for function-scoped stages.
 
+`analyze_ghidra_snapshot(project_id, revision, snapshot, stage)` sends an
+exported Ghidra snapshot as bytes or a file path to the v3 service. The
+project must already contain the same binary. The server checks the snapshot
+digest against that binary and runs a bounded worker. Supported stages are
+`pcode`, `semantics`, `state`, `cfg`, `coverage`, and `llvm-cfg`. For the last
+stage, pass `start_address=0x...` to select a CFG entry. The SDK checks the
+artifact hash, media type, schema version, and project revision before
+returning JSON.
+
 v2 methods expose digest-checked
 `RegionSpec` v3, `PhysicalRegionIR` v1, and `DecompilationUnit` v1 JSON, compile scalar patch v1 into
 reversible `PatchBundle` v2, apply it with revision/idempotency protection, and

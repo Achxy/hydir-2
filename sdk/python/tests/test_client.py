@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -142,6 +143,60 @@ class ClientBoundaryTests(unittest.TestCase):
                 "project", 4, "high_level_cfg_cir", "hydir_cfg_sum"
             )
             self.assertEqual(artifact["schema_version"], 3)
+
+    def test_v3_ghidra_snapshot_artifact_uses_revisioned_rpc_and_checks_reply(self):
+        snapshot = Path(self.directory.name) / "snapshot.json"
+        snapshot.write_bytes(b'{"schema_version":2}')
+        artifact = json.dumps({"schema_version": 2, "llvm_ir": "define void @f() {}"}).encode()
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def call(method, request):
+                self.assertIs(method, client._stub_v3.AnalyzeGhidraSnapshot)
+                requests.append(request)
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(artifact).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=2",
+                    content=artifact,
+                    project_revision=4,
+                )
+
+            client._call = call
+            result = client.analyze_ghidra_snapshot(
+                "project", 4, snapshot, "llvm-cfg", start_address=0x20137C
+            )
+            self.assertEqual(result["schema_version"], 2)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0].snapshot_json, snapshot.read_bytes())
+            self.assertEqual(requests[0].start_address, "0x20137c")
+            self.assertEqual(requests[0].expected_revision, 4)
+            self.assertEqual(requests[0].stage, "llvm-cfg")
+
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(artifact).hexdigest(),
+                media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=2",
+                content=artifact,
+                project_revision=5,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_snapshot("project", 4, snapshot.read_bytes(), "llvm-cfg")
+
+    def test_v3_ghidra_snapshot_rejects_invalid_request_before_network(self):
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            client._call = lambda *_: self.fail("invalid request reached the server")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, b"{}", "llvm-prefix")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, b"{}", "cfg", start_address=0x10)
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, b"{}", "llvm-cfg", start_address="0xGG")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, b"", "pcode")
+            oversized = Path(self.directory.name) / "oversized.json"
+            with oversized.open("wb") as handle:
+                handle.truncate(16 * 1024 * 1024 + 1)
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, oversized, "pcode")
 
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:

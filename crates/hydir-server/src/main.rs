@@ -33,6 +33,7 @@ use hydir_decompile::{
     lower_state_ir, measure_native_coverage,
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
+use hydir_ir::pcode::{MAX_GHIDRA_SNAPSHOT_BYTES, PcodeAddress, parse_ghidra_snapshot};
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
     STATE_FUNCTION_IR_VERSION,
@@ -1750,10 +1751,10 @@ fn valid_symbol(symbol: &str) -> Result<(), Status> {
 }
 
 fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
-    if action == "native-artifact" {
+    if matches!(action, "native-artifact" | "ghidra-snapshot-artifact") {
         if argument.is_empty() || argument.len() > 1024 || argument.chars().any(char::is_control) {
             return Err(Status::invalid_argument(
-                "native artifact selector must be 1..=1024 non-control bytes",
+                "worker artifact selector must be 1..=1024 non-control bytes",
             ));
         }
         Ok(())
@@ -2035,6 +2036,77 @@ struct NativeArtifactSelector {
     function: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GhidraSnapshotArtifactSelector {
+    stage: String,
+    binary_sha256: String,
+    #[serde(default)]
+    start_address: String,
+}
+
+fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
+    match stage {
+        "pcode" => Some("application/vnd.hydir.pcode-ir+json;version=1"),
+        "semantics" => Some("application/vnd.hydir.pcode-semantic-ir+json;version=1"),
+        "state" => Some("application/vnd.hydir.pcode-state-ir+json;version=1"),
+        "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
+        "coverage" => Some("application/vnd.hydir.pcode-coverage+json;version=1"),
+        "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
+        _ => None,
+    }
+}
+
+fn validate_ghidra_start_address(stage: &str, address: &str) -> Result<(), String> {
+    if address.is_empty() {
+        return Ok(());
+    }
+    if stage != "llvm-cfg" {
+        return Err("start address is supported only for llvm-cfg".to_owned());
+    }
+    let digits = address
+        .strip_prefix("0x")
+        .ok_or("start address must be 0x-prefixed hexadecimal")?;
+    if digits.is_empty()
+        || digits.len() > 16
+        || !digits
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("start address must contain 1..=16 lowercase hexadecimal digits".to_owned());
+    }
+    Ok(())
+}
+
+fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraSnapshotArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra artifact selector: {error}"))?;
+    ghidra_snapshot_artifact_media_type(&selector.stage)
+        .ok_or_else(|| "unsupported Ghidra artifact stage".to_owned())?;
+    validate_ghidra_start_address(&selector.stage, &selector.start_address)?;
+    let snapshot = parse_ghidra_snapshot(bytes, &selector.binary_sha256)?;
+    let raw = snapshot.pcode_function_ir()?;
+    let content = match selector.stage.as_str() {
+        "pcode" => serde_json::to_vec(&raw),
+        "semantics" => serde_json::to_vec(&raw.lower_semantics()),
+        "state" => serde_json::to_vec(&raw.lower_state()),
+        "cfg" => serde_json::to_vec(&snapshot.pcode_cfg_ir()?),
+        "coverage" => serde_json::to_vec(&snapshot.pcode_coverage_report()?),
+        "llvm-cfg" => {
+            let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: selector.start_address,
+            });
+            serde_json::to_vec(&hydir_decompile::emit_pcode_cfg_llvm(
+                &snapshot,
+                start.as_ref(),
+            )?)
+        }
+        _ => unreachable!("stage was checked above"),
+    };
+    content.map_err(|error| error.to_string())
+}
+
 fn native_artifact_media_type(stage: &str) -> Option<&'static str> {
     match stage {
         "program_spec" => Some("application/vnd.hydir.program-spec+json;version=5"),
@@ -2183,6 +2255,7 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
     match (action, symbol) {
         ("native-analysis", None) => native_analysis_bundle(bytes),
         ("native-artifact", Some(selector)) => native_artifact(bytes, selector),
+        ("ghidra-snapshot-artifact", Some(selector)) => ghidra_snapshot_artifact(bytes, selector),
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
             .and_then(|spec| serde_json::to_vec(&spec).map_err(|error| error.to_string())),
@@ -3638,6 +3711,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             stable_contract: "native bounded ELF analysis with explicit unknown effects; LLVM is an optional export; partial artifacts are never rewrite-ready".to_owned(),
             isolated_analysis_jobs: true,
             analyst_fact_updates: true,
+            ghidra_snapshot_analysis: true,
         }))
     }
 
@@ -3896,6 +3970,82 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             .await?;
         Ok(Response::new(api_v3::ArtifactReply {
             sha256: digest,
+            media_type: media_type.to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
+    async fn analyze_ghidra_snapshot(
+        &self,
+        request: Request<api_v3::GhidraSnapshotArtifactRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        let media_type = ghidra_snapshot_artifact_media_type(&input.stage)
+            .ok_or_else(|| Status::invalid_argument("unsupported Ghidra artifact stage"))?;
+        validate_ghidra_start_address(&input.stage, &input.start_address)
+            .map_err(Status::invalid_argument)?;
+        if input.snapshot_json.is_empty() || input.snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+            return Err(Status::resource_exhausted(
+                "Ghidra snapshot must be 1..=16 MiB",
+            ));
+        }
+        let project = self.project(&principal, &input.project_id)?;
+        if project.revision != input.expected_revision {
+            return Err(Status::aborted("stale project revision"));
+        }
+        if project.binary_sha256.is_empty() {
+            return Err(Status::failed_precondition(
+                "project has no uploaded binary",
+            ));
+        }
+        let selector = serde_json::to_string(&GhidraSnapshotArtifactSelector {
+            stage: input.stage,
+            binary_sha256: project.binary_sha256.clone(),
+            start_address: input.start_address,
+        })
+        .map_err(|_| Status::internal("Ghidra artifact selector serialization failed"))?;
+        let content = run_worker(
+            "ghidra-snapshot-artifact",
+            Some(&selector),
+            input.snapshot_json,
+        )
+        .await?;
+        // Do not attach an artifact to a revision that ceased to be current
+        // while the isolated worker was processing the snapshot.
+        let current = self.project(&principal, &input.project_id)?;
+        if current.revision != input.expected_revision
+            || current.binary_sha256 != project.binary_sha256
+        {
+            return Err(Status::aborted("stale project revision"));
+        }
+        let staged = self.content_storage.stage(&content).await?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(internal)?;
+        let stored: (i64, String) = transaction
+            .query_row(
+                "SELECT p.current_revision,r.binary_sha256 FROM projects p \
+                 JOIN project_revisions r ON r.project_id=p.id AND r.revision=p.current_revision \
+                 WHERE p.id=?1",
+                params![input.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(internal)?;
+        if stored.0 != input.expected_revision as i64 || stored.1 != project.binary_sha256 {
+            return Err(Status::aborted("stale project revision"));
+        }
+        insert_artifact(
+            &transaction,
+            &input.project_id,
+            input.expected_revision as i64,
+            media_type,
+            &staged,
+        )?;
+        transaction.commit().map_err(internal)?;
+        Ok(Response::new(api_v3::ArtifactReply {
+            sha256: staged.digest,
             media_type: media_type.to_owned(),
             content,
             project_revision: input.expected_revision,
@@ -4975,6 +5125,148 @@ mod tests {
         .into_inner();
         assert_eq!(replay.revision, applied.revision);
         assert_eq!(replay.binary_sha256, applied.binary_sha256);
+    }
+
+    #[tokio::test]
+    async fn v3_ghidra_snapshot_artifacts_are_binary_and_revision_bound() {
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("ghidra-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Ghidra imported analysis".to_owned(),
+                    idempotency_key: "create-ghidra-import".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../demo/hydir-prism.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let snapshot =
+            include_bytes!("../../../tests/fixtures/ghidra_prism_snapshot_v2.json").to_vec();
+        let request = |stage: &str, bytes: Vec<u8>| api_v3::GhidraSnapshotArtifactRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            snapshot_json: bytes,
+            stage: stage.to_owned(),
+            start_address: String::new(),
+        };
+        for stage in ["pcode", "semantics", "state", "cfg", "coverage", "llvm-cfg"] {
+            let mut stage_request = request(stage, snapshot.clone());
+            if stage == "llvm-cfg" {
+                stage_request.start_address = "0x20137c".to_owned();
+            }
+            let artifact =
+                HydirV3::analyze_ghidra_snapshot(&store, authorized(stage_request, &token))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(artifact.project_revision, uploaded.revision);
+            assert_eq!(artifact.sha256, sha256(&artifact.content));
+            assert_eq!(
+                artifact.media_type,
+                ghidra_snapshot_artifact_media_type(stage).unwrap()
+            );
+            let json: serde_json::Value = serde_json::from_slice(&artifact.content).unwrap();
+            assert_eq!(json["binary_sha256"], uploaded.binary_sha256);
+            assert_eq!(
+                json["schema_version"],
+                if stage == "llvm-cfg" { 2 } else { 1 }
+            );
+            if stage != "cfg" {
+                assert_eq!(json["semantic_fidelity"], "unknown");
+                assert_eq!(json["verification"], "not_run");
+            } else {
+                assert_eq!(json["state"]["semantic_fidelity"], "unknown");
+            }
+            if stage == "llvm-cfg" {
+                assert_eq!(json["start"]["offset"], "0x20137c");
+            }
+        }
+
+        let stale = api_v3::GhidraSnapshotArtifactRequest {
+            expected_revision: 0,
+            ..request("pcode", snapshot.clone())
+        };
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+
+        let mut wrong: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        wrong["binary_sha256"] = json!("0".repeat(64));
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(
+                &store,
+                authorized(
+                    request("pcode", serde_json::to_vec(&wrong).unwrap()),
+                    &token
+                ),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let oversized = request("pcode", vec![b' '; MAX_GHIDRA_SNAPSHOT_BYTES + 1]);
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(oversized, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let invalid_start = api_v3::GhidraSnapshotArtifactRequest {
+            start_address: "0x20137c".to_owned(),
+            ..request("pcode", snapshot.clone())
+        };
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(invalid_start, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(
+                &store,
+                Request::new(request("pcode", snapshot.clone())),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(
+                &store,
+                authorized(request("invalid", snapshot), &token),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test]
