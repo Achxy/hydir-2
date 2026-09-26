@@ -16,8 +16,9 @@ references, and flow. Unsupported operations remain explicit effects.
 Hydir's versioned IR is canonical after import. Existing native x86-64 ELF
 analysis remains available for compatibility and cross-checks. LLVM remains
 an optional export as decided in ADR 0019; verifier-clean text alone does not
-establish semantic equivalence. The desktop app and Ghidra extension are
-clients of the framework, not mandatory hosts for it.
+establish semantic equivalence. Hydir's existing desktop GUI is a first-class
+workbench for imported artifacts. CLI, SDK, and API clients share the same
+framework; the Ghidra extension provides export and address navigation.
 
 This decision supersedes the CTF-centered product and release framing in the
 historical workflow proposal. CTF and VM cases remain useful tests and later
