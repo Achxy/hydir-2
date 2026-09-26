@@ -345,6 +345,39 @@ pub fn emit_pcode_exact_operation_llvm(
             ));
             "%result".to_owned()
         }
+        PcodeExactOp::UnsignedCarry | PcodeExactOp::SignedCarry | PcodeExactOp::SignedBorrow => {
+            let input_bits = operation.source.inputs[0].size * 8;
+            let instruction = if kind == PcodeExactOp::SignedBorrow {
+                "sub"
+            } else {
+                "add"
+            };
+            body.push_str(&format!(
+                "  %arithmetic = {instruction} i{input_bits} {}, {}\n",
+                operands[0], operands[1]
+            ));
+            if kind == PcodeExactOp::UnsignedCarry {
+                body.push_str(&format!(
+                    "  %overflow = icmp ult i{input_bits} %arithmetic, {}\n",
+                    operands[0]
+                ));
+            } else {
+                body.push_str(&format!(
+                    "  %left_sign = icmp slt i{input_bits} {}, 0\n  %right_sign = icmp slt i{input_bits} {}, 0\n  %result_sign = icmp slt i{input_bits} %arithmetic, 0\n",
+                    operands[0], operands[1]
+                ));
+                let operand_relation = if kind == PcodeExactOp::SignedCarry {
+                    "icmp eq"
+                } else {
+                    "xor"
+                };
+                body.push_str(&format!(
+                    "  %operand_relation = {operand_relation} i1 %left_sign, %right_sign\n  %result_relation = xor i1 %left_sign, %result_sign\n  %overflow = and i1 %operand_relation, %result_relation\n"
+                ));
+            }
+            body.push_str("  %result = zext i1 %overflow to i8\n");
+            "%result".to_owned()
+        }
         PcodeExactOp::Equal
         | PcodeExactOp::NotEqual
         | PcodeExactOp::UnsignedLess
@@ -494,6 +527,9 @@ mod tests {
             18 => PcodeExactOp::SignExtend,
             19 => PcodeExactOp::Add,
             20 => PcodeExactOp::Sub,
+            21 => PcodeExactOp::UnsignedCarry,
+            22 => PcodeExactOp::SignedCarry,
+            23 => PcodeExactOp::SignedBorrow,
             24 => PcodeExactOp::TwosComplement,
             25 => PcodeExactOp::BitwiseNegate,
             26 => PcodeExactOp::Xor,
@@ -577,6 +613,9 @@ mod tests {
             (18, "INT_SEXT", 8, vec![1]),
             (19, "INT_ADD", 1, vec![1, 1]),
             (20, "INT_SUB", 1, vec![1, 1]),
+            (21, "INT_CARRY", 1, vec![8, 8]),
+            (22, "INT_SCARRY", 1, vec![8, 8]),
+            (23, "INT_SBORROW", 1, vec![8, 8]),
             (24, "INT_2COMP", 1, vec![1]),
             (25, "INT_NEGATE", 1, vec![1]),
             (26, "INT_XOR", 1, vec![1, 1]),
@@ -653,6 +692,11 @@ mod tests {
             (18, "INT_SEXT", 8, &[1], &[0x80]),
             (19, "INT_ADD", 1, &[1, 1], &[0xff, 2]),
             (20, "INT_SUB", 1, &[1, 1], &[0, 1]),
+            (21, "INT_CARRY", 1, &[1, 1], &[0xff, 1]),
+            (22, "INT_SCARRY", 1, &[1, 1], &[0x7f, 1]),
+            (23, "INT_SBORROW", 1, &[1, 1], &[0x80, 1]),
+            (22, "INT_SCARRY", 1, &[8, 8], &[i64::MAX as u64, 1]),
+            (23, "INT_SBORROW", 1, &[8, 8], &[i64::MIN as u64, 1]),
             (24, "INT_2COMP", 1, &[1], &[0x80]),
             (25, "INT_NEGATE", 1, &[1], &[0x80]),
             (26, "INT_XOR", 1, &[1, 1], &[0xf0, 0x0f]),

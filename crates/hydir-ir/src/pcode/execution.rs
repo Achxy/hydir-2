@@ -1772,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn real_ghidra_fixture_stops_at_first_unsupported_effect() {
+    fn real_ghidra_fixture_reaches_control_after_exact_flags() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/ghidra_prism_snapshot_v2.json"
@@ -1790,13 +1790,13 @@ mod tests {
             .write_varnode(&node("register", "0x30", 8), 5)
             .unwrap();
         let trace = f.execute_exact_prefix(&state, 32).unwrap();
-        assert_eq!(trace.executed.len(), 3);
+        assert_eq!(trace.executed.len(), 12);
         assert!(matches!(
             &trace.stop,
             PcodeExecutionStop::OpaqueBoundary {
                 source: PcodeOperation { mnemonic, source_address, .. },
                 ..
-            } if mnemonic == "INT_SBORROW" && source_address.offset == "0x20137f"
+            } if mnemonic == "CBRANCH" && source_address.offset == "0x201382"
         ));
         let roundtrip: PcodeExecutionTrace =
             serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();

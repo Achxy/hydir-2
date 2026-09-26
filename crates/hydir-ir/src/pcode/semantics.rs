@@ -21,6 +21,9 @@ pub enum PcodeExactOp {
     Copy,
     Add,
     Sub,
+    UnsignedCarry,
+    SignedCarry,
+    SignedBorrow,
     TwosComplement,
     BitwiseNegate,
     Xor,
@@ -217,6 +220,20 @@ impl PcodeSemanticOperation {
             PcodeExactOp::SignExtend => signed(values[0], widths[0]) as u64,
             PcodeExactOp::Add => values[0].wrapping_add(values[1]),
             PcodeExactOp::Sub => values[0].wrapping_sub(values[1]),
+            PcodeExactOp::UnsignedCarry => u64::from(
+                u128::from(values[0]) + u128::from(values[1]) > u128::from(mask(widths[0])),
+            ),
+            PcodeExactOp::SignedCarry | PcodeExactOp::SignedBorrow => {
+                let left = i128::from(signed(values[0], widths[0]));
+                let right = i128::from(signed(values[1], widths[1]));
+                let result = if operation == PcodeExactOp::SignedCarry {
+                    left + right
+                } else {
+                    left - right
+                };
+                let limit = 1i128 << (widths[0] - 1);
+                u64::from(result < -limit || result >= limit)
+            }
             PcodeExactOp::TwosComplement => values[0].wrapping_neg(),
             PcodeExactOp::BitwiseNegate => !values[0],
             PcodeExactOp::Xor => values[0] ^ values[1],
@@ -289,6 +306,9 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         18 => (Op::SignExtend, "INT_SEXT"),
         19 => (Op::Add, "INT_ADD"),
         20 => (Op::Sub, "INT_SUB"),
+        21 => (Op::UnsignedCarry, "INT_CARRY"),
+        22 => (Op::SignedCarry, "INT_SCARRY"),
+        23 => (Op::SignedBorrow, "INT_SBORROW"),
         24 => (Op::TwosComplement, "INT_2COMP"),
         25 => (Op::BitwiseNegate, "INT_NEGATE"),
         26 => (Op::Xor, "INT_XOR"),
@@ -383,7 +403,10 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
             | PcodeExactOp::UnsignedLess
             | PcodeExactOp::UnsignedLessEqual
             | PcodeExactOp::SignedLess
-            | PcodeExactOp::SignedLessEqual => {
+            | PcodeExactOp::SignedLessEqual
+            | PcodeExactOp::UnsignedCarry
+            | PcodeExactOp::SignedCarry
+            | PcodeExactOp::SignedBorrow => {
                 sizes.len() == 2 && sizes[0] == sizes[1] && output.size == 1
             }
             PcodeExactOp::ShiftLeft
@@ -575,6 +598,39 @@ mod tests {
             op(32, "INT_MULT", Some(1), &[1, 2]),
             op(37, "BOOL_NEGATE", Some(2), &[1]),
             op(37, "BOOL_NEGATE", Some(1), &[2]),
+        ] {
+            assert!(matches!(
+                lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn carry_and_signed_overflow_use_input_width() {
+        for (opcode, mnemonic, width, left, right, expected) in [
+            (21, "INT_CARRY", 1, 0xff, 1, 1),
+            (21, "INT_CARRY", 1, 0x7f, 1, 0),
+            (21, "INT_CARRY", 8, u64::MAX, 1, 1),
+            (22, "INT_SCARRY", 1, 0x7f, 1, 1),
+            (22, "INT_SCARRY", 1, 0x80, 0xff, 1),
+            (22, "INT_SCARRY", 1, 0xff, 1, 0),
+            (22, "INT_SCARRY", 8, i64::MAX as u64, 1, 1),
+            (23, "INT_SBORROW", 1, 0x80, 1, 1),
+            (23, "INT_SBORROW", 1, 0x7f, 0xff, 1),
+            (23, "INT_SBORROW", 1, 0xff, 1, 0),
+            (23, "INT_SBORROW", 8, i64::MIN as u64, 1, 1),
+        ] {
+            let operation = lowered(op(opcode, mnemonic, Some(1), &[width, width]));
+            assert_eq!(
+                operation.evaluate_exact(&[left, right]).unwrap(),
+                Some(expected)
+            );
+        }
+        for source in [
+            op(21, "INT_CARRY", Some(2), &[1, 1]),
+            op(22, "INT_SCARRY", Some(1), &[1, 2]),
+            op(23, "INT_SBORROW", Some(1), &[1]),
         ] {
             assert!(matches!(
                 lower_operation(&source),
