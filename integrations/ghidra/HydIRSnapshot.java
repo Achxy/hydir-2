@@ -9,9 +9,13 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.FlowType;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -28,6 +32,8 @@ public class HydIRSnapshot extends GhidraScript {
     // export; it never produces a plausible-looking partial analysis.
     private static final int MAX_FUNCTIONS = 65_536;
     private static final int MAX_ADDRESS_SPACES = 256;
+    private static final int MAX_MEMORY_BLOCKS = 4_096;
+    private static final int MAX_SYMBOLS = 65_536;
     private static final int MAX_INSTRUCTIONS = 16_384;
     private static final int MAX_PCODE_OPS = 262_144;
     private static final int MAX_OPS_PER_INSTRUCTION = 256;
@@ -208,6 +214,11 @@ public class HydIRSnapshot extends GhidraScript {
         return addresses * unit;
     }
 
+    private static String namespace(Symbol symbol) {
+        Namespace parent = symbol.getParentNamespace();
+        return parent == null ? "" : parent.getName(true);
+    }
+
     private Function selectFunction(List<Function> functions, String[] args) {
         if (args.length == 2) {
             for (Function function : functions) {
@@ -321,6 +332,74 @@ public class HydIRSnapshot extends GhidraScript {
             json.raw(",\"type\":" + space.getType());
             json.raw(",\"addressable_unit_size\":" + space.getAddressableUnitSize());
             json.raw(",\"pointer_size\":" + space.getPointerSize() + "}");
+        }
+        json.raw("],\"memory_blocks\":[");
+        MemoryBlock[] blocks = currentProgram.getMemory().getBlocks();
+        if (blocks.length > MAX_MEMORY_BLOCKS) {
+            throw new IllegalStateException("HydIR snapshot exceeds memory block limit "
+                + MAX_MEMORY_BLOCKS);
+        }
+        Arrays.sort(blocks, Comparator
+            .comparing((MemoryBlock block) -> block.getStart().getAddressSpace().getName())
+            .thenComparing((left, right) -> Long.compareUnsigned(
+                left.getStart().getOffset(), right.getStart().getOffset()))
+            .thenComparing(MemoryBlock::getName));
+        for (int i = 0; i < blocks.length; i++) {
+            monitor.checkCancelled();
+            MemoryBlock block = blocks[i];
+            if (i != 0) json.raw(",");
+            json.raw("{\"name\":").quoted(block.getName());
+            json.raw(",\"start\":").address(block.getStart());
+            json.raw(",\"end\":").address(block.getEnd());
+            json.raw(",\"size\":" + block.getSize());
+            json.raw(",\"read\":" + block.isRead());
+            json.raw(",\"write\":" + block.isWrite());
+            json.raw(",\"execute\":" + block.isExecute());
+            json.raw(",\"initialized\":" + block.isInitialized());
+            json.raw(",\"loaded\":" + block.isLoaded());
+            json.raw(",\"overlay\":" + block.isOverlay());
+            json.raw(",\"block_type\":").quoted(block.getType().toString());
+            json.raw("}");
+        }
+        json.raw("],\"symbols\":[");
+        List<Symbol> symbols = new ArrayList<>();
+        SymbolIterator symbolIterator = currentProgram.getSymbolTable().getDefinedSymbols();
+        while (symbolIterator.hasNext()) {
+            monitor.checkCancelled();
+            Symbol symbol = symbolIterator.next();
+            Address address = symbol.getAddress();
+            // Local-variable and namespace placeholders have no program memory
+            // address. The snapshot covers program and external symbols only.
+            if (address == null || (!address.isMemoryAddress() && !address.isExternalAddress())) {
+                continue;
+            }
+            if (symbols.size() >= MAX_SYMBOLS) {
+                throw new IllegalStateException("HydIR snapshot exceeds symbol limit " + MAX_SYMBOLS);
+            }
+            symbols.add(symbol);
+        }
+        symbols.sort(Comparator
+            .comparing((Symbol symbol) -> symbol.getAddress().getAddressSpace().getName())
+            .thenComparing((left, right) -> Long.compareUnsigned(
+                left.getAddress().getOffset(), right.getAddress().getOffset()))
+            .thenComparing(HydIRSnapshot::namespace)
+            .thenComparing(symbol -> symbol.getName())
+            .thenComparing(symbol -> symbol.getSymbolType().toString())
+            .thenComparing(symbol -> symbol.getSource().name())
+            .thenComparing(Symbol::isPrimary)
+            .thenComparing(Symbol::isExternal));
+        for (int i = 0; i < symbols.size(); i++) {
+            monitor.checkCancelled();
+            Symbol symbol = symbols.get(i);
+            if (i != 0) json.raw(",");
+            json.raw("{\"address\":").address(symbol.getAddress());
+            json.raw(",\"name\":").quoted(symbol.getName());
+            json.raw(",\"namespace\":").quoted(namespace(symbol));
+            json.raw(",\"symbol_type\":").quoted(symbol.getSymbolType().toString());
+            json.raw(",\"source_type\":").quoted(symbol.getSource().name());
+            json.raw(",\"primary\":" + symbol.isPrimary());
+            json.raw(",\"external\":" + symbol.isExternal());
+            json.raw("}");
         }
         json.raw("],\"functions\":[");
         for (int i = 0; i < functions.size(); i++) {
