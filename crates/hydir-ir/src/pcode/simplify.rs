@@ -12,7 +12,7 @@ use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
 
 pub const PCODE_SIMPLIFICATION_VERSION: u32 = 1;
-const SIMPLIFICATION_SOURCE: &str = "hydir_checked_pcode_simplification";
+pub(super) const SIMPLIFICATION_SOURCE: &str = "hydir_checked_pcode_simplification";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +379,11 @@ mod tests {
         let artifact = original.simplify_checked().unwrap();
         assert_eq!(artifact.binary_sha256, original.binary_sha256);
         assert_eq!(artifact.after.source, SIMPLIFICATION_SOURCE);
+        assert_eq!(
+            artifact.after.lower_semantics().source,
+            SIMPLIFICATION_SOURCE
+        );
+        assert_eq!(artifact.after.lower_state().source, SIMPLIFICATION_SOURCE);
         assert_eq!(artifact.semantic_fidelity, SemanticFidelity::Unknown);
         assert_eq!(artifact.verification, VerificationStatus::NotRun);
         assert_eq!(artifact.after.semantic_fidelity, SemanticFidelity::Unknown);

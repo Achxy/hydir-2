@@ -164,7 +164,7 @@ impl PcodeFunctionIr {
         PcodeSemanticFunctionIr {
             schema_version: PCODE_SEMANTIC_IR_VERSION,
             binary_sha256: self.binary_sha256.clone(),
-            source: "ghidra_raw_pcode".to_owned(),
+            source: self.source.clone(),
             entry: self.entry.clone(),
             name: self.name.clone(),
             ghidra_version: self.ghidra_version.clone(),

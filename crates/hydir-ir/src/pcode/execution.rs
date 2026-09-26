@@ -750,7 +750,10 @@ impl PcodeSemanticFunctionIr {
         max_operations: usize,
     ) -> Result<(), String> {
         if self.schema_version != PCODE_SEMANTIC_IR_VERSION
-            || self.source != "ghidra_raw_pcode"
+            || !matches!(
+                self.source.as_str(),
+                "ghidra_raw_pcode" | super::simplify::SIMPLIFICATION_SOURCE
+            )
             || !self.flow_overrides_applied
         {
             return Err("unsupported P-code semantic artifact".to_owned());
