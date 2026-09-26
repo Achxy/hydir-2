@@ -1,7 +1,7 @@
 <h1 align="center">HydIR</h1>
 
 <p align="center">
-  <strong>Native x86-64 ELF analysis and bounded decompilation.</strong><br>
+  <strong>Ghidra-backed binary lifting and reverse engineering in Rust.</strong><br>
   Desktop workbench, command-line tools, Python SDK, and authenticated service.
 </p>
 
@@ -20,11 +20,14 @@
 
 *The desktop workbench with a local ELF loaded: the overview presents the native analysis pipeline, program inventory, diagnostics, and inspector in one view.*
 
-HydIR opens little-endian x86-64 ELF files locally, shows a function's bytes and
-reachable branches, and turns supported semantics into inspectable LLVM IR and
-C. The desktop app, CLI, Python SDK, and authenticated service share the native
-core. The checked-in [`hydir_max2` walkthrough](https://hydir.wiki/articles/max2)
-shows the path on a 16-byte function.
+HydIR opens little-endian x86-64 ELF files, runs Ghidra analysis headlessly,
+and imports source-linked raw P-code into its Rust analysis core. Its desktop
+workbench shows functions, bytes, control flow, P-code effects, bounded LLVM,
+and the evidence behind type hints. A native ELF frontend remains available
+for independent analysis and comparison. The CLI, Python SDK, and authenticated
+service expose the same artifacts. The checked-in
+[`hydir_max2` walkthrough](https://hydir.wiki/articles/max2) shows the native
+path on a 16-byte function.
 
 The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
 GUI the entry point for automatic Ghidra analysis. Opening a local ELF now starts
@@ -40,6 +43,12 @@ The v3 service and Python SDK can run the same managed worker on an uploaded
 ELF and return a validated snapshot, raw P-code, state effects, CFG LLVM, and
 bounded dependency slices.
 
+The [Ubuntu container smoke test](https://github.com/Achxy/hydir-2/actions/runs/36261135599)
+exercises automatic CLI and v3 API analysis on a real ELF. A separate
+[Ghidra emulator comparison](integrations/ghidra/README.md) checks selected
+seeded paths against Hydir's Rust executor. These gates cover a declared
+subset; unresolved operations remain visible in coverage reports.
+
 ## Quick start
 
 Open the checked-in PRISM ELF for a tour of the workbench. Use the smaller
@@ -51,6 +60,16 @@ cargo run --locked --bin hydir -- --open-local demo/hydir-prism.elf hydir_stage_
 cargo run --locked --bin hydirctl -- discover fuzz/corpus/elf_import/max2.elf
 cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/max2.elf --function hydir_max2 --ir state
 cargo run --locked --bin hydirctl -- decompile fuzz/corpus/elf_import/max2.elf --function hydir_max2 --view unit
+```
+
+To reproduce the Ghidra-backed path from the CLI, run the following commands.
+HydIR provisions its pinned container on the first analysis; no Ghidra project
+setup is required. The GUI starts the same analysis when you open the ELF.
+
+```bash
+cargo run --locked -p hydir-cli -- ghidra analyze demo/hydir-prism.elf --output target/prism-ghidra.json --function 0x20137c
+cargo run --locked -p hydir-cli -- ghidra-snapshot verify demo/hydir-prism.elf target/prism-ghidra.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf target/prism-ghidra.json
 ```
 
 Replace the ELF path and function selector with your own. `discover` returns
