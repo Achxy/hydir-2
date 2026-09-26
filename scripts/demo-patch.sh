@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+trap 'status=$?; printf "patch gate failed at line %s: %s (status %s)\n" "$LINENO" "$BASH_COMMAND" "$status" >&2' ERR
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
@@ -66,7 +67,11 @@ if "$client" patch "$run_dir/add2-original" "$run_dir/oversize.json" \
   echo 'oversize patch unexpectedly accepted' >&2
   exit 1
 fi
-grep -q 'replacement needs 11 bytes' "$run_dir/oversize.err"
+if ! grep -q 'replacement needs 11 bytes' "$run_dir/oversize.err"; then
+  cat "$run_dir/oversize.err" >&2
+  echo 'undersized patch refusal did not report the placement limit' >&2
+  exit 1
+fi
 test ! -e "$run_dir/oversize-patched"
 
 clang -O0 -no-pie tests/fixtures/add2.S tests/fixtures/add2_main.c \
