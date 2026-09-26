@@ -32,7 +32,9 @@ a headless worker and imports a bounded raw P-code snapshot into Hydir. The
 default worker provisions a pinned container image; developers can set
 `HYDIR_GHIDRA_HOME` to use a local Ghidra 12.1.4 installation. Hydir also exposes
 Rust semantic classification and LLVM for a narrow exact operation subset.
-Whole-function P-code lifting and persistent Ghidra projects remain in progress.
+Hydir caches the analyzed Ghidra project for later function selections. Its
+function state artifact is an ordered effect inventory; executable
+whole-function P-code lifting remains in progress.
 
 ## Quick start
 

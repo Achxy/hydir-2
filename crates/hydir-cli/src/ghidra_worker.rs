@@ -30,6 +30,64 @@ struct CacheRecord {
     snapshot_sha256: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectRecord {
+    schema_version: u32,
+    key: String,
+    generation: String,
+}
+
+fn project_key(binary_digest: &str, mode: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"hydir-ghidra-project-v1\0");
+    hash.update(GHIDRA_VERSION.as_bytes());
+    hash.update(binary_digest.as_bytes());
+    hash.update(EXPORTER.as_bytes());
+    hash.update(DOCKERFILE.as_bytes());
+    hash.update(mode.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+fn project_root(key: &str) -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let base = env::var_os("LOCALAPPDATA").or_else(|| env::var_os("APPDATA"));
+    #[cfg(target_os = "macos")]
+    let base =
+        env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Caches").into_os_string());
+    #[cfg(target_os = "linux")]
+    let base = env::var_os("XDG_CACHE_HOME").or_else(|| {
+        env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").into_os_string())
+    });
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let base: Option<std::ffi::OsString> = None;
+    let base = base.ok_or("cannot determine user cache directory for Ghidra projects")?;
+    Ok(PathBuf::from(base)
+        .join("HydIR")
+        .join("ghidra-projects")
+        .join(key))
+}
+
+fn existing_project(root: &Path, key: &str) -> Option<PathBuf> {
+    let record: ProjectRecord =
+        serde_json::from_slice(&fs::read(root.join("project.json")).ok()?).ok()?;
+    if record.schema_version != 1
+        || record.key != key
+        || !record.generation.starts_with("generation-")
+        || record.generation.len() <= 11
+        || !record.generation[11..]
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let directory = root.join(record.generation);
+    directory
+        .join("HydirAuto.gpr")
+        .is_file()
+        .then_some(directory)
+}
+
 fn digest_file(path: &Path) -> Result<String, String> {
     let mut file =
         File::open(path).map_err(|e| format!("cannot open binary {}: {e}", path.display()))?;
@@ -322,6 +380,8 @@ fn docker_run_args(
     name: &str,
     binary: &Path,
     work: &Path,
+    project: &Path,
+    reuse_project: bool,
     selected_entry: Option<u64>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -355,15 +415,18 @@ fn docker_run_args(
         ),
         "--mount".into(),
         format!("type=bind,source={},target=/work", work.display()),
+        "--mount".into(),
+        format!("type=bind,source={},target=/project", project.display()),
         tag.into(),
-        "/work/projects".into(),
+        "/project".into(),
         "HydirAuto".into(),
-        "-import".into(),
-        "/input/binary".into(),
-        "-scriptPath".into(),
-        "/opt/hydir/scripts".into(),
-        "-deleteProject".into(),
     ];
+    if reuse_project {
+        args.extend(["-process".into(), "-noanalysis".into()]);
+    } else {
+        args.extend(["-import".into(), "/input/binary".into()]);
+    }
+    args.extend(["-scriptPath".into(), "/opt/hydir/scripts".into()]);
     args.extend(script_args(
         selected_entry,
         "/work/snapshot.json",
@@ -376,10 +439,10 @@ fn local_analyze(
     home: &Path,
     binary: &Path,
     work: &Path,
+    project: &Path,
+    reuse_project: bool,
     selected_entry: Option<u64>,
 ) -> Result<(), String> {
-    fs::create_dir_all(work.join("projects"))
-        .map_err(|e| format!("cannot create Ghidra project directory: {e}"))?;
     let script_dir = work.join("scripts");
     fs::create_dir(&script_dir)
         .map_err(|e| format!("cannot create Ghidra script directory: {e}"))?;
@@ -395,14 +458,13 @@ fn local_analyze(
     }
     let snapshot = work.join("snapshot.json");
     let mut command = Command::new(&executable);
-    command
-        .arg(work.join("projects"))
-        .arg("HydirAuto")
-        .arg("-import")
-        .arg(binary)
-        .arg("-scriptPath")
-        .arg(&script_dir)
-        .arg("-deleteProject");
+    command.arg(project).arg("HydirAuto");
+    if reuse_project {
+        command.args(["-process", "-noanalysis"]);
+    } else {
+        command.arg("-import").arg(binary);
+    }
+    command.arg("-scriptPath").arg(&script_dir);
     command.args(script_args(
         selected_entry,
         &snapshot.display().to_string(),
@@ -417,12 +479,16 @@ fn local_analyze(
     )
 }
 
-fn docker_analyze(binary: &Path, work: &Path, selected_entry: Option<u64>) -> Result<(), String> {
+fn docker_analyze(
+    binary: &Path,
+    work: &Path,
+    project: &Path,
+    reuse_project: bool,
+    selected_entry: Option<u64>,
+) -> Result<(), String> {
     let tag = provision_image(work)?;
     let staging = work.join("container-work");
     fs::create_dir(&staging).map_err(|e| format!("cannot stage Ghidra project: {e}"))?;
-    let projects = staging.join("projects");
-    fs::create_dir(&projects).map_err(|e| format!("cannot stage Ghidra project directory: {e}"))?;
     // The image runs as uid 10001. The private outer temporary directory still
     // limits host access, while this bind-mounted leaf is writable by that uid.
     #[cfg(unix)]
@@ -430,7 +496,7 @@ fn docker_analyze(binary: &Path, work: &Path, selected_entry: Option<u64>) -> Re
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o777))
             .map_err(|e| format!("cannot grant Ghidra scratch access: {e}"))?;
-        fs::set_permissions(&projects, fs::Permissions::from_mode(0o777))
+        fs::set_permissions(project, fs::Permissions::from_mode(0o777))
             .map_err(|e| format!("cannot grant Ghidra project access: {e}"))?;
     }
     let name = format!(
@@ -443,7 +509,15 @@ fn docker_analyze(binary: &Path, work: &Path, selected_entry: Option<u64>) -> Re
             .filter(char::is_ascii_alphanumeric)
             .collect::<String>()
     );
-    let args = docker_run_args(&tag, &name, binary, &staging, selected_entry);
+    let args = docker_run_args(
+        &tag,
+        &name,
+        binary,
+        &staging,
+        project,
+        reuse_project,
+        selected_entry,
+    );
     let mut command = Command::new("docker");
     command.args(&args);
     let result = run_bounded(
@@ -522,14 +596,47 @@ pub fn analyze(
     if let Some(snapshot) = try_cached(&output_abs, &binary_digest, selected_entry, &key) {
         return Ok(snapshot);
     }
+    let project_key = project_key(&binary_digest, mode);
+    let project_root = project_root(&project_key)?;
+    fs::create_dir_all(&project_root)
+        .map_err(|e| format!("cannot create managed Ghidra project directory: {e}"))?;
+    let _project_lock = lock_output(&project_root.join("project"))?;
+    let old_project = existing_project(&project_root, &project_key);
+    let fresh_project = if old_project.is_none() {
+        Some(
+            tempfile::Builder::new()
+                .prefix("generation-")
+                .tempdir_in(&project_root)
+                .map_err(|e| format!("cannot stage managed Ghidra project: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let project = old_project
+        .as_deref()
+        .unwrap_or_else(|| fresh_project.as_ref().unwrap().path());
+    let reuse_project = old_project.is_some();
     let scratch = tempfile::Builder::new()
         .prefix("hydir-ghidra-")
         .tempdir()
         .map_err(|e| format!("cannot create Ghidra scratch directory: {e}"))?;
     if let Some(home) = local_home {
-        local_analyze(Path::new(&home), &binary, scratch.path(), selected_entry)?;
+        local_analyze(
+            Path::new(&home),
+            &binary,
+            scratch.path(),
+            project,
+            reuse_project,
+            selected_entry,
+        )?;
     } else {
-        docker_analyze(&binary, scratch.path(), selected_entry)?;
+        docker_analyze(
+            &binary,
+            scratch.path(),
+            project,
+            reuse_project,
+            selected_entry,
+        )?;
     }
     let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
         format!(
@@ -543,6 +650,28 @@ pub fn analyze(
             log_tail(&scratch.path().join("analysis.log"))
         )
     })?;
+    if let Some(fresh_project) = fresh_project {
+        if !fresh_project.path().join("HydirAuto.gpr").is_file() {
+            return Err("Ghidra exported a snapshot but did not save its managed project".into());
+        }
+        let generation = fresh_project
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let _ = fresh_project.keep();
+        let record = ProjectRecord {
+            schema_version: 1,
+            key: project_key,
+            generation,
+        };
+        atomic_write(
+            &project_root.join("project.json"),
+            &serde_json::to_vec(&record)
+                .map_err(|e| format!("cannot encode managed Ghidra project: {e}"))?,
+        )?;
+    }
     atomic_write(&output_abs, &bytes)?;
     let record = CacheRecord {
         schema_version: 1,
@@ -568,6 +697,8 @@ mod tests {
             "hydir-test",
             Path::new("/tmp/input"),
             Path::new("/tmp/scratch"),
+            Path::new("/tmp/project"),
+            false,
             Some(0x401080),
         );
         assert!(args.windows(2).any(|w| w == ["--network", "none"]));
@@ -578,6 +709,19 @@ mod tests {
         );
         assert!(args.iter().any(|a| a == "no-new-privileges"));
         assert_eq!(args.last().unwrap(), "0x401080");
+        assert!(args.iter().any(|arg| arg == "-import"));
+        let reused = docker_run_args(
+            "hydir-ghidra:test",
+            "hydir-test",
+            Path::new("/tmp/input"),
+            Path::new("/tmp/scratch"),
+            Path::new("/tmp/project"),
+            true,
+            None,
+        );
+        assert!(reused.iter().any(|arg| arg == "-process"));
+        assert!(reused.iter().any(|arg| arg == "-noanalysis"));
+        assert!(!reused.iter().any(|arg| arg == "-import"));
     }
 
     #[test]
@@ -609,5 +753,36 @@ mod tests {
         };
         fs::write(cache_path(&output), serde_json::to_vec(&record).unwrap()).unwrap();
         assert!(try_cached(&output, &"a".repeat(64), None, &key).is_none());
+    }
+
+    #[test]
+    fn managed_project_record_requires_matching_identity_and_project_file() {
+        let root = tempfile::tempdir().unwrap();
+        let generation = root.path().join("generation-test123");
+        fs::create_dir(&generation).unwrap();
+        let record = ProjectRecord {
+            schema_version: 1,
+            key: "expected".to_owned(),
+            generation: "generation-test123".to_owned(),
+        };
+        fs::write(
+            root.path().join("project.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(existing_project(root.path(), "expected").is_none());
+        fs::write(generation.join("HydirAuto.gpr"), b"project").unwrap();
+        assert_eq!(existing_project(root.path(), "expected"), Some(generation));
+        assert!(existing_project(root.path(), "other").is_none());
+        let traversal = ProjectRecord {
+            generation: "../other".to_owned(),
+            ..record
+        };
+        fs::write(
+            root.path().join("project.json"),
+            serde_json::to_vec(&traversal).unwrap(),
+        )
+        .unwrap();
+        assert!(existing_project(root.path(), "expected").is_none());
     }
 }

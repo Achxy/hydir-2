@@ -1,5 +1,22 @@
 # HydIR Python SDK (compatible v1/v2 plus additive v3)
 
+For local Ghidra-backed lifting, `LocalGhidra` calls the same `hydirctl`
+worker as the desktop app. It needs no service credentials:
+
+```python
+from hydir_sdk import LocalGhidra
+
+client = LocalGhidra("hydirctl")
+snapshot = client.analyze("sample.elf", "snapshot.json")
+state = client.artifact("state", "sample.elf", "snapshot.json")
+```
+
+`analyze(..., function=0x...)` selects another function from the managed
+Ghidra project. `artifact` also accepts `pcode` and `semantics`;
+`llvm_operation` emits LLVM for one exact P-code operation. Artifacts are
+checked against the binary SHA-256, and a function-level state artifact is
+an effect inventory rather than an executable lift.
+
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,
 explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
