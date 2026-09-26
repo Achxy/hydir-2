@@ -72,6 +72,7 @@ Usage:
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
   hydirctl ghidra-snapshot pcode <binary> <snapshot.json> [--output <pcode-ir.json>]
+  hydirctl ghidra-snapshot simplify <binary> <snapshot.json> [--output <simplification.json>]
   hydirctl ghidra-snapshot semantics <binary> <snapshot.json> [--output <semantic-ir.json>]
   hydirctl ghidra-snapshot state <binary> <snapshot.json> [--output <state-ir.json>]
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
@@ -520,6 +521,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     args[1].as_str(),
                     "verify"
                         | "pcode"
+                        | "simplify"
                         | "semantics"
                         | "state"
                         | "cfg"
@@ -557,6 +559,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
             } else {
                 let output = match args[1].as_str() {
+                    "simplify" => serde_json::to_vec_pretty(&ir.simplify_checked()?)?,
                     "semantics" => serde_json::to_vec_pretty(&ir.lower_semantics())?,
                     "state" => serde_json::to_vec_pretty(&ir.lower_state())?,
                     "cfg" => serde_json::to_vec_pretty(&snapshot.pcode_cfg_ir()?)?,

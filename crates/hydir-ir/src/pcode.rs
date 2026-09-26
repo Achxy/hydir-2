@@ -11,6 +11,7 @@ pub mod coverage;
 pub mod execution;
 pub mod seed;
 pub mod semantics;
+pub mod simplify;
 pub mod slice;
 pub mod state;
 pub use cfg::{
@@ -31,6 +32,10 @@ pub use semantics::{
     PCODE_SEMANTIC_IR_VERSION, PcodeEffect, PcodeExactOp, PcodeOpaqueClass,
     PcodeSemanticDiagnostic, PcodeSemanticFunctionIr, PcodeSemanticInstruction,
     PcodeSemanticOperation,
+};
+pub use simplify::{
+    PCODE_SIMPLIFICATION_VERSION, PcodeSimplificationArtifact, PcodeSimplificationRewrite,
+    PcodeSimplificationRule,
 };
 pub use slice::{
     MAX_PCODE_SLICE_INSTRUCTIONS, MAX_PCODE_SLICE_OPERATIONS, MAX_PCODE_SLICE_PENDING_VALUES,

@@ -273,6 +273,7 @@ class HydirClient:
         media_types = {
             "snapshot": ("application/vnd.hydir.ghidra-snapshot+json;version=2", 2),
             "pcode": ("application/vnd.hydir.pcode-ir+json;version=1", 1),
+            "simplify": ("application/vnd.hydir.pcode-simplification+json;version=1", 1),
             "semantics": ("application/vnd.hydir.pcode-semantic-ir+json;version=1", 1),
             "state": ("application/vnd.hydir.pcode-state-ir+json;version=1", 1),
             "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),

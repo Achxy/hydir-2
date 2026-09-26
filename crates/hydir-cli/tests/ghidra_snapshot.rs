@@ -3,6 +3,34 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
+fn ghidra_simplification_cli_preserves_digest_and_raw_evidence() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("demo/hydir-prism.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_prism_snapshot_v2.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "simplify"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let digest = format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()));
+    assert_eq!(artifact["binary_sha256"], digest);
+    assert_eq!(artifact["before"]["binary_sha256"], digest);
+    assert_eq!(artifact["after"]["binary_sha256"], digest);
+    assert_eq!(artifact["before"]["entry"], artifact["after"]["entry"]);
+    assert_eq!(
+        artifact["before"]["instructions"].as_array().unwrap().len(),
+        artifact["after"]["instructions"].as_array().unwrap().len()
+    );
+}
+
+#[test]
 fn ghidra_function_index_imports_into_analysis_model() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = tempfile::tempdir().unwrap();

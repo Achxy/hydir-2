@@ -2104,6 +2104,7 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
     match stage {
         "snapshot" => Some("application/vnd.hydir.ghidra-snapshot+json;version=2"),
         "pcode" => Some("application/vnd.hydir.pcode-ir+json;version=1"),
+        "simplify" => Some("application/vnd.hydir.pcode-simplification+json;version=1"),
         "semantics" => Some("application/vnd.hydir.pcode-semantic-ir+json;version=1"),
         "state" => Some("application/vnd.hydir.pcode-state-ir+json;version=1"),
         "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
@@ -2287,6 +2288,7 @@ fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>
     let content = match selector.stage.as_str() {
         "snapshot" => serde_json::to_vec(&snapshot),
         "pcode" => serde_json::to_vec(&raw),
+        "simplify" => serde_json::to_vec(&raw.simplify_checked()?),
         "semantics" => serde_json::to_vec(&raw.lower_semantics()),
         "state" => serde_json::to_vec(&raw.lower_state()),
         "cfg" => serde_json::to_vec(&snapshot.pcode_cfg_ir()?),
@@ -6120,6 +6122,7 @@ mod tests {
         for stage in [
             "snapshot",
             "pcode",
+            "simplify",
             "semantics",
             "state",
             "cfg",
@@ -6162,6 +6165,10 @@ mod tests {
                 assert_eq!(json["target"]["input_index"], 0);
                 assert_eq!(json["steps"][0]["source"]["mnemonic"], "INT_EQUAL");
                 assert_eq!(json["path_proven"], false);
+            } else if stage == "simplify" {
+                assert_eq!(json["before"]["binary_sha256"], uploaded.binary_sha256);
+                assert_eq!(json["after"]["binary_sha256"], uploaded.binary_sha256);
+                assert_eq!(json["before"]["entry"], json["after"]["entry"]);
             } else if stage == "snapshot" {
                 assert!(
                     json["functions"]

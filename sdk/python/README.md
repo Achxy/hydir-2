@@ -12,7 +12,7 @@ state = client.artifact("state", "sample.elf", "snapshot.json")
 ```
 
 `analyze(..., function=0x...)` selects another function from the managed
-Ghidra project. `artifact` also accepts `pcode`, `semantics`, `cfg`,
+Ghidra project. `artifact` also accepts `pcode`, `simplify`, `semantics`, `cfg`,
 `llvm-prefix`, and `llvm-standalone`;
 `llvm_operation` emits LLVM for one exact P-code operation. Artifacts are
 checked against the binary SHA-256, and a function-level state artifact is
@@ -52,7 +52,9 @@ idempotency key when retrying an uncertain save.
 exported Ghidra snapshot as bytes or a file path to the v3 service. The
 project must already contain the same binary. The server checks the snapshot
 digest against that binary and runs a bounded worker. Supported stages are
-`snapshot`, `pcode`, `semantics`, `state`, `cfg`, `coverage`, `llvm-cfg`, and `slice`. For
+`snapshot`, `pcode`, `simplify`, `semantics`, `state`, `cfg`, `coverage`, `llvm-cfg`, and `slice`. The
+`simplify` stage returns original and rewritten raw P-code with per-operation
+preconditions; its local bitvector identities do not claim native equivalence. For
 `llvm-cfg`, pass `start_address=0x...` to select a CFG entry. For `slice`, pass
 `instruction_index` and `operation_index`, plus optional `input_index`. The SDK checks the
 artifact hash, media type, schema version, and project revision before
