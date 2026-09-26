@@ -73,6 +73,9 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(result["stop_sites"], [])
         self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg"))
         self.assertEqual(run.call_args.args[-2:], ("--start", "0x401000"))
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
+            self.client.llvm_cfg(self.binary, self.snapshot, simplified=True)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-simplified"))
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
 

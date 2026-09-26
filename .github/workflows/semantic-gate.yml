@@ -27,6 +27,14 @@ jobs:
         run: |
           cargo build --locked -p hydir-cli --bin hydirctl
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_bit_gate_native_test.py -q
+      - name: Native execution of checked P-code rewrite fixture
+        run: |
+          clang -O0 -no-pie -DHYDIR_NO_START \
+            tests/fixtures/ghidra_add_zero.S tests/fixtures/ghidra_add_zero_main.c \
+            -o "$RUNNER_TEMP/ghidra-add-zero-native"
+          for value in 0 1 255 18446744073709551615; do
+            test "$("$RUNNER_TEMP/ghidra-add-zero-native" "$value")" = "$value"
+          done
       - name: Checked scalar patch and native replay
         run: bash scripts/demo-patch.sh
       - name: Native replay smoke

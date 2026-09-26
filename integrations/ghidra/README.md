@@ -75,6 +75,7 @@ cargo run -p hydir-cli -- ghidra-snapshot slice .\demo\hydir-prism.elf .\snapsho
 cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-standalone .\demo\hydir-prism.elf .\snapshot.json --output .\standalone.json
 cargo run -p hydir-cli -- ghidra-snapshot llvm-cfg .\demo\hydir-prism.elf .\snapshot.json --start 0x2013d9 --output .\cfg-llvm.json
+cargo run -p hydir-cli -- ghidra-snapshot llvm-cfg-simplified .\demo\hydir-prism.elf .\snapshot.json --start 0x2013d9 --output .\simplified-cfg-llvm.json
 cargo run -p hydir-cli -- ghidra-snapshot trace-prefix .\demo\hydir-prism.elf .\snapshot.json .\seed.json --max-ops 4096 --output .\trace.json
 cargo run -p hydir-cli -- ghidra-snapshot trace-path .\demo\hydir-prism.elf .\snapshot.json .\seed.json --start 0x2013d9 --max-ops 4096 --max-visits 1024 --output .\path.json
 ```

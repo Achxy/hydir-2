@@ -223,6 +223,20 @@ class ClientBoundaryTests(unittest.TestCase):
                 [],
             )
 
+            transformed = json.dumps({"schema_version": 1, "simplification": {"rewrites": []}}).encode()
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(transformed).hexdigest(),
+                media_type="application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1",
+                content=transformed,
+                project_revision=4,
+            )
+            self.assertEqual(
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-simplified", start_address=0x20137C
+                )["simplification"]["rewrites"],
+                [],
+            )
+
             client._call = lambda *_: proto_v3.ArtifactReply(
                 sha256=hashlib.sha256(artifact).hexdigest(),
                 media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=2",

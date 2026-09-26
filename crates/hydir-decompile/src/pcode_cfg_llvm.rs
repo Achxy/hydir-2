@@ -6,13 +6,14 @@ use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_spa
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
 use hydir_ir::pcode::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeOperation,
-    PcodeVarnode,
+    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode,
 };
 use hydir_ir::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PCODE_CFG_LLVM_VERSION: u32 = 2;
+pub const PCODE_SIMPLIFIED_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
 const MAX_CFG_INSTRUCTIONS: usize = 4096;
 const MAX_CFG_OPERATIONS: usize = 4096;
@@ -84,6 +85,19 @@ pub struct PcodeCfgLlvmArtifact {
     pub byte_map: Vec<PcodeStateByte>,
     pub state_abi: String,
     pub llvm_ir: String,
+    pub semantic_fidelity: SemanticFidelity,
+    pub verification: VerificationStatus,
+}
+
+/// The transformed IR and its LLVM path module are emitted together so the
+/// source operation, local proof, and unverified machine claim stay visible.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeSimplifiedCfgLlvmArtifact {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub simplification: PcodeSimplificationArtifact,
+    pub llvm: PcodeCfgLlvmArtifact,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
 }
@@ -461,11 +475,39 @@ pub fn emit_pcode_cfg_llvm(
     snapshot: &GhidraSnapshot,
     start: Option<&PcodeAddress>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
+    let semantic = snapshot.pcode_function_ir()?.lower_semantics();
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic)
+}
+
+/// Emit LLVM from Hydir's checked P-code rewrite. The transformation is
+/// recomputed from the validated snapshot; callers cannot swap in unrelated
+/// operations or source addresses. This remains a bounded path artifact.
+pub fn emit_pcode_simplified_cfg_llvm(
+    snapshot: &GhidraSnapshot,
+    start: Option<&PcodeAddress>,
+) -> Result<PcodeSimplifiedCfgLlvmArtifact, String> {
+    let simplification = snapshot.pcode_function_ir()?.simplify_checked()?;
+    let llvm =
+        emit_pcode_cfg_llvm_semantic(snapshot, start, simplification.after.lower_semantics())?;
+    Ok(PcodeSimplifiedCfgLlvmArtifact {
+        schema_version: PCODE_SIMPLIFIED_CFG_LLVM_VERSION,
+        binary_sha256: snapshot.binary_sha256.clone(),
+        simplification,
+        llvm,
+        semantic_fidelity: SemanticFidelity::Unknown,
+        verification: VerificationStatus::NotRun,
+    })
+}
+
+fn emit_pcode_cfg_llvm_semantic(
+    snapshot: &GhidraSnapshot,
+    start: Option<&PcodeAddress>,
+    semantic: PcodeSemanticFunctionIr,
+) -> Result<PcodeCfgLlvmArtifact, String> {
     snapshot.pcode_cfg_ir()?;
     if !snapshot.program.language_id.starts_with("x86:LE:64:") {
         return Err("P-code CFG LLVM currently requires x86-64 little endian".into());
     }
-    let semantic = snapshot.pcode_function_ir()?.lower_semantics();
     if semantic.instructions.len() > MAX_CFG_INSTRUCTIONS {
         return Err("P-code CFG LLVM instruction limit exceeded".into());
     }
@@ -955,8 +997,10 @@ pub fn emit_pcode_cfg_llvm(
         ));
     }
     body.push_str("}\n");
-    let mut llvm_ir =
-        String::from("; Hydir raw P-code concrete CFG path; equivalence unverified.\n\n");
+    let mut llvm_ir = format!(
+        "; Hydir {} concrete CFG path; equivalence unverified.\n\n",
+        semantic.source
+    );
     llvm_ir.push_str("declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n");
     llvm_ir.push_str("declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n\n");
     llvm_ir.push_str(&helper_definitions(&byte_map));
@@ -1000,6 +1044,17 @@ mod tests {
                 "/../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
             )),
             "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
+        )
+        .unwrap()
+    }
+
+    fn add_zero_fixture() -> GhidraSnapshot {
+        parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_add_zero_v2.json"
+            )),
+            "8e68f73f3d55b242d4c968446a9b011aaad4032443dab3d3b678ca7be10e1874",
         )
         .unwrap()
     }
@@ -1390,6 +1445,107 @@ mod tests {
                 &ids,
                 Some(expected_rax),
             );
+        }
+    }
+
+    #[test]
+    fn real_ghidra_add_zero_rewrite_preserves_bounded_rust_and_llvm_execution() {
+        let snapshot = add_zero_fixture();
+        let original_llvm = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        let transformed = emit_pcode_simplified_cfg_llvm(&snapshot, None).unwrap();
+        assert_eq!(transformed.simplification.rewrites.len(), 1);
+        assert_eq!(
+            transformed.simplification.rewrites[0].before.mnemonic,
+            "INT_ADD"
+        );
+        assert_eq!(
+            transformed.simplification.rewrites[0].after.mnemonic,
+            "COPY"
+        );
+        assert_eq!(
+            transformed.simplification.rewrites[0].source_address.offset,
+            "0x201177"
+        );
+        assert_eq!(original_llvm.byte_map, transformed.llvm.byte_map);
+        assert!(transformed.llvm.source_operations.iter().any(|operation| {
+            operation.address.offset == "0x201177" && operation.mnemonic == "COPY"
+        }));
+        assert_eq!(transformed.verification, VerificationStatus::NotRun);
+        verify(&original_llvm.llvm_ir);
+        verify(&transformed.llvm.llvm_ir);
+
+        let mut rewritten_snapshot = snapshot.clone();
+        for (instruction, replacement) in rewritten_snapshot
+            .selected_function
+            .instructions
+            .iter_mut()
+            .zip(&transformed.simplification.after.instructions)
+        {
+            instruction.pcode.clone_from(&replacement.pcode);
+        }
+        for value in [0, 1, 0xff, u64::MAX] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), value).unwrap();
+            seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+            seed.write_memory("ram", 0x700000, 8, 0xdeadbeef).unwrap();
+            let original = snapshot.execute_concrete_path(&seed, None, 64, 8).unwrap();
+            let rewritten = rewritten_snapshot
+                .execute_concrete_path(&seed, None, 64, 8)
+                .unwrap();
+            assert!(matches!(original.stop, PcodePathStop::Return { .. }));
+            assert_eq!(original.stop, rewritten.stop);
+            assert_eq!(original.instruction_visits, rewritten.instruction_visits);
+            assert_eq!(original.final_state, rewritten.final_state);
+            let original_ids = source_event_ids(&original_llvm, &original);
+            let rewritten_ids = source_event_ids(&transformed.llvm, &rewritten);
+            assert_eq!(original_ids, rewritten_ids);
+            let mut expected_state = vec![("register".to_owned(), "0x20".to_owned(), 8, true)];
+            for offset in ["0x200", "0x20b", "0x207", "0x206", "0x202"] {
+                let expected = original
+                    .final_state
+                    .read_varnode(&register(offset, 1))
+                    .unwrap()
+                    .unwrap() as u8;
+                expected_state.push(("register".to_owned(), offset.to_owned(), expected, true));
+            }
+            for byte in 0..8 {
+                expected_state.push((
+                    "register".to_owned(),
+                    format!("0x{byte:x}"),
+                    (value >> (byte * 8)) as u8,
+                    true,
+                ));
+            }
+            let guest = GuestTestMemory {
+                space_id: 433,
+                base: 0x700000,
+                bytes: vec![
+                    Some(0xef),
+                    Some(0xbe),
+                    Some(0xad),
+                    Some(0xde),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                ],
+                expected: Vec::new(),
+                expected_state,
+            };
+            for (artifact, ids) in [
+                (&original_llvm, &original_ids),
+                (&transformed.llvm, &rewritten_ids),
+            ] {
+                run_lli_with_guest(
+                    artifact,
+                    &seed,
+                    &guest,
+                    64,
+                    PcodeCfgLlvmStatus::Return,
+                    ids,
+                    Some(value as u8),
+                );
+            }
         }
     }
 

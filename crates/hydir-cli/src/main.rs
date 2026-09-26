@@ -80,6 +80,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
@@ -281,7 +282,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!("{}", String::from_utf8(content)?);
             }
         }
-        Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg" => {
+        Some("ghidra-snapshot")
+            if args.len() >= 4
+                && matches!(args[1].as_str(), "llvm-cfg" | "llvm-cfg-simplified") =>
+        {
             let mut start_address = None;
             let mut output_path = None;
             let mut options = args[4..].chunks_exact(2);
@@ -307,8 +311,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let artifact = hydir_decompile::emit_pcode_cfg_llvm(&snapshot, start.as_ref())?;
-            let bytes = serde_json::to_vec_pretty(&artifact)?;
+            let bytes = if args[1] == "llvm-cfg-simplified" {
+                serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_simplified_cfg_llvm(
+                    &snapshot,
+                    start.as_ref(),
+                )?)?
+            } else {
+                serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm(
+                    &snapshot,
+                    start.as_ref(),
+                )?)?
+            };
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
             } else {

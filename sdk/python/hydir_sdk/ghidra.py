@@ -92,8 +92,8 @@ class LocalGhidra:
         binary: str | os.PathLike[str],
         snapshot: str | os.PathLike[str],
     ) -> dict[str, Any]:
-        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "llvm-prefix", "llvm-standalone", "llvm-cfg"}:
-            raise ValueError("artifact kind must be pcode, simplify, semantics, state, cfg, coverage, llvm-prefix, llvm-standalone, or llvm-cfg")
+        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
+            raise ValueError("artifact kind must be pcode, simplify, semantics, state, cfg, coverage, llvm-prefix, llvm-standalone, llvm-cfg, or llvm-cfg-simplified")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         self._snapshot(snapshot_path, self._digest(binary_path))
@@ -142,6 +142,7 @@ class LocalGhidra:
         snapshot: str | os.PathLike[str],
         *,
         start: int | None = None,
+        simplified: bool = False,
     ) -> dict[str, Any]:
         """Emit bounded CFG-aware LLVM with explicit stop status and provenance."""
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
@@ -150,7 +151,8 @@ class LocalGhidra:
         snapshot_path = Path(snapshot).resolve(strict=True)
         digest = self._digest(binary_path)
         self._snapshot(snapshot_path, digest)
-        args = ["ghidra-snapshot", "llvm-cfg", str(binary_path), str(snapshot_path)]
+        stage = "llvm-cfg-simplified" if simplified else "llvm-cfg"
+        args = ["ghidra-snapshot", stage, str(binary_path), str(snapshot_path)]
         if start is not None:
             args.extend(["--start", hex(start)])
         data = json.loads(self._run(*args))

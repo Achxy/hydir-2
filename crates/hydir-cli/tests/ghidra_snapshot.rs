@@ -31,6 +31,49 @@ fn ghidra_simplification_cli_preserves_digest_and_raw_evidence() {
 }
 
 #[test]
+fn real_ghidra_rewrite_flows_into_cfg_llvm_with_provenance() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/ghidra_add_zero.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_add_zero_v2.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-simplified"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let digest = format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()));
+    assert_eq!(artifact["binary_sha256"], digest);
+    assert_eq!(artifact["simplification"]["binary_sha256"], digest);
+    assert_eq!(artifact["verification"], "not_run");
+    assert_eq!(artifact["semantic_fidelity"], "unknown");
+    let rewrites = artifact["simplification"]["rewrites"].as_array().unwrap();
+    assert_eq!(rewrites.len(), 1);
+    let rewrite = &rewrites[0];
+    assert_eq!(rewrite["before"]["mnemonic"], "INT_ADD");
+    assert_eq!(rewrite["after"]["mnemonic"], "COPY");
+    assert_eq!(rewrite["source_address"]["offset"], "0x201177");
+    assert!(
+        artifact["llvm"]["source_operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["address"] == rewrite["source_address"] && op["mnemonic"] == "COPY")
+    );
+    assert!(
+        artifact["llvm"]["llvm_ir"]
+            .as_str()
+            .unwrap()
+            .starts_with("; Hydir hydir_checked_pcode_simplification concrete CFG path")
+    );
+}
+
+#[test]
 fn ghidra_function_index_imports_into_analysis_model() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = tempfile::tempdir().unwrap();

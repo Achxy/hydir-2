@@ -279,12 +279,13 @@ class HydirClient:
             "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
             "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
+            "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
             "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
         if stage not in media_types:
             raise ValueError("Unsupported Ghidra snapshot artifact stage")
-        if start_address is not None and stage != "llvm-cfg":
-            raise ValueError("Start address is supported only for llvm-cfg")
+        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-simplified"}:
+            raise ValueError("Start address is supported only for CFG LLVM stages")
         if stage == "slice":
             if instruction_index is None or operation_index is None:
                 raise ValueError("Slice requires instruction and operation indices")

@@ -8,6 +8,7 @@ hydir_add_zero:
     ret
 .size hydir_add_zero, .-hydir_add_zero
 
+#ifndef HYDIR_NO_START
 .globl _start
 .type _start, @function
 _start:
@@ -15,4 +16,5 @@ _start:
     xorq %rdi, %rdi
     syscall
 .size _start, .-_start
+#endif
 .section .note.GNU-stack,"",@progbits

@@ -28,9 +28,10 @@ use hydir_core::{
     overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_decompile::{
-    NativeCoverageReport, NativeDecompilation, PcodeCfgLlvmArtifact, PcodeStandalonePrefixArtifact,
-    decompile_function_at, decompile_symbol, discover_functions, emit_pcode_cfg_llvm,
-    emit_pcode_exact_operation_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
+    NativeCoverageReport, NativeDecompilation, PcodeCfgLlvmArtifact,
+    PcodeSimplifiedCfgLlvmArtifact, PcodeStandalonePrefixArtifact, decompile_function_at,
+    decompile_symbol, discover_functions, emit_pcode_cfg_llvm, emit_pcode_exact_operation_llvm,
+    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
@@ -3263,6 +3264,7 @@ struct AnalystApp {
     ghidra_llvm_operation: Option<String>,
     ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
     ghidra_llvm_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
+    ghidra_llvm_simplified: Option<Result<PcodeSimplifiedCfgLlvmArtifact, String>>,
     ghidra_simplification: Option<Result<PcodeSimplificationArtifact, String>>,
     ghidra_trace_seed_json: String,
     ghidra_trace_start: String,
@@ -3399,6 +3401,7 @@ impl AnalystApp {
             ghidra_llvm_operation: None,
             ghidra_llvm_prefix: None,
             ghidra_llvm_cfg: None,
+            ghidra_llvm_simplified: None,
             ghidra_simplification: None,
             ghidra_trace_seed_json: String::new(),
             ghidra_trace_start: String::new(),
@@ -3595,6 +3598,7 @@ impl AnalystApp {
                     self.ghidra_llvm_operation = None;
                     self.ghidra_llvm_prefix = None;
                     self.ghidra_llvm_cfg = None;
+                    self.ghidra_llvm_simplified = None;
                     self.ghidra_simplification = None;
                     self.ghidra_trace_seed_json.clear();
                     self.ghidra_trace_start.clear();
@@ -3769,6 +3773,7 @@ impl AnalystApp {
                             self.ghidra_llvm_operation = None;
                             self.ghidra_llvm_prefix = None;
                             self.ghidra_llvm_cfg = None;
+                            self.ghidra_llvm_simplified = None;
                             self.ghidra_simplification = None;
                             self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
                             self.ghidra_trace_start =
@@ -6202,6 +6207,7 @@ impl AnalystApp {
                         self.ghidra_path_trace = None;
                         self.ghidra_path_lines.clear();
                         self.ghidra_llvm_cfg = None;
+                        self.ghidra_llvm_simplified = None;
                     }
                     if let Some(address) = selected_ghidra_trace_address(
                         snapshot,
@@ -6212,6 +6218,7 @@ impl AnalystApp {
                             self.ghidra_path_trace = None;
                             self.ghidra_path_lines.clear();
                             self.ghidra_llvm_cfg = None;
+                            self.ghidra_llvm_simplified = None;
                         }
                 });
                 ui.label(RichText::new("Seed JSON · offsets and values use 0x hexadecimal")
@@ -6377,6 +6384,41 @@ impl AnalystApp {
                         egui::ScrollArea::both().id_salt("ghidra_llvm_cfg_source")
                             .max_height(200.0).show(ui, |ui| {
                                 ui.label(RichText::new(&artifact.llvm_ir).monospace().size(11.0));
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("LLVM after checked P-code simplification")
+            .id_salt("ghidra_llvm_simplified")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Hydir applies the listed local identities to raw P-code and emits a bounded CFG path module. Binary equivalence is unverified.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Generate simplified CFG LLVM").clicked() {
+                    self.ghidra_llvm_simplified = Some(
+                        ghidra_trace_start(snapshot, &self.ghidra_trace_start)
+                            .and_then(|start| emit_pcode_simplified_cfg_llvm(snapshot, Some(&start)))
+                    );
+                }
+                match &self.ghidra_llvm_simplified {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!("{} rewrites · {} static stop sites · verification: {:?}",
+                            artifact.simplification.rewrites.len(),
+                            artifact.llvm.stop_sites.len(), artifact.verification))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy transformed LLVM artifact JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                ui.ctx().copy_text(json);
+                            }
+                        if ui.button("Copy transformed LLVM module").clicked() {
+                            ui.ctx().copy_text(artifact.llvm.llvm_ir.clone());
+                        }
+                        egui::ScrollArea::both().id_salt("ghidra_llvm_simplified_source")
+                            .max_height(200.0).show(ui, |ui| {
+                                ui.label(RichText::new(&artifact.llvm.llvm_ir).monospace().size(11.0));
                             });
                     }
                     Some(Err(error)) => {

@@ -2110,6 +2110,9 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
         "coverage" => Some("application/vnd.hydir.pcode-coverage+json;version=1"),
         "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
+        "llvm-cfg-simplified" => {
+            Some("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1")
+        }
         "slice" => Some("application/vnd.hydir.pcode-slice+json;version=1"),
         _ => None,
     }
@@ -2142,8 +2145,8 @@ fn validate_ghidra_start_address(stage: &str, address: &str) -> Result<(), Strin
     if address.is_empty() {
         return Ok(());
     }
-    if stage != "llvm-cfg" {
-        return Err("start address is supported only for llvm-cfg".to_owned());
+    if !matches!(stage, "llvm-cfg" | "llvm-cfg-simplified") {
+        return Err("start address is supported only for CFG LLVM stages".to_owned());
     }
     let digits = address
         .strip_prefix("0x")
@@ -2303,6 +2306,16 @@ fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>
                 offset: selector.start_address,
             });
             serde_json::to_vec(&hydir_decompile::emit_pcode_cfg_llvm(
+                &snapshot,
+                start.as_ref(),
+            )?)
+        }
+        "llvm-cfg-simplified" => {
+            let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: selector.start_address,
+            });
+            serde_json::to_vec(&hydir_decompile::emit_pcode_simplified_cfg_llvm(
                 &snapshot,
                 start.as_ref(),
             )?)
@@ -6128,10 +6141,11 @@ mod tests {
             "cfg",
             "coverage",
             "llvm-cfg",
+            "llvm-cfg-simplified",
             "slice",
         ] {
             let mut stage_request = request(stage, snapshot.clone());
-            if stage == "llvm-cfg" {
+            if matches!(stage, "llvm-cfg" | "llvm-cfg-simplified") {
                 stage_request.start_address = "0x20137c".to_owned();
             } else if stage == "slice" {
                 stage_request.instruction_index = Some(1);
@@ -6169,6 +6183,13 @@ mod tests {
                 assert_eq!(json["before"]["binary_sha256"], uploaded.binary_sha256);
                 assert_eq!(json["after"]["binary_sha256"], uploaded.binary_sha256);
                 assert_eq!(json["before"]["entry"], json["after"]["entry"]);
+            } else if stage == "llvm-cfg-simplified" {
+                assert_eq!(
+                    json["simplification"]["before"]["binary_sha256"],
+                    uploaded.binary_sha256
+                );
+                assert_eq!(json["llvm"]["start"]["offset"], "0x20137c");
+                assert_eq!(json["verification"], "not_run");
             } else if stage == "snapshot" {
                 assert!(
                     json["functions"]
