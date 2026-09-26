@@ -7,11 +7,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub mod cfg;
+pub mod execution;
 pub mod semantics;
 pub mod state;
 pub use cfg::{
     PCODE_CFG_IR_VERSION, PcodeCfgCall, PcodeCfgCompleteness, PcodeCfgEdge, PcodeCfgFunctionIr,
     PcodeCfgNode,
+};
+pub use execution::{
+    PCODE_EXECUTION_TRACE_VERSION, PcodeConcreteState, PcodeExecutedOperation, PcodeExecutionStop,
+    PcodeExecutionTrace,
 };
 pub use semantics::{
     PCODE_SEMANTIC_IR_VERSION, PcodeEffect, PcodeExactOp, PcodeOpaqueClass,

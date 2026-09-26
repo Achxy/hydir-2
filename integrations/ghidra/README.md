@@ -20,6 +20,7 @@ cargo run -p hydir-cli -- ghidra-snapshot verify .\demo\hydir-prism.elf .\snapsh
 cargo run -p hydir-cli -- ghidra-snapshot semantics .\demo\hydir-prism.elf .\snapshot.json --output .\semantic-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot state .\demo\hydir-prism.elf .\snapshot.json --output .\state-ir.json
 cargo run -p hydir-cli -- ghidra-snapshot cfg .\demo\hydir-prism.elf .\snapshot.json --output .\cfg-ir.json
+cargo run -p hydir-cli -- ghidra-snapshot llvm-prefix .\demo\hydir-prism.elf .\snapshot.json --output .\prefix.json
 ```
 
 For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
@@ -63,6 +64,11 @@ artifacts are inspectable building blocks; they do not yet represent a complete
 function lift or establish whole-function equivalence. The raw
 PcodeFunctionIr artifact reports `semantic_fidelity: unknown` and
 `verification: not_run`.
+`llvm-prefix` emits a bounded straight-line state transition module with source
+operation provenance and an explicit stop reason. Its external read, write,
+and unique-clear helpers follow the ABI recorded in the artifact. It requires
+explicit fallthrough evidence before crossing an instruction boundary and
+stops before memory, control, and unsupported effects.
 
 The JSON includes the SHA-256 of the supplied original binary and requires it
 to match Ghidra's recorded import hash. Addresses are objects
