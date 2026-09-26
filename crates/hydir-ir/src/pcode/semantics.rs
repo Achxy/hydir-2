@@ -42,6 +42,8 @@ pub enum PcodeExactOp {
     ArithmeticShiftRight,
     Multiply,
     BooleanNegate,
+    Piece,
+    Subpiece,
     PopCount,
 }
 
@@ -241,6 +243,8 @@ impl PcodeSemanticOperation {
             PcodeExactOp::Or => values[0] | values[1],
             PcodeExactOp::Multiply => values[0].wrapping_mul(values[1]),
             PcodeExactOp::BooleanNegate => u64::from(values[0] == 0),
+            PcodeExactOp::Piece => (values[0] << widths[1]) | values[1],
+            PcodeExactOp::Subpiece => values[0] >> (values[1] * 8),
             PcodeExactOp::Equal => u64::from(values[0] == values[1]),
             PcodeExactOp::NotEqual => u64::from(values[0] != values[1]),
             PcodeExactOp::UnsignedLess => u64::from(values[0] < values[1]),
@@ -319,6 +323,8 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         31 => (Op::ArithmeticShiftRight, "INT_SRIGHT"),
         32 => (Op::Multiply, "INT_MULT"),
         37 => (Op::BooleanNegate, "BOOL_NEGATE"),
+        62 => (Op::Piece, "PIECE"),
+        63 => (Op::Subpiece, "SUBPIECE"),
         72 => (Op::PopCount, "POPCOUNT"),
         _ => return None,
     })
@@ -392,6 +398,15 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
                 sizes.as_slice() == [output.size]
             }
             PcodeExactOp::BooleanNegate => output.size == 1 && sizes.as_slice() == [1],
+            PcodeExactOp::Piece => sizes.len() == 2 && sizes[0] + sizes[1] == output.size,
+            PcodeExactOp::Subpiece => {
+                sizes.len() == 2
+                    && source.inputs[1].space == "const"
+                    && super::hex_u64(&source.inputs[1].offset)
+                        .ok()
+                        .and_then(|drop| drop.checked_add(u64::from(output.size)))
+                        .is_some_and(|end| end <= u64::from(sizes[0]))
+            }
             // Ghidra permits independent input and output widths. Within our
             // 64-bit bound the count (0..=64) fits even a one-byte output.
             PcodeExactOp::PopCount => sizes.len() == 1,
@@ -636,6 +651,48 @@ mod tests {
                 lower_operation(&source),
                 PcodeEffect::Opaque { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn piece_and_subpiece_preserve_byte_positions_with_constant_offset() {
+        let piece = lowered(op(62, "PIECE", Some(8), &[4, 4]));
+        assert_eq!(
+            piece.evaluate_exact(&[0x1122_3344, 0x5566_7788]).unwrap(),
+            Some(0x1122_3344_5566_7788)
+        );
+        for (drop, output_size, expected) in [
+            (0, 8, 0x1122_3344_5566_7788),
+            (2, 4, 0x3344_5566),
+            (7, 1, 0x11),
+        ] {
+            let mut source = op(63, "SUBPIECE", Some(output_size), &[8, 1]);
+            source.inputs[1].space = "const".to_owned();
+            source.inputs[1].offset = format!("0x{drop:x}");
+            let subpiece = lowered(source);
+            assert_eq!(
+                subpiece
+                    .evaluate_exact(&[0x1122_3344_5566_7788, drop])
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        for mut source in [
+            op(62, "PIECE", Some(8), &[4, 3]),
+            op(63, "SUBPIECE", Some(4), &[8, 1]),
+        ] {
+            assert!(matches!(
+                lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+            source.inputs[1].space = "const".to_owned();
+            source.inputs[1].offset = "0x5".to_owned();
+            if source.opcode == 63 {
+                assert!(matches!(
+                    lower_operation(&source),
+                    PcodeEffect::Opaque { .. }
+                ));
+            }
         }
     }
 

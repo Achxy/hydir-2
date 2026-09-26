@@ -274,6 +274,36 @@ pub fn emit_pcode_exact_operation_llvm(
             ));
             "%result".to_owned()
         }
+        PcodeExactOp::Piece => {
+            let high_bits = operation.source.inputs[0].size * 8;
+            let low_bits = operation.source.inputs[1].size * 8;
+            body.push_str(&format!(
+                "  %high_wide = zext i{high_bits} {} to {result_type}\n  %low_wide = zext i{low_bits} {} to {result_type}\n  %high_shifted = shl {result_type} %high_wide, {low_bits}\n  %result = or {result_type} %high_shifted, %low_wide\n",
+                operands[0], operands[1]
+            ));
+            "%result".to_owned()
+        }
+        PcodeExactOp::Subpiece => {
+            let input_bits = operation.source.inputs[0].size * 8;
+            let drop_bits = witness[1] * 8;
+            let shifted = if drop_bits == 0 {
+                operands[0].clone()
+            } else {
+                body.push_str(&format!(
+                    "  %shifted = lshr i{input_bits} {}, {drop_bits}\n",
+                    operands[0]
+                ));
+                "%shifted".to_owned()
+            };
+            if input_bits == result_bits {
+                shifted
+            } else {
+                body.push_str(&format!(
+                    "  %result = trunc i{input_bits} {shifted} to {result_type}\n"
+                ));
+                "%result".to_owned()
+            }
+        }
         PcodeExactOp::PopCount => {
             // A fixed 64-bit SWAR count avoids an external intrinsic
             // declaration in each independently emitted helper. The source
@@ -540,6 +570,8 @@ mod tests {
             31 => PcodeExactOp::ArithmeticShiftRight,
             32 => PcodeExactOp::Multiply,
             37 => PcodeExactOp::BooleanNegate,
+            62 => PcodeExactOp::Piece,
+            63 => PcodeExactOp::Subpiece,
             72 => PcodeExactOp::PopCount,
             _ => panic!("unexpected opcode"),
         };
@@ -626,12 +658,17 @@ mod tests {
             (31, "INT_SRIGHT", 1, vec![1, 8]),
             (32, "INT_MULT", 1, vec![1, 1]),
             (37, "BOOL_NEGATE", 1, vec![1]),
+            (62, "PIECE", 8, vec![4, 4]),
+            (63, "SUBPIECE", 4, vec![8, 1]),
             (72, "POPCOUNT", 1, vec![8]),
             (72, "POPCOUNT", 8, vec![1]),
         ] {
-            let llvm =
-                emit_pcode_exact_operation_llvm(&operation(opcode, mnemonic, output, &inputs))
-                    .unwrap();
+            let mut op = operation(opcode, mnemonic, output, &inputs);
+            if opcode == 63 {
+                op.source.inputs[1].space = "const".to_owned();
+                op.source.inputs[1].offset = "0x2".to_owned();
+            }
+            let llvm = emit_pcode_exact_operation_llvm(&op).unwrap();
             let _ = run_opt(&llvm, &["-passes=verify", "-disable-output", "-"]);
         }
     }
@@ -709,6 +746,9 @@ mod tests {
             (32, "INT_MULT", 1, &[1, 1], &[0x80, 3]),
             (37, "BOOL_NEGATE", 1, &[1], &[0]),
             (37, "BOOL_NEGATE", 1, &[1], &[1]),
+            (62, "PIECE", 8, &[4, 4], &[0x1122_3344, 0x5566_7788]),
+            (63, "SUBPIECE", 4, &[8, 1], &[0x1122_3344_5566_7788, 2]),
+            (63, "SUBPIECE", 1, &[8, 1], &[0x1122_3344_5566_7788, 7]),
             (29, "INT_LEFT", 1, &[1, 8], &[3, 0x100]),
             (72, "POPCOUNT", 1, &[8], &[u64::MAX]),
             (72, "POPCOUNT", 8, &[1], &[0x81]),
