@@ -10,6 +10,7 @@ service HydirV3 {
   rpc CancelAnalysisJob (JobRequest) returns (JobReply);
   rpc StreamAnalysisEvents (JobEventRequest) returns (stream JobEvent);
   rpc GetProgramArtifact (ProgramArtifactRequest) returns (ArtifactReply);
+  rpc AnalyzeGhidraSnapshot (GhidraSnapshotArtifactRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
 
@@ -26,6 +27,7 @@ message DiscoverReply {
   string stable_contract = 9;
   bool isolated_analysis_jobs = 10;
   bool analyst_fact_updates = 11;
+  bool ghidra_snapshot_analysis = 12;
 }
 
 message StartProgramAnalysisRequest {
@@ -79,6 +81,19 @@ message ArtifactReply {
   string media_type = 2;
   bytes content = 3;
   uint64 project_revision = 4;
+}
+
+// The caller supplies an exporter snapshot for the current project binary.
+// stage is pcode, semantics, state, cfg, coverage, or llvm-cfg. Only llvm-cfg
+// accepts start_address, a 0x-prefixed address in the selected function space.
+// The server validates the snapshot digest against the uploaded binary and
+// runs the bounded Rust analysis in its isolated worker process.
+message GhidraSnapshotArtifactRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  bytes snapshot_json = 3;
+  string stage = 4;
+  string start_address = 5;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.

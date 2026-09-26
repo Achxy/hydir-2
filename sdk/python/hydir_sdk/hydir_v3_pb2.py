@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ehydir_v3.proto\x12\x08hydir.v3\"\x11\n\x0f\x44iscoverRequest\"\xc5\x02\n\rDiscoverReply\x12\x13\n\x0b\x61pi_version\x18\x01 \x01(\r\x12\x1c\n\x14program_spec_version\x18\x02 \x01(\r\x12\x1e\n\x16\x66unction_index_version\x18\x03 \x01(\r\x12\x1a\n\x12machine_ir_version\x18\x04 \x01(\r\x12\x18\n\x10state_ir_version\x18\x05 \x01(\r\x12\x1b\n\x13\x66unction_ir_version\x18\x06 \x01(\r\x12\x13\n\x0b\x63ir_version\x18\x07 \x01(\r\x12\"\n\x1a\x64\x65\x63ompilation_unit_version\x18\x08 \x01(\r\x12\x17\n\x0fstable_contract\x18\t \x01(\t\x12\x1e\n\x16isolated_analysis_jobs\x18\n \x01(\x08\x12\x1c\n\x14\x61nalyst_fact_updates\x18\x0b \x01(\x08\"e\n\x1bStartProgramAnalysisRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\"0\n\nJobRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\"\x92\x01\n\x08JobReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x18\n\x10project_revision\x18\x03 \x01(\x04\x12\x0c\n\x04kind\x18\x04 \x01(\t\x12\r\n\x05state\x18\x05 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x06 \x01(\t\x12\x12\n\ndiagnostic\x18\x07 \x01(\t\"M\n\x0fJobEventRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x16\n\x0e\x61\x66ter_sequence\x18\x03 \x01(\x04\"e\n\x08JobEvent\x12\x10\n\x08sequence\x18\x01 \x01(\x04\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\r\n\x05state\x18\x03 \x01(\t\x12\x0f\n\x07message\x18\x04 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x05 \x01(\t\"q\n\x16ProgramArtifactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\r\n\x05stage\x18\x03 \x01(\t\x12\x19\n\x11\x66unction_selector\x18\x04 \x01(\t\"^\n\rArtifactReply\x12\x0e\n\x06sha256\x18\x01 \x01(\t\x12\x12\n\nmedia_type\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x18\n\x10project_revision\x18\x04 \x01(\x04\"\x99\x01\n\x12\x41nalystFactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12\x0c\n\x04kind\x18\x04 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x05 \x01(\t\x12\r\n\x05value\x18\x06 \x01(\t\x12\r\n\x05scope\x18\x07 \x01(\t\"L\n\rMutationReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x03 \x01(\t2\xfd\x03\n\x07HydirV3\x12>\n\x08\x44iscover\x12\x19.hydir.v3.DiscoverRequest\x1a\x17.hydir.v3.DiscoverReply\x12Q\n\x14StartProgramAnalysis\x12%.hydir.v3.StartProgramAnalysisRequest\x1a\x12.hydir.v3.JobReply\x12:\n\x0eGetAnalysisJob\x12\x14.hydir.v3.JobRequest\x1a\x12.hydir.v3.JobReply\x12=\n\x11\x43\x61ncelAnalysisJob\x12\x14.hydir.v3.JobRequest\x1a\x12.hydir.v3.JobReply\x12G\n\x14StreamAnalysisEvents\x12\x19.hydir.v3.JobEventRequest\x1a\x12.hydir.v3.JobEvent0\x01\x12O\n\x12GetProgramArtifact\x12 .hydir.v3.ProgramArtifactRequest\x1a\x17.hydir.v3.ArtifactReply\x12J\n\x11UpdateAnalystFact\x12\x1c.hydir.v3.AnalystFactRequest\x1a\x17.hydir.v3.MutationReplyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ehydir_v3.proto\x12\x08hydir.v3\"\x11\n\x0f\x44iscoverRequest\"\xe7\x02\n\rDiscoverReply\x12\x13\n\x0b\x61pi_version\x18\x01 \x01(\r\x12\x1c\n\x14program_spec_version\x18\x02 \x01(\r\x12\x1e\n\x16\x66unction_index_version\x18\x03 \x01(\r\x12\x1a\n\x12machine_ir_version\x18\x04 \x01(\r\x12\x18\n\x10state_ir_version\x18\x05 \x01(\r\x12\x1b\n\x13\x66unction_ir_version\x18\x06 \x01(\r\x12\x13\n\x0b\x63ir_version\x18\x07 \x01(\r\x12\"\n\x1a\x64\x65\x63ompilation_unit_version\x18\x08 \x01(\r\x12\x17\n\x0fstable_contract\x18\t \x01(\t\x12\x1e\n\x16isolated_analysis_jobs\x18\n \x01(\x08\x12\x1c\n\x14\x61nalyst_fact_updates\x18\x0b \x01(\x08\x12 \n\x18ghidra_snapshot_analysis\x18\x0c \x01(\x08\"e\n\x1bStartProgramAnalysisRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\"0\n\nJobRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\"\x92\x01\n\x08JobReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x18\n\x10project_revision\x18\x03 \x01(\x04\x12\x0c\n\x04kind\x18\x04 \x01(\t\x12\r\n\x05state\x18\x05 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x06 \x01(\t\x12\x12\n\ndiagnostic\x18\x07 \x01(\t\"M\n\x0fJobEventRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\x16\n\x0e\x61\x66ter_sequence\x18\x03 \x01(\x04\"e\n\x08JobEvent\x12\x10\n\x08sequence\x18\x01 \x01(\x04\x12\x0e\n\x06job_id\x18\x02 \x01(\t\x12\r\n\x05state\x18\x03 \x01(\t\x12\x0f\n\x07message\x18\x04 \x01(\t\x12\x17\n\x0f\x61rtifact_sha256\x18\x05 \x01(\t\"q\n\x16ProgramArtifactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\r\n\x05stage\x18\x03 \x01(\t\x12\x19\n\x11\x66unction_selector\x18\x04 \x01(\t\"^\n\rArtifactReply\x12\x0e\n\x06sha256\x18\x01 \x01(\t\x12\x12\n\nmedia_type\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x18\n\x10project_revision\x18\x04 \x01(\x04\"\x8b\x01\n\x1dGhidraSnapshotArtifactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x15\n\rsnapshot_json\x18\x03 \x01(\x0c\x12\r\n\x05stage\x18\x04 \x01(\t\x12\x15\n\rstart_address\x18\x05 \x01(\t\"\x99\x01\n\x12\x41nalystFactRequest\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x19\n\x11\x65xpected_revision\x18\x02 \x01(\x04\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12\x0c\n\x04kind\x18\x04 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x05 \x01(\t\x12\r\n\x05value\x18\x06 \x01(\t\x12\r\n\x05scope\x18\x07 \x01(\t\"L\n\rMutationReply\x12\x12\n\nproject_id\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\x04\x12\x15\n\rbinary_sha256\x18\x03 \x01(\t2\xd8\x04\n\x07HydirV3\x12>\n\x08\x44iscover\x12\x19.hydir.v3.DiscoverRequest\x1a\x17.hydir.v3.DiscoverReply\x12Q\n\x14StartProgramAnalysis\x12%.hydir.v3.StartProgramAnalysisRequest\x1a\x12.hydir.v3.JobReply\x12:\n\x0eGetAnalysisJob\x12\x14.hydir.v3.JobRequest\x1a\x12.hydir.v3.JobReply\x12=\n\x11\x43\x61ncelAnalysisJob\x12\x14.hydir.v3.JobRequest\x1a\x12.hydir.v3.JobReply\x12G\n\x14StreamAnalysisEvents\x12\x19.hydir.v3.JobEventRequest\x1a\x12.hydir.v3.JobEvent0\x01\x12O\n\x12GetProgramArtifact\x12 .hydir.v3.ProgramArtifactRequest\x1a\x17.hydir.v3.ArtifactReply\x12Y\n\x15\x41nalyzeGhidraSnapshot\x12\'.hydir.v3.GhidraSnapshotArtifactRequest\x1a\x17.hydir.v3.ArtifactReply\x12J\n\x11UpdateAnalystFact\x12\x1c.hydir.v3.AnalystFactRequest\x1a\x17.hydir.v3.MutationReplyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,25 +34,27 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_DISCOVERREQUEST']._serialized_start=28
   _globals['_DISCOVERREQUEST']._serialized_end=45
   _globals['_DISCOVERREPLY']._serialized_start=48
-  _globals['_DISCOVERREPLY']._serialized_end=373
-  _globals['_STARTPROGRAMANALYSISREQUEST']._serialized_start=375
-  _globals['_STARTPROGRAMANALYSISREQUEST']._serialized_end=476
-  _globals['_JOBREQUEST']._serialized_start=478
-  _globals['_JOBREQUEST']._serialized_end=526
-  _globals['_JOBREPLY']._serialized_start=529
-  _globals['_JOBREPLY']._serialized_end=675
-  _globals['_JOBEVENTREQUEST']._serialized_start=677
-  _globals['_JOBEVENTREQUEST']._serialized_end=754
-  _globals['_JOBEVENT']._serialized_start=756
-  _globals['_JOBEVENT']._serialized_end=857
-  _globals['_PROGRAMARTIFACTREQUEST']._serialized_start=859
-  _globals['_PROGRAMARTIFACTREQUEST']._serialized_end=972
-  _globals['_ARTIFACTREPLY']._serialized_start=974
-  _globals['_ARTIFACTREPLY']._serialized_end=1068
-  _globals['_ANALYSTFACTREQUEST']._serialized_start=1071
-  _globals['_ANALYSTFACTREQUEST']._serialized_end=1224
-  _globals['_MUTATIONREPLY']._serialized_start=1226
-  _globals['_MUTATIONREPLY']._serialized_end=1302
-  _globals['_HYDIRV3']._serialized_start=1305
-  _globals['_HYDIRV3']._serialized_end=1814
+  _globals['_DISCOVERREPLY']._serialized_end=407
+  _globals['_STARTPROGRAMANALYSISREQUEST']._serialized_start=409
+  _globals['_STARTPROGRAMANALYSISREQUEST']._serialized_end=510
+  _globals['_JOBREQUEST']._serialized_start=512
+  _globals['_JOBREQUEST']._serialized_end=560
+  _globals['_JOBREPLY']._serialized_start=563
+  _globals['_JOBREPLY']._serialized_end=709
+  _globals['_JOBEVENTREQUEST']._serialized_start=711
+  _globals['_JOBEVENTREQUEST']._serialized_end=788
+  _globals['_JOBEVENT']._serialized_start=790
+  _globals['_JOBEVENT']._serialized_end=891
+  _globals['_PROGRAMARTIFACTREQUEST']._serialized_start=893
+  _globals['_PROGRAMARTIFACTREQUEST']._serialized_end=1006
+  _globals['_ARTIFACTREPLY']._serialized_start=1008
+  _globals['_ARTIFACTREPLY']._serialized_end=1102
+  _globals['_GHIDRASNAPSHOTARTIFACTREQUEST']._serialized_start=1105
+  _globals['_GHIDRASNAPSHOTARTIFACTREQUEST']._serialized_end=1244
+  _globals['_ANALYSTFACTREQUEST']._serialized_start=1247
+  _globals['_ANALYSTFACTREQUEST']._serialized_end=1400
+  _globals['_MUTATIONREPLY']._serialized_start=1402
+  _globals['_MUTATIONREPLY']._serialized_end=1478
+  _globals['_HYDIRV3']._serialized_start=1481
+  _globals['_HYDIRV3']._serialized_end=2081
 # @@protoc_insertion_point(module_scope)

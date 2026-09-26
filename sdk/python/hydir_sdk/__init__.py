@@ -22,6 +22,7 @@ from .hydir_v3_pb2_grpc import HydirV3Stub
 from .ghidra import LocalGhidra
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
+MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
 
 
 class HydirClient:
@@ -195,6 +196,69 @@ class HydirClient:
         if not isinstance(value, dict) or value.get("schema_version") != schema_version:
             raise RuntimeError("Native artifact schema version verification failed")
         return value
+
+    def analyze_ghidra_snapshot(
+        self,
+        project_id: str,
+        revision: int,
+        snapshot: bytes | str | os.PathLike[str],
+        stage: str,
+        *,
+        start_address: int | str | None = None,
+    ) -> dict:
+        """Analyze a Ghidra export bound to this project's uploaded binary.
+
+        The service checks the binary digest and revision, runs the bounded
+        analysis in an isolated worker, and returns a versioned JSON artifact.
+        """
+        media_types = {
+            "pcode": ("application/vnd.hydir.pcode-ir+json;version=1", 1),
+            "semantics": ("application/vnd.hydir.pcode-semantic-ir+json;version=1", 1),
+            "state": ("application/vnd.hydir.pcode-state-ir+json;version=1", 1),
+            "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
+            "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
+            "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
+        }
+        if stage not in media_types:
+            raise ValueError("Unsupported Ghidra snapshot artifact stage")
+        if start_address is not None and stage != "llvm-cfg":
+            raise ValueError("Start address is supported only for llvm-cfg")
+        if isinstance(start_address, int):
+            if not 0 <= start_address <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("Start address must fit in 64 bits")
+            start_address = f"0x{start_address:x}"
+        if start_address is not None and (
+            not start_address.startswith("0x")
+            or not 1 <= len(start_address[2:]) <= 16
+            or any(character not in "0123456789abcdef" for character in start_address[2:])
+        ):
+            raise ValueError("Start address must be 0x plus 1..=16 lowercase hex digits")
+        if isinstance(snapshot, bytes):
+            content = snapshot
+        else:
+            path = Path(snapshot)
+            if path.stat().st_size > MAX_GHIDRA_SNAPSHOT_BYTES:
+                raise ValueError("Ghidra snapshot exceeds 16 MiB")
+            content = path.read_bytes()
+        if not 1 <= len(content) <= MAX_GHIDRA_SNAPSHOT_BYTES:
+            raise ValueError("Ghidra snapshot must be 1..=16 MiB")
+        reply = self._call(
+            self._stub_v3.AnalyzeGhidraSnapshot,
+            proto_v3.GhidraSnapshotArtifactRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                snapshot_json=content,
+                stage=stage,
+                start_address=start_address or "",
+            ),
+        )
+        expected_media_type, schema_version = media_types[stage]
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type=expected_media_type,
+            schema_version=schema_version,
+        )
 
     def start_program_analysis(
         self, project_id: str, revision: int, *, idempotency_key: str | None = None,
