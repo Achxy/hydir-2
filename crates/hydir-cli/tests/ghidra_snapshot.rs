@@ -163,4 +163,19 @@ fn imports_snapshot_exported_by_headless_ghidra() {
     let summary: serde_json::Value = serde_json::from_slice(&flow.stdout).unwrap();
     assert_eq!(summary["call_targets"], 1);
     assert!(summary["flow_edges"].as_u64().unwrap() >= 2);
+    let cfg = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "cfg"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_calls_flow_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        cfg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cfg.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&cfg.stdout).unwrap();
+    assert_eq!(artifact["cfg_completeness"], "incomplete");
+    assert_eq!(artifact["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(artifact["binary_sha256"], summary["binary_sha256"]);
 }

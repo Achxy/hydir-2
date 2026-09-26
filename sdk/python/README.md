@@ -12,7 +12,7 @@ state = client.artifact("state", "sample.elf", "snapshot.json")
 ```
 
 `analyze(..., function=0x...)` selects another function from the managed
-Ghidra project. `artifact` also accepts `pcode` and `semantics`;
+Ghidra project. `artifact` also accepts `pcode`, `semantics`, and `cfg`;
 `llvm_operation` emits LLVM for one exact P-code operation. Artifacts are
 checked against the binary SHA-256, and a function-level state artifact is
 an effect inventory rather than an executable lift.

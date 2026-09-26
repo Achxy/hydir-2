@@ -66,6 +66,7 @@ Usage:
   hydirctl ghidra-snapshot pcode <binary> <snapshot.json> [--output <pcode-ir.json>]
   hydirctl ghidra-snapshot semantics <binary> <snapshot.json> [--output <semantic-ir.json>]
   hydirctl ghidra-snapshot state <binary> <snapshot.json> [--output <state-ir.json>]
+  hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
@@ -265,7 +266,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra-snapshot")
             if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
-                && matches!(args[1].as_str(), "verify" | "pcode" | "semantics" | "state") =>
+                && matches!(
+                    args[1].as_str(),
+                    "verify" | "pcode" | "semantics" | "state" | "cfg"
+                ) =>
         {
             if args[1] == "verify" && args.len() != 4 {
                 return Err(HELP.into());
@@ -298,6 +302,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let output = match args[1].as_str() {
                     "semantics" => serde_json::to_vec_pretty(&ir.lower_semantics())?,
                     "state" => serde_json::to_vec_pretty(&ir.lower_state())?,
+                    "cfg" => serde_json::to_vec_pretty(&snapshot.pcode_cfg_ir()?)?,
                     _ => serde_json::to_vec_pretty(&ir)?,
                 };
                 if args.len() == 6 {
