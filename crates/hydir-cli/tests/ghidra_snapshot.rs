@@ -167,6 +167,32 @@ fn ghidra_project_cli_reopens_a_saved_binary_bound_snapshot() {
     let saved: serde_json::Value = serde_json::from_slice(&save.stdout).unwrap();
     assert_eq!(saved["selected_function"]["offset"], "0x2013cf");
 
+    let model_output = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .env("HYDIR_LOCAL_DB", &database)
+        .args(["local", "model"])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        model_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&model_output.stderr)
+    );
+    let model: serde_json::Value = serde_json::from_slice(&model_output.stdout).unwrap();
+    assert!(
+        model["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|function| {
+                function["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|evidence| evidence["source"] == "ghidra_analysis")
+            })
+    );
+
     let get = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
         .env("HYDIR_LOCAL_DB", &database)
         .args(["ghidra-project", "get"])
