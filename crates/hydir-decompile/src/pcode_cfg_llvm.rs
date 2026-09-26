@@ -561,6 +561,15 @@ fn emit_pcode_cfg_llvm_semantic(
                 )
             {
                 node_bytes(&operation.source.inputs[1], &mut byte_keys)?;
+            } else if operation.source.opcode == 6
+                && operation.source.inputs.len() == 1
+                && (1..=8).contains(&operation.source.inputs[0].size)
+                && matches!(
+                    operation.source.inputs[0].space.as_str(),
+                    "register" | "unique" | "const"
+                )
+            {
+                node_bytes(&operation.source.inputs[0], &mut byte_keys)?;
             } else if matches!(operation.source.opcode, 2 | 3)
                 && let Ok(layout) = memory_layout(&operation.source, &semantic.address_spaces)
             {
@@ -740,14 +749,91 @@ fn emit_pcode_cfg_llvm_semantic(
                     }
                 }
                 6 => {
+                    let pointer = source.inputs.first();
+                    let pointer_size = semantic
+                        .address_spaces
+                        .iter()
+                        .find(|space| space.name == instruction.address.space)
+                        .map(|space| space.pointer_size);
+                    if source.mnemonic != "BRANCHIND"
+                        || source.output.is_some()
+                        || source.inputs.len() != 1
+                        || pointer_size.is_none_or(|size| size == 0 || size > 8)
+                        || pointer.is_none_or(|node| Some(node.size) != pointer_size)
+                        || !matches!(
+                            pointer.map(|node| node.space.as_str()),
+                            Some("register" | "unique" | "const")
+                        )
+                    {
+                        stop_site(
+                            &mut sites,
+                            &source.source_address,
+                            Some(operation_index),
+                            PcodeCfgLlvmStatus::MalformedTarget,
+                            "invalid BRANCHIND target shape, space, or pointer width",
+                        );
+                        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::MalformedTarget));
+                        continue;
+                    }
+                    let pointer = pointer.expect("checked above");
                     stop_site(
                         &mut sites,
                         &source.source_address,
                         Some(operation_index),
-                        PcodeCfgLlvmStatus::IndirectFlow,
-                        "BRANCHIND requires dynamic target resolution",
+                        PcodeCfgLlvmStatus::UnknownInput,
+                        "BRANCHIND target bytes are unknown",
                     );
-                    body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::IndirectFlow));
+                    stop_site(
+                        &mut sites,
+                        &source.source_address,
+                        Some(operation_index),
+                        PcodeCfgLlvmStatus::OutOfFunction,
+                        "BRANCHIND target is not a selected instruction",
+                    );
+                    let check = known_check(pointer, &format!("indirect_{id}"), &mut body)?;
+                    emit_known_guard(
+                        &check.into_iter().collect::<Vec<_>>(),
+                        &format!("indirect_{id}"),
+                        &mut body,
+                        &format!("indirect_known_{id}"),
+                        PcodeCfgLlvmStatus::UnknownInput,
+                    );
+                    body.push_str(&format!("indirect_known_{id}:\n"));
+                    let value = if pointer.space == "const" {
+                        format!("{}", offset(&pointer.offset)?)
+                    } else {
+                        let name = format!("%indirect_value_{id}");
+                        body.push_str(&format!(
+                            "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                            pcode_space_id(&pointer.space)?,
+                            pcode_offset(pointer)?,
+                            pointer.size
+                        ));
+                        name
+                    };
+                    body.push_str(&format!(
+                        "  switch i64 {value}, label %{} [\n",
+                        stop_label(PcodeCfgLlvmStatus::OutOfFunction)
+                    ));
+                    for ((space, address), next) in &index {
+                        if *space == instruction.address.space {
+                            body.push_str(&format!(
+                                "    i64 {address}, label %indirect_{id}_{next}\n"
+                            ));
+                        }
+                    }
+                    body.push_str("  ]\n");
+                    for ((space, _), next) in &index {
+                        if *space == instruction.address.space {
+                            body.push_str(&format!("indirect_{id}_{next}:\n"));
+                            body.push_str(&log_event(
+                                id,
+                                &format!("%count_{id}"),
+                                &format!("indirect_{next}"),
+                                &format!("ins_{next}"),
+                            ));
+                        }
+                    }
                 }
                 7 | 8 | 10 => {
                     let status = if source.opcode == 10 {
@@ -1066,6 +1152,17 @@ mod tests {
                 "/../../tests/fixtures/ghidra_prism_calls_flow_v2.json"
             )),
             "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
+        )
+        .unwrap()
+    }
+
+    fn indirect_jump_fixture() -> GhidraSnapshot {
+        parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_jump_v2.json"
+            )),
+            "66c6db98e7a88b6434437935e7fcc0bcf960fc5eace744e4d435f65dd253760e",
         )
         .unwrap()
     }
@@ -1578,6 +1675,152 @@ mod tests {
             3,
             PcodeCfgLlvmStatus::StepBudget,
             &[0, 0, 0],
+            None,
+        );
+    }
+
+    #[test]
+    fn selected_indirect_branch_matches_rust_path_and_stops_on_unknown_targets() {
+        let mut snapshot = fixture();
+        snapshot.selected_function.instructions.truncate(2);
+        snapshot.selected_function.flow_edges.clear();
+        let target = snapshot.selected_function.instructions[1].address.clone();
+        let mut branch = snapshot.selected_function.instructions[0].pcode[0].clone();
+        branch.mnemonic = "BRANCHIND".into();
+        branch.opcode = 6;
+        branch.output = None;
+        branch.inputs = vec![register("0x0", 8)];
+        snapshot.selected_function.instructions[0].pcode = vec![branch];
+        let mut ret = snapshot.selected_function.instructions[1].pcode[0].clone();
+        ret.mnemonic = "RETURN".into();
+        ret.opcode = 10;
+        ret.output = None;
+        ret.inputs = vec![register("0x0", 8)];
+        snapshot.selected_function.instructions[1].pcode = vec![ret];
+
+        let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        verify(&artifact.llvm_ir);
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&register("0x0", 8), offset(&target.offset).unwrap())
+            .unwrap();
+        let rust = snapshot.execute_concrete_path(&seed, None, 8, 8).unwrap();
+        assert!(matches!(rust.stop, PcodePathStop::Return { .. }));
+        assert_eq!(source_event_ids(&artifact, &rust), vec![0]);
+        run_lli(&artifact, &seed, 8, PcodeCfgLlvmStatus::Return, &[0], None);
+
+        let unknown = PcodeConcreteState::default();
+        let rust = snapshot
+            .execute_concrete_path(&unknown, None, 8, 8)
+            .unwrap();
+        assert!(matches!(
+            rust.stop,
+            PcodePathStop::UnknownIndirectTarget { .. }
+        ));
+        run_lli(
+            &artifact,
+            &unknown,
+            8,
+            PcodeCfgLlvmStatus::UnknownInput,
+            &[],
+            None,
+        );
+
+        seed.write_varnode(&register("0x0", 8), 0xdeadbeef).unwrap();
+        let rust = snapshot.execute_concrete_path(&seed, None, 8, 8).unwrap();
+        assert!(matches!(rust.stop, PcodePathStop::TargetNotSelected { .. }));
+        run_lli(
+            &artifact,
+            &seed,
+            8,
+            PcodeCfgLlvmStatus::OutOfFunction,
+            &[],
+            None,
+        );
+    }
+
+    #[test]
+    fn real_ghidra_indirect_jump_matches_rust_and_llvm() {
+        let snapshot = indirect_jump_fixture();
+        let entry_artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        verify(&entry_artifact.llvm_ir);
+        for (rdi, budget, expected_indirect) in [(0, 11, false), (1, 12, true)] {
+            let mut entry_seed = PcodeConcreteState::default();
+            entry_seed
+                .write_varnode(&register("0x0", 8), 0x20117b)
+                .unwrap();
+            entry_seed.write_varnode(&register("0x38", 8), rdi).unwrap();
+            let rust = snapshot
+                .execute_concrete_path(&entry_seed, None, budget, 8)
+                .unwrap();
+            assert!(matches!(rust.stop, PcodePathStop::OperationBudget { .. }));
+            assert_eq!(
+                rust.instruction_visits
+                    .iter()
+                    .any(|address| address.offset == "0x201179"),
+                expected_indirect
+            );
+            let events = source_event_ids(&entry_artifact, &rust);
+            run_lli(
+                &entry_artifact,
+                &entry_seed,
+                budget as u32,
+                PcodeCfgLlvmStatus::StepBudget,
+                &events,
+                Some(7),
+            );
+        }
+        let start = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x201179".into(),
+        };
+        let artifact = emit_pcode_cfg_llvm(&snapshot, Some(&start)).unwrap();
+        verify(&artifact.llvm_ir);
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&register("0x0", 8), 0x20117b).unwrap();
+        let rust = snapshot
+            .execute_concrete_path(&seed, Some(&start), 2, 8)
+            .unwrap();
+        assert!(matches!(rust.stop, PcodePathStop::OperationBudget { .. }));
+        assert_eq!(rust.instruction_visits.len(), 3);
+        let events = source_event_ids(&artifact, &rust);
+        assert_eq!(events.len(), 2);
+        run_lli(
+            &artifact,
+            &seed,
+            2,
+            PcodeCfgLlvmStatus::StepBudget,
+            &events,
+            Some(7),
+        );
+
+        let unknown = PcodeConcreteState::default();
+        let rust = snapshot
+            .execute_concrete_path(&unknown, Some(&start), 2, 8)
+            .unwrap();
+        assert!(matches!(
+            rust.stop,
+            PcodePathStop::UnknownIndirectTarget { .. }
+        ));
+        run_lli(
+            &artifact,
+            &unknown,
+            2,
+            PcodeCfgLlvmStatus::UnknownInput,
+            &[],
+            None,
+        );
+
+        seed.write_varnode(&register("0x0", 8), 0xdeadbeef).unwrap();
+        let rust = snapshot
+            .execute_concrete_path(&seed, Some(&start), 2, 8)
+            .unwrap();
+        assert!(matches!(rust.stop, PcodePathStop::TargetNotSelected { .. }));
+        run_lli(
+            &artifact,
+            &seed,
+            2,
+            PcodeCfgLlvmStatus::OutOfFunction,
+            &[],
             None,
         );
     }

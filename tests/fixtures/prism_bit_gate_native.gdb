@@ -29,6 +29,8 @@ gdb.selected_inferior().write_memory(entry_rsp, ret_address.to_bytes(8, "little"
 gdb.execute("set $rip = 0x%x" % entry)
 gdb.execute("set $rdi = %s" % os.environ["HYDIR_NATIVE_RDI"])
 gdb.execute("set $rsi = %s" % os.environ["HYDIR_NATIVE_RSI"])
+if "HYDIR_NATIVE_RAX" in os.environ:
+    gdb.execute("set $rax = %s" % os.environ["HYDIR_NATIVE_RAX"])
 
 visits = []
 for _ in range(len(instructions) + 1):

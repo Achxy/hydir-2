@@ -75,6 +75,7 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot verify demo/hydir-prism.elf t
 cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf target/prism-ghidra.json
 cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
 cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
 ```
 
 Replace the ELF path and function selector with your own. `discover` returns
@@ -84,6 +85,8 @@ explicitly at unsupported or unresolved call boundaries. In the GUI, open
 `hydir_stage_call_chain` and use the Call trace panel with the seed JSON.
 The second command exercises bounded automatic export for a concrete indirect
 callee. Unknown indirect targets stop without guessing a function.
+The last command emits a bounded LLVM path module that dispatches a known
+indirect jump to an instruction in the selected function.
 [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.

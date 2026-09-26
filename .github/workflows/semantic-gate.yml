@@ -33,6 +33,9 @@ jobs:
       - name: Concrete indirect-call native differential
         run: |
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/ghidra_indirect_call_native_test.py -q
+      - name: Concrete indirect-jump native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/ghidra_indirect_jump_native_test.py -q
       - name: Native execution of checked P-code rewrite fixture
         run: |
           clang -O0 -no-pie -DHYDIR_NO_START \
