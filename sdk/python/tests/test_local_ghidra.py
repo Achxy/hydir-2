@@ -70,6 +70,28 @@ class LocalGhidraTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
 
+    def test_slice_uses_bounded_source_artifact(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        artifact = {
+            "schema_version": 1,
+            "binary_sha256": self.digest,
+            "path_proven": False,
+            "steps": [],
+            "boundaries": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
+            result = self.client.slice(self.binary, self.snapshot, 3, 2, input_index=1)
+        self.assertEqual(result["path_proven"], False)
+        self.assertEqual(run.call_args.args[-6:],
+                         ("--instruction", "3", "--op", "2", "--input", "1"))
+        with self.assertRaises(ValueError):
+            self.client.slice(self.binary, self.snapshot, -1, 0)
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            **artifact, "path_proven": True,
+        }).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.slice(self.binary, self.snapshot, 0, 0)
+
     def test_saved_snapshot_roundtrip_commands_check_binary_and_function(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         saved = {"binary_sha256": self.digest, "selected_function": {"space": "ram", "offset": "0x401000"}}

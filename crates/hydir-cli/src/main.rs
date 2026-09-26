@@ -30,7 +30,8 @@ use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
-    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, parse_ghidra_snapshot, parse_pcode_seed,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeSliceTarget, parse_ghidra_snapshot,
+    parse_pcode_seed,
 };
 use hydir_model::{
     import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
@@ -78,6 +79,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
+  hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
@@ -306,6 +308,45 @@ fn run() -> Result<(), Box<dyn Error>> {
             });
             let artifact = hydir_decompile::emit_pcode_cfg_llvm(&snapshot, start.as_ref())?;
             let bytes = serde_json::to_vec_pretty(&artifact)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot") if args.len() >= 8 && args[1] == "slice" => {
+            if args[4] != "--instruction" || args[6] != "--op" {
+                return Err(HELP.into());
+            }
+            let instruction_index = args[5].parse::<u32>()?;
+            let operation_index = args[7].parse::<u32>()?;
+            let mut input_index = None;
+            let mut output_path = None;
+            let mut options = args[8..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--input" if input_index.is_none() => {
+                        input_index = Some(pair[1].parse::<u32>()?)
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let slice = snapshot.backward_pcode_slice(PcodeSliceTarget {
+                instruction_index,
+                operation_index,
+                input_index,
+            })?;
+            let bytes = serde_json::to_vec_pretty(&slice)?;
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
             } else {
