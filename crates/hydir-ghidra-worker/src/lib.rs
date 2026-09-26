@@ -406,6 +406,7 @@ fn docker_run_args(
     project: &Path,
     reuse_project: bool,
     selected_entry: Option<u64>,
+    run_as: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".into(),
@@ -440,10 +441,11 @@ fn docker_run_args(
         format!("type=bind,source={},target=/work", work.display()),
         "--mount".into(),
         format!("type=bind,source={},target=/project", project.display()),
-        tag.into(),
-        "/project".into(),
-        "HydirAuto".into(),
     ];
+    if let Some(user) = run_as {
+        args.extend(["--user".into(), user.into()]);
+    }
+    args.extend([tag.into(), "/project".into(), "HydirAuto".into()]);
     if reuse_project {
         args.extend(["-process".into(), "-noanalysis".into()]);
     } else {
@@ -512,10 +514,22 @@ fn docker_analyze(
     let tag = provision_image(work)?;
     let staging = work.join("container-work");
     fs::create_dir(&staging).map_err(|e| format!("cannot stage Ghidra project: {e}"))?;
-    // The image runs as uid 10001. The private outer temporary directory still
-    // limits host access, while this bind-mounted leaf is writable by that uid.
+    // On Unix, use the host user's uid/gid for bind-mounted output and project
+    // files. A fixed image uid can write them but may leave mode-0600 snapshots
+    // unreadable to the Rust process on the host.
     #[cfg(unix)]
-    {
+    let run_as = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(&staging)
+            .map_err(|e| format!("cannot inspect Ghidra scratch owner: {e}"))?;
+        (metadata.uid() != 0).then(|| format!("{}:{}", metadata.uid(), metadata.gid()))
+    };
+    #[cfg(not(unix))]
+    let run_as: Option<String> = None;
+    // If the host runs as root (or uses a non-Unix bind mount), keep the
+    // image's uid 10001 and grant access only to the mounted leaf directories.
+    #[cfg(unix)]
+    if run_as.is_none() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&staging, fs::Permissions::from_mode(0o777))
             .map_err(|e| format!("cannot grant Ghidra scratch access: {e}"))?;
@@ -540,6 +554,7 @@ fn docker_analyze(
         project,
         reuse_project,
         selected_entry,
+        run_as.as_deref(),
     );
     let mut command = Command::new("docker");
     command.args(&args);
@@ -723,6 +738,7 @@ mod tests {
             Path::new("/tmp/project"),
             false,
             Some(0x401080),
+            Some("1001:1001"),
         );
         assert!(args.windows(2).any(|w| w == ["--network", "none"]));
         assert!(args.iter().any(|a| a == "--read-only"));
@@ -731,6 +747,7 @@ mod tests {
                 .any(|a| a.contains("target=/input/binary,readonly"))
         );
         assert!(args.iter().any(|a| a == "no-new-privileges"));
+        assert!(args.windows(2).any(|w| w == ["--user", "1001:1001"]));
         assert_eq!(args.last().unwrap(), "0x401080");
         assert!(args.iter().any(|arg| arg == "-import"));
         let reused = docker_run_args(
@@ -741,7 +758,9 @@ mod tests {
             Path::new("/tmp/project"),
             true,
             None,
+            None,
         );
+        assert!(!reused.iter().any(|arg| arg == "--user"));
         assert!(reused.iter().any(|arg| arg == "-process"));
         assert!(reused.iter().any(|arg| arg == "-noanalysis"));
         assert!(!reused.iter().any(|arg| arg == "-import"));
