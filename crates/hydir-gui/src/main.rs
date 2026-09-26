@@ -46,8 +46,9 @@ use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeBackwardSlice,
     PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace, PcodePathDestination,
-    PcodePathEvent, PcodePathTrace, PcodeSemanticFunctionIr, PcodeSimplificationArtifact,
-    PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
+    PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeSemanticFunctionIr,
+    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -2207,6 +2208,7 @@ fn ghidra_trace_lines(trace: &PcodePathTrace) -> Vec<(Option<u64>, String)> {
 
 fn ghidra_call_trace_lines(trace: &PcodeInterproceduralTrace) -> Vec<(Option<u64>, String)> {
     let mut lines = Vec::new();
+    let mut next_call = 0;
     for (index, segment) in trace.segments.iter().enumerate() {
         lines.push((
             parse_ghidra_offset(&segment.function_entry.offset),
@@ -2217,18 +2219,28 @@ fn ghidra_call_trace_lines(trace: &PcodeInterproceduralTrace) -> Vec<(Option<u64
             ),
         ));
         lines.extend(ghidra_trace_lines(&segment.path));
-        if let Some(call) = trace
-            .calls
-            .iter()
-            .find(|call| segment.path.instruction_visits.last() == Some(&call.call_site))
-        {
-            lines.push((
-                parse_ghidra_offset(&call.call_site.offset),
-                format!(
-                    "CALL {} → {} · resume {}",
-                    call.call_site.offset, call.callee_entry.offset, call.return_address.offset
-                ),
-            ));
+        if let PcodePathStop::Call { source } = &segment.path.stop {
+            if let Some(call) = trace.calls.get(next_call) {
+                if call.caller_entry == segment.function_entry
+                    && segment.path.instruction_visits.last() == Some(&call.call_site)
+                {
+                    let mnemonic = if source.opcode == 8 {
+                        "CALLIND"
+                    } else {
+                        "CALL"
+                    };
+                    lines.push((
+                        parse_ghidra_offset(&call.call_site.offset),
+                        format!(
+                            "{mnemonic} {} → {} · resume {}",
+                            call.call_site.offset,
+                            call.callee_entry.offset,
+                            call.return_address.offset
+                        ),
+                    ));
+                    next_call += 1;
+                }
+            }
         }
     }
     lines
