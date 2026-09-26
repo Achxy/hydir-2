@@ -148,4 +148,19 @@ fn imports_snapshot_exported_by_headless_ghidra() {
         String::from_utf8_lossy(&llvm.stderr)
     );
     assert!(String::from_utf8_lossy(&llvm.stdout).contains("define i64 @hydir_pcode_exact"));
+
+    let flow = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "verify"])
+        .arg(root.join("demo/hydir-prism.elf"))
+        .arg(root.join("tests/fixtures/ghidra_prism_calls_flow_v2.json"))
+        .output()
+        .unwrap();
+    assert!(
+        flow.status.success(),
+        "{}",
+        String::from_utf8_lossy(&flow.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&flow.stdout).unwrap();
+    assert_eq!(summary["call_targets"], 1);
+    assert!(summary["flow_edges"].as_u64().unwrap() >= 2);
 }

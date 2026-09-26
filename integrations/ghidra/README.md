@@ -1,8 +1,10 @@
 # Ghidra snapshot exporter
 
 `HydIRSnapshot.java` runs as a Ghidra post-analysis script. It exports a program
-function index and one function's **raw instruction P-code** in Hydir snapshot
-schema v2. It does not lift, simplify, or type the P-code. Those steps belong to
+function index, one function's **raw instruction P-code**, analyzed flow edges,
+and call targets in Hydir snapshot schema v2. Flow and call sections are
+optional so earlier v2 snapshots remain readable. It does not lift, simplify,
+or type the P-code. Those steps belong to
 Hydir's Rust core. `HydIRExport.java` remains the separate v1 graph exporter.
 
 Hydir normally launches headless Ghidra for the user. The default path builds
@@ -71,6 +73,12 @@ distinct from decompiler high P-code. The top-level
 `flow_overrides_applied: true` records this choice. `CALLOTHER` retains the language-defined
 name in `userop_name` when Ghidra can resolve its constant ID; other ops use
 `null`.
+
+`selected_function.flow_edges` records fallthrough, branch, and call edges
+from Ghidra's analyzed instruction flow. A `null` target keeps computed or
+otherwise unresolved flow visible. `call_targets` indexes call sites
+separately; a resolved call target can be opened from Hydir's GUI. These are
+Ghidra analysis facts rather than a proven complete CFG.
 
 The export fails on missing functions/instructions, mismatched input hashes,
 or any size cap: 65,536 functions, 256 address spaces, 16,384 selected

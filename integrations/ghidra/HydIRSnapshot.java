@@ -11,6 +11,7 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.symbol.FlowType;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -31,6 +32,8 @@ public class HydIRSnapshot extends GhidraScript {
     private static final int MAX_PCODE_OPS = 262_144;
     private static final int MAX_OPS_PER_INSTRUCTION = 256;
     private static final int MAX_INPUTS_PER_OP = 256;
+    private static final int MAX_FLOW_TARGETS_PER_INSTRUCTION = 256;
+    private static final int MAX_FLOW_EDGES = 262_144;
     private static final int MAX_INSTRUCTION_BYTES = 32;
     private static final int MAX_JSON_CHARS = 16 * 1024 * 1024;
     private static final int MAX_JSON_BYTES = 16 * 1024 * 1024;
@@ -103,6 +106,71 @@ public class HydIRSnapshot extends GhidraScript {
             }
             return bytes;
         }
+    }
+
+    private static final class FlowEdge {
+        final Address source;
+        final Address target;
+        final String kind;
+        final boolean conditional;
+        final boolean computed;
+
+        FlowEdge(Address source, Address target, String kind, boolean conditional, boolean computed) {
+            this.source = source;
+            this.target = target;
+            this.kind = kind;
+            this.conditional = conditional;
+            this.computed = computed;
+        }
+
+        void write(Json json) {
+            json.raw("{\"source\":").address(source);
+            json.raw(",\"target\":");
+            if (target == null) json.raw("null");
+            else json.address(target);
+            json.raw(",\"kind\":").quoted(kind);
+            json.raw(",\"conditional\":" + conditional);
+            json.raw(",\"computed\":" + computed + "}");
+        }
+    }
+
+    private static final class CallTarget {
+        final Address source;
+        final Address target;
+        final boolean conditional;
+        final boolean computed;
+
+        CallTarget(Address source, Address target, boolean conditional, boolean computed) {
+            this.source = source;
+            this.target = target;
+            this.conditional = conditional;
+            this.computed = computed;
+        }
+
+        void write(Json json) {
+            json.raw("{\"call_site\":").address(source);
+            json.raw(",\"target\":");
+            if (target == null) json.raw("null");
+            else json.address(target);
+            json.raw(",\"conditional\":" + conditional);
+            json.raw(",\"computed\":" + computed + "}");
+        }
+    }
+
+    private static void addFlow(List<FlowEdge> edges, Address source, Address target,
+            String kind, boolean conditional, boolean computed) {
+        if (edges.size() >= MAX_FLOW_EDGES) {
+            throw new IllegalStateException("HydIR snapshot exceeds flow edge limit " + MAX_FLOW_EDGES);
+        }
+        edges.add(new FlowEdge(source, target, kind, conditional, computed));
+    }
+
+    private static void addCall(List<CallTarget> calls, Address source, Address target,
+            boolean conditional, boolean computed) {
+        if (calls.size() >= MAX_FLOW_EDGES) {
+            throw new IllegalStateException("HydIR snapshot exceeds call target limit " + MAX_FLOW_EDGES);
+        }
+        calls.add(new CallTarget(source, target, conditional, computed));
     }
 
     private static String hex(long value) {
@@ -269,6 +337,8 @@ public class HydIRSnapshot extends GhidraScript {
         InstructionIterator instructions = currentProgram.getListing().getInstructions(selected.getBody(), true);
         int instructionCount = 0;
         int totalOps = 0;
+        List<FlowEdge> flowEdges = new ArrayList<>();
+        List<CallTarget> callTargets = new ArrayList<>();
         while (instructions.hasNext()) {
             monitor.checkCancelled();
             if (instructionCount >= MAX_INSTRUCTIONS) {
@@ -339,14 +409,72 @@ public class HydIRSnapshot extends GhidraScript {
             }
             json.raw("]}");
             totalOps += ops.length;
+
+            // Ghidra's analyzed instruction flow includes flow overrides and
+            // references. Keep unresolved computed flows even when it also
+            // reports candidate targets; the candidate list need not be complete.
+            Address source = instruction.getAddress();
+            Address fallthrough = instruction.getFallThrough();
+            if (fallthrough != null) {
+                addFlow(flowEdges, source,
+                    Address.NO_ADDRESS.equals(fallthrough) ? null : fallthrough,
+                    "fallthrough", false, false);
+            }
+            FlowType flowType = instruction.getFlowType();
+            String flowKind = flowType.isCall() ? "call" : flowType.isJump() ? "branch" : "other";
+            Address[] rawFlows = instruction.getFlows();
+            if (rawFlows == null) rawFlows = new Address[0];
+            if (rawFlows.length > MAX_FLOW_TARGETS_PER_INSTRUCTION) {
+                throw new IllegalStateException("Instruction exceeds flow target limit at " + source);
+            }
+            List<Address> flows = new ArrayList<>();
+            boolean unresolved = flowType.isComputed();
+            for (Address target : rawFlows) {
+                if (target == null || Address.NO_ADDRESS.equals(target)) {
+                    unresolved = true;
+                } else if (!flows.contains(target)) {
+                    flows.add(target);
+                }
+            }
+            flows.sort(Comparator.comparing(Address::toString));
+            for (Address target : flows) {
+                addFlow(flowEdges, source, target, flowKind,
+                    flowType.isConditional(), flowType.isComputed());
+                if (flowType.isCall()) {
+                    addCall(callTargets, source, target,
+                        flowType.isConditional(), flowType.isComputed());
+                }
+            }
+            if (flows.isEmpty() && (flowType.isCall() || flowType.isJump())) {
+                unresolved = true;
+            }
+            if (unresolved) {
+                addFlow(flowEdges, source, null, flowKind,
+                    flowType.isConditional(), flowType.isComputed());
+                if (flowType.isCall()) {
+                    addCall(callTargets, source, null,
+                        flowType.isConditional(), flowType.isComputed());
+                }
+            }
         }
         if (instructionCount == 0) {
             throw new IllegalStateException("Selected function has no analyzed instructions: "
                 + selected.getEntryPoint());
         }
+        json.raw("],\"flow_edges\":[");
+        for (int i = 0; i < flowEdges.size(); i++) {
+            if (i != 0) json.raw(",");
+            flowEdges.get(i).write(json);
+        }
+        json.raw("],\"call_targets\":[");
+        for (int i = 0; i < callTargets.size(); i++) {
+            if (i != 0) json.raw(",");
+            callTargets.get(i).write(json);
+        }
         json.raw("]}}\n");
         writeAtomically(output, json.bytes());
         println("HydIR snapshot written to " + output.toAbsolutePath()
-            + " (" + instructionCount + " instructions, " + totalOps + " raw P-code ops)");
+            + " (" + instructionCount + " instructions, " + totalOps + " raw P-code ops, "
+            + flowEdges.size() + " flow edges, " + callTargets.size() + " call targets)");
     }
 }
