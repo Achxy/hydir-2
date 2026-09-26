@@ -8,6 +8,7 @@ on:
       - crates/hydir-ghidra-worker/**
       - crates/hydir-cli/**
       - crates/hydir-ir/**
+      - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
       - tests/fixtures/ghidra_prototype.elf
@@ -17,6 +18,7 @@ on:
       - crates/hydir-ghidra-worker/**
       - crates/hydir-cli/**
       - crates/hydir-ir/**
+      - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
       - tests/fixtures/ghidra_prototype.elf
@@ -57,6 +59,10 @@ jobs:
           assert high and high['source'] == 'ghidra_decompiler'
           assert high['status'] == 'complete' and high['operations']
           PY
+      - name: Run the automatic v3 RPC against the same container worker
+        run: |
+          cargo test --locked -p hydir-server --bin hydird \
+            automatic_ghidra_worker_exports_selected_real_elf -- --ignored
       - name: Retain snapshot and Ghidra diagnostics
         if: always()
         uses: actions/upload-artifact@v4
