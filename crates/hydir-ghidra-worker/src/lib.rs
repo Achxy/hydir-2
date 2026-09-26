@@ -22,6 +22,92 @@ const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DOCKER_LOG_BYTES: u64 = 16 * 1024;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct GhidraRuntimeStatus {
+    pub mode: &'static str,
+    pub pinned_version: &'static str,
+    pub runtime_ready: bool,
+    pub worker_image_cached: Option<bool>,
+    pub detail: String,
+}
+
+fn bounded_status(command: &mut Command, timeout: Duration) -> Result<bool, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Ok(status.success());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("runtime probe exceeded five seconds".to_owned());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Read-only setup probe for the managed frontend. This never builds an image
+/// or runs analysis; successful output still requires snapshot validation.
+pub fn runtime_status() -> GhidraRuntimeStatus {
+    if let Some(home) = env::var_os("HYDIR_GHIDRA_HOME") {
+        let executable = PathBuf::from(&home).join("support").join(if cfg!(windows) {
+            "analyzeHeadless.bat"
+        } else {
+            "analyzeHeadless"
+        });
+        let ready = executable.is_file();
+        return GhidraRuntimeStatus {
+            mode: "local",
+            pinned_version: GHIDRA_VERSION,
+            runtime_ready: ready,
+            worker_image_cached: None,
+            detail: if ready {
+                "Ghidra executable found; version and output are checked during analysis".to_owned()
+            } else {
+                format!("HYDIR_GHIDRA_HOME lacks {}", executable.display())
+            },
+        };
+    }
+    let check = bounded_status(
+        Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]),
+        Duration::from_secs(5),
+    );
+    let ready = check.as_ref().is_ok_and(|available| *available);
+    let tag = image_tag();
+    let image_cached = ready.then(|| {
+        bounded_status(
+            Command::new("docker").args(["image", "inspect", &tag]),
+            Duration::from_secs(5),
+        )
+        .unwrap_or(false)
+    });
+    GhidraRuntimeStatus {
+        mode: "docker",
+        pinned_version: GHIDRA_VERSION,
+        runtime_ready: ready,
+        worker_image_cached: image_cached,
+        detail: match check {
+            Ok(true) => {
+                "Docker engine reachable; Hydir provisions the pinned image on first analysis"
+                    .to_owned()
+            }
+            Ok(false) => {
+                "Docker engine did not accept a probe; start Docker or set HYDIR_GHIDRA_HOME"
+                    .to_owned()
+            }
+            Err(error) => {
+                format!("Docker engine unavailable: {error}; start Docker or set HYDIR_GHIDRA_HOME")
+            }
+        },
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CacheRecord {

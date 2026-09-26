@@ -1455,6 +1455,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "llvm_opt": opt_version,
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
+                    "ghidra_frontend": ghidra_worker::runtime_status(),
                     "remote_api": true,
                     "local_project_annotations": true,
                     "local_project_scope": "private path-bound SQLite ledger, digest-scoped names/comments/assumptions, revisioned CLI/GUI writes; no automatic remote sync",
