@@ -32,7 +32,9 @@ use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, parse_ghidra_snapshot, parse_pcode_seed,
 };
-use hydir_model::{import_dwarf, infer_model, init_model, parse_model, validate_model};
+use hydir_model::{
+    import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
+};
 use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod ghidra_worker;
@@ -102,6 +104,7 @@ Usage:
   hydirctl model init <elf> [--output <model.json>]
   hydirctl model verify <elf> <model.json>
   hydirctl model import-dwarf <elf> <model.json> [--output <new-model.json>]
+  hydirctl model import-ghidra <elf> <model.json> <snapshot.json> [--output <new-model.json>]
   hydirctl model infer <elf> <model.json> [--output <new-model.json>]
   hydirctl vm-profile <linked-elf> <profile.json>
   hydirctl vm-explore <linked-elf> <profile.json>
@@ -1108,6 +1111,34 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut model = parse_model(&fs::read(&args[3])?)?;
             validate_model(&bytes, &model)?;
             import_dwarf(&bytes, &mut model)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("import-ghidra")
+                && (args.len() == 5 || args.len() == 7) =>
+        {
+            let output = if args.len() == 7 {
+                if args[5] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[6].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let mut model =
+                parse_model(&read_bounded_json(&args[3], hydir_model::MAX_MODEL_BYTES)?)?;
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[4], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &model.binary_sha256,
+            )?;
+            import_ghidra_functions(&bytes, &mut model, &snapshot)?;
             let json = serde_json::to_vec_pretty(&model)?;
             if let Some(path) = output {
                 write_new_or_identical(path, &json)?;

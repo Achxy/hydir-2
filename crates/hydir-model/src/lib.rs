@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod dwarf;
+mod ghidra;
 mod infer;
 pub use dwarf::import_dwarf;
+pub use ghidra::{GhidraModelImportReport, import_ghidra_functions};
 pub use infer::{InferenceReport, infer_model};
 
 pub const ANALYSIS_MODEL_VERSION: u32 = 1;
@@ -23,6 +25,7 @@ const MAX_FIELDS: usize = 4_096;
 pub enum ModelSource {
     ElfMetadata,
     Dwarf,
+    GhidraAnalysis,
     NativeAnalysis,
     AnalystAssertion,
     LegacyTypedModel,

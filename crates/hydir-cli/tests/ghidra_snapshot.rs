@@ -3,6 +3,82 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
+fn ghidra_function_index_imports_into_analysis_model() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = tempfile::tempdir().unwrap();
+    let binary = root.join("demo/hydir-prism.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_prism_metadata_v2.json");
+    let model = directory.path().join("model.json");
+    let imported = directory.path().join("imported.json");
+
+    let init = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["model", "init"])
+        .arg(&binary)
+        .args(["--output"])
+        .arg(&model)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let run = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["model", "import-ghidra"])
+        .arg(&binary)
+        .arg(&model)
+        .arg(&snapshot)
+        .args(["--output"])
+        .arg(&imported)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let data: serde_json::Value = serde_json::from_slice(&fs::read(&imported).unwrap()).unwrap();
+    assert_eq!(data["schema_version"], 1);
+    assert!(
+        data["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|function| {
+                function["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|evidence| evidence["source"] == "ghidra_analysis")
+            })
+    );
+
+    let verify = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["model", "verify"])
+        .arg(&binary)
+        .arg(&imported)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let wrong_binary = directory.path().join("wrong.elf");
+    fs::write(&wrong_binary, b"not this binary").unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["model", "import-ghidra"])
+        .arg(&wrong_binary)
+        .arg(&model)
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}
+
+#[test]
 fn raw_pcode_snapshot_cli_binds_binary_and_emits_unclaimed_ir() {
     let directory = tempfile::tempdir().unwrap();
     let binary = directory.path().join("sample.bin");
