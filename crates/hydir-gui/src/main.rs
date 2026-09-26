@@ -5561,6 +5561,110 @@ impl AnalystApp {
             .size(11.0)
             .color(MUTED),
         );
+        if !snapshot.memory_blocks.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Ghidra memory map ({})",
+                snapshot.memory_blocks.len()
+            ))
+            .id_salt("ghidra_memory_blocks")
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Analyzed Ghidra ranges and permissions; these are project evidence.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_memory_block_rows")
+                    .max_height(160.0)
+                    .show_rows(ui, 26.0, snapshot.memory_blocks.len(), |ui, range| {
+                        for row in range {
+                            let block = &snapshot.memory_blocks[row];
+                            let address = block
+                                .start
+                                .offset
+                                .strip_prefix("0x")
+                                .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                            let label = format!(
+                                "{} {}:{}..{} · {} bytes · {}{}{} · {}",
+                                block.name,
+                                block.start.space,
+                                block.start.offset,
+                                block.end.offset,
+                                block.size,
+                                if block.read { "r" } else { "-" },
+                                if block.write { "w" } else { "-" },
+                                if block.execute { "x" } else { "-" },
+                                if block.initialized {
+                                    "initialized"
+                                } else {
+                                    "uninitialized"
+                                }
+                            );
+                            if ui
+                                .add_enabled(
+                                    block.start.space == "ram",
+                                    egui::Button::selectable(
+                                        self.selected_address == address,
+                                        RichText::new(label).monospace().size(11.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.selected_address = address;
+                            }
+                        }
+                    });
+            });
+        }
+        if !snapshot.symbols.is_empty() {
+            egui::CollapsingHeader::new(format!("Ghidra symbols ({})", snapshot.symbols.len()))
+                .id_salt("ghidra_symbols")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Defined program and external symbols with Ghidra source evidence.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("ghidra_symbol_rows")
+                        .max_height(160.0)
+                        .show_rows(ui, 26.0, snapshot.symbols.len(), |ui, range| {
+                            for row in range {
+                                let symbol = &snapshot.symbols[row];
+                                let address = symbol
+                                    .address
+                                    .offset
+                                    .strip_prefix("0x")
+                                    .and_then(|digits| u64::from_str_radix(digits, 16).ok());
+                                let label = format!(
+                                    "{}:{} {}::{} · {} · {}",
+                                    symbol.address.space,
+                                    symbol.address.offset,
+                                    symbol.namespace,
+                                    symbol.name,
+                                    symbol.symbol_type,
+                                    symbol.source_type
+                                );
+                                if ui
+                                    .add_enabled(
+                                        symbol.address.space == "ram",
+                                        egui::Button::selectable(
+                                            self.selected_address == address,
+                                            RichText::new(label).monospace().size(11.0),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_address = address;
+                                }
+                            }
+                        });
+                });
+        }
         if let Some(report) = &self.ghidra_coverage {
             egui::CollapsingHeader::new(format!(
                 "P-code coverage: {} exact assignments / {} operations",
