@@ -79,6 +79,62 @@ fn ghidra_function_index_imports_into_analysis_model() {
 }
 
 #[test]
+fn ghidra_high_pcode_hints_round_trip_through_model_cli() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = tempfile::tempdir().unwrap();
+    let binary = root.join("tests/fixtures/ghidra_prototype.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_prototype_high_v2.json");
+    let initial = directory.path().join("initial.json");
+    let imported = directory.path().join("imported.json");
+    let cli = env!("CARGO_BIN_EXE_hydirctl");
+
+    let init = Command::new(cli)
+        .args(["model", "init"])
+        .arg(&binary)
+        .arg("--output")
+        .arg(&initial)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let import = Command::new(cli)
+        .args(["model", "import-ghidra"])
+        .arg(&binary)
+        .arg(&initial)
+        .arg(&snapshot)
+        .arg("--output")
+        .arg(&imported)
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let model: serde_json::Value = serde_json::from_slice(&fs::read(&imported).unwrap()).unwrap();
+    let hints = model["high_pcode_hints"].as_array().unwrap();
+    assert!(hints.iter().any(|hint| {
+        hint["high_name"] == "node"
+            && hint["high_type"]["display_name"] == "Node *"
+            && hint["source"] == "ghidra_analysis"
+    }));
+    let verify = Command::new(cli)
+        .args(["model", "verify"])
+        .arg(&binary)
+        .arg(&imported)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn pcode_slice_cli_reports_bounded_source_linked_dependencies() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let binary = root.join("demo/hydir-prism.elf");

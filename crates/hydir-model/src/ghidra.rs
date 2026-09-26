@@ -2,13 +2,14 @@
 //! Names are evidence. Existing names are retained and disagreements visible.
 
 use super::{
-    AnalysisModel, ModelConflict, ModelEvidence, ModelFunction, ModelParameter, ModelPrototype,
-    ModelSource, PrimitiveType, TypeDefinitionKind, TypeRef, valid_identifier, validate_model,
+    AnalysisModel, MAX_HIGH_PCODE_HINT_BYTES, MAX_HIGH_PCODE_HINTS, ModelConflict, ModelEvidence,
+    ModelFunction, ModelHighPcodeHint, ModelParameter, ModelPrototype, ModelSource, PrimitiveType,
+    TypeDefinitionKind, TypeRef, valid_identifier, validate_model,
 };
 use hydir_core::{Address, Location, annotation_address_in_spec};
 use hydir_ir::pcode::{
-    GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraFunctionPrototype, GhidraSnapshot,
-    validate_ghidra_snapshot,
+    GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraFunctionPrototype, GhidraHighPcodeStatus,
+    GhidraHighVarnodeEvidence, GhidraSnapshot, validate_ghidra_snapshot,
 };
 use hydir_loader::import_elf;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ pub struct GhidraModelImportReport {
     pub conflicting_prototypes: usize,
     pub unresolved_prototypes: usize,
     pub skipped_unmapped: usize,
+    #[serde(default)]
+    pub imported_high_pcode_hints: usize,
+    #[serde(default)]
+    pub skipped_high_pcode_hints: usize,
     pub model_revision: u64,
 }
 
@@ -232,6 +237,45 @@ fn prototype_evidence(prototype: &GhidraFunctionPrototype, location: Location) -
     }
 }
 
+fn high_pcode_hint(
+    node: &GhidraHighVarnodeEvidence,
+    function_entry: Location,
+    source_site: Location,
+    operation_index: u32,
+    input_index: Option<u16>,
+    ghidra_base: u64,
+    elf_base: u64,
+    spec: &hydir_core::ProgramSpec,
+) -> Result<ModelHighPcodeHint, String> {
+    let linked_ram_address = if node.varnode.space == "ram" {
+        linked_elf_address(
+            parse_snapshot_offset(&node.varnode.offset)?,
+            ghidra_base,
+            elf_base,
+        )
+        .filter(|address| annotation_address_in_spec(spec, Address(*address)))
+        .map(|address| Location {
+            address_space: 0,
+            value: Address(address),
+        })
+    } else {
+        None
+    };
+    Ok(ModelHighPcodeHint {
+        function_entry,
+        source_site,
+        operation_index,
+        input_index,
+        ssa_id: node.ssa_id,
+        is_input: node.is_input,
+        varnode: node.varnode.clone(),
+        linked_ram_address,
+        high_name: node.high_name.clone(),
+        high_type: node.high_type.clone(),
+        source: ModelSource::GhidraAnalysis,
+    })
+}
+
 /// Import Ghidra's linked-ELF function index without asserting prototypes or
 /// changing existing names. Repeating the same import does not advance the
 /// model revision or duplicate evidence and conflicts.
@@ -278,6 +322,8 @@ pub fn import_ghidra_functions(
     let mut conflicting_prototypes = 0;
     let mut unresolved_prototypes = 0;
     let mut skipped_unmapped = 0;
+    let mut imported_high_pcode_hints = 0;
+    let mut skipped_high_pcode_hints = 0;
     let mut indexed = BTreeMap::new();
     for (index, function) in candidate.functions.iter().enumerate() {
         indexed.insert(function.entry, index);
@@ -413,6 +459,86 @@ pub fn import_ghidra_functions(
         }
     }
     candidate.functions.sort_by_key(|function| function.entry);
+    if let Some(high) = &snapshot.selected_function.high_pcode
+        && high.status == GhidraHighPcodeStatus::Complete
+    {
+        let function_entry = Location {
+            address_space: 0,
+            value: Address(selected_address),
+        };
+        let mut seen_hints = BTreeSet::new();
+        let mut hint_bytes = 0usize;
+        for hint in &candidate.high_pcode_hints {
+            let encoded = serde_json::to_vec(hint)
+                .map_err(|error| format!("cannot encode existing high-P-code hint: {error}"))?;
+            hint_bytes += encoded.len();
+            seen_hints.insert(encoded);
+        }
+        let model_bytes_before_hints = serde_json::to_vec(&candidate)
+            .map_err(|error| format!("cannot encode analysis model: {error}"))?
+            .len();
+        let mut added_model_bytes = 0usize;
+        for operation in &high.operations {
+            let source_address = if operation.source_address.space == "ram" {
+                linked_elf_address(
+                    parse_snapshot_offset(&operation.source_address.offset)?,
+                    ghidra_base,
+                    elf_base,
+                )
+                .filter(|address| annotation_address_in_spec(&spec, Address(*address)))
+            } else {
+                None
+            };
+            let nodes = operation.output.iter().map(|node| (None, node)).chain(
+                operation
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| (Some(index as u16), node)),
+            );
+            for (input_index, node) in nodes {
+                let Some(address) = source_address else {
+                    skipped_high_pcode_hints += 1;
+                    continue;
+                };
+                let hint = high_pcode_hint(
+                    node,
+                    function_entry,
+                    Location {
+                        address_space: 0,
+                        value: Address(address),
+                    },
+                    operation.index,
+                    input_index,
+                    ghidra_base,
+                    elf_base,
+                    &spec,
+                )?;
+                let encoded = serde_json::to_vec(&hint)
+                    .map_err(|error| format!("cannot encode high-P-code hint: {error}"))?;
+                if seen_hints.contains(&encoded) {
+                    continue;
+                }
+                let encoded_len = encoded.len();
+                if candidate.high_pcode_hints.len() >= MAX_HIGH_PCODE_HINTS
+                    || hint_bytes.saturating_add(encoded_len) > MAX_HIGH_PCODE_HINT_BYTES
+                    || model_bytes_before_hints
+                        .saturating_add(added_model_bytes)
+                        .saturating_add(encoded_len)
+                        .saturating_add(64)
+                        > super::MAX_MODEL_BYTES
+                {
+                    skipped_high_pcode_hints += 1;
+                    continue;
+                }
+                candidate.high_pcode_hints.push(hint);
+                seen_hints.insert(encoded);
+                hint_bytes += encoded_len;
+                added_model_bytes += encoded_len + 1;
+                imported_high_pcode_hints += 1;
+            }
+        }
+    }
     if candidate != *model {
         candidate.revision = candidate
             .revision
@@ -420,6 +546,13 @@ pub fn import_ghidra_functions(
             .ok_or("analysis model revision overflow")?;
     }
     validate_model(bytes, &candidate)?;
+    if serde_json::to_vec(&candidate)
+        .map_err(|error| format!("cannot encode analysis model: {error}"))?
+        .len()
+        > super::MAX_MODEL_BYTES
+    {
+        return Err("analysis model exceeds 16 MiB after Ghidra import".to_owned());
+    }
     let report = GhidraModelImportReport {
         binary_sha256: candidate.binary_sha256.clone(),
         selected_function: Location {
@@ -434,6 +567,8 @@ pub fn import_ghidra_functions(
         conflicting_prototypes,
         unresolved_prototypes,
         skipped_unmapped,
+        imported_high_pcode_hints,
+        skipped_high_pcode_hints,
         model_revision: candidate.revision,
     };
     *model = candidate;
@@ -443,7 +578,7 @@ pub fn import_ghidra_functions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{import_dwarf, init_model};
+    use crate::{import_dwarf, init_model, parse_model, record_analyst_edits};
     use hydir_ir::pcode::{GhidraParameterEvidence, parse_ghidra_snapshot};
 
     #[test]
@@ -690,5 +825,129 @@ mod tests {
                 name: PrimitiveType::I32
             }
         );
+    }
+
+    #[test]
+    fn real_high_pcode_hints_are_structured_linked_evidence_and_idempotent() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prototype.elf"
+        ));
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prototype_high_v2.json"
+            )),
+            "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f",
+        )
+        .unwrap();
+        let mut model = init_model(bytes).unwrap();
+        let report = import_ghidra_functions(bytes, &mut model, &snapshot).unwrap();
+        assert!(report.imported_high_pcode_hints > 30);
+        assert_eq!(report.skipped_high_pcode_hints, 0);
+        assert_eq!(
+            model.high_pcode_hints.len(),
+            report.imported_high_pcode_hints
+        );
+        let first = model.high_pcode_hints[0].clone();
+        assert_eq!(first.function_entry.value, Address(0x1320));
+        assert_eq!(first.source_site.value, Address(0x1320));
+        assert_eq!(first.ssa_id, 10);
+        assert_eq!(first.high_type.as_ref().unwrap().display_name, "bool");
+        assert!(model.high_pcode_hints.iter().any(|hint| {
+            hint.ssa_id == 217
+                && hint.high_name.as_deref() == Some("node")
+                && hint.high_type.as_ref().unwrap().display_name == "Node *"
+        }));
+        assert!(model.types.is_empty());
+        assert!(model.stack_objects.is_empty());
+        let encoded = serde_json::to_vec(&model).unwrap();
+        assert_eq!(parse_model(&encoded).unwrap(), model);
+        let mut legacy_json = serde_json::to_value(&model).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("high_pcode_hints");
+        assert!(
+            parse_model(&serde_json::to_vec(&legacy_json).unwrap())
+                .unwrap()
+                .high_pcode_hints
+                .is_empty()
+        );
+        let first_import = model.clone();
+        let repeat = import_ghidra_functions(bytes, &mut model, &snapshot).unwrap();
+        assert_eq!(repeat.imported_high_pcode_hints, 0);
+        assert_eq!(model, first_import);
+
+        let mut changed_snapshot = snapshot.clone();
+        changed_snapshot
+            .selected_function
+            .high_pcode
+            .as_mut()
+            .unwrap()
+            .operations[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .high_name = Some("different_analysis_name".to_owned());
+        let mut revised_evidence = model.clone();
+        let changed_report =
+            import_ghidra_functions(bytes, &mut revised_evidence, &changed_snapshot).unwrap();
+        assert_eq!(changed_report.imported_high_pcode_hints, 1);
+        assert!(revised_evidence.high_pcode_hints.contains(&first));
+        assert!(revised_evidence.high_pcode_hints.iter().any(|hint| {
+            hint.operation_index == 0
+                && hint.input_index.is_none()
+                && hint.high_name.as_deref() == Some("different_analysis_name")
+        }));
+
+        let mut edited = model.clone();
+        edited.high_pcode_hints.clear(); // An older editor omitted the optional field.
+        let function = edited
+            .functions
+            .iter_mut()
+            .find(|function| function.entry.value == Address(0x1320))
+            .unwrap();
+        function.name = "analyst_walk".to_owned();
+        record_analyst_edits(&model, &mut edited).unwrap();
+        assert_eq!(edited.high_pcode_hints, model.high_pcode_hints);
+        import_ghidra_functions(bytes, &mut edited, &snapshot).unwrap();
+        assert_eq!(
+            edited
+                .functions
+                .iter()
+                .find(|function| function.entry.value == Address(0x1320))
+                .unwrap()
+                .name,
+            "analyst_walk"
+        );
+        assert_eq!(edited.high_pcode_hints, model.high_pcode_hints);
+    }
+
+    #[test]
+    fn high_pcode_hints_reject_unmapped_sites_and_duplicates() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prototype.elf"
+        ));
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prototype_high_v2.json"
+            )),
+            "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f",
+        )
+        .unwrap();
+        let mut model = init_model(bytes).unwrap();
+        import_ghidra_functions(bytes, &mut model, &snapshot).unwrap();
+        let mut bad = model.clone();
+        bad.high_pcode_hints[0].source_site.value = Address(u64::MAX);
+        assert!(validate_model(bytes, &bad).is_err());
+        let mut bad = model.clone();
+        bad.high_pcode_hints.push(bad.high_pcode_hints[0].clone());
+        assert!(validate_model(bytes, &bad).is_err());
+        let mut bad = model.clone();
+        bad.high_pcode_hints[0].high_name = Some("x".repeat(4097));
+        assert!(validate_model(bytes, &bad).is_err());
     }
 }

@@ -1,7 +1,10 @@
 //! Editable, digest-bound analyst model. Inference never silently replaces
 //! analyst assertions or converts an unresolved observation into a proof.
 
-use hydir_core::{Address, FactSource, Location, ProgramSpec, ScalarType, TypedModel};
+use hydir_core::{
+    Address, FactSource, Location, ProgramSpec, ScalarType, TypedModel, annotation_address_in_spec,
+};
+use hydir_ir::pcode::{GhidraDataTypeEvidence, PcodeVarnode};
 use hydir_loader::import_elf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +22,8 @@ pub const MAX_MODEL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TYPES: usize = 16_384;
 const MAX_FUNCTIONS: usize = 65_536;
 const MAX_FIELDS: usize = 4_096;
+const MAX_HIGH_PCODE_HINTS: usize = 8_192;
+const MAX_HIGH_PCODE_HINT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +177,29 @@ pub struct ModelConflict {
     pub evidence: Vec<ModelEvidence>,
 }
 
+/// One Ghidra decompiler observation at a high-P-code operand. SSA identity,
+/// variable name, and type are hints, not source-level model assertions.
+/// `source_site` and `linked_ram_address` use linked ELF addresses; `varnode`
+/// retains Ghidra's original address-space coordinates for auditability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelHighPcodeHint {
+    pub function_entry: Location,
+    pub source_site: Location,
+    pub operation_index: u32,
+    /// None denotes the operation output; Some(n) denotes input n.
+    pub input_index: Option<u16>,
+    pub ssa_id: i32,
+    pub is_input: bool,
+    pub varnode: PcodeVarnode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ram_address: Option<Location>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_type: Option<GhidraDataTypeEvidence>,
+    pub source: ModelSource,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AnalysisModel {
     pub schema_version: u32,
@@ -183,6 +211,9 @@ pub struct AnalysisModel {
     pub stack_objects: Vec<ModelStackObject>,
     #[serde(default)]
     pub conflicts: Vec<ModelConflict>,
+    /// Optional in v1 so existing saved models remain readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub high_pcode_hints: Vec<ModelHighPcodeHint>,
 }
 
 pub fn init_model(bytes: &[u8]) -> Result<AnalysisModel, String> {
@@ -214,6 +245,7 @@ pub fn init_model(bytes: &[u8]) -> Result<AnalysisModel, String> {
         functions,
         stack_objects: Vec::new(),
         conflicts: Vec::new(),
+        high_pcode_hints: Vec::new(),
     };
     import_legacy_typed_model(&mut model, &spec)?;
     validate_model(bytes, &model)?;
@@ -269,6 +301,20 @@ pub fn record_analyst_edits(
 ) -> Result<(), String> {
     if previous.binary_sha256 != candidate.binary_sha256 {
         return Err("cannot compare models for different binaries".to_owned());
+    }
+    // These rows are machine observations. A local analyst edit to a name or
+    // prototype must not silently discard them when older editors omit the
+    // optional field from their JSON serialization.
+    let mut present_hints = candidate
+        .high_pcode_hints
+        .iter()
+        .map(|hint| serde_json::to_vec(hint).map_err(|error| error.to_string()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for hint in &previous.high_pcode_hints {
+        let encoded = serde_json::to_vec(hint).map_err(|error| error.to_string())?;
+        if present_hints.insert(encoded) {
+            candidate.high_pcode_hints.push(hint.clone());
+        }
     }
     let mut edit_conflicts = Vec::new();
     for definition in &mut candidate.types {
@@ -410,6 +456,14 @@ pub fn validate_model(bytes: &[u8], model: &AnalysisModel) -> Result<(), String>
     let spec = import_elf(bytes).map_err(|error| error.to_string())?;
     if model.target_triple != spec.target_triple {
         return Err("analysis model target triple differs from supplied ELF".to_owned());
+    }
+    if model.high_pcode_hints.iter().any(|hint| {
+        !annotation_address_in_spec(&spec, hint.source_site.value)
+            || hint
+                .linked_ram_address
+                .is_some_and(|location| !annotation_address_in_spec(&spec, location.value))
+    }) {
+        return Err("Ghidra high-P-code hint refers outside the linked ELF".to_owned());
     }
     Ok(())
 }
@@ -576,6 +630,7 @@ pub fn validate_structure(model: &AnalysisModel) -> Result<(), String> {
         || model.functions.len() > MAX_FUNCTIONS
         || model.stack_objects.len() > MAX_FUNCTIONS
         || model.conflicts.len() > MAX_FUNCTIONS
+        || model.high_pcode_hints.len() > MAX_HIGH_PCODE_HINTS
     {
         return Err("analysis model row limit exceeded".to_owned());
     }
@@ -720,6 +775,61 @@ pub fn validate_structure(model: &AnalysisModel) -> Result<(), String> {
             return Err("empty model conflict".to_owned());
         }
         validate_evidence(&conflict.evidence)?;
+    }
+    let mut hint_keys = BTreeSet::new();
+    let mut hint_bytes = 0usize;
+    for hint in &model.high_pcode_hints {
+        if hint.source != ModelSource::GhidraAnalysis
+            || !entries.contains(&hint.function_entry)
+            || hint.function_entry.address_space != 0
+            || hint.source_site.address_space != 0
+            || hint.operation_index > 16_383
+            || hint.input_index.is_some_and(|index| index > 255)
+            || hint.varnode.space.is_empty()
+            || hint.varnode.space.len() > 128
+            || !(1..=4096).contains(&hint.varnode.size)
+            || !hint.varnode.offset.starts_with("0x")
+            || u64::from_str_radix(&hint.varnode.offset[2..], 16).is_err()
+            || hint
+                .high_name
+                .as_ref()
+                .is_some_and(|name| name.is_empty() || name.len() > 4096)
+            || hint
+                .linked_ram_address
+                .is_some_and(|location| location.address_space != 0)
+            || (hint.varnode.space != "ram" && hint.linked_ram_address.is_some())
+        {
+            return Err("invalid Ghidra high-P-code model hint".to_owned());
+        }
+        if let Some(ty) = &hint.high_type {
+            validate_high_type_hint(ty, 0)?;
+        }
+        let encoded = serde_json::to_vec(hint)
+            .map_err(|error| format!("cannot encode high-P-code hint: {error}"))?;
+        if !hint_keys.insert(encoded.clone()) {
+            return Err("duplicate Ghidra high-P-code model hint".to_owned());
+        }
+        hint_bytes = hint_bytes.saturating_add(encoded.len());
+        if hint_bytes > MAX_HIGH_PCODE_HINT_BYTES {
+            return Err("Ghidra high-P-code model hints exceed 4 MiB".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_high_type_hint(ty: &GhidraDataTypeEvidence, depth: usize) -> Result<(), String> {
+    if depth > 4
+        || ty.display_name.is_empty()
+        || ty.display_name.len() > 4096
+        || ty.path.is_empty()
+        || ty.path.len() > 4096
+        || ty.size_bytes.is_some_and(|size| size > 1_048_576)
+        || ty.element_count.is_some_and(|count| count > 1_000_000)
+    {
+        return Err("invalid Ghidra high-P-code type hint".to_owned());
+    }
+    if let Some(target) = &ty.target_type {
+        validate_high_type_hint(target, depth + 1)?;
     }
     Ok(())
 }
