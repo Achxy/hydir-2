@@ -162,4 +162,11 @@ class PasswordMixNativeTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    program = unittest.main(exit=False)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        for case, details in program.result.failures + program.result.errors:
+            message = f"{case.id()}: {details[-1800:]}"
+            message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error title=Hydir password native differential::{message}", flush=True)
+    if not program.result.wasSuccessful():
+        raise SystemExit(1)
