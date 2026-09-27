@@ -116,6 +116,21 @@ class LocalGhidraTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.client.llvm_cfg_calls(self.binary, self.snapshot, (callee,))
 
+    def test_automatic_call_cfg_llvm_uses_managed_worker(self):
+        seed = Path(self.directory.name) / "seed.json"
+        seed.write_text("{}", encoding="utf-8")
+        artifact = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "llvm": {"binary_sha256": self.digest, "llvm_ir": "module"},
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
+            self.client.llvm_cfg_calls_auto(self.binary, seed, function=0x401000, max_functions=2)
+        self.assertEqual(run.call_args.args[:2], ("ghidra", "llvm-cfg-calls"))
+        self.assertIn("0x401000", run.call_args.args)
+        self.assertIn("--max-functions", run.call_args.args)
+        with self.assertRaises(ValueError):
+            self.client.llvm_cfg_calls_auto(self.binary, seed, function=0x401000, max_depth=17)
+
     def test_slice_uses_bounded_source_artifact(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         artifact = {

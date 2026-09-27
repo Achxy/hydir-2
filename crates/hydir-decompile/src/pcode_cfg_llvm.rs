@@ -114,6 +114,9 @@ pub struct PcodeInterproceduralCfgLlvmArtifact {
     pub binary_sha256: String,
     pub function_entries: Vec<PcodeAddress>,
     pub snapshot_sha256: Vec<String>,
+    /// Export failures from demand-driven collection; a missing callee stays
+    /// an explicit stop in the LLVM module.
+    pub snapshot_diagnostics: Vec<String>,
     pub max_call_depth: usize,
     pub llvm: PcodeCfgLlvmArtifact,
     pub semantic_fidelity: SemanticFidelity,
@@ -902,6 +905,7 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
             .map(|snapshot| snapshot.selected_function.entry.clone())
             .collect(),
         snapshot_sha256: digests,
+        snapshot_diagnostics: Vec::new(),
         max_call_depth,
         llvm,
         semantic_fidelity: SemanticFidelity::Unknown,

@@ -195,6 +195,40 @@ class LocalGhidra:
             raise RuntimeError("Hydir call CFG LLVM artifact is invalid or belongs to another binary")
         return data
 
+    def llvm_cfg_calls_auto(
+        self,
+        binary: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        function: int,
+        max_functions: int = 8,
+        max_operations: int = 4096,
+        max_visits: int = 1024,
+        max_depth: int = 8,
+    ) -> dict[str, Any]:
+        """Analyze a binary and lift the callees reached by one concrete seed."""
+        if not isinstance(function, int) or not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("function entry must be a 64-bit address")
+        if not 1 <= max_functions <= 32 or not 0 <= max_depth <= 16:
+            raise ValueError("call-path function or depth limit is invalid")
+        if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
+            raise ValueError("call-path operation or visit budget is invalid")
+        binary_path = Path(binary).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        data = json.loads(self._run(
+            "ghidra", "llvm-cfg-calls", str(binary_path), str(seed_path),
+            "--function", hex(function), "--max-functions", str(max_functions),
+            "--max-ops", str(max_operations), "--max-visits", str(max_visits),
+            "--max-depth", str(max_depth),
+        ))
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or data.get("binary_sha256") != digest
+                or not isinstance(data.get("llvm"), dict)
+                or data["llvm"].get("binary_sha256") != digest):
+            raise RuntimeError("Hydir automatic call CFG LLVM artifact belongs to another binary")
+        return data
+
     def slice(
         self,
         binary: str | os.PathLike[str],

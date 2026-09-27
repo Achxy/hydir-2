@@ -70,6 +70,7 @@ Usage:
   hydirctl analyze <linked-elf>
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
   hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
@@ -413,6 +414,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra") if args.len() >= 6 && args[1] == "trace-calls" => {
             ghidra_calls::run_automatic(&args[2..])?;
+        }
+        Some("ghidra") if args.len() >= 6 && args[1] == "llvm-cfg-calls" => {
+            ghidra_calls::run_automatic_llvm(&args[2..])?;
         }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-calls" => {
             ghidra_calls::run_snapshots(&args[2..])?;

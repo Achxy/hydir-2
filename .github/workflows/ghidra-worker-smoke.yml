@@ -157,6 +157,28 @@ jobs:
           assert trace['final_state']['register_bytes']['0'] == 7
           assert trace['snapshot_diagnostics'] == []
           PY
+      - name: Lift the automatically reached callee into one LLVM module
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls \
+            tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json \
+            --function 0x20117c --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-call-module.json"
+          python3 - "$RUNNER_TEMP/ghidra-call-module.json" "$RUNNER_TEMP/ghidra-call-module.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert len(artifact['function_entries']) == 2
+          assert artifact['function_entries'][1]['offset'] == '0x201174'
+          assert len(artifact['snapshot_sha256']) == 2
+          assert artifact['snapshot_diagnostics'] == []
+          assert artifact['semantic_fidelity'] == 'unknown'
+          assert any(op['mnemonic'] == 'CALLIND' for op in artifact['llvm']['source_operations'])
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm']['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/ghidra-call-module.ll" \
+            -o "$RUNNER_TEMP/ghidra-call-module.o"
       - name: Export only the reached callee under a two-function budget
         run: |
           cargo run --locked -p hydir-cli -- ghidra trace-calls \

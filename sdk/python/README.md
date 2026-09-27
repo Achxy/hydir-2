@@ -31,6 +31,8 @@ provides the same artifact through the authenticated v3 service.
 emits one bounded LLVM state machine across validated loaded callees. Its
 fidelity claim remains unknown until a concrete path is compared with an
 execution oracle.
+`LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
+managed worker and collects only callees reached by the seed before lifting.
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,

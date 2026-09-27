@@ -75,6 +75,7 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot verify demo/hydir-prism.elf t
 cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf target/prism-ghidra.json
 cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
 cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
+cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c --max-functions 2
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
 ```
@@ -84,14 +85,15 @@ FunctionIndex IDs for entries without usable names. The GUI also opens an ELF
 through its local file control. The call trace uses a concrete seed and stops
 explicitly at unsupported or unresolved call boundaries. In the GUI, open
 `hydir_stage_call_chain` and use the Call trace panel with the seed JSON.
-The second command exercises bounded automatic export for a concrete indirect
+The indirect call command exercises bounded automatic export for a concrete
 callee. Unknown indirect targets stop without guessing a function.
 Automatic call tracing exports the function reached by the seed before spending
 its function budget on other static call targets.
 The indirect-jump command emits a bounded LLVM path module that dispatches a known
-indirect jump to an instruction in the selected function. The final command
-emits one LLVM state machine over the loaded caller and callee snapshots. It
-shares register and RAM state, checks return targets, and leaves unsupported
+indirect jump to an instruction in the selected function. The call LLVM
+commands emit one state machine over the loaded caller and callee snapshots.
+The automatic form collects functions reached by the seed; the snapshot form
+accepts saved exports. Both share register and RAM state, check return targets, and leave unsupported
 effects and missing callees as explicit stops. Its fidelity is still unknown
 until a path is compared with Rust, Ghidra, or native execution.
 [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)

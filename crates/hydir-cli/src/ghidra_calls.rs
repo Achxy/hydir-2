@@ -110,6 +110,33 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("trace-calls needs binary and seed".into());
     };
     let options = parse_options(options, true)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    emit(&snapshots, seed, &options, diagnostics)
+}
+
+pub fn run_automatic_llvm(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let [binary, seed, options @ ..] = args else {
+        return Err("llvm-cfg-calls needs binary and seed".into());
+    };
+    let options = parse_options(options, true)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let mut artifact =
+        hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, options.max_depth)?;
+    artifact.snapshot_diagnostics = diagnostics;
+    let bytes = serde_json::to_vec_pretty(&artifact)?;
+    if let Some(path) = options.output {
+        write_new_or_identical(path, &bytes)?;
+    } else {
+        println!("{}", String::from_utf8(bytes)?);
+    }
+    Ok(())
+}
+
+fn collect_automatic(
+    binary: &str,
+    seed: &str,
+    options: &Options<'_>,
+) -> Result<(Vec<GhidraSnapshot>, Vec<String>), Box<dyn Error>> {
     let root_entry = options.function.ok_or("missing Ghidra function entry")?;
     let digest = format!("{:x}", Sha256::digest(read_binary(binary)?));
     let scratch = tempfile::tempdir()?;
@@ -169,5 +196,5 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         snapshots.push(snapshot);
     }
-    emit(&snapshots, seed, &options, diagnostics)
+    Ok((snapshots, diagnostics))
 }
