@@ -13,6 +13,7 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - scripts/demo-ghidra-password-lift.sh
       - tests/fixtures/ghidra_prototype.elf
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
@@ -36,6 +37,7 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - scripts/demo-ghidra-password-lift.sh
       - tests/fixtures/ghidra_prototype.elf
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
@@ -413,3 +415,4 @@ jobs:
             ${{ runner.temp }}/ghidra-chosen-call-trace.json
             ${{ runner.temp }}/ghidra-indirect-jump-snapshot.json
             ${{ runner.temp }}/ghidra-indirect-jump-llvm.json
+            target/demo-ghidra-password-lift/run.*/
