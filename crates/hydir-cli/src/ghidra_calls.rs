@@ -7,11 +7,7 @@ use hydir_ir::pcode::{
     parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
 };
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeSet, VecDeque},
-    error::Error,
-    path::Path,
-};
+use std::{collections::BTreeSet, error::Error, path::Path};
 
 const MAX_FUNCTIONS: usize = 32;
 const MAX_OPERATIONS: usize = 262_144;
@@ -117,15 +113,36 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
     let root_entry = options.function.ok_or("missing Ghidra function entry")?;
     let digest = format!("{:x}", Sha256::digest(read_binary(binary)?));
     let scratch = tempfile::tempdir()?;
-    let mut pending = VecDeque::from([root_entry]);
+    let root_output = scratch.path().join("function-0.json");
+    let root = ghidra_worker::analyze(Path::new(binary), Some(root_entry), &root_output)?;
+    if root.binary_sha256 != digest
+        || root.selected_function.entry.offset != format!("0x{root_entry:x}")
+    {
+        return Err("Ghidra worker returned a different binary or function".into());
+    }
+    let mut snapshots = vec![root.clone()];
     let mut seen = BTreeSet::from([root_entry]);
-    let mut snapshots = Vec::<GhidraSnapshot>::new();
     let mut diagnostics = Vec::new();
-    while let Some(entry) = pending.pop_front() {
+    let parsed_seed = parse_pcode_seed(&read_bounded_json(seed, MAX_PCODE_SEED_BYTES)?, &root)?;
+    loop {
+        let trace = execute_concrete_call_path(
+            &snapshots,
+            &parsed_seed,
+            options.max_operations,
+            options.max_visits,
+            options.max_depth,
+        )?;
+        let Some(target) = unloaded_call_target(&snapshots, &trace)? else {
+            break;
+        };
+        let entry = super::parse_u64_auto(&target.offset, "reached call target")?;
         if snapshots.len() >= options.max_functions {
             diagnostics.push(format!(
-                "function collection limit reached before 0x{entry:x}"
+                "function collection limit reached before callee 0x{entry:x}"
             ));
+            break;
+        }
+        if !seen.insert(entry) {
             break;
         }
         let output = scratch
@@ -133,103 +150,24 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
             .join(format!("function-{}.json", snapshots.len()));
         let snapshot = match ghidra_worker::analyze(Path::new(binary), Some(entry), &output) {
             Ok(snapshot) => snapshot,
-            Err(error) if entry != root_entry => {
+            Err(error) => {
                 diagnostics.push(format!("callee 0x{entry:x} export failed: {error}"));
-                continue;
+                break;
             }
-            Err(error) => return Err(error.into()),
         };
         if snapshot.binary_sha256 != digest
-            || snapshot.selected_function.entry.offset != format!("0x{entry:x}")
+            || snapshot.selected_function.entry != target
+            || snapshot.program != root.program
+            || snapshot.address_spaces != root.address_spaces
+            || snapshot.functions != root.functions
+            || snapshot.flow_overrides_applied != root.flow_overrides_applied
         {
-            return Err("Ghidra worker returned a different binary or function".into());
-        }
-        if let Some(root) = snapshots.first() {
-            if snapshot.program != root.program
-                || snapshot.address_spaces != root.address_spaces
-                || snapshot.functions != root.functions
-                || snapshot.flow_overrides_applied != root.flow_overrides_applied
-            {
-                diagnostics.push(format!(
-                    "callee 0x{entry:x} has inconsistent analysis identity"
-                ));
-                continue;
-            }
-        }
-        for call in &snapshot.selected_function.call_targets {
-            if call.computed || call.conditional {
-                continue;
-            }
-            let Some(target) = &call.target else { continue };
-            let Ok(target_entry) = super::parse_u64_auto(&target.offset, "call target") else {
-                continue;
-            };
-            if snapshot
-                .functions
-                .iter()
-                .any(|function| function.entry == *target)
-                && seen.insert(target_entry)
-            {
-                pending.push_back(target_entry);
-            }
+            diagnostics.push(format!(
+                "callee 0x{entry:x} has inconsistent analysis identity"
+            ));
+            break;
         }
         snapshots.push(snapshot);
-    }
-    if !snapshots.is_empty() {
-        let root = snapshots[0].clone();
-        let seed = parse_pcode_seed(&read_bounded_json(seed, MAX_PCODE_SEED_BYTES)?, &root)?;
-        loop {
-            let trace = execute_concrete_call_path(
-                &snapshots,
-                &seed,
-                options.max_operations,
-                options.max_visits,
-                options.max_depth,
-            )?;
-            let Some(target) = unloaded_call_target(&snapshots, &trace)? else {
-                break;
-            };
-            let entry = super::parse_u64_auto(&target.offset, "computed call target")?;
-            if snapshots.len() >= options.max_functions {
-                if !diagnostics.iter().any(|diagnostic| {
-                    diagnostic.starts_with("function collection limit reached before ")
-                        && diagnostic.ends_with(&format!("0x{entry:x}"))
-                }) {
-                    diagnostics.push(format!(
-                        "function collection limit reached before computed callee 0x{entry:x}"
-                    ));
-                }
-                break;
-            }
-            if !seen.insert(entry) {
-                break;
-            }
-            let output = scratch
-                .path()
-                .join(format!("computed-function-{}.json", snapshots.len()));
-            let snapshot = match ghidra_worker::analyze(Path::new(binary), Some(entry), &output) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    diagnostics.push(format!(
-                        "computed callee 0x{entry:x} export failed: {error}"
-                    ));
-                    break;
-                }
-            };
-            if snapshot.binary_sha256 != digest
-                || snapshot.selected_function.entry != target
-                || snapshot.program != root.program
-                || snapshot.address_spaces != root.address_spaces
-                || snapshot.functions != root.functions
-                || snapshot.flow_overrides_applied != root.flow_overrides_applied
-            {
-                diagnostics.push(format!(
-                    "computed callee 0x{entry:x} has inconsistent analysis identity"
-                ));
-                break;
-            }
-            snapshots.push(snapshot);
-        }
     }
     emit(&snapshots, seed, &options, diagnostics)
 }

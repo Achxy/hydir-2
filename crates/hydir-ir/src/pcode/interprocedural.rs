@@ -16,6 +16,7 @@ pub const PCODE_CALL_PATH_VERSION: u32 = 1;
 const MAX_SNAPSHOTS: usize = 128;
 const MAX_SEGMENTS: usize = 128;
 const MAX_CALL_DEPTH: usize = 16;
+const MISSING_CALLEE_REASON: &str = "CALL callee snapshot is unavailable";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,9 +190,12 @@ pub fn unloaded_call_target(
     snapshots: &[GhidraSnapshot],
     trace: &PcodeInterproceduralTrace,
 ) -> Result<Option<PcodeAddress>, String> {
-    let PcodeCallPathStop::CallBoundary { source, .. } = &trace.stop else {
+    let PcodeCallPathStop::CallBoundary { source, reason } = &trace.stop else {
         return Ok(None);
     };
+    if reason != MISSING_CALLEE_REASON {
+        return Ok(None);
+    }
     let Some(segment) = trace.segments.last() else {
         return Ok(None);
     };
@@ -321,18 +325,18 @@ pub fn execute_concrete_call_path(
                     Ok(value) => value,
                     Err(reason) => break PcodeCallPathStop::CallBoundary { source, reason },
                 };
-                let Some(&callee) = index.get(&key(&target)?) else {
-                    break PcodeCallPathStop::CallBoundary {
-                        source,
-                        reason: "CALL callee snapshot is unavailable".to_owned(),
-                    };
-                };
                 if frames.len() >= max_call_depth {
                     break PcodeCallPathStop::CallBoundary {
                         source,
                         reason: "call depth budget exhausted".to_owned(),
                     };
                 }
+                let Some(&callee) = index.get(&key(&target)?) else {
+                    break PcodeCallPathStop::CallBoundary {
+                        source,
+                        reason: MISSING_CALLEE_REASON.to_owned(),
+                    };
+                };
                 if !active_entries.insert(key(&target)?) {
                     break PcodeCallPathStop::CallBoundary {
                         source,
@@ -591,6 +595,16 @@ mod tests {
                 .unwrap()
                 .offset,
             "0x201174"
+        );
+        let depth = execute_concrete_call_path(&snapshots[..1], &seed, 128, 16, 0).unwrap();
+        assert!(matches!(
+            depth.stop,
+            PcodeCallPathStop::CallBoundary { ref reason, .. } if reason.contains("depth")
+        ));
+        assert!(
+            unloaded_call_target(&snapshots[..1], &depth)
+                .unwrap()
+                .is_none()
         );
         let mut unknown = PcodeConcreteState::default();
         unknown

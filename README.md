@@ -85,6 +85,8 @@ explicitly at unsupported or unresolved call boundaries. In the GUI, open
 `hydir_stage_call_chain` and use the Call trace panel with the seed JSON.
 The second command exercises bounded automatic export for a concrete indirect
 callee. Unknown indirect targets stop without guessing a function.
+Automatic call tracing exports the function reached by the seed before spending
+its function budget on other static call targets.
 The last command emits a bounded LLVM path module that dispatches a known
 indirect jump to an instruction in the selected function.
 [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)

@@ -34,9 +34,9 @@ use hydir_decompile::{
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress,
-    PcodeInterproceduralTrace, PcodeSliceTarget, execute_concrete_call_path, parse_ghidra_snapshot,
-    parse_pcode_seed, unloaded_call_target,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeInterproceduralTrace,
+    PcodeSliceTarget, execute_concrete_call_path, parse_ghidra_snapshot, parse_pcode_seed,
+    unloaded_call_target,
 };
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
@@ -63,7 +63,7 @@ use sha2::{Digest, Sha256};
 #[cfg(not(test))]
 use std::process::Stdio;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     error::Error,
     ffi::OsString,
@@ -2344,133 +2344,54 @@ async fn automatic_ghidra_snapshot(
     })
 }
 
-async fn collect_ghidra_call_snapshots(
+async fn collect_ghidra_call_root_snapshot(
     store: &Store,
     principal: &str,
     project: &ProjectReply,
     root_entry: u64,
-    max_functions: usize,
     seed_json: &[u8],
-) -> Result<(Vec<Vec<u8>>, Vec<String>), Status> {
-    let mut pending = VecDeque::from([root_entry]);
-    let mut seen = BTreeSet::from([root_entry]);
-    let mut binary = None::<Vec<u8>>;
-    let mut snapshots = Vec::new();
-    let mut parsed = Vec::<GhidraSnapshot>::new();
-    let mut diagnostics = Vec::new();
-    while let Some(entry) = pending.pop_front() {
-        if snapshots.len() >= max_functions {
-            diagnostics.push(format!(
-                "function collection limit reached before 0x{entry:x}"
-            ));
-            break;
-        }
-        let key = hydir_ghidra_worker::analysis_cache_key(&project.binary_sha256, Some(entry));
-        let cached = {
+) -> Result<Vec<u8>, Status> {
+    let key = hydir_ghidra_worker::analysis_cache_key(&project.binary_sha256, Some(root_entry));
+    let cached = {
+        let connection = store.connection()?;
+        cached_ghidra_snapshot(
+            &connection,
+            &project.project_id,
+            &project.binary_sha256,
+            &key,
+            Some(root_entry),
+        )?
+    };
+    let bytes = if let Some(cached) = cached {
+        cached
+    } else {
+        let binary = store
+            .current_binary(principal, &project.project_id, project.revision)
+            .await?;
+        let produced = automatic_ghidra_snapshot(binary, Some(root_entry)).await?;
+        {
             let connection = store.connection()?;
-            cached_ghidra_snapshot(
+            save_ghidra_snapshot(
                 &connection,
                 &project.project_id,
                 &project.binary_sha256,
+                project.revision,
                 &key,
-                Some(entry),
-            )?
-        };
-        let bytes = if let Some(cached) = cached {
-            cached
-        } else {
-            if binary.is_none() {
-                binary = Some(
-                    store
-                        .current_binary(principal, &project.project_id, project.revision)
-                        .await?,
-                );
-            }
-            let produced = match automatic_ghidra_snapshot(
-                binary.as_ref().expect("loaded above").clone(),
-                Some(entry),
-            )
-            .await
-            {
-                Ok(produced) => produced,
-                Err(error) if entry != root_entry => {
-                    diagnostics.push(format!(
-                        "callee 0x{entry:x} export failed: {}",
-                        error.message().chars().take(512).collect::<String>()
-                    ));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            {
-                let connection = store.connection()?;
-                save_ghidra_snapshot(
-                    &connection,
-                    &project.project_id,
-                    &project.binary_sha256,
-                    project.revision,
-                    &key,
-                    Some(entry),
-                    &produced,
-                )?;
-            }
-            produced
-        };
-        let snapshot = parse_ghidra_snapshot(&bytes, &project.binary_sha256).map_err(|error| {
-            Status::invalid_argument(format!("invalid Ghidra snapshot: {error}"))
-        })?;
-        if snapshot.selected_function.entry.offset != format!("0x{entry:x}") {
-            return Err(Status::invalid_argument(
-                "Ghidra worker selected a different function",
-            ));
+                Some(root_entry),
+                &produced,
+            )?;
         }
-        if let Some(root) = parsed.first() {
-            if snapshot.program != root.program
-                || snapshot.address_spaces != root.address_spaces
-                || snapshot.functions != root.functions
-                || snapshot.flow_overrides_applied != root.flow_overrides_applied
-            {
-                diagnostics.push(format!(
-                    "callee 0x{entry:x} has inconsistent analysis identity"
-                ));
-                continue;
-            }
-        } else {
-            parse_pcode_seed(seed_json, &snapshot).map_err(Status::invalid_argument)?;
-        }
-        for call in &snapshot.selected_function.call_targets {
-            if call.computed || call.conditional {
-                continue;
-            }
-            let Some(target) = &call.target else { continue };
-            if target.space != snapshot.selected_function.entry.space
-                || !snapshot
-                    .functions
-                    .iter()
-                    .any(|function| function.entry == *target)
-            {
-                continue;
-            }
-            let Ok(Some(target_entry)) = ghidra_selected_entry(&target.offset, true) else {
-                continue;
-            };
-            if seen.len() < max_functions * 4 {
-                if seen.insert(target_entry) {
-                    pending.push_back(target_entry);
-                }
-            } else if diagnostics.is_empty() {
-                diagnostics.push("direct callee discovery queue limit reached".to_owned());
-            }
-        }
-        snapshots.push(bytes);
-        parsed.push(snapshot);
-    }
-    if snapshots.is_empty() {
-        return Err(Status::failed_precondition(
-            "Ghidra call trace has no root snapshot",
+        produced
+    };
+    let snapshot = parse_ghidra_snapshot(&bytes, &project.binary_sha256)
+        .map_err(|error| Status::invalid_argument(format!("invalid Ghidra snapshot: {error}")))?;
+    if snapshot.selected_function.entry.offset != format!("0x{root_entry:x}") {
+        return Err(Status::invalid_argument(
+            "Ghidra worker selected a different function",
         ));
     }
-    Ok((snapshots, diagnostics))
+    parse_pcode_seed(seed_json, &snapshot).map_err(Status::invalid_argument)?;
+    Ok(bytes)
 }
 
 fn cached_ghidra_snapshot(
@@ -5067,15 +4988,16 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
                 "project has no uploaded binary",
             ));
         }
-        let (mut snapshots, mut diagnostics) = collect_ghidra_call_snapshots(
+        let root = collect_ghidra_call_root_snapshot(
             self,
             &principal,
             &project,
             root_entry,
-            max_functions,
             &input.seed_json,
         )
         .await?;
+        let mut snapshots = vec![root];
+        let mut diagnostics = Vec::new();
         let selector = serde_json::to_string(&GhidraCallTraceSelector {
             binary_sha256: project.binary_sha256.clone(),
             max_operations,
@@ -5119,14 +5041,9 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
                 .map_err(Status::internal)?
                 .ok_or_else(|| Status::internal("computed callee has no entry"))?;
             if snapshots.len() >= max_functions {
-                if !diagnostics.iter().any(|diagnostic| {
-                    diagnostic.starts_with("function collection limit reached before ")
-                        && diagnostic.ends_with(&format!("0x{entry:x}"))
-                }) {
-                    diagnostics.push(format!(
-                        "function collection limit reached before computed callee 0x{entry:x}"
-                    ));
-                }
+                diagnostics.push(format!(
+                    "function collection limit reached before callee 0x{entry:x}"
+                ));
                 break trace;
             }
             if !seen.insert(entry) {
@@ -5161,7 +5078,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
                     Ok(produced) => produced,
                     Err(error) => {
                         diagnostics.push(format!(
-                            "computed callee 0x{entry:x} export failed: {}",
+                            "callee 0x{entry:x} export failed: {}",
                             error.message().chars().take(512).collect::<String>()
                         ));
                         break trace;
@@ -5191,7 +5108,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
                 || snapshot.flow_overrides_applied != root.flow_overrides_applied
             {
                 diagnostics.push(format!(
-                    "computed callee 0x{entry:x} has inconsistent analysis identity"
+                    "callee 0x{entry:x} has inconsistent analysis identity"
                 ));
                 break trace;
             }
@@ -6081,6 +5998,124 @@ mod tests {
             hydir_ir::pcode::PcodeCallPathStop::CallBoundary { .. }
         ));
         assert_eq!(trace.snapshot_diagnostics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ghidra_call_trace_exports_only_the_reached_direct_callee() {
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("chosen-call-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Chosen direct call fixture".to_owned(),
+                    idempotency_key: "chosen-call-fixture".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../tests/fixtures/ghidra_choose_calls.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        for (entry, bytes) in [
+            (
+                0x201174,
+                include_bytes!("../../../tests/fixtures/ghidra_choose_root_v2.json").as_slice(),
+            ),
+            (
+                0x20118d,
+                include_bytes!("../../../tests/fixtures/ghidra_choose_left_v2.json").as_slice(),
+            ),
+            (
+                0x201185,
+                include_bytes!("../../../tests/fixtures/ghidra_choose_right_v2.json").as_slice(),
+            ),
+        ] {
+            let key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, Some(entry));
+            save_ghidra_snapshot(
+                &store.connection().unwrap(),
+                &project.project_id,
+                &uploaded.binary_sha256,
+                uploaded.revision,
+                &key,
+                Some(entry),
+                bytes,
+            )
+            .unwrap();
+        }
+
+        for (seed, expected_callee, expected_rax, skipped_callee) in [
+            (
+                include_bytes!("../../../tests/fixtures/ghidra_choose_left_seed_v1.json")
+                    .as_slice(),
+                "0x20118d",
+                1,
+                "0x201185",
+            ),
+            (
+                include_bytes!("../../../tests/fixtures/ghidra_choose_right_seed_v1.json")
+                    .as_slice(),
+                "0x201185",
+                2,
+                "0x20118d",
+            ),
+        ] {
+            let request = api_v3::GhidraCallTraceRequest {
+                project_id: project.project_id.clone(),
+                expected_revision: uploaded.revision,
+                function_entry: "0x201174".to_owned(),
+                seed_json: seed.to_vec(),
+                max_functions: Some(2),
+                max_operations: Some(128),
+                max_visits: Some(16),
+                max_depth: Some(4),
+            };
+            let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request, &token))
+                .await
+                .unwrap()
+                .into_inner();
+            let trace: PcodeInterproceduralTrace =
+                serde_json::from_slice(&artifact.content).unwrap();
+            assert_eq!(trace.calls.len(), 1);
+            assert_eq!(trace.calls[0].callee_entry.offset, expected_callee);
+            assert_eq!(trace.segments.len(), 3);
+            assert!(
+                trace
+                    .segments
+                    .iter()
+                    .all(|segment| segment.function_entry.offset != skipped_callee)
+            );
+            assert!(trace.snapshot_diagnostics.is_empty());
+            assert!(matches!(
+                trace.stop,
+                hydir_ir::pcode::PcodeCallPathStop::Return { .. }
+            ));
+            assert_eq!(
+                trace
+                    .final_state
+                    .read_varnode(&hydir_ir::pcode::PcodeVarnode {
+                        space: "register".to_owned(),
+                        offset: "0x0".to_owned(),
+                        size: 8,
+                    })
+                    .unwrap(),
+                Some(expected_rax)
+            );
+        }
     }
 
     #[test]

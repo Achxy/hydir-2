@@ -19,6 +19,7 @@ on:
       - tests/fixtures/ghidra_indirect_jump.S
       - tests/fixtures/ghidra_indirect_jump.elf
       - tests/fixtures/ghidra_indirect_jump_v2.json
+      - 'tests/fixtures/ghidra_choose_*'
   pull_request:
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
@@ -36,6 +37,7 @@ on:
       - tests/fixtures/ghidra_indirect_jump.S
       - tests/fixtures/ghidra_indirect_jump.elf
       - tests/fixtures/ghidra_indirect_jump_v2.json
+      - 'tests/fixtures/ghidra_choose_*'
   workflow_dispatch:
 
 jobs:
@@ -155,6 +157,28 @@ jobs:
           assert trace['final_state']['register_bytes']['0'] == 7
           assert trace['snapshot_diagnostics'] == []
           PY
+      - name: Export only the reached callee under a two-function budget
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra trace-calls \
+            tests/fixtures/ghidra_choose_calls.elf \
+            tests/fixtures/ghidra_choose_left_seed_v1.json \
+            --function 0x201174 --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-chosen-call-trace.json"
+          python3 - "$RUNNER_TEMP/ghidra-chosen-call-trace.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          trace = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert trace['stop']['kind'] == 'return'
+          assert len(trace['calls']) == 1
+          assert trace['calls'][0]['callee_entry']['offset'] == '0x20118d'
+          assert len(trace['segments']) == 3
+          assert all(segment['function_entry']['offset'] != '0x201185'
+                     for segment in trace['segments'])
+          assert trace['final_state']['register_bytes']['0'] == 1
+          assert trace['snapshot_diagnostics'] == []
+          PY
       - name: Export and compile a real indirect-jump LLVM path
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -199,5 +223,6 @@ jobs:
             ${{ runner.temp }}/ghidra-add-zero-llvm.json
             ${{ runner.temp }}/ghidra-call-trace.json
             ${{ runner.temp }}/ghidra-indirect-call-trace.json
+            ${{ runner.temp }}/ghidra-chosen-call-trace.json
             ${{ runner.temp }}/ghidra-indirect-jump-snapshot.json
             ${{ runner.temp }}/ghidra-indirect-jump-llvm.json
