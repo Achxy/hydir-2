@@ -27,6 +27,10 @@ returns source-linked branch events and its explicit stop reason.
 calls and automatically collects callee snapshots. For an uploaded project,
 `HydirClient.trace_ghidra_calls(project_id, revision, seed, function_entry=...)`
 provides the same artifact through the authenticated v3 service.
+`LocalGhidra.llvm_cfg_calls(binary, root_snapshot, (callee_snapshot,))`
+emits one bounded LLVM state machine across validated loaded callees. Its
+fidelity claim remains unknown until a concrete path is compared with an
+execution oracle.
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,

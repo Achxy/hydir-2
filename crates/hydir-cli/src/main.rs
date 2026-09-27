@@ -83,6 +83,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
   hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
@@ -325,6 +326,46 @@ fn run() -> Result<(), Box<dyn Error>> {
                     start.as_ref(),
                 )?)?
             };
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg-calls" => {
+            let mut callee_paths = Vec::new();
+            let mut max_depth = 4usize;
+            let mut depth_seen = false;
+            let mut output_path = None;
+            let mut options = args[4..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--callee" if callee_paths.len() < 127 => callee_paths.push(pair[1].as_str()),
+                    "--max-depth" if !depth_seen => {
+                        max_depth = pair[1].parse()?;
+                        depth_seen = true;
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let digest = format!("{:x}", sha2::Sha256::digest(read_binary(&args[2])?));
+            let mut snapshots = vec![parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?];
+            for path in callee_paths {
+                snapshots.push(parse_ghidra_snapshot(
+                    &read_bounded_json(path, MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                    &digest,
+                )?);
+            }
+            let bytes = serde_json::to_vec_pretty(
+                &hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?,
+            )?;
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
             } else {

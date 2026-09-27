@@ -95,6 +95,27 @@ class LocalGhidraTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.client.trace_calls(self.binary, seed, function=0x401000)
 
+    def test_interprocedural_cfg_llvm_checks_all_snapshot_identities(self):
+        callee = Path(self.directory.name) / "callee.json"
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        callee.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        artifact = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "function_entries": [{}, {}], "snapshot_sha256": ["a", "b"],
+            "llvm": {"binary_sha256": self.digest, "llvm_ir": "define i32 @hydir_pcode_cfg() { ret i32 1 }"},
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
+            result = self.client.llvm_cfg_calls(self.binary, self.snapshot, (callee,), max_depth=2)
+        self.assertEqual(len(result["function_entries"]), 2)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-calls"))
+        self.assertIn("--callee", run.call_args.args)
+        self.assertEqual(run.call_args.args[-2:], ("--max-depth", "2"))
+        with self.assertRaises(ValueError):
+            self.client.llvm_cfg_calls(self.binary, self.snapshot, (callee,), max_depth=17)
+        callee.write_text(json.dumps({"binary_sha256": "0" * 64}), encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            self.client.llvm_cfg_calls(self.binary, self.snapshot, (callee,))
+
     def test_slice_uses_bounded_source_artifact(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         artifact = {

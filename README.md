@@ -76,6 +76,7 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf
 cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
 cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
 ```
 
 Replace the ELF path and function selector with your own. `discover` returns
@@ -87,8 +88,12 @@ The second command exercises bounded automatic export for a concrete indirect
 callee. Unknown indirect targets stop without guessing a function.
 Automatic call tracing exports the function reached by the seed before spending
 its function budget on other static call targets.
-The last command emits a bounded LLVM path module that dispatches a known
-indirect jump to an instruction in the selected function.
+The indirect-jump command emits a bounded LLVM path module that dispatches a known
+indirect jump to an instruction in the selected function. The final command
+emits one LLVM state machine over the loaded caller and callee snapshots. It
+shares register and RAM state, checks return targets, and leaves unsupported
+effects and missing callees as explicit stops. Its fidelity is still unknown
+until a path is compared with Rust, Ghidra, or native execution.
 [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.

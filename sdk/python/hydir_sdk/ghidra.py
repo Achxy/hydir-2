@@ -160,6 +160,41 @@ class LocalGhidra:
             raise RuntimeError("Hydir CFG LLVM artifact belongs to another binary")
         return data
 
+    def llvm_cfg_calls(
+        self,
+        binary: str | os.PathLike[str],
+        root_snapshot: str | os.PathLike[str],
+        callees: tuple[str | os.PathLike[str], ...] = (),
+        *,
+        max_depth: int = 4,
+    ) -> dict[str, Any]:
+        """Emit bounded LLVM across loaded, validated Ghidra call snapshots."""
+        if not isinstance(max_depth, int) or not 0 <= max_depth <= 16:
+            raise ValueError("max_depth must be between 0 and 16")
+        if len(callees) > 127:
+            raise ValueError("at most 127 callee snapshots are supported")
+        binary_path = Path(binary).resolve(strict=True)
+        digest = self._digest(binary_path)
+        paths = [Path(root_snapshot).resolve(strict=True)]
+        paths.extend(Path(callee).resolve(strict=True) for callee in callees)
+        for path in paths:
+            self._snapshot(path, digest)
+        args = ["ghidra-snapshot", "llvm-cfg-calls", str(binary_path), str(paths[0])]
+        for path in paths[1:]:
+            args.extend(["--callee", str(path)])
+        args.extend(["--max-depth", str(max_depth)])
+        data = json.loads(self._run(*args))
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or data.get("binary_sha256") != digest
+                or not isinstance(data.get("llvm"), dict)
+                or data["llvm"].get("binary_sha256") != digest
+                or not isinstance(data.get("snapshot_sha256"), list)
+                or len(data["snapshot_sha256"]) != len(paths)
+                or not isinstance(data.get("function_entries"), list)
+                or len(data["function_entries"]) != len(paths)):
+            raise RuntimeError("Hydir call CFG LLVM artifact is invalid or belongs to another binary")
+        return data
+
     def slice(
         self,
         binary: str | os.PathLike[str],

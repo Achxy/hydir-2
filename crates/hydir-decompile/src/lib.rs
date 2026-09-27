@@ -11,9 +11,11 @@ mod pcode_cfg_llvm;
 mod pcode_llvm;
 mod pcode_standalone;
 pub use pcode_cfg_llvm::{
-    PCODE_CFG_GUEST_RAM_MAX_BYTES, PCODE_CFG_LLVM_VERSION, PCODE_SIMPLIFIED_CFG_LLVM_VERSION,
-    PcodeCfgLlvmArtifact, PcodeCfgLlvmSourceOperation, PcodeCfgLlvmStatus, PcodeCfgLlvmStopSite,
-    PcodeSimplifiedCfgLlvmArtifact, emit_pcode_cfg_llvm, emit_pcode_simplified_cfg_llvm,
+    PCODE_CFG_GUEST_RAM_MAX_BYTES, PCODE_CFG_LLVM_VERSION, PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
+    PCODE_SIMPLIFIED_CFG_LLVM_VERSION, PcodeCfgLlvmArtifact, PcodeCfgLlvmSourceOperation,
+    PcodeCfgLlvmStatus, PcodeCfgLlvmStopSite, PcodeInterproceduralCfgLlvmArtifact,
+    PcodeSimplifiedCfgLlvmArtifact, emit_pcode_cfg_llvm, emit_pcode_interprocedural_cfg_llvm,
+    emit_pcode_simplified_cfg_llvm,
 };
 pub use pcode_llvm::{
     PcodeLlvmPrefixArtifact, PcodeLlvmSourceOperation, emit_pcode_exact_operation_llvm,

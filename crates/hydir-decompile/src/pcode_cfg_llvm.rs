@@ -6,14 +6,16 @@ use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_spa
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
 use hydir_ir::pcode::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeOperation,
-    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode,
+    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode, validate_ghidra_snapshot,
 };
 use hydir_ir::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PCODE_CFG_LLVM_VERSION: u32 = 2;
 pub const PCODE_SIMPLIFIED_CFG_LLVM_VERSION: u32 = 1;
+pub const PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
 const MAX_CFG_INSTRUCTIONS: usize = 4096;
 const MAX_CFG_OPERATIONS: usize = 4096;
@@ -46,6 +48,9 @@ pub enum PcodeCfgLlvmStatus {
     MemoryUnsupportedLayout = 20,
     MemoryNonRamSpace = 21,
     MemoryUnknownSpace = 22,
+    CallDepth = 23,
+    ReturnMismatch = 24,
+    RecursiveCall = 25,
 }
 
 impl PcodeCfgLlvmStatus {
@@ -100,6 +105,25 @@ pub struct PcodeSimplifiedCfgLlvmArtifact {
     pub llvm: PcodeCfgLlvmArtifact,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeInterproceduralCfgLlvmArtifact {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub function_entries: Vec<PcodeAddress>,
+    pub snapshot_sha256: Vec<String>,
+    pub max_call_depth: usize,
+    pub llvm: PcodeCfgLlvmArtifact,
+    pub semantic_fidelity: SemanticFidelity,
+    pub verification: VerificationStatus,
+}
+
+struct CallLlvmContext<'a> {
+    snapshots: &'a [GhidraSnapshot],
+    owners: Vec<usize>,
+    max_call_depth: usize,
 }
 
 fn offset(value: &str) -> Result<u64, String> {
@@ -198,6 +222,9 @@ fn stop_label(status: PcodeCfgLlvmStatus) -> &'static str {
         PcodeCfgLlvmStatus::MemoryUnsupportedLayout => "stop_memory_layout",
         PcodeCfgLlvmStatus::MemoryNonRamSpace => "stop_memory_nonram",
         PcodeCfgLlvmStatus::MemoryUnknownSpace => "stop_memory_unknown_space",
+        PcodeCfgLlvmStatus::CallDepth => "stop_call_depth",
+        PcodeCfgLlvmStatus::ReturnMismatch => "stop_return_mismatch",
+        PcodeCfgLlvmStatus::RecursiveCall => "stop_recursive_call",
     }
 }
 
@@ -249,6 +276,347 @@ fn emit_known_guard(
         "  br i1 {combined}, label %{next}, label %{}\n",
         stop_label(missing_status)
     ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_interprocedural_call(
+    context: &CallLlvmContext<'_>,
+    source: &PcodeOperation,
+    site: &PcodeAddress,
+    instruction_index: usize,
+    operation_index: usize,
+    id: usize,
+    index: &BTreeMap<(String, u64), usize>,
+    caller_index: &BTreeMap<(String, u64), usize>,
+    body: &mut String,
+    sites: &mut Vec<PcodeCfgLlvmStopSite>,
+) -> Result<(), String> {
+    let owner = context.owners[instruction_index];
+    let snapshot = &context.snapshots[owner];
+    let indirect = source.opcode == 8;
+    let pointer = source.inputs.first();
+    let target_space = if indirect {
+        site.space.as_str()
+    } else {
+        pointer.map(|node| node.space.as_str()).unwrap_or("")
+    };
+    let pointer_size = snapshot
+        .address_spaces
+        .iter()
+        .find(|space| space.name == target_space)
+        .map(|space| space.pointer_size);
+    if source.mnemonic != if indirect { "CALLIND" } else { "CALL" }
+        || source.output.is_some()
+        || source.inputs.len() != 1
+        || pointer_size.is_none_or(|size| size == 0 || size > 8)
+        || pointer.is_none_or(|node| Some(node.size) != pointer_size)
+        || indirect
+            && !matches!(
+                pointer.map(|node| node.space.as_str()),
+                Some("register" | "unique" | "const")
+            )
+    {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::MalformedTarget,
+            "invalid CALL target shape, space, or width",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::MalformedTarget));
+        return Ok(());
+    }
+    let pointer = pointer.expect("checked above");
+    let site_key = (site.space.clone(), offset(&site.offset)?);
+    let evidence = snapshot
+        .selected_function
+        .call_targets
+        .iter()
+        .filter(|call| {
+            (
+                call.call_site.space.clone(),
+                offset(&call.call_site.offset).ok(),
+            ) == (site_key.0.clone(), Some(site_key.1))
+        })
+        .collect::<Vec<_>>();
+    let continuation = snapshot
+        .selected_function
+        .flow_edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == GhidraFlowKind::Fallthrough
+                && (edge.source.space.clone(), offset(&edge.source.offset).ok())
+                    == (site_key.0.clone(), Some(site_key.1))
+        })
+        .collect::<Vec<_>>();
+    let Some(continuation) = (continuation.len() == 1)
+        .then(|| continuation[0].target.as_ref())
+        .flatten()
+    else {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL has no unique analyzed fallthrough",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    };
+    let continuation_key = (continuation.space.clone(), offset(&continuation.offset)?);
+    let continuation_width = snapshot
+        .address_spaces
+        .iter()
+        .find(|space| space.name == continuation.space)
+        .map(|space| space.pointer_size)
+        .ok_or("CALL continuation has an unknown address space")?;
+    let Some(&return_index) = caller_index.get(&continuation_key) else {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL fallthrough is outside caller",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    };
+    let valid_evidence =
+        evidence.len() == 1 && !evidence[0].conditional && evidence[0].computed == indirect;
+    if !valid_evidence {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL target disagrees with Ghidra call evidence",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    }
+    let evidence_target = evidence[0].target.as_ref().map(|target| {
+        (
+            target.space.clone(),
+            offset(&target.offset).unwrap_or(u64::MAX),
+        )
+    });
+    let target_key = if indirect {
+        None
+    } else {
+        Some((pointer.space.clone(), offset(&pointer.offset)?))
+    };
+    if !indirect && evidence_target != target_key {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL target disagrees with Ghidra call evidence",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    }
+    let routes = context
+        .snapshots
+        .iter()
+        .filter_map(|callee| {
+            let entry = &callee.selected_function.entry;
+            let key = (entry.space.clone(), offset(&entry.offset).ok()?);
+            if key.0 != target_space
+                || target_key.as_ref().is_some_and(|target| target != &key)
+                || evidence_target
+                    .as_ref()
+                    .is_some_and(|target| target != &key)
+            {
+                return None;
+            }
+            index.get(&key).map(|instruction| (key.1, *instruction))
+        })
+        .collect::<Vec<_>>();
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(operation_index),
+        PcodeCfgLlvmStatus::CallDepth,
+        "call depth budget exhausted",
+    );
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(operation_index),
+        PcodeCfgLlvmStatus::RecursiveCall,
+        "recursive call requires a separate bounded model",
+    );
+    let target_value =
+        if indirect {
+            stop_site(
+                sites,
+                &source.source_address,
+                Some(operation_index),
+                PcodeCfgLlvmStatus::UnknownInput,
+                "CALLIND target bytes are unknown",
+            );
+            let check = known_check(pointer, &format!("call_{id}"), body)?;
+            emit_known_guard(
+                &check.into_iter().collect::<Vec<_>>(),
+                &format!("call_{id}"),
+                body,
+                &format!("call_known_{id}"),
+                PcodeCfgLlvmStatus::UnknownInput,
+            );
+            body.push_str(&format!("call_known_{id}:\n"));
+            let value =
+                if pointer.space == "const" {
+                    format!("{}", offset(&pointer.offset)?)
+                } else {
+                    let name = format!("%call_value_{id}");
+                    body.push_str(&format!(
+                "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                pcode_space_id(&pointer.space)?, pcode_offset(pointer)?, pointer.size));
+                    name
+                };
+            Some(value)
+        } else {
+            None
+        };
+    body.push_str(&format!(
+        "  %depth_{id} = load i32, ptr %call_depth\n  %depth_full_{id} = icmp uge i32 %depth_{id}, {}\n  br i1 %depth_full_{id}, label %{}, label %call_target_{id}\ncall_target_{id}:\n",
+        context.max_call_depth, stop_label(PcodeCfgLlvmStatus::CallDepth)
+    ));
+    if let Some(value) = target_value {
+        body.push_str(&format!(
+            "  switch i64 {value}, label %{} [\n",
+            stop_label(PcodeCfgLlvmStatus::Call)
+        ));
+        for (target, callee_index) in &routes {
+            body.push_str(&format!(
+                "    i64 {target}, label %call_route_{id}_{callee_index}\n"
+            ));
+        }
+        body.push_str("  ]\n");
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALLIND target is not a loaded, evidenced callee",
+        );
+    } else if let Some((_, callee)) = routes.first() {
+        body.push_str(&format!("  br label %call_route_{id}_{callee}\n"));
+    } else {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL callee snapshot is unavailable",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+    }
+    for (_, callee_index) in routes {
+        let callee_owner = context.owners[callee_index];
+        body.push_str(&format!(
+            "call_route_{id}_{callee_index}:\n  %active_ptr_{id}_{callee_index} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {callee_owner}\n  %active_value_{id}_{callee_index} = load i8, ptr %active_ptr_{id}_{callee_index}\n  %recursive_{id}_{callee_index} = icmp ne i8 %active_value_{id}_{callee_index}, 0\n  br i1 %recursive_{id}_{callee_index}, label %{}, label %call_enter_{id}_{callee_index}\ncall_enter_{id}_{callee_index}:\n  store i8 1, ptr %active_ptr_{id}_{callee_index}\n  %return_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %depth_{id}\n  store i32 {return_index}, ptr %return_slot_{id}_{callee_index}\n  %address_slot_{id}_{callee_index} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %depth_{id}\n  store i64 {}, ptr %address_slot_{id}_{callee_index}\n  %width_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_widths, i32 0, i32 %depth_{id}\n  store i32 {continuation_width}, ptr %width_slot_{id}_{callee_index}\n  %depth_next_{id}_{callee_index} = add i32 %depth_{id}, 1\n  store i32 %depth_next_{id}_{callee_index}, ptr %call_depth\n",
+            stop_label(PcodeCfgLlvmStatus::RecursiveCall), continuation_key.1
+        ));
+        body.push_str(&log_event(
+            id,
+            &format!("%count_{id}"),
+            &format!("call_{callee_index}"),
+            &format!("ins_{callee_index}"),
+        ));
+    }
+    Ok(())
+}
+
+fn emit_interprocedural_return(
+    source: &PcodeOperation,
+    id: usize,
+    owner: usize,
+    return_sites: &BTreeSet<usize>,
+    body: &mut String,
+    sites: &mut Vec<PcodeCfgLlvmStopSite>,
+) -> Result<(), String> {
+    let pointer = source.inputs.first();
+    if source.mnemonic != "RETURN"
+        || source.output.is_some()
+        || source.inputs.len() != 1
+        || pointer.is_none_or(|node| {
+            !(1..=8).contains(&node.size)
+                || !matches!(node.space.as_str(), "register" | "unique" | "const")
+        })
+    {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(source.sequence_index as usize),
+            PcodeCfgLlvmStatus::MalformedTarget,
+            "invalid RETURN target shape",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::MalformedTarget));
+        return Ok(());
+    }
+    let pointer = pointer.expect("checked above");
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(source.sequence_index as usize),
+        PcodeCfgLlvmStatus::UnknownInput,
+        "RETURN target bytes are unknown",
+    );
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(source.sequence_index as usize),
+        PcodeCfgLlvmStatus::ReturnMismatch,
+        "callee RETURN target differs from caller continuation",
+    );
+    body.push_str(&format!(
+        "  %return_depth_{id} = load i32, ptr %call_depth\n  %return_root_{id} = icmp eq i32 %return_depth_{id}, 0\n  br i1 %return_root_{id}, label %{}, label %return_nested_{id}\nreturn_nested_{id}:\n  %return_prev_{id} = sub i32 %return_depth_{id}, 1\n",
+        stop_label(PcodeCfgLlvmStatus::Return)
+    ));
+    let check = known_check(pointer, &format!("return_{id}"), body)?;
+    emit_known_guard(
+        &check.into_iter().collect::<Vec<_>>(),
+        &format!("return_{id}"),
+        body,
+        &format!("return_known_{id}"),
+        PcodeCfgLlvmStatus::UnknownInput,
+    );
+    body.push_str(&format!("return_known_{id}:\n  %return_width_slot_{id} = getelementptr [16 x i32], ptr %return_widths, i32 0, i32 %return_prev_{id}\n  %return_width_{id} = load i32, ptr %return_width_slot_{id}\n  %return_width_ok_{id} = icmp eq i32 %return_width_{id}, {}\n  br i1 %return_width_ok_{id}, label %return_value_ready_{id}, label %{}\nreturn_value_ready_{id}:\n", pointer.size, stop_label(PcodeCfgLlvmStatus::ReturnMismatch)));
+    let value = if pointer.space == "const" {
+        format!("{}", offset(&pointer.offset)?)
+    } else {
+        let name = format!("%return_value_{id}");
+        body.push_str(&format!(
+            "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+            pcode_space_id(&pointer.space)?,
+            pcode_offset(pointer)?,
+            pointer.size
+        ));
+        name
+    };
+    body.push_str(&format!(
+        "  %return_address_slot_{id} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %return_prev_{id}\n  %return_expected_{id} = load i64, ptr %return_address_slot_{id}\n  %return_matches_{id} = icmp eq i64 {value}, %return_expected_{id}\n  br i1 %return_matches_{id}, label %return_dispatch_{id}, label %{}\nreturn_dispatch_{id}:\n  store i32 %return_prev_{id}, ptr %call_depth\n  %returned_active_{id} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {owner}\n  store i8 0, ptr %returned_active_{id}\n  %return_site_slot_{id} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %return_prev_{id}\n  %return_site_{id} = load i32, ptr %return_site_slot_{id}\n  switch i32 %return_site_{id}, label %{} [\n",
+        stop_label(PcodeCfgLlvmStatus::ReturnMismatch),
+        stop_label(PcodeCfgLlvmStatus::ReturnMismatch)
+    ));
+    for instruction in return_sites {
+        body.push_str(&format!(
+            "    i32 {instruction}, label %return_route_{id}_{instruction}\n"
+        ));
+    }
+    body.push_str("  ]\n");
+    for instruction in return_sites {
+        body.push_str(&format!("return_route_{id}_{instruction}:\n"));
+        body.push_str(&log_event(
+            id,
+            &format!("%count_{id}"),
+            &format!("return_{instruction}"),
+            &format!("ins_{instruction}"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,7 +844,69 @@ pub fn emit_pcode_cfg_llvm(
     start: Option<&PcodeAddress>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
     let semantic = snapshot.pcode_function_ir()?.lower_semantics();
-    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic)
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None)
+}
+
+/// Emit a single bounded LLVM state machine over validated function snapshots.
+/// The root is the first snapshot. Only Ghidra-evidenced calls into loaded
+/// function entries can cross functions; all other calls stop explicitly.
+pub fn emit_pcode_interprocedural_cfg_llvm(
+    snapshots: &[GhidraSnapshot],
+    max_call_depth: usize,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    let root = snapshots
+        .first()
+        .ok_or("interprocedural LLVM needs a root snapshot")?;
+    if snapshots.len() > 128 || max_call_depth > 16 {
+        return Err("interprocedural LLVM snapshot or call-depth limit exceeded".into());
+    }
+    let mut owners = Vec::new();
+    let mut semantic = root.pcode_function_ir()?.lower_semantics();
+    semantic.instructions.clear();
+    let mut entries = BTreeSet::new();
+    let mut digests = Vec::new();
+    for (owner, snapshot) in snapshots.iter().enumerate() {
+        validate_ghidra_snapshot(snapshot, &root.binary_sha256)?;
+        snapshot.pcode_cfg_ir()?;
+        if snapshot.program != root.program
+            || snapshot.address_spaces != root.address_spaces
+            || snapshot.functions != root.functions
+            || snapshot.flow_overrides_applied != root.flow_overrides_applied
+        {
+            return Err("interprocedural LLVM snapshots disagree on program identity".into());
+        }
+        let entry = &snapshot.selected_function.entry;
+        if !entries.insert((entry.space.clone(), offset(&entry.offset)?)) {
+            return Err("interprocedural LLVM has duplicate function entries".into());
+        }
+        let lowered = snapshot.pcode_function_ir()?.lower_semantics();
+        owners.extend(std::iter::repeat_n(owner, lowered.instructions.len()));
+        semantic.instructions.extend(lowered.instructions);
+        digests.push(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(snapshot).map_err(|error| error.to_string())?)
+        ));
+    }
+    let context = CallLlvmContext {
+        snapshots,
+        owners,
+        max_call_depth,
+    };
+    let mut llvm = emit_pcode_cfg_llvm_semantic(root, None, semantic, Some(&context))?;
+    llvm.state_abi.push_str("; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly");
+    Ok(PcodeInterproceduralCfgLlvmArtifact {
+        schema_version: PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
+        binary_sha256: root.binary_sha256.clone(),
+        function_entries: snapshots
+            .iter()
+            .map(|snapshot| snapshot.selected_function.entry.clone())
+            .collect(),
+        snapshot_sha256: digests,
+        max_call_depth,
+        llvm,
+        semantic_fidelity: SemanticFidelity::Unknown,
+        verification: VerificationStatus::NotRun,
+    })
 }
 
 /// Emit LLVM from Hydir's checked P-code rewrite. The transformation is
@@ -487,8 +917,12 @@ pub fn emit_pcode_simplified_cfg_llvm(
     start: Option<&PcodeAddress>,
 ) -> Result<PcodeSimplifiedCfgLlvmArtifact, String> {
     let simplification = snapshot.pcode_function_ir()?.simplify_checked()?;
-    let llvm =
-        emit_pcode_cfg_llvm_semantic(snapshot, start, simplification.after.lower_semantics())?;
+    let llvm = emit_pcode_cfg_llvm_semantic(
+        snapshot,
+        start,
+        simplification.after.lower_semantics(),
+        None,
+    )?;
     Ok(PcodeSimplifiedCfgLlvmArtifact {
         schema_version: PCODE_SIMPLIFIED_CFG_LLVM_VERSION,
         binary_sha256: snapshot.binary_sha256.clone(),
@@ -503,6 +937,7 @@ fn emit_pcode_cfg_llvm_semantic(
     snapshot: &GhidraSnapshot,
     start: Option<&PcodeAddress>,
     semantic: PcodeSemanticFunctionIr,
+    call_context: Option<&CallLlvmContext<'_>>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
     snapshot.pcode_cfg_ir()?;
     if !snapshot.program.language_id.starts_with("x86:LE:64:") {
@@ -521,20 +956,74 @@ fn emit_pcode_cfg_llvm_semantic(
     }
     let mut index = BTreeMap::new();
     for (number, instruction) in semantic.instructions.iter().enumerate() {
-        index.insert(
-            (
-                instruction.address.space.clone(),
-                offset(&instruction.address.offset)?,
-            ),
-            number,
-        );
+        if index
+            .insert(
+                (
+                    instruction.address.space.clone(),
+                    offset(&instruction.address.offset)?,
+                ),
+                number,
+            )
+            .is_some()
+        {
+            return Err("interprocedural LLVM has overlapping instruction addresses".into());
+        }
     }
+    let owners = call_context.map(|context| context.owners.as_slice());
+    let scoped_indices = call_context.map(|context| {
+        (0..context.snapshots.len())
+            .map(|owner| {
+                index
+                    .iter()
+                    .filter(|(_, instruction)| context.owners[**instruction] == owner)
+                    .map(|(address, instruction)| (address.clone(), *instruction))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .collect::<Vec<_>>()
+    });
+    let return_sites = call_context.map(|context| {
+        let mut sites = BTreeSet::new();
+        for (owner, snapshot) in context.snapshots.iter().enumerate() {
+            for call in &snapshot.selected_function.call_targets {
+                let call_key = (
+                    call.call_site.space.as_str(),
+                    offset(&call.call_site.offset).ok(),
+                );
+                for edge in &snapshot.selected_function.flow_edges {
+                    if edge.kind != GhidraFlowKind::Fallthrough
+                        || (edge.source.space.as_str(), offset(&edge.source.offset).ok())
+                            != call_key
+                    {
+                        continue;
+                    }
+                    if let Some(target) = &edge.target
+                        && let Ok(address) = offset(&target.offset)
+                        && let Some(instruction) = scoped_indices
+                            .as_ref()
+                            .and_then(|scoped| scoped[owner].get(&(target.space.clone(), address)))
+                    {
+                        sites.insert(*instruction);
+                    }
+                }
+            }
+        }
+        sites
+    });
     let start = start.unwrap_or(&snapshot.selected_function.entry).clone();
     let start_index = index
         .get(&(start.space.clone(), offset(&start.offset)?))
         .ok_or("P-code CFG LLVM start is not a selected instruction")?;
     let mut fallthroughs = vec![Vec::<Option<PcodeAddress>>::new(); semantic.instructions.len()];
-    for edge in &snapshot.selected_function.flow_edges {
+    let flow_edges = call_context
+        .map(|context| {
+            context
+                .snapshots
+                .iter()
+                .flat_map(|snapshot| &snapshot.selected_function.flow_edges)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| snapshot.selected_function.flow_edges.iter().collect());
+    for edge in flow_edges {
         if edge.kind == GhidraFlowKind::Fallthrough {
             let source = index[&(edge.source.space.clone(), offset(&edge.source.offset)?)];
             fallthroughs[source].push(edge.target.clone());
@@ -562,6 +1051,16 @@ fn emit_pcode_cfg_llvm_semantic(
             {
                 node_bytes(&operation.source.inputs[1], &mut byte_keys)?;
             } else if operation.source.opcode == 6
+                && operation.source.inputs.len() == 1
+                && (1..=8).contains(&operation.source.inputs[0].size)
+                && matches!(
+                    operation.source.inputs[0].space.as_str(),
+                    "register" | "unique" | "const"
+                )
+            {
+                node_bytes(&operation.source.inputs[0], &mut byte_keys)?;
+            } else if call_context.is_some()
+                && matches!(operation.source.opcode, 8 | 10)
                 && operation.source.inputs.len() == 1
                 && (1..=8).contains(&operation.source.inputs[0].size)
                 && matches!(
@@ -621,8 +1120,24 @@ fn emit_pcode_cfg_llvm_semantic(
          initialize:\n  store i32 0, ptr %event_count\n  %visit_counter = alloca i32\n\
            store i32 0, ptr %visit_counter\n",
     );
+    if let Some(context) = call_context {
+        body.push_str(
+            "  %call_depth = alloca i32\n  store i32 0, ptr %call_depth\n  %return_sites = alloca [16 x i32]\n  %return_addresses = alloca [16 x i64]\n  %return_widths = alloca [16 x i32]\n  %active_functions = alloca [128 x i8]\n"
+        );
+        for owner in 0..context.snapshots.len() {
+            body.push_str(&format!(
+                "  %initial_active_{owner} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {owner}\n  store i8 {}, ptr %initial_active_{owner}\n",
+                u8::from(owner == 0)
+            ));
+        }
+    }
     body.push_str(&format!("  br label %ins_{start_index}\n"));
     for (instruction_index, instruction) in semantic.instructions.iter().enumerate() {
+        let current_index = if let (Some(owners), Some(scoped)) = (owners, &scoped_indices) {
+            &scoped[owners[instruction_index]]
+        } else {
+            &index
+        };
         body.push_str(&format!(
             "ins_{instruction_index}:\n  %visits_{instruction_index} = load i32, ptr %visit_counter\n\
                %visit_exhausted_{instruction_index} = icmp uge i32 %visits_{instruction_index}, {MAX_RUNTIME_STEPS}\n\
@@ -682,7 +1197,7 @@ fn emit_pcode_cfg_llvm_semantic(
                         instruction_index,
                         operation_index,
                         instruction.operations.len(),
-                        &index,
+                        current_index,
                     );
                     if conditional {
                         let condition = &source.inputs[1];
@@ -815,7 +1330,7 @@ fn emit_pcode_cfg_llvm_semantic(
                         "  switch i64 {value}, label %{} [\n",
                         stop_label(PcodeCfgLlvmStatus::OutOfFunction)
                     ));
-                    for ((space, address), next) in &index {
+                    for ((space, address), next) in current_index {
                         if *space == instruction.address.space {
                             body.push_str(&format!(
                                 "    i64 {address}, label %indirect_{id}_{next}\n"
@@ -823,7 +1338,7 @@ fn emit_pcode_cfg_llvm_semantic(
                         }
                     }
                     body.push_str("  ]\n");
-                    for ((space, _), next) in &index {
+                    for ((space, _), next) in current_index {
                         if *space == instruction.address.space {
                             body.push_str(&format!("indirect_{id}_{next}:\n"));
                             body.push_str(&log_event(
@@ -836,19 +1351,47 @@ fn emit_pcode_cfg_llvm_semantic(
                     }
                 }
                 7 | 8 | 10 => {
-                    let status = if source.opcode == 10 {
-                        PcodeCfgLlvmStatus::Return
+                    if let Some(context) = call_context {
+                        if source.opcode == 10 {
+                            emit_interprocedural_return(
+                                source,
+                                id,
+                                context.owners[instruction_index],
+                                return_sites
+                                    .as_ref()
+                                    .expect("call context has return sites"),
+                                &mut body,
+                                &mut sites,
+                            )?;
+                        } else {
+                            emit_interprocedural_call(
+                                context,
+                                source,
+                                &instruction.address,
+                                instruction_index,
+                                operation_index,
+                                id,
+                                &index,
+                                current_index,
+                                &mut body,
+                                &mut sites,
+                            )?;
+                        }
                     } else {
-                        PcodeCfgLlvmStatus::Call
-                    };
-                    stop_site(
-                        &mut sites,
-                        &source.source_address,
-                        Some(operation_index),
-                        status,
-                        format!("{} ends the emitted path", source.mnemonic),
-                    );
-                    body.push_str(&branch_to_stop(status));
+                        let status = if source.opcode == 10 {
+                            PcodeCfgLlvmStatus::Return
+                        } else {
+                            PcodeCfgLlvmStatus::Call
+                        };
+                        stop_site(
+                            &mut sites,
+                            &source.source_address,
+                            Some(operation_index),
+                            status,
+                            format!("{} ends the emitted path", source.mnemonic),
+                        );
+                        body.push_str(&branch_to_stop(status));
+                    }
                 }
                 2 | 3 => match memory_layout(source, &semantic.address_spaces) {
                     Ok(layout) => {
@@ -1017,7 +1560,7 @@ fn emit_pcode_cfg_llvm_semantic(
         match fallthroughs[instruction_index].as_slice() {
             [Some(target)] => {
                 let target_key = (target.space.clone(), offset(&target.offset)?);
-                if let Some(next) = index.get(&target_key) {
+                if let Some(next) = current_index.get(&target_key) {
                     body.push_str(&format!("  br label %ins_{next}\n"));
                 } else {
                     stop_site(
@@ -1075,6 +1618,9 @@ fn emit_pcode_cfg_llvm_semantic(
         PcodeCfgLlvmStatus::MemoryUnsupportedLayout,
         PcodeCfgLlvmStatus::MemoryNonRamSpace,
         PcodeCfgLlvmStatus::MemoryUnknownSpace,
+        PcodeCfgLlvmStatus::CallDepth,
+        PcodeCfgLlvmStatus::ReturnMismatch,
+        PcodeCfgLlvmStatus::RecursiveCall,
     ] {
         body.push_str(&format!(
             "{}:\n  ret i32 {}\n",
@@ -1154,6 +1700,366 @@ mod tests {
             "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
         )
         .unwrap()
+    }
+
+    fn call_snapshots() -> Vec<GhidraSnapshot> {
+        let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
+        [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prism_calls_flow_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_prism_leaf_add_v2.json"
+            ))
+            .as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, digest).unwrap())
+        .collect()
+    }
+
+    fn call_event_ids(
+        artifact: &PcodeCfgLlvmArtifact,
+        trace: &hydir_ir::pcode::PcodeInterproceduralTrace,
+    ) -> Vec<usize> {
+        let mut ids = Vec::new();
+        for (segment_index, segment) in trace.segments.iter().enumerate() {
+            ids.extend(source_event_ids(artifact, &segment.path));
+            if segment_index + 1 == trace.segments.len() {
+                continue;
+            }
+            let source = match &segment.path.stop {
+                PcodePathStop::Call { source } | PcodePathStop::Return { source } => source,
+                other => panic!("unexpected interprocedural boundary: {other:?}"),
+            };
+            ids.push(
+                artifact
+                    .source_operations
+                    .iter()
+                    .position(|candidate| {
+                        candidate.address == source.source_address
+                            && candidate.operation_index == source.sequence_index as usize
+                    })
+                    .unwrap(),
+            );
+        }
+        ids
+    }
+
+    #[test]
+    fn interprocedural_direct_call_llvm_matches_shared_rust_state() {
+        let snapshots = call_snapshots();
+        let artifact = emit_pcode_interprocedural_cfg_llvm(&snapshots, 4).unwrap();
+        assert_eq!(artifact.function_entries.len(), 2);
+        assert_eq!(artifact.snapshot_sha256.len(), 2);
+        assert_eq!(artifact.llvm.semantic_fidelity, SemanticFidelity::Unknown);
+        verify(&artifact.llvm.llvm_ir);
+        for (a, b) in [(0u64, 0u64), (7, 5), (u64::MAX, 1)] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), a).unwrap();
+            seed.write_varnode(&register("0x30", 8), b).unwrap();
+            seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+            seed.write_memory("ram", 0x700000, 8, 0xdeadbeef).unwrap();
+            let rust =
+                hydir_ir::pcode::execute_concrete_call_path(&snapshots, &seed, 128, 16, 4).unwrap();
+            assert!(matches!(
+                rust.stop,
+                hydir_ir::pcode::PcodeCallPathStop::Return { .. }
+            ));
+            run_lli_with_guest(
+                &artifact.llvm,
+                &seed,
+                &GuestTestMemory {
+                    space_id: 433,
+                    base: 0x6ffff0,
+                    bytes: vec![
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(0xef),
+                        Some(0xbe),
+                        Some(0xad),
+                        Some(0xde),
+                        Some(0),
+                        Some(0),
+                        Some(0),
+                        Some(0),
+                    ],
+                    expected: Vec::new(),
+                    expected_state: Vec::new(),
+                },
+                128,
+                PcodeCfgLlvmStatus::Return,
+                &call_event_ids(&artifact.llvm, &rust),
+                Some(a.wrapping_add(b) as u8),
+            );
+        }
+        let mut alternate_spelling = snapshots.clone();
+        alternate_spelling[0].selected_function.call_targets[0]
+            .call_site
+            .offset = "0x002013ad".to_owned();
+        let alternate = emit_pcode_interprocedural_cfg_llvm(&alternate_spelling, 4).unwrap();
+        assert!(
+            alternate
+                .llvm
+                .stop_sites
+                .iter()
+                .all(|site| !site.reason.contains("disagrees with Ghidra call evidence"))
+        );
+    }
+
+    #[test]
+    fn interprocedural_computed_call_llvm_matches_rust_and_reports_missing_callee() {
+        let digest = "9568944aec254be3cb78235667b0575d3104cd063101428abc4055dacb067582";
+        let snapshots = [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_root_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_leaf_v2.json"
+            ))
+            .as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, digest).unwrap())
+        .collect::<Vec<_>>();
+        let seed = hydir_ir::pcode::parse_pcode_seed(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_indirect_seed_v1.json"
+            )),
+            &snapshots[0],
+        )
+        .unwrap();
+        let artifact = emit_pcode_interprocedural_cfg_llvm(&snapshots, 4).unwrap();
+        verify(&artifact.llvm.llvm_ir);
+        let rust =
+            hydir_ir::pcode::execute_concrete_call_path(&snapshots, &seed, 128, 16, 4).unwrap();
+        let guest = GuestTestMemory {
+            space_id: 433,
+            base: 0x6ffff8,
+            bytes: vec![
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(0xef),
+                Some(0xbe),
+                Some(0xad),
+                Some(0xde),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+            ],
+            expected: Vec::new(),
+            expected_state: Vec::new(),
+        };
+        run_lli_with_guest(
+            &artifact.llvm,
+            &seed,
+            &guest,
+            128,
+            PcodeCfgLlvmStatus::Return,
+            &call_event_ids(&artifact.llvm, &rust),
+            Some(7),
+        );
+
+        let missing = emit_pcode_interprocedural_cfg_llvm(&snapshots[..1], 4).unwrap();
+        verify(&missing.llvm.llvm_ir);
+        assert!(
+            missing
+                .llvm
+                .stop_sites
+                .iter()
+                .any(|site| site.status == PcodeCfgLlvmStatus::Call
+                    && site.reason.contains("not a loaded"))
+        );
+        let rust_missing =
+            hydir_ir::pcode::execute_concrete_call_path(&snapshots[..1], &seed, 128, 16, 4)
+                .unwrap();
+        let expected = source_event_ids(&missing.llvm, &rust_missing.segments[0].path);
+        run_lli_with_guest(
+            &missing.llvm,
+            &seed,
+            &guest,
+            128,
+            PcodeCfgLlvmStatus::Call,
+            &expected,
+            Some(0x74),
+        );
+
+        let mut recursive_seed = seed.clone();
+        recursive_seed
+            .write_varnode(&register("0x0", 8), 0x20117c)
+            .unwrap();
+        let recursive =
+            hydir_ir::pcode::execute_concrete_call_path(&snapshots, &recursive_seed, 128, 16, 4)
+                .unwrap();
+        assert!(matches!(recursive.stop,
+            hydir_ir::pcode::PcodeCallPathStop::CallBoundary { ref reason, .. }
+                if reason.contains("recursive")));
+        run_lli_with_guest(
+            &artifact.llvm,
+            &recursive_seed,
+            &guest,
+            128,
+            PcodeCfgLlvmStatus::RecursiveCall,
+            &source_event_ids(&artifact.llvm, &recursive.segments[0].path),
+            Some(0x7c),
+        );
+
+        let depth_zero = emit_pcode_interprocedural_cfg_llvm(&snapshots[..1], 0).unwrap();
+        let no_depth =
+            hydir_ir::pcode::execute_concrete_call_path(&snapshots[..1], &seed, 128, 16, 0)
+                .unwrap();
+        run_lli_with_guest(
+            &depth_zero.llvm,
+            &seed,
+            &guest,
+            128,
+            PcodeCfgLlvmStatus::CallDepth,
+            &source_event_ids(&depth_zero.llvm, &no_depth.segments[0].path),
+            Some(0x74),
+        );
+    }
+
+    #[test]
+    fn interprocedural_return_width_and_cross_function_fallthrough_stop() {
+        let mut snapshots = call_snapshots();
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&register("0x38", 8), 7).unwrap();
+        seed.write_varnode(&register("0x30", 8), 5).unwrap();
+        seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+        seed.write_memory("ram", 0x700000, 8, 0xdeadbeef).unwrap();
+        let guest = GuestTestMemory {
+            space_id: 433,
+            base: 0x6ffff0,
+            bytes: vec![
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(0xef),
+                Some(0xbe),
+                Some(0xad),
+                Some(0xde),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+            ],
+            expected: Vec::new(),
+            expected_state: Vec::new(),
+        };
+        let leaf_return = snapshots[1]
+            .selected_function
+            .instructions
+            .last_mut()
+            .unwrap()
+            .pcode
+            .last_mut()
+            .unwrap();
+        assert_eq!(leaf_return.mnemonic, "RETURN");
+        leaf_return.inputs[0].size = 4;
+        let mismatch =
+            hydir_ir::pcode::execute_concrete_call_path(&snapshots, &seed, 128, 16, 4).unwrap();
+        assert!(matches!(
+            mismatch.stop,
+            hydir_ir::pcode::PcodeCallPathStop::ReturnBoundary { .. }
+        ));
+        let artifact = emit_pcode_interprocedural_cfg_llvm(&snapshots, 4).unwrap();
+        verify(&artifact.llvm.llvm_ir);
+        let mut expected = source_event_ids(&artifact.llvm, &mismatch.segments[0].path);
+        let call = mismatch.segments[0].path.stop.clone();
+        let PcodePathStop::Call { source } = call else {
+            panic!("expected CALL");
+        };
+        expected.push(
+            artifact
+                .llvm
+                .source_operations
+                .iter()
+                .position(|candidate| {
+                    candidate.address == source.source_address
+                        && candidate.operation_index == source.sequence_index as usize
+                })
+                .unwrap(),
+        );
+        expected.extend(source_event_ids(&artifact.llvm, &mismatch.segments[1].path));
+        run_lli_with_guest(
+            &artifact.llvm,
+            &seed,
+            &guest,
+            128,
+            PcodeCfgLlvmStatus::ReturnMismatch,
+            &expected,
+            Some(12),
+        );
+
+        let mut snapshots = call_snapshots();
+        let leaf_entry = snapshots[1].selected_function.entry.clone();
+        let edge = snapshots[0]
+            .selected_function
+            .flow_edges
+            .iter_mut()
+            .find(|edge| {
+                edge.source.offset == "0x2013a9" && edge.kind == GhidraFlowKind::Fallthrough
+            })
+            .unwrap();
+        edge.target = Some(leaf_entry);
+        let artifact = emit_pcode_interprocedural_cfg_llvm(&snapshots, 4).unwrap();
+        verify(&artifact.llvm.llvm_ir);
+        let rust = snapshots[0]
+            .execute_concrete_path(&seed, None, 128, 16)
+            .unwrap();
+        assert!(matches!(
+            rust.stop,
+            PcodePathStop::FallthroughTargetNotSelected { .. }
+        ));
+        run_lli(
+            &artifact.llvm,
+            &seed,
+            128,
+            PcodeCfgLlvmStatus::OutOfFunction,
+            &source_event_ids(&artifact.llvm, &rust),
+            None,
+        );
     }
 
     fn indirect_jump_fixture() -> GhidraSnapshot {
@@ -1377,6 +2283,29 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), format!("{}\n{main}", artifact.llvm_ir)).unwrap();
         let output = Command::new("lli").arg(file.path()).output().unwrap();
+        if !output.status.success() {
+            let status_main = main.replace("ret i32 %result\n}", "ret i32 %status\n}");
+            std::fs::write(file.path(), format!("{}\n{status_main}", artifact.llvm_ir)).unwrap();
+            let status = Command::new("lli")
+                .arg(file.path())
+                .output()
+                .unwrap()
+                .status
+                .code();
+            let count_main = main.replace("ret i32 %result\n}", "ret i32 %count\n}");
+            std::fs::write(file.path(), format!("{}\n{count_main}", artifact.llvm_ir)).unwrap();
+            let count = Command::new("lli")
+                .arg(file.path())
+                .output()
+                .unwrap()
+                .status
+                .code();
+            panic!(
+                "LLVM path mismatch: status={status:?}, events={count:?}, expected_status={expected_status:?}, expected_events={}\n{}",
+                expected_events.len(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         assert_eq!(
             output.status.code(),
             Some(0),

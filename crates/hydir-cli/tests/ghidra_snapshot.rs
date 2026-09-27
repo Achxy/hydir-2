@@ -101,6 +101,42 @@ fn real_prism_call_trace_uses_two_binary_bound_snapshots() {
 }
 
 #[test]
+fn real_prism_call_snapshots_emit_one_binary_bound_llvm_module() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("demo/hydir-prism.elf");
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-calls"])
+        .arg(&binary)
+        .arg(root.join("tests/fixtures/ghidra_prism_calls_flow_v2.json"))
+        .arg("--callee")
+        .arg(root.join("tests/fixtures/ghidra_prism_leaf_add_v2.json"))
+        .arg("--max-depth")
+        .arg("4")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(artifact["schema_version"], 1);
+    assert_eq!(
+        artifact["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()))
+    );
+    assert_eq!(artifact["snapshot_sha256"].as_array().unwrap().len(), 2);
+    assert_eq!(artifact["function_entries"][1]["offset"], "0x2013a2");
+    assert_eq!(artifact["llvm"]["semantic_fidelity"], "unknown");
+    assert!(
+        artifact["llvm"]["llvm_ir"]
+            .as_str()
+            .unwrap()
+            .contains("%call_depth = alloca i32")
+    );
+}
+
+#[test]
 fn ghidra_function_index_imports_into_analysis_model() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = tempfile::tempdir().unwrap();
