@@ -218,6 +218,15 @@ enum Task {
         selector: String,
         entry: Location,
     },
+    RenameModel {
+        binary_sha256: String,
+        expected_revision: u64,
+        model: AnalysisModel,
+        target: ModelRenameTarget,
+        name: String,
+        native: Box<NativeDecompilation>,
+        key: String,
+    },
     Disassemble,
     Triton {
         path: PathBuf,
@@ -323,6 +332,13 @@ enum Event {
     NativeSelected {
         label: String,
         native: Box<Result<NativeDecompilation, String>>,
+        typed: Box<Result<TypedNativeView, String>>,
+        project_revision: Option<u64>,
+    },
+    ModelRenamed {
+        binary_sha256: String,
+        entry: Location,
+        revision: u64,
         typed: Box<Result<TypedNativeView, String>>,
     },
     Disassembled(Result<DisassemblyReport, String>),
@@ -2946,10 +2962,20 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     }
                     Source::None => Err("Open an ELF before selecting a function".to_owned()),
                 };
+                let mut project_revision = None;
                 let typed = match (&source, &native) {
-                    (Source::Local(bytes), Ok(native)) => {
+                    (Source::Local(bytes), Ok(native)) => (|| {
+                        let project = local_project
+                            .as_ref()
+                            .ok_or("Open a local project before inspecting typed C")?;
+                        // Ghidra imports can save a model from a background thread.
+                        // Refresh before reading so the GUI sees its new revision.
+                        let spec = import_elf(bytes).map_err(|error| error.to_string())?;
+                        let refreshed = attach_local_project(&project.path, &spec)?;
+                        project_revision = Some(refreshed.revision);
+                        local_project = Some(refreshed);
                         local_typed_view(bytes, local_project.as_ref(), native)
-                    }
+                    })(),
                     (Source::Remote(_), _) => Err("Typed model view is local-only in this desktop release".to_owned()),
                     (_, Err(error)) => Err(error.clone()),
                     _ => Err("Open a local ELF to inspect typed C".to_owned()),
@@ -2957,7 +2983,53 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 Event::NativeSelected {
                     native: Box::new(native),
                     typed: Box::new(typed),
+                    project_revision,
                     label,
+                }
+            }
+            Task::RenameModel {
+                binary_sha256,
+                expected_revision,
+                model,
+                target,
+                name,
+                native,
+                key,
+            } => {
+                let result = (|| {
+                    let Source::Local(bytes) = &source else {
+                        return Err("Model editing requires an open local ELF".to_owned());
+                    };
+                    let project = local_project
+                        .as_ref()
+                        .ok_or("Open a local project before editing its model")?;
+                    if project.binary_sha256 != binary_sha256 {
+                        return Err("Model edit binary differs from the open ELF".to_owned());
+                    }
+                    let mut store = LocalProjectStore::open_default()?;
+                    let (updated, _) = persist_local_model_rename(
+                        &mut store,
+                        project,
+                        bytes,
+                        expected_revision,
+                        &model,
+                        &target,
+                        &name,
+                        &key,
+                    )?;
+                    let typed = local_typed_view(bytes, Some(&updated), &native);
+                    let revision = updated.revision;
+                    local_project = Some(updated);
+                    Ok::<_, String>((revision, typed))
+                })();
+                match result {
+                    Ok((revision, typed)) => Event::ModelRenamed {
+                        binary_sha256,
+                        entry: native.machine_ir.entry,
+                        revision,
+                        typed: Box::new(typed),
+                    },
+                    Err(error) => Event::Failed(format!("Could not save model rename: {error}")),
                 }
             }
             Task::Disassemble => Event::Disassembled(match &source {
@@ -3384,12 +3456,78 @@ enum NativeViewMode {
     Evidence,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModelRenameTarget {
+    Function(Location),
+    Type(String),
+}
+
 struct TypedNativeView {
     model: AnalysisModel,
     ir: Option<HighLevelCir>,
     cfg_ir: Option<HighLevelCfgCir>,
     c: Option<String>,
     diagnostic: Option<String>,
+}
+
+fn valid_model_rename(name: &str) -> bool {
+    // These names can become file-scope C declarations, where leading
+    // underscores are reserved to the implementation.
+    !name.starts_with('_')
+        && !matches!(name, "asm" | "typeof")
+        && hydir_model::is_c11_identifier(name)
+}
+
+fn persist_local_model_rename(
+    store: &mut LocalProjectStore,
+    project: &LocalProject,
+    bytes: &[u8],
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    target: &ModelRenameTarget,
+    name: &str,
+    key: &str,
+) -> Result<(LocalProject, AnalysisModel), String> {
+    if project.revision != expected_revision {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    if name.len() > 128 || !valid_model_rename(name) {
+        return Err("Model name must be a C identifier of at most 128 characters".to_owned());
+    }
+    hydir_model::validate_model(bytes, displayed)?;
+    if let Some(saved) = store.load_model(project)?
+        && saved != *displayed
+    {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    let mut edited = displayed.clone();
+    let previous_name = match target {
+        ModelRenameTarget::Function(entry) => {
+            let function = edited
+                .functions
+                .iter_mut()
+                .find(|function| function.entry == *entry)
+                .ok_or("Selected function is absent from the analysis model")?;
+            std::mem::replace(&mut function.name, name.to_owned())
+        }
+        ModelRenameTarget::Type(id) => {
+            let definition = edited
+                .types
+                .iter_mut()
+                .find(|definition| definition.id == *id)
+                .ok_or("Selected type is absent from the analysis model")?;
+            std::mem::replace(&mut definition.name, name.to_owned())
+        }
+    };
+    if previous_name == name {
+        return Err("Choose a different name before saving".to_owned());
+    }
+    hydir_model::validate_model(bytes, &edited)?;
+    let updated = store.save_model(project, &edited, key)?;
+    let saved = store
+        .load_model(&updated)?
+        .ok_or("Saved analysis model could not be reloaded")?;
+    Ok((updated, saved))
 }
 
 fn local_typed_view(
@@ -3508,7 +3646,11 @@ fn typed_cfg_source_sites(
     selected
 }
 
-fn typed_types_view(ui: &mut egui::Ui, model: &AnalysisModel) -> Option<u64> {
+fn typed_types_view(
+    ui: &mut egui::Ui,
+    model: &AnalysisModel,
+    function_entry: Location,
+) -> (Option<u64>, Option<ModelRenameTarget>) {
     ui.label(format!(
         "Model revision {} · {} types · {} functions · {} unresolved conflicts",
         model.revision,
@@ -3517,7 +3659,32 @@ fn typed_types_view(ui: &mut egui::Ui, model: &AnalysisModel) -> Option<u64> {
         model.conflicts.len()
     ));
     let mut selected = None;
+    let mut rename = None;
+    if let Some(function) = model
+        .functions
+        .iter()
+        .find(|function| function.entry == function_entry)
+    {
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Function 0x{:x}: {}",
+                function_entry.value.0, function.name
+            ));
+            if ui.small_button("Rename").clicked() {
+                rename = Some(ModelRenameTarget::Function(function_entry));
+            }
+        });
+        for evidence in &function.evidence {
+            ui.label(format!("  {:?}: {}", evidence.source, evidence.detail));
+        }
+    }
     for ty in &model.types {
+        ui.horizontal(|ui| {
+            ui.label(format!("Type {}", ty.id));
+            if ui.small_button("Rename").clicked() {
+                rename = Some(ModelRenameTarget::Type(ty.id.clone()));
+            }
+        });
         ui.collapsing(
             format!(
                 "{} · {} bytes{}",
@@ -3529,35 +3696,41 @@ fn typed_types_view(ui: &mut egui::Ui, model: &AnalysisModel) -> Option<u64> {
                     ""
                 }
             ),
-            |ui| match &ty.kind {
-                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
-                    for field in fields {
-                        ui.label(format!(
-                            "+0x{:x}  {}: {:?}",
-                            field.offset_bytes, field.name, field.ty
-                        ));
-                        for evidence in &field.evidence {
-                            if let Some(site) = evidence.site {
-                                if ui
-                                    .small_button(format!(
-                                        "0x{:x} · {:?}: {}",
-                                        site.value.0, evidence.source, evidence.detail
-                                    ))
-                                    .clicked()
-                                {
-                                    selected = Some(site.value.0);
+            |ui| {
+                for evidence in &ty.evidence {
+                    ui.label(format!("{:?}: {}", evidence.source, evidence.detail));
+                }
+                match &ty.kind {
+                    TypeDefinitionKind::Struct { fields }
+                    | TypeDefinitionKind::Union { fields } => {
+                        for field in fields {
+                            ui.label(format!(
+                                "+0x{:x}  {}: {:?}",
+                                field.offset_bytes, field.name, field.ty
+                            ));
+                            for evidence in &field.evidence {
+                                if let Some(site) = evidence.site {
+                                    if ui
+                                        .small_button(format!(
+                                            "0x{:x} · {:?}: {}",
+                                            site.value.0, evidence.source, evidence.detail
+                                        ))
+                                        .clicked()
+                                    {
+                                        selected = Some(site.value.0);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                TypeDefinitionKind::Enum { variants, .. } => {
-                    for (name, value) in variants {
-                        ui.label(format!("{name} = {value}"));
+                    TypeDefinitionKind::Enum { variants, .. } => {
+                        for (name, value) in variants {
+                            ui.label(format!("{name} = {value}"));
+                        }
                     }
-                }
-                TypeDefinitionKind::Alias { target } => {
-                    ui.label(format!("Alias of {target:?}"));
+                    TypeDefinitionKind::Alias { target } => {
+                        ui.label(format!("Alias of {target:?}"));
+                    }
                 }
             },
         );
@@ -3565,7 +3738,7 @@ fn typed_types_view(ui: &mut egui::Ui, model: &AnalysisModel) -> Option<u64> {
     for conflict in &model.conflicts {
         ui.colored_label(ACCENT, format!("{}: {}", conflict.subject, conflict.detail));
     }
-    selected
+    (selected, rename)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3717,6 +3890,8 @@ struct AnalystApp {
     native_decompilation_error: Option<String>,
     typed_native_view: Option<TypedNativeView>,
     typed_native_error: Option<String>,
+    model_rename_target: Option<ModelRenameTarget>,
+    model_rename_name: String,
     native_coverage: Option<NativeCoverageReport>,
     native_coverage_error: Option<String>,
     analysis: Option<AnalysisReport>,
@@ -3862,6 +4037,8 @@ impl AnalystApp {
             native_decompilation_error: None,
             typed_native_view: None,
             typed_native_error: None,
+            model_rename_target: None,
+            model_rename_name: String::new(),
             native_coverage: None,
             native_coverage_error: None,
             analysis: None,
@@ -4471,10 +4648,16 @@ impl AnalystApp {
                     label,
                     native,
                     typed,
+                    project_revision,
                 } => {
                     if self.symbol.as_deref() != Some(&label) {
                         continue;
                     }
+                    if !self.remote {
+                        self.project_revision = project_revision;
+                    }
+                    self.model_rename_target = None;
+                    self.model_rename_name.clear();
                     match *native {
                         Ok(value) => {
                             self.selected_address = Some(value.machine_ir.entry.value.0);
@@ -4505,6 +4688,48 @@ impl AnalystApp {
                         self.selected_address = Some(address);
                     }
                     self.tab = self.selection_target_tab.take().unwrap_or(Tab::Native);
+                }
+                Event::ModelRenamed {
+                    binary_sha256,
+                    entry,
+                    revision,
+                    typed,
+                } => {
+                    if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
+                        != Some(binary_sha256.as_str())
+                    {
+                        continue;
+                    }
+                    self.project_revision = Some(revision);
+                    self.model_rename_target = None;
+                    self.model_rename_name.clear();
+                    if self
+                        .native_decompilation
+                        .as_ref()
+                        .is_some_and(|native| native.machine_ir.entry == entry)
+                    {
+                        match *typed {
+                            Ok(view) => {
+                                self.typed_native_view = Some(view);
+                                self.typed_native_error = None;
+                            }
+                            Err(error) => {
+                                self.typed_native_view = None;
+                                self.typed_native_error = Some(error.clone());
+                                self.failure = Some(format!(
+                                    "Model saved, but typed C refresh failed: {error}"
+                                ));
+                            }
+                        }
+                    } else if self.native_decompilation.is_some() {
+                        self.typed_native_view = None;
+                        self.typed_native_error = Some(
+                            "Analysis model changed; reselect this function to refresh typed C"
+                                .to_owned(),
+                        );
+                    }
+                    self.status = format!("Saved model rename in local revision {revision}");
+                    self.history.push(self.status.clone());
                 }
                 Event::Disassembled(result) => match result {
                     Ok(report) => {
@@ -5064,6 +5289,8 @@ impl AnalystApp {
         self.native_decompilation_error = None;
         self.typed_native_view = None;
         self.typed_native_error = None;
+        self.model_rename_target = None;
+        self.model_rename_name.clear();
         self.region_studio_mode = RegionStudioMode::Contract;
         self.native_view_mode = NativeViewMode::Summary;
     }
@@ -10294,6 +10521,8 @@ impl AnalystApp {
         });
         ui.separator();
 
+        let mut rename_selection = None;
+        let mut rename_save = None;
         let clicked_address = match self.native_view_mode {
             NativeViewMode::Summary => {
                 native_summary_view(ui, native);
@@ -10345,7 +10574,35 @@ impl AnalystApp {
             }
             NativeViewMode::Types => {
                 if let Some(typed) = &self.typed_native_view {
-                    typed_types_view(ui, &typed.model)
+                    if let Some(target) = &self.model_rename_target {
+                        ui.horizontal(|ui| {
+                            ui.label(match target {
+                                ModelRenameTarget::Function(_) => "Function name",
+                                ModelRenameTarget::Type(_) => "Type name",
+                            });
+                            ui.text_edit_singleline(&mut self.model_rename_name);
+                            if ui
+                                .add_enabled(
+                                    !self.busy && !self.remote,
+                                    egui::Button::new("Save rename"),
+                                )
+                                .clicked()
+                            {
+                                rename_save = Some((typed.model.clone(), native.clone()));
+                            }
+                            if ui.small_button("Cancel").clicked() {
+                                rename_selection = Some(None);
+                            }
+                        });
+                        ui.label("Model evidence and unresolved conflicts remain visible after a rename.");
+                        ui.separator();
+                    }
+                    let (site, target) =
+                        typed_types_view(ui, &typed.model, native.machine_ir.entry);
+                    if let Some(target) = target {
+                        rename_selection = Some(Some(target));
+                    }
+                    site
                 } else {
                     ui.colored_label(
                         ACCENT,
@@ -10414,6 +10671,60 @@ impl AnalystApp {
         };
         if let Some(address) = clicked_address {
             self.selected_address = Some(address);
+        }
+        if let Some(target) = rename_selection {
+            self.model_rename_name = match &target {
+                Some(ModelRenameTarget::Function(entry)) => self
+                    .typed_native_view
+                    .as_ref()
+                    .and_then(|view| {
+                        view.model
+                            .functions
+                            .iter()
+                            .find(|function| function.entry == *entry)
+                    })
+                    .map(|function| function.name.clone())
+                    .unwrap_or_default(),
+                Some(ModelRenameTarget::Type(id)) => self
+                    .typed_native_view
+                    .as_ref()
+                    .and_then(|view| {
+                        view.model
+                            .types
+                            .iter()
+                            .find(|definition| definition.id == *id)
+                    })
+                    .map(|definition| definition.name.clone())
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            self.model_rename_target = target;
+        }
+        if let Some((model, native)) = rename_save {
+            match (
+                self.spec.as_ref(),
+                self.project_revision,
+                self.model_rename_target.clone(),
+            ) {
+                (Some(spec), Some(expected_revision), Some(target)) => self.enqueue(
+                    Task::RenameModel {
+                        binary_sha256: spec.binary_sha256.clone(),
+                        expected_revision,
+                        model,
+                        target,
+                        name: self.model_rename_name.clone(),
+                        native: Box::new(native),
+                        key: uuid::Uuid::new_v4().to_string(),
+                    },
+                    "Saving revisioned analysis model rename…",
+                ),
+                _ => {
+                    self.failure = Some(
+                        "Open a local ELF and select a function before editing its model"
+                            .to_owned(),
+                    );
+                }
+            }
         }
     }
 
@@ -12009,12 +12320,13 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
-        NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
-        ghidra_composite_evidence, ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines,
-        ghidra_trace_start, high_pcode_varnode, indexed_function_action, ir_slice,
-        local_region_artifacts, native_function_excerpt, native_instruction_count,
-        native_opaque_instruction_count, pcode_display_lines, pcode_line_target, pcode_state_lines,
-        persist_ghidra_snapshot, preview_patch_local, resized_console_height, run_ghidra_command,
+        ModelRenameTarget, NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode,
+        captured_code_elf_address, ghidra_composite_evidence, ghidra_readiness_copy,
+        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
+        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
+        native_instruction_count, native_opaque_instruction_count, pcode_display_lines,
+        pcode_line_target, pcode_state_lines, persist_ghidra_snapshot, persist_local_model_rename,
+        preview_patch_local, resized_console_height, run_ghidra_command,
         selected_ghidra_trace_address, valid_bearer_token, validate_endpoint,
         workbench_graph_layout,
     };
@@ -12029,6 +12341,10 @@ mod tests {
     use hydir_execution::StopPoint;
     use hydir_ghidra_worker::GhidraRuntimeStatus;
     use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect, parse_ghidra_snapshot, parse_pcode_seed};
+    use hydir_model::{
+        ModelConflict, ModelEvidence, ModelSource, PrimitiveType, TypeDefinition,
+        TypeDefinitionKind, TypeRef, init_model,
+    };
     use hydir_project::LocalProjectStore;
     use std::fs;
     use std::path::Path;
@@ -12307,6 +12623,137 @@ mod tests {
             persist_ghidra_snapshot(&database, &binary, "wrong", &snapshot)
                 .unwrap_err()
                 .contains("changed")
+        );
+    }
+
+    #[test]
+    fn gui_model_renames_persist_evidence_and_reject_stale_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        let project = store.open_binary(&binary, &spec).unwrap();
+        let mut displayed = init_model(bytes).unwrap();
+        let entry = displayed.functions[0].entry;
+        let original_evidence = displayed.functions[0].evidence.clone();
+        let machine_evidence = ModelEvidence {
+            source: ModelSource::NativeAnalysis,
+            detail: "fixture machine observation".to_owned(),
+            site: None,
+        };
+        displayed.types.push(TypeDefinition {
+            id: "fixture_word".to_owned(),
+            name: "OldWord".to_owned(),
+            size_bytes: 8,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Alias {
+                target: TypeRef::Primitive {
+                    name: PrimitiveType::U64,
+                },
+            },
+            evidence: vec![machine_evidence.clone()],
+        });
+        displayed.conflicts.push(ModelConflict {
+            subject: "fixture_alias".to_owned(),
+            detail: "unresolved alias".to_owned(),
+            evidence: vec![machine_evidence.clone()],
+        });
+        for reserved in ["inline", "restrict", "_Atomic", "_Thread_local", "asm"] {
+            assert!(
+                persist_local_model_rename(
+                    &mut store,
+                    &project,
+                    bytes,
+                    project.revision,
+                    &displayed,
+                    &ModelRenameTarget::Function(entry),
+                    reserved,
+                    "invalid-rename",
+                )
+                .unwrap_err()
+                .contains("C identifier")
+            );
+        }
+
+        let (updated, saved) = persist_local_model_rename(
+            &mut store,
+            &project,
+            bytes,
+            project.revision,
+            &displayed,
+            &ModelRenameTarget::Function(entry),
+            "analyst_entry",
+            "rename-function",
+        )
+        .unwrap();
+        assert_eq!(updated.revision, project.revision + 1);
+        let function = saved
+            .functions
+            .iter()
+            .find(|row| row.entry == entry)
+            .unwrap();
+        assert_eq!(function.name, "analyst_entry");
+        assert!(
+            original_evidence
+                .iter()
+                .all(|fact| function.evidence.contains(fact))
+        );
+        assert!(
+            function
+                .evidence
+                .iter()
+                .any(|fact| fact.source == ModelSource::AnalystAssertion)
+        );
+        assert_eq!(saved.conflicts[0].detail, "unresolved alias");
+        assert!(
+            persist_local_model_rename(
+                &mut store,
+                &project,
+                bytes,
+                project.revision,
+                &displayed,
+                &ModelRenameTarget::Function(entry),
+                "stale_entry",
+                "stale-rename",
+            )
+            .unwrap_err()
+            .contains("Stale local project revision")
+        );
+
+        let (updated_again, saved_again) = persist_local_model_rename(
+            &mut store,
+            &updated,
+            bytes,
+            updated.revision,
+            &saved,
+            &ModelRenameTarget::Type("fixture_word".to_owned()),
+            "AnalystWord",
+            "rename-type",
+        )
+        .unwrap();
+        assert_eq!(updated_again.revision, updated.revision + 1);
+        let definition = saved_again
+            .types
+            .iter()
+            .find(|definition| definition.id == "fixture_word")
+            .unwrap();
+        assert_eq!(definition.name, "AnalystWord");
+        assert!(definition.evidence.contains(&machine_evidence));
+        assert!(
+            definition
+                .evidence
+                .iter()
+                .any(|fact| fact.source == ModelSource::AnalystAssertion)
+        );
+        assert_eq!(saved_again.conflicts, saved.conflicts);
+
+        let reopened = LocalProjectStore::open(&database).unwrap();
+        assert_eq!(
+            reopened.load_model(&updated_again).unwrap(),
+            Some(saved_again.clone())
         );
     }
 
