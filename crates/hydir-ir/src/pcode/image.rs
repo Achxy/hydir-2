@@ -37,10 +37,33 @@ pub struct PcodeReadOnlyElfImage {
 /// address gaps remain unknown even when `bytes` contains zero there.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PcodeReadOnlyElfWindow {
-    pub space: String,
-    pub base: u64,
-    pub bytes: Vec<u8>,
-    pub known: Vec<u8>,
+    binary_sha256: String,
+    space: String,
+    base: u64,
+    bytes: Vec<u8>,
+    known: Vec<u8>,
+}
+
+impl PcodeReadOnlyElfWindow {
+    pub fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+
+    pub fn space(&self) -> &str {
+        &self.space
+    }
+
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn known(&self) -> &[u8] {
+        &self.known
+    }
 }
 
 impl PcodeReadOnlyElfImage {
@@ -96,6 +119,7 @@ impl PcodeReadOnlyElfImage {
             known[start..end].fill(0xff);
         }
         Ok(PcodeReadOnlyElfWindow {
+            binary_sha256: self.binary_sha256.clone(),
             space: self.space.clone(),
             base: first.start,
             bytes,
@@ -374,6 +398,7 @@ mod tests {
         let (binary, snapshot) = password_fixture();
         let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot).unwrap();
         let window = image.materialize_window(64 * 1024).unwrap();
+        assert_eq!(window.binary_sha256, snapshot.binary_sha256);
         assert_eq!(window.space, "ram");
         assert_eq!(window.base, 0x200000);
         assert_eq!(window.bytes[0], 0x7f); // ELF header
