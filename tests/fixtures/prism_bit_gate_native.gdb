@@ -32,13 +32,22 @@ gdb.execute("set $rsp = $rsp - 8")
 entry_rsp = int(gdb.parse_and_eval("$rsp"))
 gdb.selected_inferior().write_memory(entry_rsp, ret_address.to_bytes(8, "little"))
 gdb.execute("set $rip = 0x%x" % entry)
-gdb.execute("set $rdi = %s" % os.environ["HYDIR_NATIVE_RDI"])
+if "HYDIR_NATIVE_INPUT_HEX" in os.environ:
+    input_bytes = bytes.fromhex(os.environ["HYDIR_NATIVE_INPUT_HEX"])
+    if not input_bytes or len(input_bytes) > 128:
+        raise RuntimeError("native input must contain 1..128 bytes")
+    input_address = entry_rsp - 0x100
+    gdb.selected_inferior().write_memory(input_address, input_bytes)
+    gdb.execute("set $rdi = 0x%x" % input_address)
+else:
+    gdb.execute("set $rdi = %s" % os.environ["HYDIR_NATIVE_RDI"])
 gdb.execute("set $rsi = %s" % os.environ["HYDIR_NATIVE_RSI"])
 if "HYDIR_NATIVE_RAX" in os.environ:
     gdb.execute("set $rax = %s" % os.environ["HYDIR_NATIVE_RAX"])
 
 visits = []
-for _ in range(len(instructions) + 1):
+max_visits = int(os.environ.get("HYDIR_NATIVE_MAX_VISITS", str(len(instructions) + 1)))
+for _ in range(max_visits):
     pc = int(gdb.parse_and_eval("$rip"))
     if pc == ret_address and visits and visits[-1] == ret_instruction:
         break

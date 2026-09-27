@@ -34,6 +34,9 @@ jobs:
       - name: Stripped password function native differential
         run: |
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/password_mix_native_test.py -q
+      - name: Stripped password comparison native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/password_secure_equals_native_test.py -q
       - name: Direct-call PRISM native differential
         run: |
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_call_chain_native_test.py -q
