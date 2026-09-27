@@ -32,7 +32,77 @@ pub struct PcodeReadOnlyElfImage {
     regions: Vec<ImageRegion>,
 }
 
+/// A bounded address window over the image. A `known` byte is `0xff` only
+/// where both the ELF PT_LOAD and Ghidra mark a file-backed, read-only byte;
+/// address gaps remain unknown even when `bytes` contains zero there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcodeReadOnlyElfWindow {
+    pub space: String,
+    pub base: u64,
+    pub bytes: Vec<u8>,
+    pub known: Vec<u8>,
+}
+
 impl PcodeReadOnlyElfImage {
+    /// Materialize the smallest contiguous window covering the eligible
+    /// regions. Callers choose a strict allocation limit for their memory ABI.
+    pub fn materialize_window(&self, max_bytes: usize) -> Result<PcodeReadOnlyElfWindow, String> {
+        let first = self
+            .regions
+            .first()
+            .ok_or("read-only ELF image has no eligible regions")?;
+        let last = self
+            .regions
+            .last()
+            .ok_or("read-only ELF image has no eligible regions")?;
+        let span = last
+            .end
+            .checked_sub(first.start)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or("read-only ELF image window size overflows")?;
+        if span == 0 || max_bytes == 0 || span > max_bytes {
+            return Err(format!(
+                "read-only ELF image window requires {span} bytes, limit is {max_bytes}"
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(span)
+            .map_err(|_| "read-only ELF image window allocation exceeds limit")?;
+        bytes.resize(span, 0);
+        let mut known = Vec::new();
+        known
+            .try_reserve_exact(span)
+            .map_err(|_| "read-only ELF image known mask allocation exceeds limit")?;
+        known.resize(span, 0);
+        for region in &self.regions {
+            let start = usize::try_from(region.start - first.start)
+                .map_err(|_| "read-only ELF image region offset overflows")?;
+            let len = usize::try_from(region.end - region.start)
+                .map_err(|_| "read-only ELF image region length overflows")?;
+            let end = start
+                .checked_add(len)
+                .filter(|end| *end <= span)
+                .ok_or("read-only ELF image region exceeds window")?;
+            let file_end = region
+                .file_offset
+                .checked_add(len)
+                .ok_or("read-only ELF image file offset overflows")?;
+            let source = self
+                .binary
+                .get(region.file_offset..file_end)
+                .ok_or("read-only ELF image region exceeds binary")?;
+            bytes[start..end].copy_from_slice(source);
+            known[start..end].fill(0xff);
+        }
+        Ok(PcodeReadOnlyElfWindow {
+            space: self.space.clone(),
+            base: first.start,
+            bytes,
+            known,
+        })
+    }
+
     /// Older v2 snapshots may have no memory-block inventory. They cannot
     /// establish which Ghidra addresses correspond to immutable ELF bytes.
     pub fn has_eligible_blocks(snapshot: &GhidraSnapshot) -> bool {
@@ -297,6 +367,26 @@ mod tests {
                 trace
             );
         }
+    }
+
+    #[test]
+    fn stripped_elf_window_marks_only_eligible_bytes_and_obeys_limit() {
+        let (binary, snapshot) = password_fixture();
+        let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot).unwrap();
+        let window = image.materialize_window(64 * 1024).unwrap();
+        assert_eq!(window.space, "ram");
+        assert_eq!(window.base, 0x200000);
+        assert_eq!(window.bytes[0], 0x7f); // ELF header
+        assert_eq!(window.known[0], 0xff);
+        let phrase = usize::try_from(0x2001f0 - window.base).unwrap();
+        assert_eq!(window.bytes[phrase], b'H');
+        assert_eq!(window.known[phrase], 0xff);
+        let gap = usize::try_from(0x2001e4 - window.base).unwrap();
+        assert_eq!(window.bytes[gap], 0);
+        assert_eq!(window.known[gap], 0); // between .interp and .rodata
+        assert_eq!(window.bytes.len(), window.known.len());
+        assert!(image.materialize_window(window.bytes.len() - 1).is_err());
+        assert!(image.materialize_window(0).is_err());
     }
 
     #[test]

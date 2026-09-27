@@ -29,7 +29,7 @@ pub use execution::{
     PcodeMemoryAccessKind, PcodeMemoryBoundaryKind, PcodePathBranchKind, PcodePathDestination,
     PcodePathEvent, PcodePathStop, PcodePathTrace,
 };
-pub use image::PcodeReadOnlyElfImage;
+pub use image::{PcodeReadOnlyElfImage, PcodeReadOnlyElfWindow};
 pub use interprocedural::{
     PCODE_CALL_PATH_VERSION, PcodeCallPathSegment, PcodeCallPathStop, PcodeCallTransition,
     PcodeInterproceduralTrace, execute_concrete_call_path, execute_concrete_call_path_with_image,
