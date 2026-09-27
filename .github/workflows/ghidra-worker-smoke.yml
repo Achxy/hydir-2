@@ -127,7 +127,8 @@ jobs:
                          for site in artifact['stop_sites'])
           pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
           PY
-          opt -passes=verify -disable-output "$RUNNER_TEMP/hydir-password.ll"
+          clang -x ir -c "$RUNNER_TEMP/hydir-password.ll" \
+            -o "$RUNNER_TEMP/hydir-password.o"
       - name: Probe the Hydir desktop import path with the container worker
         env:
           HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-demo.sqlite
