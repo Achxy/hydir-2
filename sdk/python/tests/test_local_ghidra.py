@@ -61,7 +61,7 @@ class LocalGhidraTests(unittest.TestCase):
             )
         self.assertEqual(result["binary_sha256"], self.digest)
         with patch.object(self.client, "_run") as worker:
-            for selector in ("../main.elf", "/main.elf", "firmware/*.elf", "firmware//main.elf"):
+            for selector in ("../main.elf", "/main.elf", "firmware/*.elf", "firmware//main.elf", "firmware/\nmain.elf"):
                 with self.assertRaises(ValueError):
                     self.client.import_project(self.binary, project, selector, self.snapshot)
             worker.assert_not_called()

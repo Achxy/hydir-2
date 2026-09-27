@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 from typing import Any
+import unicodedata
 
 
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
@@ -110,7 +111,9 @@ class LocalGhidra:
             raise ValueError("project needs a matching .rep directory")
         if (not isinstance(program, str) or not program or program.startswith("/")
                 or "\\" in program or ":" in program or any(
-                    not part or part in {".", ".."} or any(ch in part for ch in "*?[]")
+                    not part or part in {".", ".."} or any(
+                        ch in "*?[]" or unicodedata.category(ch) == "Cc" for ch in part
+                    )
                     for part in program.split("/"))):
             raise ValueError("program must be an exact project-relative path")
         if snapshot_path in {binary_path, project_path}:
