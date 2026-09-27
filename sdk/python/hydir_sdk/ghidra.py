@@ -86,6 +86,49 @@ class LocalGhidra:
                 raise RuntimeError("Ghidra returned a different function")
         return data
 
+    def import_project(
+        self,
+        binary: str | os.PathLike[str],
+        project: str | os.PathLike[str],
+        program: str,
+        snapshot: str | os.PathLike[str],
+        *,
+        function: int | None = None,
+    ) -> dict[str, Any]:
+        """Export one program from a closed, analyst-edited Ghidra project.
+
+        The CLI stages an isolated project copy and verifies the original ELF.
+        This route runs fresh on each call, so later project edits are visible.
+        """
+        binary_path = Path(binary).resolve(strict=True)
+        project_path = Path(project).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve()
+        digest = self._digest(binary_path)
+        if project_path.suffix.lower() != ".gpr" or not project_path.is_file():
+            raise ValueError("project must be a .gpr file")
+        if not project_path.with_suffix(".rep").is_dir():
+            raise ValueError("project needs a matching .rep directory")
+        if (not isinstance(program, str) or not program or program.startswith("/")
+                or "\\" in program or ":" in program or any(
+                    not part or part in {".", ".."} or any(ch in part for ch in "*?[]")
+                    for part in program.split("/"))):
+            raise ValueError("program must be an exact project-relative path")
+        if snapshot_path in {binary_path, project_path}:
+            raise ValueError("snapshot path must differ from binary and project")
+        args = ["ghidra", "import-project", str(binary_path), str(project_path),
+                "--program", program, "--output", str(snapshot_path)]
+        if function is not None:
+            if not isinstance(function, int) or not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("function entry must be a 64-bit address")
+            args.extend(["--function", hex(function)])
+        self._run(*args)
+        data = self._snapshot(snapshot_path, digest)
+        if function is not None:
+            selected = data.get("selected_function", {}).get("entry", {}).get("offset")
+            if not isinstance(selected, str) or int(selected, 16) != function:
+                raise RuntimeError("Ghidra returned a different function")
+        return data
+
     def artifact(
         self,
         kind: str,

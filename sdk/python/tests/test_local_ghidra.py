@@ -38,6 +38,51 @@ class LocalGhidraTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.client.artifact("state", self.binary, self.snapshot)
 
+    def test_import_project_checks_program_binary_and_selected_function(self):
+        project = Path(self.directory.name) / "Expert.gpr"
+        project.write_bytes(b"")
+        project.with_suffix(".rep").mkdir()
+
+        def run(*args):
+            self.assertEqual(args[:2], ("ghidra", "import-project"))
+            self.assertEqual(args[2:4], (str(self.binary), str(project)))
+            self.assertEqual(args[4:6], ("--program", "firmware/main.elf"))
+            self.assertEqual(args[-2:], ("--function", "0x401000"))
+            self.snapshot.write_text(json.dumps({
+                "binary_sha256": self.digest,
+                "selected_function": {"entry": {"offset": "0x401000"}},
+            }), encoding="utf-8")
+            return b"{}"
+
+        with patch.object(self.client, "_run", side_effect=run):
+            result = self.client.import_project(
+                self.binary, project, "firmware/main.elf", self.snapshot,
+                function=0x401000,
+            )
+        self.assertEqual(result["binary_sha256"], self.digest)
+        with patch.object(self.client, "_run") as worker:
+            for selector in ("../main.elf", "/main.elf", "firmware/*.elf", "firmware//main.elf"):
+                with self.assertRaises(ValueError):
+                    self.client.import_project(self.binary, project, selector, self.snapshot)
+            worker.assert_not_called()
+        with patch.object(self.client, "_run", return_value=b"{}"):
+            with self.assertRaises(RuntimeError):
+                self.client.import_project(
+                    self.binary, project, "firmware/main.elf", self.snapshot,
+                    function=0x401001,
+                )
+
+        self.snapshot.write_text(json.dumps({
+            "binary_sha256": "0" * 64,
+            "selected_function": {"entry": {"offset": "0x401000"}},
+        }), encoding="utf-8")
+        with patch.object(self.client, "_run", return_value=b"{}"):
+            with self.assertRaises(RuntimeError):
+                self.client.import_project(
+                    self.binary, project, "firmware/main.elf", self.snapshot,
+                    function=0x401000,
+                )
+
     def test_artifact_is_bound_to_binary_and_kind(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         with patch.object(self.client, "_run", return_value=json.dumps({

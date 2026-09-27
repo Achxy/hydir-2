@@ -19,6 +19,11 @@ checked against the binary SHA-256, and a function-level state artifact is
 an effect inventory rather than an executable lift. `llvm-standalone` provides
 a runnable byte-state module for the supported straight-line prefix, with an
 explicit stop reason; it does not claim whole-function equivalence.
+`import_project(binary, project_gpr, "folder/program.elf", snapshot,
+function=0x...)` exports one program from a closed, analyst-edited Ghidra
+project. The CLI stages an isolated copy, checks that the selected program
+matches the original ELF, and runs fresh on each call so later analyst edits
+are visible.
 `trace_prefix(binary, snapshot, seed, max_operations=4096)` runs the bounded
 concrete interpreter against a binary-bound JSON seed and returns its trace.
 `trace_path(...)` follows a bounded path through selected instructions and
