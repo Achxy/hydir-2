@@ -36,7 +36,8 @@ use hydir_decompile::{
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeInterproceduralTrace,
-    PcodeSliceTarget, execute_concrete_call_path, parse_ghidra_snapshot, parse_pcode_seed,
+    PcodeReadOnlyElfImage, PcodeSliceTarget, execute_concrete_call_path,
+    execute_concrete_call_path_with_image, parse_ghidra_snapshot, parse_pcode_seed,
     unloaded_call_target,
 };
 use hydir_ir::{
@@ -95,6 +96,10 @@ const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_CALL_TRACE_FUNCTIONS: usize = 8;
 const MAX_CALL_TRACE_INPUT: usize =
     MAX_CALL_TRACE_FUNCTIONS * (MAX_GHIDRA_SNAPSHOT_BYTES + 4) + MAX_PCODE_SEED_BYTES + 8;
+const GHIDRA_CALL_IMAGE_MAGIC: &[u8; 4] = b"HCIM";
+const MAX_CALL_TRACE_IMAGE_INPUT: usize = MAX_CALL_TRACE_INPUT + MAX_BINARY_BYTES + 12;
+const LEGACY_CALL_IMAGE_DIAGNOSTIC: &str =
+    "root Ghidra snapshot has no memory blocks; trace uses seed-only memory";
 const MAX_CALL_TRACE_OPERATIONS: usize = 65_536;
 const MAX_ACTIVE_JOBS_PER_IDENTITY: i64 = 2;
 const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
@@ -2216,6 +2221,76 @@ fn unpack_ghidra_call_trace_input(bytes: &[u8]) -> Result<(&[u8], Vec<&[u8]>), S
     Ok((seed, snapshots))
 }
 
+/// Worker-only v1 envelope: magic, legacy-input length, binary length,
+/// legacy seed/snapshots, then the exact uploaded ELF bytes. The old envelope
+/// remains available for old no-memory-block snapshots and the LLVM action.
+fn pack_ghidra_call_image_input(
+    binary: &[u8],
+    seed: &[u8],
+    snapshots: &[Vec<u8>],
+) -> Result<Vec<u8>, String> {
+    if binary.is_empty() || binary.len() > MAX_BINARY_BYTES {
+        return Err("Ghidra call image binary must be 1..=64 MiB".to_owned());
+    }
+    let legacy = pack_ghidra_call_trace_input(seed, snapshots)?;
+    let size = 12usize
+        .checked_add(legacy.len())
+        .and_then(|size| size.checked_add(binary.len()))
+        .ok_or("Ghidra call image input length overflow")?;
+    if size > MAX_CALL_TRACE_IMAGE_INPUT {
+        return Err("Ghidra call image input exceeds service limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend_from_slice(GHIDRA_CALL_IMAGE_MAGIC);
+    bytes.extend_from_slice(&(legacy.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(binary.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&legacy);
+    bytes.extend_from_slice(binary);
+    Ok(bytes)
+}
+
+fn unpack_ghidra_call_image_input(bytes: &[u8]) -> Result<(&[u8], &[u8], Vec<&[u8]>), String> {
+    if bytes.len() > MAX_CALL_TRACE_IMAGE_INPUT || bytes.get(..4) != Some(GHIDRA_CALL_IMAGE_MAGIC) {
+        return Err("Ghidra call image envelope header is invalid".to_owned());
+    }
+    let payload_size = u32::from_le_bytes(
+        bytes
+            .get(4..8)
+            .ok_or("Ghidra call image envelope is truncated")?
+            .try_into()
+            .map_err(|_| "Ghidra call image payload size is invalid")?,
+    ) as usize;
+    let binary_size = u32::from_le_bytes(
+        bytes
+            .get(8..12)
+            .ok_or("Ghidra call image envelope is truncated")?
+            .try_into()
+            .map_err(|_| "Ghidra call image binary size is invalid")?,
+    ) as usize;
+    if !(1..=MAX_CALL_TRACE_INPUT).contains(&payload_size)
+        || !(1..=MAX_BINARY_BYTES).contains(&binary_size)
+    {
+        return Err("Ghidra call image envelope exceeds service limits".to_owned());
+    }
+    let payload_end = 12usize
+        .checked_add(payload_size)
+        .ok_or("Ghidra call image payload length overflow")?;
+    let binary_end = payload_end
+        .checked_add(binary_size)
+        .ok_or("Ghidra call image binary length overflow")?;
+    if binary_end != bytes.len() {
+        return Err("Ghidra call image envelope is truncated or has trailing bytes".to_owned());
+    }
+    let payload = bytes
+        .get(12..payload_end)
+        .ok_or("Ghidra call image payload is truncated")?;
+    let binary = bytes
+        .get(payload_end..binary_end)
+        .ok_or("Ghidra call image binary is truncated")?;
+    let (seed, snapshots) = unpack_ghidra_call_trace_input(payload)?;
+    Ok((binary, seed, snapshots))
+}
+
 fn ghidra_call_trace_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
     let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
         .map_err(|error| format!("invalid Ghidra call trace selector: {error}"))?;
@@ -2225,19 +2300,46 @@ fn ghidra_call_trace_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u
     {
         return Err("Ghidra call trace budget exceeds service limit".to_owned());
     }
-    let (seed_bytes, raw_snapshots) = unpack_ghidra_call_trace_input(bytes)?;
+    let (binary, seed_bytes, raw_snapshots) = if bytes.starts_with(GHIDRA_CALL_IMAGE_MAGIC) {
+        let (binary, seed, snapshots) = unpack_ghidra_call_image_input(bytes)?;
+        if sha256(binary) != selector.binary_sha256 {
+            return Err("Ghidra call image binary digest disagrees with selector".to_owned());
+        }
+        (Some(binary), seed, snapshots)
+    } else {
+        let (seed, snapshots) = unpack_ghidra_call_trace_input(bytes)?;
+        (None, seed, snapshots)
+    };
     let snapshots = raw_snapshots
         .into_iter()
         .map(|bytes| parse_ghidra_snapshot(bytes, &selector.binary_sha256))
         .collect::<Result<Vec<_>, _>>()?;
     let seed = parse_pcode_seed(seed_bytes, &snapshots[0])?;
-    let trace = execute_concrete_call_path(
-        &snapshots,
-        &seed,
-        selector.max_operations,
-        selector.max_visits,
-        selector.max_depth,
-    )?;
+    let mut trace = if !snapshots[0].memory_blocks.is_empty() {
+        let binary = binary.ok_or("Ghidra call trace requires its revision-bound ELF image")?;
+        let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshots[0])?;
+        execute_concrete_call_path_with_image(
+            &snapshots,
+            &seed,
+            &image,
+            selector.max_operations,
+            selector.max_visits,
+            selector.max_depth,
+        )?
+    } else {
+        execute_concrete_call_path(
+            &snapshots,
+            &seed,
+            selector.max_operations,
+            selector.max_visits,
+            selector.max_depth,
+        )?
+    };
+    if snapshots[0].memory_blocks.is_empty() {
+        trace
+            .snapshot_diagnostics
+            .push(LEGACY_CALL_IMAGE_DIAGNOSTIC.to_owned());
+    }
     serde_json::to_vec(&trace).map_err(|error| error.to_string())
 }
 
@@ -3195,7 +3297,8 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut bytes = Vec::new();
     let limit = match arguments.first().map(String::as_str) {
         Some("native-artifact-model") => MAX_BINARY_BYTES + MAX_MODEL_BYTES + 4,
-        Some("ghidra-call-trace" | "ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
+        Some("ghidra-call-trace") => MAX_CALL_TRACE_IMAGE_INPUT,
+        Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
         _ => MAX_BINARY_BYTES,
     };
     std::io::stdin()
@@ -4430,6 +4533,19 @@ async fn ghidra_call_artifact(
             "project has no uploaded binary",
         ));
     }
+    let binary = store
+        .current_binary(&principal, &project.project_id, project.revision)
+        .await?;
+    if binary.is_empty() || binary.len() > MAX_BINARY_BYTES {
+        return Err(Status::resource_exhausted(
+            "revision binary exceeds Ghidra call trace limit",
+        ));
+    }
+    if sha256(&binary) != project.binary_sha256 {
+        return Err(Status::data_loss(
+            "revision binary digest disagrees with project",
+        ));
+    }
     let root = collect_ghidra_call_root_snapshot(
         store,
         &principal,
@@ -4460,9 +4576,8 @@ async fn ghidra_call_artifact(
                 .flatten()
         })
         .collect::<BTreeSet<_>>();
-    let mut binary = None::<Vec<u8>>;
     let mut trace = loop {
-        let envelope = pack_ghidra_call_trace_input(&input.seed_json, &snapshots)
+        let envelope = pack_ghidra_call_image_input(&binary, &input.seed_json, &snapshots)
             .map_err(Status::resource_exhausted)?;
         let raw = run_worker("ghidra-call-trace", Some(&selector), envelope).await?;
         let trace: PcodeInterproceduralTrace = serde_json::from_slice(&raw).map_err(|error| {
@@ -4507,19 +4622,7 @@ async fn ghidra_call_artifact(
         let bytes = if let Some(cached) = cached {
             cached
         } else {
-            if binary.is_none() {
-                binary = Some(
-                    store
-                        .current_binary(&principal, &project.project_id, project.revision)
-                        .await?,
-                );
-            }
-            let produced = match automatic_ghidra_snapshot(
-                binary.as_ref().expect("loaded above").clone(),
-                Some(entry),
-            )
-            .await
-            {
+            let produced = match automatic_ghidra_snapshot(binary.clone(), Some(entry)).await {
                 Ok(produced) => produced,
                 Err(error) => {
                     diagnostics.push(format!(
@@ -4603,7 +4706,7 @@ async fn ghidra_call_artifact(
             GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE,
         )
     } else {
-        trace.snapshot_diagnostics = diagnostics;
+        trace.snapshot_diagnostics.extend(diagnostics);
         (
             serde_json::to_vec(&trace)
                 .map_err(|_| Status::internal("Ghidra call trace serialization failed"))?,
@@ -7233,7 +7336,10 @@ mod tests {
         let trace: PcodeInterproceduralTrace = serde_json::from_slice(&artifact.content).unwrap();
         assert_eq!(trace.calls.len(), 1);
         assert_eq!(trace.segments.len(), 3);
-        assert!(trace.snapshot_diagnostics.is_empty());
+        assert_eq!(
+            trace.snapshot_diagnostics,
+            vec![LEGACY_CALL_IMAGE_DIAGNOSTIC]
+        );
         assert!(matches!(
             trace.stop,
             hydir_ir::pcode::PcodeCallPathStop::Return { .. }
@@ -7293,7 +7399,11 @@ mod tests {
             bounded_trace.stop,
             hydir_ir::pcode::PcodeCallPathStop::CallBoundary { .. }
         ));
-        assert_eq!(bounded_trace.snapshot_diagnostics.len(), 1);
+        assert_eq!(bounded_trace.snapshot_diagnostics.len(), 2);
+        assert_eq!(
+            bounded_trace.snapshot_diagnostics[0],
+            LEGACY_CALL_IMAGE_DIAGNOSTIC
+        );
         let bounded_llvm = HydirV3::build_ghidra_call_cfg_llvm(&store, authorized(bounded, &token))
             .await
             .unwrap()
@@ -7348,6 +7458,172 @@ mod tests {
             unpack_ghidra_call_trace_input(&trailing)
                 .unwrap_err()
                 .contains("trailing")
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_ghidra_call_trace_reads_stripped_elf_rodata_without_seed() {
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("stripped-call-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Stripped Ghidra call trace".to_owned(),
+                    idempotency_key: "create-stripped-call-trace".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let snapshot =
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(binary),
+                    content: binary.to_vec(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, Some(0x2016d0));
+        save_ghidra_snapshot(
+            &store.connection().unwrap(),
+            &project.project_id,
+            &uploaded.binary_sha256,
+            uploaded.revision,
+            &key,
+            Some(0x2016d0),
+            snapshot,
+        )
+        .unwrap();
+
+        for (input_head, expected) in [
+            ("0x43412d5249445948", 1), // HYDIR-AC
+            ("0x43412d5249445968", 0), // hYDIR-AC
+        ] {
+            let seed = json!({
+                "schema_version": 1,
+                "binary_sha256": uploaded.binary_sha256,
+                "entry": {"space": "ram", "offset": "0x2016d0"},
+                "registers": [
+                    {"offset":"0x38", "size":8, "value":"0x700100"},
+                    {"offset":"0x30", "size":8, "value":"0xc"},
+                    {"offset":"0x20", "size":8, "value":"0x700000"},
+                    {"offset":"0x0", "size":8, "value":"0x0"},
+                    {"offset":"0x8", "size":8, "value":"0x0"}
+                ],
+                "memory": [
+                    {"space":"ram", "byte_offset":"0x700000", "size":8, "value":"0xdeadbeef"},
+                    {"space":"ram", "byte_offset":"0x700100", "size":8, "value":input_head},
+                    {"space":"ram", "byte_offset":"0x700108", "size":4, "value":"0x53534543"}
+                ]
+            });
+            let request = api_v3::GhidraCallTraceRequest {
+                project_id: project.project_id.clone(),
+                expected_revision: uploaded.revision,
+                function_entry: "0x2016d0".to_owned(),
+                seed_json: serde_json::to_vec(&seed).unwrap(),
+                max_functions: Some(1),
+                max_operations: Some(2048),
+                max_visits: Some(128),
+                max_depth: Some(1),
+            };
+            let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request, &token))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(artifact.media_type, GHIDRA_CALL_TRACE_MEDIA_TYPE);
+            assert_eq!(artifact.sha256, sha256(&artifact.content));
+            assert_eq!(artifact.project_revision, uploaded.revision);
+            let trace: PcodeInterproceduralTrace =
+                serde_json::from_slice(&artifact.content).unwrap();
+            assert_eq!(trace.segments.len(), 1);
+            assert!(matches!(
+                trace.stop,
+                hydir_ir::pcode::PcodeCallPathStop::Return { .. }
+            ));
+            assert_eq!(
+                trace
+                    .final_state
+                    .read_varnode(&hydir_ir::pcode::PcodeVarnode {
+                        space: "register".to_owned(),
+                        offset: "0x0".to_owned(),
+                        size: 8,
+                    })
+                    .unwrap(),
+                Some(expected)
+            );
+            assert!(trace.segments[0].path.events.iter().any(|event| matches!(
+                event,
+                hydir_ir::pcode::PcodePathEvent::Effect { operation }
+                    if operation.source.source_address.offset == "0x2016f0"
+                        && operation.memory_access.as_ref().is_some_and(|access|
+                            access.byte_offset == 0x2001f0 && access.value == u64::from(b'H'))
+            )));
+        }
+    }
+
+    #[test]
+    fn ghidra_call_image_envelope_rejects_trailing_truncated_and_wrong_binary() {
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let snapshot =
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+        let seed = json!({
+            "schema_version": 1,
+            "binary_sha256": sha256(binary),
+            "entry": {"space": "ram", "offset": "0x2016d0"},
+            "registers": [],
+            "memory": []
+        });
+        let seed = serde_json::to_vec(&seed).unwrap();
+        let snapshots = vec![snapshot.to_vec()];
+        let packed = pack_ghidra_call_image_input(binary, &seed, &snapshots).unwrap();
+        let (unpacked_binary, unpacked_seed, unpacked_snapshots) =
+            unpack_ghidra_call_image_input(&packed).unwrap();
+        assert_eq!(unpacked_binary, binary);
+        assert_eq!(unpacked_seed, seed);
+        assert_eq!(unpacked_snapshots, vec![snapshot.as_slice()]);
+
+        let mut trailing = packed.clone();
+        trailing.push(0);
+        assert!(unpack_ghidra_call_image_input(&trailing).is_err());
+        assert!(unpack_ghidra_call_image_input(&packed[..packed.len() - 1]).is_err());
+        let mut oversized = packed.clone();
+        oversized[8..12].copy_from_slice(&((MAX_BINARY_BYTES + 1) as u32).to_le_bytes());
+        assert!(
+            unpack_ghidra_call_image_input(&oversized)
+                .unwrap_err()
+                .contains("service limits")
+        );
+
+        let selector = serde_json::to_string(&GhidraCallTraceSelector {
+            binary_sha256: sha256(binary),
+            max_operations: 2048,
+            max_visits: 128,
+            max_depth: 1,
+        })
+        .unwrap();
+        let mut tampered = packed;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            ghidra_call_trace_artifact(&tampered, &selector)
+                .unwrap_err()
+                .contains("digest disagrees")
+        );
+        let legacy = pack_ghidra_call_trace_input(&seed, &snapshots).unwrap();
+        assert!(
+            ghidra_call_trace_artifact(&legacy, &selector)
+                .unwrap_err()
+                .contains("requires its revision-bound ELF image")
         );
     }
 
