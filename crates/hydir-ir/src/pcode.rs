@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 pub mod cfg;
 pub mod coverage;
 pub mod execution;
+pub mod image;
 pub mod interprocedural;
 pub mod seed;
 pub mod semantics;
@@ -28,9 +29,11 @@ pub use execution::{
     PcodeMemoryAccessKind, PcodeMemoryBoundaryKind, PcodePathBranchKind, PcodePathDestination,
     PcodePathEvent, PcodePathStop, PcodePathTrace,
 };
+pub use image::PcodeReadOnlyElfImage;
 pub use interprocedural::{
     PCODE_CALL_PATH_VERSION, PcodeCallPathSegment, PcodeCallPathStop, PcodeCallTransition,
-    PcodeInterproceduralTrace, execute_concrete_call_path, unloaded_call_target,
+    PcodeInterproceduralTrace, execute_concrete_call_path, execute_concrete_call_path_with_image,
+    unloaded_call_target,
 };
 pub use seed::{MAX_PCODE_SEED_BYTES, PCODE_SEED_VERSION, parse_pcode_seed};
 pub use semantics::{

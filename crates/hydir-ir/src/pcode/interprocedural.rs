@@ -239,6 +239,44 @@ pub fn execute_concrete_call_path(
     max_instruction_visits: usize,
     max_call_depth: usize,
 ) -> Result<PcodeInterproceduralTrace, String> {
+    execute_concrete_call_path_inner(
+        snapshots,
+        initial_state,
+        None,
+        max_operations,
+        max_instruction_visits,
+        max_call_depth,
+    )
+}
+
+/// Follow calls with immutable, binary-bound ELF LOAD bytes available in all
+/// selected functions. The existing call-path trace format is preserved.
+pub fn execute_concrete_call_path_with_image(
+    snapshots: &[GhidraSnapshot],
+    initial_state: &PcodeConcreteState,
+    image: &super::PcodeReadOnlyElfImage,
+    max_operations: usize,
+    max_instruction_visits: usize,
+    max_call_depth: usize,
+) -> Result<PcodeInterproceduralTrace, String> {
+    execute_concrete_call_path_inner(
+        snapshots,
+        initial_state,
+        Some(image),
+        max_operations,
+        max_instruction_visits,
+        max_call_depth,
+    )
+}
+
+fn execute_concrete_call_path_inner(
+    snapshots: &[GhidraSnapshot],
+    initial_state: &PcodeConcreteState,
+    image: Option<&super::PcodeReadOnlyElfImage>,
+    max_operations: usize,
+    max_instruction_visits: usize,
+    max_call_depth: usize,
+) -> Result<PcodeInterproceduralTrace, String> {
     let root = snapshots
         .first()
         .ok_or("call path requires a root snapshot")?;
@@ -288,12 +326,24 @@ pub fn execute_concrete_call_path(
             break PcodeCallPathStop::SegmentBudget;
         }
         let snapshot = &snapshots[current];
-        let path = snapshot.execute_concrete_path(
-            &state,
-            Some(&start),
-            max_operations.saturating_sub(executed_operations),
-            max_instruction_visits.saturating_sub(instruction_visits),
-        )?;
+        let remaining_operations = max_operations.saturating_sub(executed_operations);
+        let remaining_visits = max_instruction_visits.saturating_sub(instruction_visits);
+        let path = if let Some(image) = image {
+            snapshot.execute_concrete_path_with_image(
+                &state,
+                image,
+                Some(&start),
+                remaining_operations,
+                remaining_visits,
+            )?
+        } else {
+            snapshot.execute_concrete_path(
+                &state,
+                Some(&start),
+                remaining_operations,
+                remaining_visits,
+            )?
+        };
         let events = path
             .events
             .iter()

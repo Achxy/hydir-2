@@ -31,8 +31,8 @@ use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
-    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeSliceTarget, parse_ghidra_snapshot,
-    parse_pcode_seed,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeReadOnlyElfImage,
+    PcodeSliceTarget, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_model::{
     import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
@@ -464,16 +464,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
                 &snapshot,
             )?;
+            let image = pcode_image_or_legacy(&binary, &snapshot)?;
             let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let trace = snapshot.execute_concrete_path(
-                &initial,
-                start.as_ref(),
-                max_operations,
-                max_visits,
-            )?;
+            let trace = if let Some(image) = &image {
+                snapshot.execute_concrete_path_with_image(
+                    &initial,
+                    image,
+                    start.as_ref(),
+                    max_operations,
+                    max_visits,
+                )?
+            } else {
+                snapshot.execute_concrete_path(
+                    &initial,
+                    start.as_ref(),
+                    max_operations,
+                    max_visits,
+                )?
+            };
             let bytes = serde_json::to_vec_pretty(&trace)?;
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
@@ -2703,6 +2714,19 @@ fn read_validation_cases(path: &str) -> Result<Vec<(u64, u64)>, Box<dyn Error>> 
             Ok((parse(&pair[0])?, parse(&pair[1])?))
         })
         .collect()
+}
+
+fn pcode_image_or_legacy(
+    binary: &[u8],
+    snapshot: &GhidraSnapshot,
+) -> Result<Option<PcodeReadOnlyElfImage>, String> {
+    if !PcodeReadOnlyElfImage::has_eligible_blocks(snapshot) {
+        eprintln!(
+            "Hydir: Ghidra snapshot has no loaded read-only RAM blocks; using seed-only P-code memory"
+        );
+        return Ok(None);
+    }
+    PcodeReadOnlyElfImage::from_elf(binary, snapshot).map(Some)
 }
 
 fn read_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {

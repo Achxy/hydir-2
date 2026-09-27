@@ -748,10 +748,89 @@ fn concrete_path_cli_follows_real_ghidra_conditional_branch() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("seed-only P-code memory"));
     let trace: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(trace["start"]["offset"], "0x2013d9");
     assert_eq!(trace["instruction_visits"][1]["offset"], "0x2013e2");
     assert_eq!(trace["events"][0]["kind"], "branch");
     assert_eq!(trace["events"][0]["taken"], true);
     assert_eq!(trace["semantic_fidelity"], "unknown");
+}
+
+#[test]
+fn stripped_secure_equals_cli_uses_binary_rodata_without_manual_seed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/hydir-password-gate-stripped.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+    let digest = format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()));
+    let seed_file = tempfile::NamedTempFile::new().unwrap();
+    for (input_head, expected) in [
+        ("0x43412d5249445948", 1), // HYDIR-AC
+        ("0x43412d5249445968", 0), // hYDIR-AC
+    ] {
+        let seed = json!({
+            "schema_version": 1,
+            "binary_sha256": digest,
+            "entry": {"space": "ram", "offset": "0x2016d0"},
+            "registers": [
+                {"offset":"0x38", "size":8, "value":"0x700100"},
+                {"offset":"0x30", "size":8, "value":"0xc"},
+                {"offset":"0x20", "size":8, "value":"0x700000"},
+                {"offset":"0x0", "size":8, "value":"0x0"},
+                {"offset":"0x8", "size":8, "value":"0x0"}
+            ],
+            "memory": [
+                {"space":"ram", "byte_offset":"0x700000", "size":8, "value":"0xdeadbeef"},
+                {"space":"ram", "byte_offset":"0x700100", "size":8, "value":input_head},
+                {"space":"ram", "byte_offset":"0x700108", "size":4, "value":"0x53534543"}
+            ]
+        });
+        fs::write(seed_file.path(), serde_json::to_vec(&seed).unwrap()).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+            .args(["ghidra-snapshot", "trace-path"])
+            .arg(&binary)
+            .arg(&snapshot)
+            .arg(seed_file.path())
+            .args(["--max-ops", "2048", "--max-visits", "128"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let trace: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            trace["schema_version"],
+            hydir_ir::pcode::PCODE_PATH_TRACE_VERSION
+        );
+        assert_eq!(trace["binary_sha256"], digest);
+        assert_eq!(trace["stop"]["kind"], "return");
+        assert_eq!(trace["final_state"]["register_bytes"]["0"], expected);
+        assert!(trace["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "effect"
+                && event["operation"]["source"]["source_address"]["offset"] == "0x2016f0"
+                && event["operation"]["memory_access"]["byte_offset"] == 0x2001f0
+                && event["operation"]["memory_access"]["value"] == u64::from(b'H')
+        }));
+        if expected == 1 {
+            let calls = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+                .args(["ghidra-snapshot", "trace-calls"])
+                .arg(&binary)
+                .arg(&snapshot)
+                .arg(seed_file.path())
+                .args(["--max-ops", "2048", "--max-visits", "128"])
+                .output()
+                .unwrap();
+            assert!(
+                calls.status.success(),
+                "{}",
+                String::from_utf8_lossy(&calls.stderr)
+            );
+            let call_trace: serde_json::Value = serde_json::from_slice(&calls.stdout).unwrap();
+            assert_eq!(call_trace["stop"]["kind"], "return");
+            assert_eq!(call_trace["segments"].as_array().unwrap().len(), 1);
+            assert_eq!(call_trace["final_state"]["register_bytes"]["0"], 1);
+        }
+    }
 }

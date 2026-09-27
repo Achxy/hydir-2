@@ -17,8 +17,9 @@
 use super::semantics::lower_operation;
 use super::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PCODE_SEMANTIC_IR_VERSION, PcodeAddress,
-    PcodeEffect, PcodeFunctionIr, PcodeOpaqueClass, PcodeOperation, PcodeSemanticFunctionIr,
-    PcodeSemanticOperation, PcodeVarnode, hex_u64, validate_ghidra_snapshot,
+    PcodeEffect, PcodeFunctionIr, PcodeOpaqueClass, PcodeOperation, PcodeReadOnlyElfImage,
+    PcodeSemanticFunctionIr, PcodeSemanticOperation, PcodeVarnode, hex_u64,
+    validate_ghidra_snapshot,
 };
 use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,50 @@ pub struct PcodeConcreteState {
 }
 
 impl PcodeConcreteState {
+    pub(crate) fn validate_readonly_image(
+        &self,
+        image: &PcodeReadOnlyElfImage,
+    ) -> Result<(), String> {
+        if let Some(bytes) = self.memory_bytes.get(&image.space) {
+            for (&address, &value) in bytes {
+                if let Some(expected) = image.byte(&image.space, address) {
+                    if value != expected {
+                        return Err(format!(
+                            "seed byte at {}:0x{address:x} conflicts with binary read-only image",
+                            image.space
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_memory_with_image(
+        &self,
+        space: &str,
+        byte_offset: u64,
+        size: u32,
+        image: Option<&PcodeReadOnlyElfImage>,
+    ) -> Result<Option<u64>, String> {
+        checked_memory_range(byte_offset, size)?;
+        let mut value = 0u64;
+        for index in 0..size {
+            let address = byte_offset + u64::from(index);
+            let byte = self
+                .memory_bytes
+                .get(space)
+                .and_then(|bytes| bytes.get(&address))
+                .copied()
+                .or_else(|| image.and_then(|image| image.byte(space, address)));
+            let Some(byte) = byte else {
+                return Ok(None);
+            };
+            value |= u64::from(byte) << (index * 8);
+        }
+        Ok(Some(value))
+    }
+
     fn known_byte_count(&self) -> usize {
         self.register_bytes
             .len()
@@ -236,6 +281,7 @@ pub enum PcodeMemoryBoundaryKind {
     UnknownBytes,
     AddressOverflow,
     StateLimit,
+    ReadOnlyImageWrite,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -483,6 +529,7 @@ impl PcodeSemanticFunctionIr {
         &self,
         operation: &PcodeSemanticOperation,
         state: &mut PcodeConcreteState,
+        image: Option<&PcodeReadOnlyElfImage>,
     ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
         let source = &operation.source;
         let kind = match (source.opcode, source.mnemonic.as_str()) {
@@ -648,29 +695,45 @@ impl PcodeSemanticFunctionIr {
         })?;
         let mut input_values = vec![u128::from(id), u128::from(pointer_offset)];
         let value = match kind {
-            PcodeMemoryAccessKind::Load => match state.read_memory(&space.name, byte_offset, width)
-            {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return Err(memory_boundary(
-                        source,
-                        Some(&space.name),
-                        Some(pointer_offset),
-                        PcodeMemoryBoundaryKind::UnknownBytes,
-                        "one or more loaded memory bytes are unknown",
-                    ));
+            PcodeMemoryAccessKind::Load => {
+                match state.read_memory_with_image(&space.name, byte_offset, width, image) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return Err(memory_boundary(
+                            source,
+                            Some(&space.name),
+                            Some(pointer_offset),
+                            PcodeMemoryBoundaryKind::UnknownBytes,
+                            "one or more loaded memory bytes are unknown",
+                        ));
+                    }
+                    Err(reason) => {
+                        return Err(memory_boundary(
+                            source,
+                            Some(&space.name),
+                            Some(pointer_offset),
+                            PcodeMemoryBoundaryKind::AddressOverflow,
+                            reason,
+                        ));
+                    }
                 }
-                Err(reason) => {
-                    return Err(memory_boundary(
-                        source,
-                        Some(&space.name),
-                        Some(pointer_offset),
-                        PcodeMemoryBoundaryKind::AddressOverflow,
-                        reason,
-                    ));
-                }
-            },
+            }
             PcodeMemoryAccessKind::Store => {
+                if image.is_some_and(|image| {
+                    (0..width).any(|index| {
+                        image
+                            .byte(&space.name, byte_offset + u64::from(index))
+                            .is_some()
+                    })
+                }) {
+                    return Err(memory_boundary(
+                        source,
+                        Some(&space.name),
+                        Some(pointer_offset),
+                        PcodeMemoryBoundaryKind::ReadOnlyImageWrite,
+                        "STORE targets a byte in the binary read-only image",
+                    ));
+                }
                 let data = &source.inputs[2];
                 match state.read_varnode(data) {
                     Ok(Some(value)) => {
@@ -743,6 +806,7 @@ impl PcodeSemanticFunctionIr {
         &self,
         operation: &PcodeSemanticOperation,
         state: &mut PcodeConcreteState,
+        image: Option<&PcodeReadOnlyElfImage>,
     ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
         let source = &operation.source;
         if source.inputs.len() > 256 || lower_operation(source) != operation.effect {
@@ -756,7 +820,7 @@ impl PcodeSemanticFunctionIr {
                 class,
                 PcodeOpaqueClass::MemoryRead | PcodeOpaqueClass::MemoryWrite
             ) {
-                return self.execute_memory_operation(operation, state);
+                return self.execute_memory_operation(operation, state, image);
             }
             return Err(Box::new(PcodeExecutionStop::OpaqueBoundary {
                 source: source.clone(),
@@ -879,7 +943,47 @@ impl GhidraSnapshot {
         max_operations: usize,
         max_instruction_visits: usize,
     ) -> Result<PcodePathTrace, String> {
+        self.execute_concrete_path_inner(
+            initial_state,
+            None,
+            start,
+            max_operations,
+            max_instruction_visits,
+        )
+    }
+
+    /// Execute with immutable, digest-bound bytes from read-only ELF PT_LOAD
+    /// segments available to LOADs. The caller's mutable state remains sparse;
+    /// conflicting seeded bytes and writes into image bytes are rejected.
+    pub fn execute_concrete_path_with_image(
+        &self,
+        initial_state: &PcodeConcreteState,
+        image: &PcodeReadOnlyElfImage,
+        start: Option<&PcodeAddress>,
+        max_operations: usize,
+        max_instruction_visits: usize,
+    ) -> Result<PcodePathTrace, String> {
+        self.execute_concrete_path_inner(
+            initial_state,
+            Some(image),
+            start,
+            max_operations,
+            max_instruction_visits,
+        )
+    }
+
+    fn execute_concrete_path_inner(
+        &self,
+        initial_state: &PcodeConcreteState,
+        image: Option<&PcodeReadOnlyElfImage>,
+        start: Option<&PcodeAddress>,
+        max_operations: usize,
+        max_instruction_visits: usize,
+    ) -> Result<PcodePathTrace, String> {
         validate_ghidra_snapshot(self, &self.binary_sha256)?;
+        if let Some(image) = image {
+            image.validate_for(self, initial_state)?;
+        }
         if max_instruction_visits > super::MAX_OPERATIONS {
             return Err("P-code path visit budget exceeds artifact limit".to_owned());
         }
@@ -1196,7 +1300,7 @@ impl GhidraSnapshot {
                         }
                     };
                 }
-                _ => match semantic.execute_effect_operation(operation, &mut final_state) {
+                _ => match semantic.execute_effect_operation(operation, &mut final_state, image) {
                     Ok(executed) => {
                         events.push(PcodePathEvent::Effect {
                             operation: executed,
@@ -1263,7 +1367,7 @@ impl PcodeSemanticFunctionIr {
                     };
                     break 'instructions;
                 }
-                match self.execute_effect_operation(operation, &mut final_state) {
+                match self.execute_effect_operation(operation, &mut final_state, None) {
                     Ok(step) => executed.push(step),
                     Err(boundary) => {
                         stop = *boundary;

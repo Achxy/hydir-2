@@ -4,7 +4,8 @@ use super::{read_binary, read_bounded_json, write_new_or_identical};
 use hydir_ghidra_worker as ghidra_worker;
 use hydir_ir::pcode::{
     GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, execute_concrete_call_path,
-    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
+    execute_concrete_call_path_with_image, parse_ghidra_snapshot, parse_pcode_seed,
+    unloaded_call_target,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, error::Error, path::Path};
@@ -64,6 +65,7 @@ fn parse_options<'a>(args: &'a [String], automatic: bool) -> Result<Options<'a>,
 
 fn emit(
     snapshots: &[GhidraSnapshot],
+    binary: &[u8],
     seed_path: &str,
     options: &Options<'_>,
     diagnostics: Vec<String>,
@@ -72,13 +74,25 @@ fn emit(
         &read_bounded_json(seed_path, MAX_PCODE_SEED_BYTES)?,
         &snapshots[0],
     )?;
-    let mut trace = execute_concrete_call_path(
-        snapshots,
-        &seed,
-        options.max_operations,
-        options.max_visits,
-        options.max_depth,
-    )?;
+    let image = super::pcode_image_or_legacy(binary, &snapshots[0])?;
+    let mut trace = if let Some(image) = &image {
+        execute_concrete_call_path_with_image(
+            snapshots,
+            &seed,
+            image,
+            options.max_operations,
+            options.max_visits,
+            options.max_depth,
+        )?
+    } else {
+        execute_concrete_call_path(
+            snapshots,
+            &seed,
+            options.max_operations,
+            options.max_visits,
+            options.max_depth,
+        )?
+    };
     trace.snapshot_diagnostics = diagnostics;
     let bytes = serde_json::to_vec_pretty(&trace)?;
     if let Some(path) = options.output {
@@ -94,7 +108,8 @@ pub fn run_snapshots(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("trace-calls needs binary, root snapshot, and seed".into());
     };
     let options = parse_options(options, false)?;
-    let digest = format!("{:x}", Sha256::digest(read_binary(binary)?));
+    let binary_bytes = read_binary(binary)?;
+    let digest = format!("{:x}", Sha256::digest(&binary_bytes));
     let mut snapshots = Vec::with_capacity(options.callees.len() + 1);
     for path in std::iter::once(root.as_str()).chain(options.callees.iter().copied()) {
         snapshots.push(parse_ghidra_snapshot(
@@ -102,7 +117,7 @@ pub fn run_snapshots(args: &[String]) -> Result<(), Box<dyn Error>> {
             &digest,
         )?);
     }
-    emit(&snapshots, seed, &options, Vec::new())
+    emit(&snapshots, &binary_bytes, seed, &options, Vec::new())
 }
 
 pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -111,7 +126,8 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let options = parse_options(options, true)?;
     let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
-    emit(&snapshots, seed, &options, diagnostics)
+    let binary_bytes = read_binary(binary)?;
+    emit(&snapshots, &binary_bytes, seed, &options, diagnostics)
 }
 
 pub fn run_automatic_llvm(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -138,7 +154,8 @@ fn collect_automatic(
     options: &Options<'_>,
 ) -> Result<(Vec<GhidraSnapshot>, Vec<String>), Box<dyn Error>> {
     let root_entry = options.function.ok_or("missing Ghidra function entry")?;
-    let digest = format!("{:x}", Sha256::digest(read_binary(binary)?));
+    let binary_bytes = read_binary(binary)?;
+    let digest = format!("{:x}", Sha256::digest(&binary_bytes));
     let scratch = tempfile::tempdir()?;
     let root_output = scratch.path().join("function-0.json");
     let root = ghidra_worker::analyze(Path::new(binary), Some(root_entry), &root_output)?;
@@ -151,14 +168,26 @@ fn collect_automatic(
     let mut seen = BTreeSet::from([root_entry]);
     let mut diagnostics = Vec::new();
     let parsed_seed = parse_pcode_seed(&read_bounded_json(seed, MAX_PCODE_SEED_BYTES)?, &root)?;
+    let image = super::pcode_image_or_legacy(&binary_bytes, &root)?;
     loop {
-        let trace = execute_concrete_call_path(
-            &snapshots,
-            &parsed_seed,
-            options.max_operations,
-            options.max_visits,
-            options.max_depth,
-        )?;
+        let trace = if let Some(image) = &image {
+            execute_concrete_call_path_with_image(
+                &snapshots,
+                &parsed_seed,
+                image,
+                options.max_operations,
+                options.max_visits,
+                options.max_depth,
+            )?
+        } else {
+            execute_concrete_call_path(
+                &snapshots,
+                &parsed_seed,
+                options.max_operations,
+                options.max_visits,
+                options.max_depth,
+            )?
+        };
         let Some(target) = unloaded_call_target(&snapshots, &trace)? else {
             break;
         };
