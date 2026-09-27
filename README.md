@@ -80,6 +80,17 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidr
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
 ```
 
+For a stripped ELF with no function names, open
+`tests/fixtures/hydir-password-gate-stripped.elf` in the GUI and select the
+recovered function at `0x2016d0`. The P-code view links its loop, `.rodata`
+load, and bounded trace to disassembly. On Linux, run
+`bash scripts/demo-ghidra-password-lift.sh` to reproduce a fresh automatic
+Ghidra export, coverage and CFG LLVM artifacts, and matching versus mismatching
+password traces. The script writes its artifacts under
+`target/demo-ghidra-password-lift/` and reports both return values. It uses the
+same pinned worker as the GUI; `HYDIR_GHIDRA_HOME` can select a local Ghidra
+12.1.4 installation for development.
+
 Replace the ELF path and function selector with your own. `discover` returns
 FunctionIndex IDs for entries without usable names. The GUI also opens an ELF
 through its local file control. The call trace uses a concrete seed and stops
