@@ -6,8 +6,8 @@ use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_spa
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
 use hydir_ir::pcode::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeExactOp,
-    PcodeOperation, PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode,
-    validate_ghidra_snapshot,
+    PcodeOperation, PcodeReadOnlyElfWindow, PcodeSemanticFunctionIr, PcodeSimplificationArtifact,
+    PcodeVarnode, validate_ghidra_snapshot,
 };
 use hydir_ir::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PCODE_CFG_LLVM_VERSION: u32 = 2;
+pub const PCODE_CFG_IMAGE_LLVM_VERSION: u32 = 3;
+pub const PCODE_CFG_ELF_IMAGE_MAX_BYTES: usize = 65_536;
 pub const PCODE_SIMPLIFIED_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
@@ -52,6 +54,7 @@ pub enum PcodeCfgLlvmStatus {
     CallDepth = 23,
     ReturnMismatch = 24,
     RecursiveCall = 25,
+    MemoryReadOnly = 26,
 }
 
 impl PcodeCfgLlvmStatus {
@@ -82,6 +85,17 @@ pub struct PcodeCfgLlvmStopSite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeCfgLlvmImageBinding {
+    pub space: String,
+    pub base: u64,
+    pub byte_len: usize,
+    pub known_byte_count: usize,
+    /// Hash of the embedded bytes followed by their known-byte mask.
+    pub contents_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PcodeCfgLlvmArtifact {
     pub schema_version: u32,
     pub binary_sha256: String,
@@ -92,6 +106,8 @@ pub struct PcodeCfgLlvmArtifact {
     pub guest_ram_limit_bytes: u64,
     pub byte_map: Vec<PcodeStateByte>,
     pub state_abi: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_image: Option<PcodeCfgLlvmImageBinding>,
     pub llvm_ir: String,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
@@ -231,6 +247,7 @@ fn stop_label(status: PcodeCfgLlvmStatus) -> &'static str {
         PcodeCfgLlvmStatus::CallDepth => "stop_call_depth",
         PcodeCfgLlvmStatus::ReturnMismatch => "stop_return_mismatch",
         PcodeCfgLlvmStatus::RecursiveCall => "stop_recursive_call",
+        PcodeCfgLlvmStatus::MemoryReadOnly => "stop_memory_read_only",
     }
 }
 
@@ -720,11 +737,76 @@ fn memory_layout<'a>(
     })
 }
 
+fn validate_image_window(
+    snapshot: &GhidraSnapshot,
+    image: &PcodeReadOnlyElfWindow,
+) -> Result<PcodeCfgLlvmImageBinding, String> {
+    if image.binary_sha256() != snapshot.binary_sha256 {
+        return Err("read-only ELF image and Ghidra snapshot binary digests differ".into());
+    }
+    let space = snapshot
+        .address_spaces
+        .iter()
+        .find(|space| space.name == image.space() && space.space_type == 1)
+        .ok_or("read-only ELF image space is not a Ghidra RAM space")?;
+    if space.id < 0 {
+        return Err("read-only ELF image space ID is negative".into());
+    }
+    let len = image.bytes().len();
+    if len == 0 || len > PCODE_CFG_ELF_IMAGE_MAX_BYTES || image.known().len() != len {
+        return Err(format!(
+            "read-only ELF image requires equally sized, nonempty bytes and known mask within {} bytes",
+            PCODE_CFG_ELF_IMAGE_MAX_BYTES
+        ));
+    }
+    image
+        .base()
+        .checked_add(len as u64 - 1)
+        .ok_or("read-only ELF image address range overflows u64")?;
+    if image.known().iter().any(|byte| *byte != 0 && *byte != 0xff) {
+        return Err("read-only ELF image known mask contains a partial byte".into());
+    }
+    let known_byte_count = image.known().iter().filter(|byte| **byte == 0xff).count();
+    if known_byte_count == 0 {
+        return Err("read-only ELF image has no known bytes".into());
+    }
+    let mut digest = Sha256::new();
+    digest.update(image.bytes());
+    digest.update(image.known());
+    Ok(PcodeCfgLlvmImageBinding {
+        space: image.space().to_owned(),
+        base: image.base(),
+        byte_len: len,
+        known_byte_count,
+        contents_sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+fn encode_llvm_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut literal = String::with_capacity(bytes.len() * 3);
+    for byte in bytes {
+        write!(&mut literal, "\\{byte:02X}").expect("writing to String does not fail");
+    }
+    literal
+}
+
+fn image_globals(image: &PcodeReadOnlyElfWindow) -> String {
+    format!(
+        "@hydir_elf_image_bytes = private constant [{} x i8] c\"{}\"\n@hydir_elf_image_known = private constant [{} x i8] c\"{}\"\n\n",
+        image.bytes().len(),
+        encode_llvm_bytes(image.bytes()),
+        image.known().len(),
+        encode_llvm_bytes(image.known()),
+    )
+}
+
 fn emit_memory_operation(
     layout: &MemoryLayout<'_>,
     id: usize,
     body: &mut String,
     next_label: &str,
+    image: Option<&PcodeReadOnlyElfWindow>,
 ) -> Result<(), String> {
     let space_id = layout.space.id;
     body.push_str(&format!(
@@ -759,9 +841,22 @@ fn emit_memory_operation(
     let unit = layout.space.addressable_unit_size;
     let last = layout.width - 1;
     body.push_str(&format!(
-        "  %scaled_{id} = call {{ i64, i1 }} @llvm.umul.with.overflow.i64(i64 {pointer}, i64 {unit})\n  %byte_address_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 0\n  %scale_overflow_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 1\n  %last_{id} = call {{ i64, i1 }} @llvm.uadd.with.overflow.i64(i64 %byte_address_{id}, i64 {last})\n  %end_overflow_{id} = extractvalue {{ i64, i1 }} %last_{id}, 1\n  %address_overflow_{id} = or i1 %scale_overflow_{id}, %end_overflow_{id}\n  br i1 %address_overflow_{id}, label %stop_memory_overflow, label %memory_bounds_{id}\nmemory_bounds_{id}:\n  %below_base_{id} = icmp ult i64 %byte_address_{id}, %guest_base\n  %relative_{id} = sub i64 %byte_address_{id}, %guest_base\n  %enough_{id} = icmp uge i64 %guest_len, {}\n  %last_start_{id} = sub i64 %guest_len, {}\n  %inside_{id} = icmp ule i64 %relative_{id}, %last_start_{id}\n  %room_{id} = and i1 %enough_{id}, %inside_{id}\n  %not_below_{id} = xor i1 %below_base_{id}, true\n  %in_bounds_{id} = and i1 %room_{id}, %not_below_{id}\n  br i1 %in_bounds_{id}, label %memory_value_{id}, label %stop_memory_bounds\nmemory_value_{id}:\n",
+        "  %scaled_{id} = call {{ i64, i1 }} @llvm.umul.with.overflow.i64(i64 {pointer}, i64 {unit})\n  %byte_address_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 0\n  %scale_overflow_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 1\n  %last_{id} = call {{ i64, i1 }} @llvm.uadd.with.overflow.i64(i64 %byte_address_{id}, i64 {last})\n  %end_overflow_{id} = extractvalue {{ i64, i1 }} %last_{id}, 1\n  %address_overflow_{id} = or i1 %scale_overflow_{id}, %end_overflow_{id}\n  br i1 %address_overflow_{id}, label %stop_memory_overflow, label %memory_bounds_{id}\nmemory_bounds_{id}:\n  %below_base_{id} = icmp ult i64 %byte_address_{id}, %guest_base\n  %relative_{id} = sub i64 %byte_address_{id}, %guest_base\n  %enough_{id} = icmp uge i64 %guest_len, {}\n  %last_start_{id} = sub i64 %guest_len, {}\n  %inside_{id} = icmp ule i64 %relative_{id}, %last_start_{id}\n  %room_{id} = and i1 %enough_{id}, %inside_{id}\n  %not_below_{id} = xor i1 %below_base_{id}, true\n  %in_bounds_{id} = and i1 %room_{id}, %not_below_{id}\n",
         layout.width, layout.width
     ));
+    if let Some(image) = image.filter(|image| image.space() == layout.space.name) {
+        let image_len = image.bytes().len();
+        let enough = image_len >= layout.width as usize;
+        let last_start = image_len.saturating_sub(layout.width as usize);
+        body.push_str(&format!(
+            "  br i1 %in_bounds_{id}, label %memory_value_{id}, label %memory_image_bounds_{id}\nmemory_image_bounds_{id}:\n  %image_below_{id} = icmp ult i64 %byte_address_{id}, {}\n  %image_relative_{id} = sub i64 %byte_address_{id}, {}\n  %image_inside_{id} = icmp ule i64 %image_relative_{id}, {last_start}\n  %image_not_below_{id} = xor i1 %image_below_{id}, true\n  %image_candidate_{id} = and i1 %image_inside_{id}, %image_not_below_{id}\n  %image_in_bounds_{id} = and i1 %image_candidate_{id}, {}\n  br i1 %image_in_bounds_{id}, label %memory_image_value_{id}, label %stop_memory_bounds\nmemory_value_{id}:\n",
+            image.base(), image.base(), enough
+        ));
+    } else {
+        body.push_str(&format!(
+            "  br i1 %in_bounds_{id}, label %memory_value_{id}, label %stop_memory_bounds\nmemory_value_{id}:\n"
+        ));
+    }
     match layout.kind {
         MemoryKind::Load => {
             let mut known_checks = Vec::new();
@@ -843,6 +938,57 @@ fn emit_memory_operation(
         "memory",
         next_label,
     ));
+    if let Some(image) = image.filter(|image| image.space() == layout.space.name) {
+        body.push_str(&format!("memory_image_value_{id}:\n"));
+        let image_len = image.bytes().len();
+        let mut known_checks = Vec::new();
+        for byte in 0..layout.width {
+            body.push_str(&format!(
+                "  %image_index_{id}_{byte} = add i64 %image_relative_{id}, {byte}\n  %image_known_ptr_{id}_{byte} = getelementptr [{image_len} x i8], ptr @hydir_elf_image_known, i64 0, i64 %image_index_{id}_{byte}\n  %image_known_byte_{id}_{byte} = load i8, ptr %image_known_ptr_{id}_{byte}\n  %image_byte_ok_{id}_{byte} = icmp eq i8 %image_known_byte_{id}_{byte}, -1\n"
+            ));
+            known_checks.push(format!("%image_byte_ok_{id}_{byte}"));
+        }
+        emit_known_guard(
+            &known_checks,
+            &format!("image_{id}"),
+            body,
+            &format!("memory_image_ready_{id}"),
+            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+        );
+        body.push_str(&format!("memory_image_ready_{id}:\n"));
+        if layout.kind == MemoryKind::Store {
+            body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::MemoryReadOnly));
+            return Ok(());
+        }
+        let mut previous = None::<String>;
+        for byte in 0..layout.width {
+            body.push_str(&format!(
+                "  %image_ptr_{id}_{byte} = getelementptr [{image_len} x i8], ptr @hydir_elf_image_bytes, i64 0, i64 %image_index_{id}_{byte}\n  %image_byte_{id}_{byte} = load i8, ptr %image_ptr_{id}_{byte}\n  %image_wide_{id}_{byte} = zext i8 %image_byte_{id}_{byte} to i64\n  %image_part_{id}_{byte} = shl i64 %image_wide_{id}_{byte}, {}\n",
+                byte * 8
+            ));
+            let part = format!("%image_part_{id}_{byte}");
+            if let Some(previous_value) = previous {
+                let name = format!("%image_acc_{id}_{byte}");
+                body.push_str(&format!("  {name} = or i64 {previous_value}, {part}\n"));
+                previous = Some(name);
+            } else {
+                previous = Some(part);
+            }
+        }
+        let result = previous.expect("memory width checked nonzero");
+        let output_space = pcode_space_id(&layout.value.space)?;
+        let output_offset = pcode_offset(layout.value)?;
+        body.push_str(&format!(
+            "  call void @hydir_write_varnode(ptr %state, i32 {output_space}, i64 {output_offset}, i32 {}, i64 {result})\n  call void @hydir_write_varnode(ptr %known, i32 {output_space}, i64 {output_offset}, i32 {}, i64 -1)\n",
+            layout.width, layout.width
+        ));
+        body.push_str(&log_event(
+            id,
+            &format!("%count_{id}"),
+            "image_memory",
+            next_label,
+        ));
+    }
     Ok(())
 }
 
@@ -857,7 +1003,19 @@ pub fn emit_pcode_cfg_llvm(
     start: Option<&PcodeAddress>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
     let semantic = snapshot.pcode_function_ir()?.lower_semantics();
-    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None)
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, None)
+}
+
+/// Emit a v3 module with the validated, immutable ELF bytes embedded in LLVM.
+/// The caller still supplies a separate mutable guest RAM window through the
+/// v2 function parameters. These windows must not overlap at runtime.
+pub fn emit_pcode_cfg_llvm_with_image(
+    snapshot: &GhidraSnapshot,
+    start: Option<&PcodeAddress>,
+    image: &PcodeReadOnlyElfWindow,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    let semantic = snapshot.pcode_function_ir()?.lower_semantics();
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, Some(image))
 }
 
 /// Emit a single bounded LLVM state machine over validated function snapshots.
@@ -905,7 +1063,7 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
         owners,
         max_call_depth,
     };
-    let mut llvm = emit_pcode_cfg_llvm_semantic(root, None, semantic, Some(&context))?;
+    let mut llvm = emit_pcode_cfg_llvm_semantic(root, None, semantic, Some(&context), None)?;
     llvm.state_abi.push_str("; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly");
     Ok(PcodeInterproceduralCfgLlvmArtifact {
         schema_version: PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
@@ -936,6 +1094,7 @@ pub fn emit_pcode_simplified_cfg_llvm(
         start,
         simplification.after.lower_semantics(),
         None,
+        None,
     )?;
     Ok(PcodeSimplifiedCfgLlvmArtifact {
         schema_version: PCODE_SIMPLIFIED_CFG_LLVM_VERSION,
@@ -952,8 +1111,12 @@ fn emit_pcode_cfg_llvm_semantic(
     start: Option<&PcodeAddress>,
     semantic: PcodeSemanticFunctionIr,
     call_context: Option<&CallLlvmContext<'_>>,
+    image: Option<&PcodeReadOnlyElfWindow>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
     snapshot.pcode_cfg_ir()?;
+    let image_binding = image
+        .map(|image| validate_image_window(snapshot, image))
+        .transpose()?;
     if !snapshot.program.language_id.starts_with("x86:LE:64:") {
         return Err("P-code CFG LLVM currently requires x86-64 little endian".into());
     }
@@ -1110,6 +1273,24 @@ fn emit_pcode_cfg_llvm_semantic(
     // Reserve every mapped state byte against the Rust executor's combined
     // one-MiB known-state limit, even if the caller marks all of them known.
     let guest_ram_limit = PCODE_CFG_GUEST_RAM_MAX_BYTES - byte_map.len() as u64;
+    let (image_argument_check, bad_argument_name) = if let Some(image) = image {
+        let image_end = image.base() + image.bytes().len() as u64 - 1;
+        let image_space_id = semantic
+            .address_spaces
+            .iter()
+            .find(|space| space.name == image.space())
+            .expect("validated image RAM space")
+            .id;
+        (
+            format!(
+                "  %bad_image_space = icmp ne i32 %guest_space_id, {image_space_id}\n  %guest_end = add i64 %guest_base, %guest_tail\n  %guest_before_image_end = icmp ule i64 %guest_base, {image_end}\n  %image_before_guest_end = icmp ule i64 {}, %guest_end\n  %overlap_candidate = and i1 %guest_before_image_end, %image_before_guest_end\n  %guest_nonempty = icmp ne i64 %guest_len, 0\n  %image_guest_overlap = and i1 %overlap_candidate, %guest_nonempty\n  %bad_image_window = or i1 %bad_image_space, %image_guest_overlap\n  %bad_image_args = or i1 %bad_args, %bad_image_window\n",
+                image.base()
+            ),
+            "%bad_image_args",
+        )
+    } else {
+        (String::new(), "%bad_args")
+    };
     let mut body = format!(
         "define i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 %guest_space_id, ptr %guest_ram, ptr %guest_known, i64 %guest_base, i64 %guest_len, ptr %events, ptr %event_count, i32 %event_capacity, i32 %max_steps) {{\n\
          entry:\n  %bad_state = icmp eq ptr %state, null\n  %bad_known = icmp eq ptr %known, null\n\
@@ -1130,7 +1311,7 @@ fn emit_pcode_cfg_llvm_semantic(
            %bad_guest_range = or i1 %guest_too_large, %guest_base_overflow\n\
            %bad_bounds = or i1 %bad_steps, %bad_guest_range\n\
            %bad_args = or i1 %bad_ptr, %bad_bounds\n\
-           br i1 %bad_args, label %stop_invalid_args, label %initialize\n\
+           {image_argument_check}br i1 {bad_argument_name}, label %stop_invalid_args, label %initialize\n\
          initialize:\n  store i32 0, ptr %event_count\n  %visit_counter = alloca i32\n\
            store i32 0, ptr %visit_counter\n",
     );
@@ -1425,7 +1606,11 @@ fn emit_pcode_cfg_llvm_semantic(
                             ),
                             (
                                 PcodeCfgLlvmStatus::MemoryOutOfBounds,
-                                "memory access is outside guest RAM window",
+                                if image.is_some() {
+                                    "memory access is outside guest RAM and read-only ELF image windows"
+                                } else {
+                                    "memory access is outside guest RAM window"
+                                },
                             ),
                         ] {
                             stop_site(
@@ -1442,7 +1627,11 @@ fn emit_pcode_cfg_llvm_semantic(
                                 &source.source_address,
                                 Some(operation_index),
                                 PcodeCfgLlvmStatus::MemoryUnknownBytes,
-                                "loaded guest RAM bytes are unknown",
+                                if image.is_some() {
+                                    "loaded guest RAM or read-only ELF image bytes are unknown"
+                                } else {
+                                    "loaded guest RAM bytes are unknown"
+                                },
                             );
                         } else {
                             stop_site(
@@ -1452,8 +1641,24 @@ fn emit_pcode_cfg_llvm_semantic(
                                 PcodeCfgLlvmStatus::UnknownInput,
                                 "STORE data varnode bytes are unknown",
                             );
+                            if image.is_some_and(|image| image.space() == layout.space.name) {
+                                stop_site(
+                                    &mut sites,
+                                    &source.source_address,
+                                    Some(operation_index),
+                                    PcodeCfgLlvmStatus::MemoryUnknownBytes,
+                                    "STORE spans unknown bytes in the read-only ELF image window",
+                                );
+                                stop_site(
+                                    &mut sites,
+                                    &source.source_address,
+                                    Some(operation_index),
+                                    PcodeCfgLlvmStatus::MemoryReadOnly,
+                                    "STORE targets immutable file-backed ELF bytes",
+                                );
+                            }
                         }
-                        emit_memory_operation(&layout, id, &mut body, &next_label)?;
+                        emit_memory_operation(&layout, id, &mut body, &next_label, image)?;
                     }
                     Err((status, reason)) => {
                         stop_site(
@@ -1710,6 +1915,13 @@ fn emit_pcode_cfg_llvm_semantic(
             status.code()
         ));
     }
+    if image.is_some() {
+        body.push_str(&format!(
+            "{}:\n  ret i32 {}\n",
+            stop_label(PcodeCfgLlvmStatus::MemoryReadOnly),
+            PcodeCfgLlvmStatus::MemoryReadOnly.code()
+        ));
+    }
     body.push_str("}\n");
     let mut llvm_ir = format!(
         "; Hydir {} concrete CFG path; equivalence unverified.\n\n",
@@ -1717,6 +1929,9 @@ fn emit_pcode_cfg_llvm_semantic(
     );
     llvm_ir.push_str("declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n");
     llvm_ir.push_str("declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n\n");
+    if let Some(image) = image {
+        llvm_ir.push_str(&image_globals(image));
+    }
     llvm_ir.push_str(&helper_definitions(&byte_map));
     llvm_ir.push('\n');
     llvm_ir.push_str(&helper_ir);
@@ -1725,7 +1940,11 @@ fn emit_pcode_cfg_llvm_semantic(
         return Err("P-code CFG LLVM module exceeds byte limit".into());
     }
     Ok(PcodeCfgLlvmArtifact {
-        schema_version: PCODE_CFG_LLVM_VERSION,
+        schema_version: if image.is_some() {
+            PCODE_CFG_IMAGE_LLVM_VERSION
+        } else {
+            PCODE_CFG_LLVM_VERSION
+        },
         binary_sha256: snapshot.binary_sha256.clone(),
         start,
         source_operations: sources,
@@ -1733,9 +1952,18 @@ fn emit_pcode_cfg_llvm_semantic(
         state_bytes: byte_map.len(),
         guest_ram_limit_bytes: guest_ram_limit,
         byte_map,
-        state_abi: format!(
-            "hydir-pcode-cfg-state-v2: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram, ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; state/known use byte_map; guest arrays hold guest_len bytes in guest_space_id from guest_base byte offset; known byte 0xff, unknown 0x00; event_count initialized by callee after argument validation; event_capacity>=max_steps; guest_len<={guest_ram_limit}; max_steps<=262144; arrays must be separate and allocated to their declared lengths"
-        ),
+        state_abi: if let Some(image) = image {
+            format!(
+                "hydir-pcode-cfg-state-v3: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram, ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; mutable guest arrays hold guest_len bytes in guest_space_id from guest_base byte offset; immutable read-only ELF bytes and known mask are embedded at {} in {}; guest_space_id must match image space ID; guest and image address ranges must not overlap; LOAD requires one full-width known window; STORE to image stops with MemoryReadOnly; known byte 0xff, unknown 0x00; state/known use byte_map; event_count initialized after argument validation; event_capacity>=max_steps; guest_len<={guest_ram_limit}; max_steps<=262144; arrays must be separate and allocated to declared lengths",
+                image.base(),
+                image.space()
+            )
+        } else {
+            format!(
+                "hydir-pcode-cfg-state-v2: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram, ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; state/known use byte_map; guest arrays hold guest_len bytes in guest_space_id from guest_base byte offset; known byte 0xff, unknown 0x00; event_count initialized by callee after argument validation; event_capacity>=max_steps; guest_len<={guest_ram_limit}; max_steps<=262144; arrays must be separate and allocated to their declared lengths"
+            )
+        },
+        read_only_image: image_binding,
         llvm_ir,
         semantic_fidelity: SemanticFidelity::Unknown,
         verification: VerificationStatus::NotRun,
@@ -2051,6 +2279,221 @@ mod tests {
                 Some(expected as u8),
             );
         }
+    }
+
+    #[test]
+    fn stripped_password_secure_equals_two_window_v3_matches_rust() {
+        let snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshot).unwrap();
+        let window = image
+            .materialize_window(PCODE_CFG_ELF_IMAGE_MAX_BYTES)
+            .unwrap();
+        assert!(window.base() <= 0x2001f0);
+        assert!(window.base() + window.bytes().len() as u64 > 0x2001fb);
+        let artifact = emit_pcode_cfg_llvm_with_image(&snapshot, None, &window).unwrap();
+        assert_eq!(artifact.schema_version, PCODE_CFG_IMAGE_LLVM_VERSION);
+        assert_eq!(artifact.read_only_image.as_ref().unwrap().space, "ram");
+        assert!(artifact.state_abi.starts_with("hydir-pcode-cfg-state-v3"));
+        assert!(artifact.llvm_ir.contains("@hydir_elf_image_bytes"));
+        verify(&artifact.llvm_ir);
+        let stack = 0x700000_u64;
+        let input = 0x700100_u64;
+        for first_byte in [b'H', b'h'] {
+            let mut candidate = *b"HYDIR-ACCESS";
+            candidate[0] = first_byte;
+            let expected = u64::from(first_byte == b'H');
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), input).unwrap();
+            seed.write_varnode(&register("0x30", 8), 12).unwrap();
+            seed.write_varnode(&register("0x20", 8), stack).unwrap();
+            seed.write_varnode(&register("0x0", 8), 0).unwrap();
+            seed.write_varnode(&register("0x8", 8), 0).unwrap();
+            seed.write_memory("ram", stack, 8, 0xdeadbeef).unwrap();
+            seed.write_memory(
+                "ram",
+                input,
+                8,
+                u64::from_le_bytes(candidate[..8].try_into().unwrap()),
+            )
+            .unwrap();
+            seed.write_memory(
+                "ram",
+                input + 8,
+                4,
+                u32::from_le_bytes(candidate[8..12].try_into().unwrap()) as u64,
+            )
+            .unwrap();
+            let rust = snapshot
+                .execute_concrete_path_with_image(&seed, &image, None, 1024, 256)
+                .unwrap();
+            assert!(matches!(rust.stop, PcodePathStop::Return { .. }));
+            assert_eq!(
+                rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                Some(expected)
+            );
+            let mut guest = vec![None; (input + 12 - stack) as usize];
+            for (address, source) in [
+                (stack, 0xdeadbeefu64.to_le_bytes().as_slice()),
+                (input, candidate.as_slice()),
+            ] {
+                for (index, byte) in source.iter().enumerate() {
+                    guest[(address - stack) as usize + index] = Some(*byte);
+                }
+            }
+            run_lli_with_guest(
+                &artifact,
+                &seed,
+                &GuestTestMemory {
+                    space_id: 433,
+                    base: stack,
+                    bytes: guest,
+                    expected: Vec::new(),
+                    expected_state: Vec::new(),
+                },
+                1024,
+                PcodeCfgLlvmStatus::Return,
+                &source_event_ids(&artifact, &rust),
+                Some(expected as u8),
+            );
+        }
+    }
+
+    #[test]
+    fn image_window_boundaries_and_legacy_v2_artifact_are_explicit() {
+        let snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshot).unwrap();
+        let window = image
+            .materialize_window(PCODE_CFG_ELF_IMAGE_MAX_BYTES)
+            .unwrap();
+        let artifact = emit_pcode_cfg_llvm_with_image(&snapshot, None, &window).unwrap();
+        let legacy = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        assert_eq!(legacy.schema_version, PCODE_CFG_LLVM_VERSION);
+        assert!(!legacy.llvm_ir.contains("@hydir_elf_image_bytes"));
+        assert!(!legacy.llvm_ir.contains("stop_memory_read_only"));
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("read_only_image")
+                .is_none()
+        );
+        verify(&artifact.llvm_ir);
+        run_lli_with_guest(
+            &artifact,
+            &PcodeConcreteState::default(),
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0x2001f0,
+                bytes: vec![Some(b'H')],
+                expected: Vec::new(),
+                expected_state: Vec::new(),
+            },
+            32,
+            PcodeCfgLlvmStatus::InvalidArguments,
+            &[],
+            None,
+        );
+        run_lli_with_guest(
+            &artifact,
+            &PcodeConcreteState::default(),
+            &GuestTestMemory {
+                space_id: 42,
+                base: 0x700000,
+                bytes: vec![None; 8],
+                expected: Vec::new(),
+                expected_state: Vec::new(),
+            },
+            32,
+            PcodeCfgLlvmStatus::InvalidArguments,
+            &[],
+            None,
+        );
+
+        let mut synthetic = snapshot.clone();
+        let instruction = &mut synthetic.selected_function.instructions[0];
+        instruction.pcode.truncate(1);
+        let operation = &mut instruction.pcode[0];
+        operation.mnemonic = "STORE".into();
+        operation.opcode = 3;
+        operation.output = None;
+        operation.inputs = vec![
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x1b1".into(),
+                size: 4,
+            },
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x2001f0".into(),
+                size: 8,
+            },
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x58".into(),
+                size: 1,
+            },
+        ];
+        let store_artifact = emit_pcode_cfg_llvm_with_image(&synthetic, None, &window).unwrap();
+        verify(&store_artifact.llvm_ir);
+        assert!(
+            store_artifact
+                .stop_sites
+                .iter()
+                .any(|site| site.status == PcodeCfgLlvmStatus::MemoryReadOnly)
+        );
+        let empty_guest = GuestTestMemory {
+            space_id: 433,
+            base: 0x700000,
+            bytes: Vec::new(),
+            expected: Vec::new(),
+            expected_state: Vec::new(),
+        };
+        run_lli_with_guest(
+            &store_artifact,
+            &PcodeConcreteState::default(),
+            &empty_guest,
+            32,
+            PcodeCfgLlvmStatus::MemoryReadOnly,
+            &[],
+            None,
+        );
+        synthetic.selected_function.instructions[0].pcode[0].inputs[1].offset = "0x2001e4".into();
+        let gap_store = emit_pcode_cfg_llvm_with_image(&synthetic, None, &window).unwrap();
+        run_lli_with_guest(
+            &gap_store,
+            &PcodeConcreteState::default(),
+            &empty_guest,
+            32,
+            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+            &[],
+            None,
+        );
+        let operation = &mut synthetic.selected_function.instructions[0].pcode[0];
+        operation.mnemonic = "LOAD".into();
+        operation.opcode = 2;
+        operation.inputs.truncate(2);
+        operation.output = Some(PcodeVarnode {
+            space: "register".into(),
+            offset: "0x0".into(),
+            size: 1,
+        });
+        let gap_load = emit_pcode_cfg_llvm_with_image(&synthetic, None, &window).unwrap();
+        run_lli_with_guest(
+            &gap_load,
+            &PcodeConcreteState::default(),
+            &empty_guest,
+            32,
+            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+            &[],
+            None,
+        );
     }
 
     #[test]
@@ -2495,6 +2938,7 @@ mod tests {
                %events_array = alloca [{event_capacity} x i32]\n\
                %events = getelementptr [{event_capacity} x i32], ptr %events_array, i64 0, i64 0\n\
                 %event_count = alloca i32\n\
+                store i32 0, ptr %event_count\n\
                 call void @llvm.memset.p0.i64(ptr %guest, i8 0, i64 {guest_size}, i1 false)\n\
                 call void @llvm.memset.p0.i64(ptr %guest_mask, i8 0, i64 {guest_size}, i1 false)\n"
         );
