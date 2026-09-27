@@ -3,6 +3,10 @@
 
 use hydir_backend::MAX_BINARY_BYTES;
 use hydir_ir::pcode::{GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, parse_ghidra_snapshot};
+use quick_xml::{
+    Reader, Writer, XmlVersion,
+    events::{BytesStart, Event},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +28,9 @@ const DOCKER_LOG_BYTES: u64 = 16 * 1024;
 const MAX_PROJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PROJECT_ENTRIES: usize = 100_000;
 const MAX_PROJECT_DEPTH: usize = 32;
+const MAX_PROJECT_PROPERTY_BYTES: u64 = 64 * 1024;
+const EXPERT_PROJECT_USER: &str = "hydir";
+const EXPERT_JAVA_OPTIONS: &str = "-Duser.name=hydir";
 
 #[derive(Debug)]
 struct ProjectSelector {
@@ -162,6 +169,135 @@ fn copy_project_file(source: &Path, target: &Path, remaining: &mut u64) -> Resul
     Ok(())
 }
 
+fn owner_state(element: &BytesStart<'_>) -> Result<bool, String> {
+    if element.name().as_ref() != b"STATE" {
+        return Ok(false);
+    }
+    let mut name = None;
+    let mut state_type = None;
+    let mut value = None;
+    let mut count = 0;
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|e| format!("invalid Ghidra project owner XML: {e}"))?;
+        let decoded = attribute
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(|e| format!("invalid Ghidra project owner XML value: {e}"))?;
+        match attribute.key.as_ref() {
+            b"NAME" => name = Some(decoded.into_owned()),
+            b"TYPE" => state_type = Some(decoded.into_owned()),
+            b"VALUE" => value = Some(decoded.into_owned()),
+            _ => {}
+        }
+        count += 1;
+    }
+    if name.as_deref() != Some("OWNER") {
+        return Ok(false);
+    }
+    let owner = value.ok_or("Ghidra project OWNER state has no value")?;
+    if count != 3
+        || state_type.as_deref() != Some("string")
+        || owner.is_empty()
+        || owner.len() > 256
+        || owner.chars().any(char::is_control)
+    {
+        return Err("Ghidra project OWNER state is malformed".into());
+    }
+    Ok(true)
+}
+
+fn normalized_project_owner_xml(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROJECT_PROPERTY_BYTES {
+        return Err("Ghidra project.prp exceeds 64 KiB property limit".into());
+    }
+    std::str::from_utf8(bytes).map_err(|e| format!("Ghidra project.prp is not UTF-8 XML: {e}"))?;
+    let mut reader = Reader::from_reader(bytes);
+    let mut writer = Writer::new(Vec::new());
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut root_seen = false;
+    let mut owner_count = 0;
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| format!("invalid Ghidra project.prp XML: {e}"))?;
+        match event {
+            Event::Start(ref element) => {
+                if path.is_empty() {
+                    if root_seen || element.name().as_ref() != b"FILE_INFO" {
+                        return Err("Ghidra project.prp must have one FILE_INFO root".into());
+                    }
+                    root_seen = true;
+                }
+                if owner_state(element)? {
+                    return Err("Ghidra project OWNER state must be an empty element".into());
+                }
+                path.push(element.name().as_ref().to_vec());
+                writer.write_event(event).map_err(|e| e.to_string())?;
+            }
+            Event::Empty(ref element) => {
+                if path.is_empty() {
+                    return Err("Ghidra project.prp must have one FILE_INFO root".into());
+                }
+                if owner_state(element)? {
+                    if path.as_slice() != [b"FILE_INFO".as_slice(), b"BASIC_INFO".as_slice()]
+                        || owner_count != 0
+                    {
+                        return Err(
+                            "Ghidra project.prp has misplaced or duplicate OWNER state".into()
+                        );
+                    }
+                    owner_count += 1;
+                    let mut replacement = BytesStart::new("STATE");
+                    for attribute in element.attributes() {
+                        let attribute = attribute
+                            .map_err(|e| format!("invalid Ghidra project owner XML: {e}"))?;
+                        if attribute.key.as_ref() == b"VALUE" {
+                            replacement.push_attribute(("VALUE", EXPERT_PROJECT_USER));
+                        } else {
+                            replacement.push_attribute(attribute);
+                        }
+                    }
+                    writer
+                        .write_event(Event::Empty(replacement))
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    writer.write_event(event).map_err(|e| e.to_string())?;
+                }
+            }
+            Event::End(ref element) => {
+                if path.pop().as_deref() != Some(element.name().as_ref()) {
+                    return Err("Ghidra project.prp has mismatched XML elements".into());
+                }
+                writer.write_event(event).map_err(|e| e.to_string())?;
+            }
+            Event::DocType(_) => return Err("Ghidra project.prp must not contain a DTD".into()),
+            Event::Eof => break,
+            _ => writer.write_event(event).map_err(|e| e.to_string())?,
+        }
+    }
+    if !root_seen || !path.is_empty() || owner_count != 1 {
+        return Err("Ghidra project.prp requires exactly one OWNER state".into());
+    }
+    let normalized = writer.into_inner();
+    if normalized.len() as u64 > MAX_PROJECT_PROPERTY_BYTES {
+        return Err("Ghidra project.prp exceeds 64 KiB property limit".into());
+    }
+    Ok(normalized)
+}
+
+fn normalize_staged_project_owner(repository: &Path) -> Result<(), String> {
+    let property = repository.join("project.prp");
+    let size = fs::metadata(&property)
+        .map_err(|e| format!("Ghidra project lacks project.prp: {e}"))?
+        .len();
+    if size == 0 || size > MAX_PROJECT_PROPERTY_BYTES {
+        return Err("Ghidra project.prp exceeds 64 KiB property limit".into());
+    }
+    let bytes =
+        fs::read(&property).map_err(|e| format!("cannot read staged Ghidra project.prp: {e}"))?;
+    let normalized = normalized_project_owner_xml(&bytes)?;
+    atomic_write(&property, &normalized)
+}
+
 fn stage_closed_project(project_file: &Path, staging: &Path) -> Result<String, String> {
     if !project_file
         .extension()
@@ -195,7 +331,7 @@ fn stage_closed_project(project_file: &Path, staging: &Path) -> Result<String, S
     fs::create_dir(&staged_repository)
         .map_err(|e| format!("cannot stage Ghidra repository: {e}"))?;
     let mut entries = 1usize;
-    let mut dirs = vec![(repository, staged_repository, 0usize)];
+    let mut dirs = vec![(repository, staged_repository.clone(), 0usize)];
     while let Some((source, target, depth)) = dirs.pop() {
         checked_source_metadata(&source)?;
         for entry in fs::read_dir(&source)
@@ -226,6 +362,7 @@ fn stage_closed_project(project_file: &Path, staging: &Path) -> Result<String, S
             }
         }
     }
+    normalize_staged_project_owner(&staged_repository)?;
     Ok(name.to_owned())
 }
 
@@ -802,6 +939,13 @@ fn docker_project_args(
     args.insert(image_index + 4, selector.leaf.clone());
     args.insert(image_index + 6, "-readOnly".into());
     args.push(format!("domainPath={}", selector.domain_path));
+    args.splice(
+        image_index..image_index,
+        [
+            "--env".into(),
+            format!("JAVA_TOOL_OPTIONS={EXPERT_JAVA_OPTIONS}"),
+        ],
+    );
     args
 }
 
@@ -829,6 +973,9 @@ fn local_analyze(
     }
     let snapshot = work.join("snapshot.json");
     let mut command = Command::new(&executable);
+    if project_import.is_some() {
+        command.env("JAVA_TOOL_OPTIONS", EXPERT_JAVA_OPTIONS);
+    }
     command
         .arg(project)
         .arg(project_import.map_or("HydirAuto", |s| s.headless_name.as_str()));
@@ -1204,6 +1351,45 @@ pub fn import_project(
 mod tests {
     use super::*;
 
+    const PROJECT_PROPERTY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<FILE_INFO><BASIC_INFO><STATE NAME=\"OWNER\" TYPE=\"string\" VALUE=\"muffin\" /><STATE NAME=\"CUSTOM\" TYPE=\"int\" VALUE=\"42\" /></BASIC_INFO></FILE_INFO>";
+
+    #[test]
+    fn staged_project_owner_is_normalized_without_losing_other_properties() {
+        let normalized = normalized_project_owner_xml(PROJECT_PROPERTY.as_bytes()).unwrap();
+        let text = String::from_utf8(normalized).unwrap();
+        assert!(text.contains("NAME=\"OWNER\" TYPE=\"string\" VALUE=\"hydir\""));
+        assert!(text.contains("NAME=\"CUSTOM\" TYPE=\"int\" VALUE=\"42\""));
+        assert!(PROJECT_PROPERTY.contains("VALUE=\"muffin\""));
+    }
+
+    #[test]
+    fn malformed_project_owner_metadata_is_rejected() {
+        for invalid in [
+            PROJECT_PROPERTY.replace("NAME=\"OWNER\"", "NAME=\"OTHER\""),
+            PROJECT_PROPERTY.replace(
+                "</BASIC_INFO>",
+                "<STATE NAME=\"OWNER\" TYPE=\"string\" VALUE=\"again\" /></BASIC_INFO>",
+            ),
+            PROJECT_PROPERTY.replace("TYPE=\"string\"", "TYPE=\"int\""),
+            PROJECT_PROPERTY.replace(" VALUE=\"muffin\"", ""),
+            PROJECT_PROPERTY.replace("<BASIC_INFO>", "<WRONG>"),
+            PROJECT_PROPERTY.replace("</FILE_INFO>", ""),
+            format!(
+                "<!DOCTYPE FILE_INFO [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>{PROJECT_PROPERTY}"
+            ),
+        ] {
+            assert!(
+                normalized_project_owner_xml(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            normalized_project_owner_xml(&vec![b' '; MAX_PROJECT_PROPERTY_BYTES as usize + 1])
+                .unwrap_err()
+                .contains("64 KiB")
+        );
+    }
+
     #[test]
     fn project_selector_is_exact_and_rejects_ambiguous_paths() {
         let selector = project_selector("Expert", "firmware/main.elf").unwrap();
@@ -1235,6 +1421,7 @@ mod tests {
         let repository = root.path().join("Expert.rep");
         fs::write(&project, b"project").unwrap();
         fs::create_dir(&repository).unwrap();
+        fs::write(repository.join("project.prp"), PROJECT_PROPERTY).unwrap();
         fs::create_dir(repository.join("folder")).unwrap();
         fs::write(repository.join("folder/main.elf.gbf"), b"program").unwrap();
         fs::write(root.path().join("unrelated.txt"), b"secret").unwrap();
@@ -1246,6 +1433,15 @@ mod tests {
             b"program"
         );
         assert!(!staged.join("unrelated.txt").exists());
+        assert_eq!(
+            fs::read_to_string(repository.join("project.prp")).unwrap(),
+            PROJECT_PROPERTY
+        );
+        assert!(
+            fs::read_to_string(staged.join("Expert.rep/project.prp"))
+                .unwrap()
+                .contains("VALUE=\"hydir\"")
+        );
 
         let large = repository.join("oversize");
         File::create(&large)
@@ -1340,6 +1536,10 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg == "-import"));
         assert!(args.windows(2).any(|w| w == ["--network", "none"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--env", "JAVA_TOOL_OPTIONS=-Duser.name=hydir"])
+        );
     }
 
     #[test]

@@ -95,9 +95,11 @@ cargo run -p hydir-cli -- ghidra import-project .\tests\fixtures\ghidra_userop_r
 ```
 
 Hydir copies the `.gpr` and matching `.rep` into isolated system scratch,
-opens only the selected program with analysis disabled and read-only access,
-then validates the domain path, binary digest, and snapshot before writing the
-result. It leaves the source project untouched and runs this expert route
+normalizes the copy's Ghidra project owner for its worker account, and processes
+only the selected program with `-noanalysis -readOnly`. Ghidra checks the
+project owner before processing even with `-readOnly`. Hydir then validates the
+domain path, binary digest, and snapshot before writing the result. It leaves
+the source project untouched and runs this expert route
 fresh on each request. The checked-in
 `tests/fixtures/ghidra_userop_rdtsc_project.zip` is a real Ghidra 12.1.4
 project with the selected function renamed to `hydir_analyst_rdtsc` through
