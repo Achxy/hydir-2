@@ -98,6 +98,8 @@ const MAX_CALL_TRACE_INPUT: usize =
     MAX_CALL_TRACE_FUNCTIONS * (MAX_GHIDRA_SNAPSHOT_BYTES + 4) + MAX_PCODE_SEED_BYTES + 8;
 const GHIDRA_CALL_IMAGE_MAGIC: &[u8; 4] = b"HCIM";
 const MAX_CALL_TRACE_IMAGE_INPUT: usize = MAX_CALL_TRACE_INPUT + MAX_BINARY_BYTES + 12;
+const GHIDRA_SNAPSHOT_IMAGE_MAGIC: &[u8; 4] = b"HSIM";
+const MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT: usize = MAX_GHIDRA_SNAPSHOT_BYTES + MAX_BINARY_BYTES + 12;
 const LEGACY_CALL_IMAGE_DIAGNOSTIC: &str =
     "root Ghidra snapshot has no memory blocks; trace uses seed-only memory";
 const MAX_CALL_TRACE_OPERATIONS: usize = 65_536;
@@ -1816,6 +1818,7 @@ fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
         action,
         "native-artifact"
             | "ghidra-snapshot-artifact"
+            | "ghidra-snapshot-image-artifact"
             | "ghidra-call-trace"
             | "ghidra-call-cfg-llvm"
     ) {
@@ -2291,6 +2294,106 @@ fn unpack_ghidra_call_image_input(bytes: &[u8]) -> Result<(&[u8], &[u8], Vec<&[u
     Ok((binary, seed, snapshots))
 }
 
+/// Worker-only envelope carrying one snapshot and the uploaded ELF bytes.
+/// The digest is checked against the selector inside the isolated worker.
+fn pack_ghidra_snapshot_image_input(snapshot: &[u8], binary: &[u8]) -> Result<Vec<u8>, String> {
+    if snapshot.is_empty() || snapshot.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+        return Err("Ghidra image snapshot must be 1..=16 MiB".to_owned());
+    }
+    if binary.is_empty() || binary.len() > MAX_BINARY_BYTES {
+        return Err("Ghidra image binary must be 1..=64 MiB".to_owned());
+    }
+    let size = 12usize
+        .checked_add(snapshot.len())
+        .and_then(|size| size.checked_add(binary.len()))
+        .ok_or("Ghidra image input length overflow")?;
+    if size > MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT {
+        return Err("Ghidra image input exceeds service limit".to_owned());
+    }
+    let mut packed = Vec::with_capacity(size);
+    packed.extend_from_slice(GHIDRA_SNAPSHOT_IMAGE_MAGIC);
+    packed.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
+    packed.extend_from_slice(&(binary.len() as u32).to_le_bytes());
+    packed.extend_from_slice(snapshot);
+    packed.extend_from_slice(binary);
+    Ok(packed)
+}
+
+fn unpack_ghidra_snapshot_image_input(bytes: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    if bytes.len() > MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT
+        || bytes.get(..4) != Some(GHIDRA_SNAPSHOT_IMAGE_MAGIC)
+    {
+        return Err("Ghidra image envelope header is invalid".to_owned());
+    }
+    let snapshot_size = u32::from_le_bytes(
+        bytes
+            .get(4..8)
+            .ok_or("Ghidra image envelope is truncated")?
+            .try_into()
+            .map_err(|_| "Ghidra image snapshot size is invalid")?,
+    ) as usize;
+    let binary_size = u32::from_le_bytes(
+        bytes
+            .get(8..12)
+            .ok_or("Ghidra image envelope is truncated")?
+            .try_into()
+            .map_err(|_| "Ghidra image binary size is invalid")?,
+    ) as usize;
+    if !(1..=MAX_GHIDRA_SNAPSHOT_BYTES).contains(&snapshot_size)
+        || !(1..=MAX_BINARY_BYTES).contains(&binary_size)
+    {
+        return Err("Ghidra image envelope exceeds service limits".to_owned());
+    }
+    let snapshot_end = 12usize
+        .checked_add(snapshot_size)
+        .ok_or("Ghidra image snapshot length overflow")?;
+    let binary_end = snapshot_end
+        .checked_add(binary_size)
+        .ok_or("Ghidra image binary length overflow")?;
+    if binary_end != bytes.len() {
+        return Err("Ghidra image envelope is truncated or has trailing bytes".to_owned());
+    }
+    let snapshot = bytes
+        .get(12..snapshot_end)
+        .ok_or("Ghidra image snapshot is truncated")?;
+    let binary = bytes
+        .get(snapshot_end..binary_end)
+        .ok_or("Ghidra image binary is truncated")?;
+    Ok((snapshot, binary))
+}
+
+fn ghidra_snapshot_image_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraSnapshotArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra image selector: {error}"))?;
+    if selector.stage != "llvm-cfg-image" {
+        return Err("Ghidra image worker requires llvm-cfg-image stage".to_owned());
+    }
+    validate_ghidra_start_address(&selector.stage, &selector.start_address)?;
+    validate_ghidra_slice_target(
+        &selector.stage,
+        selector.instruction_index,
+        selector.operation_index,
+        selector.input_index,
+    )?;
+    let (snapshot_bytes, binary) = unpack_ghidra_snapshot_image_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("Ghidra image binary digest disagrees with selector".to_owned());
+    }
+    let snapshot = parse_ghidra_snapshot(snapshot_bytes, &selector.binary_sha256)?;
+    let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshot)?;
+    let window = image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+    let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
+        space: snapshot.selected_function.entry.space.clone(),
+        offset: selector.start_address,
+    });
+    serde_json::to_vec(&hydir_decompile::emit_pcode_cfg_llvm_with_image(
+        &snapshot,
+        start.as_ref(),
+        &window,
+    )?)
+    .map_err(|error| error.to_string())
+}
+
 fn ghidra_call_trace_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
     let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
         .map_err(|error| format!("invalid Ghidra call trace selector: {error}"))?;
@@ -2372,6 +2475,7 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
         "coverage" => Some("application/vnd.hydir.pcode-coverage+json;version=1"),
         "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
+        "llvm-cfg-image" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=3"),
         "llvm-cfg-simplified" => {
             Some("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1")
         }
@@ -2407,7 +2511,7 @@ fn validate_ghidra_start_address(stage: &str, address: &str) -> Result<(), Strin
     if address.is_empty() {
         return Ok(());
     }
-    if !matches!(stage, "llvm-cfg" | "llvm-cfg-simplified") {
+    if !matches!(stage, "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-simplified") {
         return Err("start address is supported only for CFG LLVM stages".to_owned());
     }
     let digits = address
@@ -3051,6 +3155,9 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             native_artifact_with_model(binary, selector, Some(model))
         }
         ("ghidra-snapshot-artifact", Some(selector)) => ghidra_snapshot_artifact(bytes, selector),
+        ("ghidra-snapshot-image-artifact", Some(selector)) => {
+            ghidra_snapshot_image_artifact(bytes, selector)
+        }
         ("ghidra-call-trace", Some(selector)) => ghidra_call_trace_artifact(bytes, selector),
         ("ghidra-call-cfg-llvm", Some(selector)) => ghidra_call_cfg_llvm_artifact(bytes, selector),
         ("inspect", None) => import_elf(bytes)
@@ -3299,6 +3406,7 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("native-artifact-model") => MAX_BINARY_BYTES + MAX_MODEL_BYTES + 4,
         Some("ghidra-call-trace") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
+        Some("ghidra-snapshot-image-artifact") => MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT,
         _ => MAX_BINARY_BYTES,
     };
     std::io::stdin()
@@ -5228,6 +5336,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             input.input_index,
         )
         .map_err(Status::invalid_argument)?;
+        let image_stage = input.stage == "llvm-cfg-image";
         let automatic = input.automatic;
         if automatic && !input.snapshot_json.is_empty() {
             return Err(Status::invalid_argument(
@@ -5299,8 +5408,17 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         } else {
             input.snapshot_json
         };
-        let content =
-            run_worker("ghidra-snapshot-artifact", Some(&selector), snapshot_json).await?;
+        let (action, worker_input) = if image_stage {
+            let binary = self
+                .current_binary(&principal, &input.project_id, input.expected_revision)
+                .await?;
+            let envelope = pack_ghidra_snapshot_image_input(&snapshot_json, &binary)
+                .map_err(Status::resource_exhausted)?;
+            ("ghidra-snapshot-image-artifact", envelope)
+        } else {
+            ("ghidra-snapshot-artifact", snapshot_json)
+        };
+        let content = run_worker(action, Some(&selector), worker_input).await?;
         // Do not attach an artifact to a revision that ceased to be current
         // while the isolated worker was processing the snapshot.
         let current = self.project(&principal, &input.project_id)?;
@@ -7458,6 +7576,164 @@ mod tests {
             unpack_ghidra_call_trace_input(&trailing)
                 .unwrap_err()
                 .contains("trailing")
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_ghidra_image_llvm_uses_revision_binary_and_preserves_v2_stage() {
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("stripped-image-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Stripped image LLVM".to_owned(),
+                    idempotency_key: "create-stripped-image-llvm".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let snapshot =
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(binary),
+                    content: binary.to_vec(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = |stage: &str, automatic: bool| api_v3::GhidraSnapshotArtifactRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            snapshot_json: if automatic {
+                Vec::new()
+            } else {
+                snapshot.to_vec()
+            },
+            stage: stage.to_owned(),
+            start_address: "0x2016d0".to_owned(),
+            instruction_index: None,
+            operation_index: None,
+            input_index: None,
+            selected_function_entry: if automatic {
+                "0x2016d0".to_owned()
+            } else {
+                String::new()
+            },
+            automatic,
+        };
+
+        let v2 = HydirV3::analyze_ghidra_snapshot(
+            &store,
+            authorized(request("llvm-cfg", false), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            v2.media_type,
+            "application/vnd.hydir.pcode-cfg-llvm+json;version=2"
+        );
+        let old: serde_json::Value = serde_json::from_slice(&v2.content).unwrap();
+        assert_eq!(old["schema_version"], 2);
+        assert!(old.get("read_only_image").is_none());
+
+        let key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, Some(0x2016d0));
+        save_ghidra_snapshot(
+            &store.connection().unwrap(),
+            &project.project_id,
+            &uploaded.binary_sha256,
+            uploaded.revision,
+            &key,
+            Some(0x2016d0),
+            snapshot,
+        )
+        .unwrap();
+        for automatic in [false, true] {
+            let artifact = HydirV3::analyze_ghidra_snapshot(
+                &store,
+                authorized(request("llvm-cfg-image", automatic), &token),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(artifact.project_revision, uploaded.revision);
+            assert_eq!(artifact.sha256, sha256(&artifact.content));
+            assert_eq!(
+                artifact.media_type,
+                "application/vnd.hydir.pcode-cfg-llvm+json;version=3"
+            );
+            let result: serde_json::Value = serde_json::from_slice(&artifact.content).unwrap();
+            assert_eq!(result["schema_version"], 3);
+            assert_eq!(result["binary_sha256"], uploaded.binary_sha256);
+            assert_eq!(result["start"]["offset"], "0x2016d0");
+            assert_eq!(result["read_only_image"]["space"], "ram");
+            assert_eq!(result["read_only_image"]["base"], 0x200000);
+            assert!(result["read_only_image"]["byte_len"].as_u64().unwrap() > 0x1f0);
+            assert!(
+                result["read_only_image"]["known_byte_count"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert!(
+                result["llvm_ir"]
+                    .as_str()
+                    .unwrap()
+                    .contains("@hydir_elf_image_bytes")
+            );
+        }
+
+        let mut stale = request("llvm-cfg-image", false);
+        stale.expected_revision = 0;
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+    }
+
+    #[test]
+    fn ghidra_snapshot_image_envelope_rejects_corruption() {
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let snapshot =
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+        let packed = pack_ghidra_snapshot_image_input(snapshot, binary).unwrap();
+        let (unpacked_snapshot, unpacked_binary) =
+            unpack_ghidra_snapshot_image_input(&packed).unwrap();
+        assert_eq!(unpacked_snapshot, snapshot);
+        assert_eq!(unpacked_binary, binary);
+        let mut trailing = packed.clone();
+        trailing.push(0);
+        assert!(unpack_ghidra_snapshot_image_input(&trailing).is_err());
+        assert!(unpack_ghidra_snapshot_image_input(&packed[..packed.len() - 1]).is_err());
+        let mut tampered = packed;
+        *tampered.last_mut().unwrap() ^= 1;
+        let selector = serde_json::to_string(&GhidraSnapshotArtifactSelector {
+            stage: "llvm-cfg-image".to_owned(),
+            binary_sha256: sha256(binary),
+            start_address: "0x2016d0".to_owned(),
+            instruction_index: None,
+            operation_index: None,
+            input_index: None,
+        })
+        .unwrap();
+        assert!(
+            ghidra_snapshot_image_artifact(&tampered, &selector)
+                .unwrap_err()
+                .contains("digest disagrees")
         );
     }
 
