@@ -4786,21 +4786,22 @@ impl AnalystApp {
                             );
                             self.status = "Disassembly discarded".to_owned();
                         } else {
-                            self.status = format!(
+                            let status = format!(
                                 "Disassembled {} instructions across {} executable sections",
                                 report.instructions.len(),
                                 report.sections.len()
                             );
-                            self.history.push(self.status.clone());
+                            self.history.push(status.clone());
                             self.disassembly_report = Some(report);
                             if let Some(address) = self.pending_recipe_address.take() {
                                 self.selected_address = Some(address);
                             }
                             if !automatic {
+                                self.status = status;
                                 self.console_json = false;
                                 self.tab = Tab::Bytes;
+                                self.failure = None;
                             }
-                            self.failure = None;
                         }
                     }
                     Err(error) => {
@@ -13023,7 +13024,7 @@ mod tests {
         sender
             .send(Event::GhidraAnalyzed {
                 binary_sha256: spec.binary_sha256.clone(),
-                result: Ok((snapshot.clone(), None)),
+                result: Ok((snapshot.clone(), Some("snapshot save failed".to_owned()))),
             })
             .unwrap();
         app.poll();
@@ -13056,6 +13057,7 @@ mod tests {
         app.poll();
         assert!(matches!(app.tab, Tab::GhidraPcode));
         assert!(app.disassembly_report.is_some());
+        assert_eq!(app.failure.as_deref(), Some("snapshot save failed"));
 
         app.tab = Tab::Bytes;
         sender
