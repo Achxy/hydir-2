@@ -137,6 +137,8 @@ jobs:
             --probe-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf 0x2015d0
           cargo run --locked -p hydir-gui --bin hydir -- \
             --probe-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf 0x2016d0
+      - name: Reproduce the stripped password lifting demo
+        run: bash scripts/demo-ghidra-password-lift.sh
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"
