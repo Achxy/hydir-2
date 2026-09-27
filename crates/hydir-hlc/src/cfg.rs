@@ -2506,6 +2506,9 @@ fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Re
 pub fn emit_typed_cfg_c(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<String, String> {
     validate_structure(model)?;
     validate_high_level_cfg_cir(ir)?;
+    if ir.name.starts_with('_') {
+        return Err("typed CFG function name is reserved at file scope".to_owned());
+    }
     if ir.binary_sha256 != model.binary_sha256 || ir.model_revision != model.revision {
         return Err("typed CFG model identity/revision differs".to_owned());
     }

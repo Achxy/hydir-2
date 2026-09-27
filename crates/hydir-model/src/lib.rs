@@ -468,7 +468,9 @@ pub fn validate_model(bytes: &[u8], model: &AnalysisModel) -> Result<(), String>
     Ok(())
 }
 
-fn valid_identifier(name: &str) -> bool {
+/// Whether a name is an ASCII C11 identifier rather than a C11 keyword.
+/// Callers emitting file-scope names must also handle reserved leading underscores.
+pub fn is_c11_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()
@@ -492,9 +494,11 @@ fn valid_identifier(name: &str) -> bool {
                 | "for"
                 | "goto"
                 | "if"
+                | "inline"
                 | "int"
                 | "long"
                 | "register"
+                | "restrict"
                 | "return"
                 | "short"
                 | "signed"
@@ -509,7 +513,20 @@ fn valid_identifier(name: &str) -> bool {
                 | "volatile"
                 | "while"
                 | "_Bool"
+                | "_Alignas"
+                | "_Alignof"
+                | "_Atomic"
+                | "_Complex"
+                | "_Generic"
+                | "_Imaginary"
+                | "_Noreturn"
+                | "_Static_assert"
+                | "_Thread_local"
         )
+}
+
+fn valid_identifier(name: &str) -> bool {
+    is_c11_identifier(name)
 }
 
 fn type_size(

@@ -1,9 +1,29 @@
 use hydir_decompile::decompile_symbol;
 use hydir_model::{
     ModelSource, PrimitiveType, TypeDefinitionKind, TypeRef, import_dwarf, infer_model, init_model,
-    parse_model, record_analyst_edits, validate_model,
+    is_c11_identifier, parse_model, record_analyst_edits, validate_model,
 };
 use std::{fs, path::PathBuf, process::Command};
+
+#[test]
+fn model_names_reject_all_c11_keywords() {
+    for keyword in [
+        "inline",
+        "restrict",
+        "_Alignas",
+        "_Alignof",
+        "_Atomic",
+        "_Complex",
+        "_Generic",
+        "_Imaginary",
+        "_Noreturn",
+        "_Static_assert",
+        "_Thread_local",
+    ] {
+        assert!(!is_c11_identifier(keyword), "{keyword}");
+    }
+    assert!(is_c11_identifier("analyst_word_2"));
+}
 
 #[test]
 fn dwarf_import_recovers_array_and_recursive_pointer_layout() {

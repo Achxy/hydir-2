@@ -118,47 +118,7 @@ fn u64_type() -> TypeRef {
 }
 
 fn valid_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && !matches!(
-            name,
-            "auto"
-                | "break"
-                | "case"
-                | "char"
-                | "const"
-                | "continue"
-                | "default"
-                | "do"
-                | "double"
-                | "else"
-                | "enum"
-                | "extern"
-                | "float"
-                | "for"
-                | "goto"
-                | "if"
-                | "int"
-                | "long"
-                | "register"
-                | "return"
-                | "short"
-                | "signed"
-                | "sizeof"
-                | "static"
-                | "struct"
-                | "switch"
-                | "typedef"
-                | "union"
-                | "unsigned"
-                | "void"
-                | "volatile"
-                | "while"
-                | "_Bool"
-        )
+    hydir_model::is_c11_identifier(name)
 }
 
 fn validate_expr(expr: &HighExpr, declared: &BTreeSet<String>, depth: usize) -> Result<(), String> {

@@ -35,6 +35,13 @@ fn direct_call_views_compile_and_match_source_at_o0_and_o2() {
         assert!(import_dwarf(&bytes, &mut model).unwrap() > 0);
         let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
         let c = emit_typed_c(&ir, &model).unwrap();
+        let mut reserved_name = ir.clone();
+        reserved_name.name = "_hidden".to_owned();
+        assert!(
+            emit_typed_c(&reserved_name, &model)
+                .unwrap_err()
+                .contains("file-scope C11 identifier")
+        );
         let mut wrong_arity = ir.clone();
         for statement in &mut wrong_arity.statements {
             if let HighStatement::Let {

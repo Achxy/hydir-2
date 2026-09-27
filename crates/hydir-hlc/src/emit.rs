@@ -4,7 +4,8 @@ use crate::{
 };
 use hydir_core::Location;
 use hydir_model::{
-    AnalysisModel, PrimitiveType, TypeDefinition, TypeDefinitionKind, TypeRef, validate_structure,
+    AnalysisModel, PrimitiveType, TypeDefinition, TypeDefinitionKind, TypeRef, is_c11_identifier,
+    validate_structure,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -328,6 +329,9 @@ pub fn emit_typed_c(ir: &HighLevelCir, model: &AnalysisModel) -> Result<String, 
     {
         return Err("typed C artifact identity/model revision differs".to_owned());
     }
+    if !is_c11_identifier(&ir.name) || ir.name.starts_with('_') {
+        return Err("typed C function name is not a usable file-scope C11 identifier".to_owned());
+    }
     let mut used = BTreeSet::new();
     collect_used_types(&ir.return_type, model, &mut used, 0)?;
     for parameter in &ir.parameters {
@@ -351,6 +355,11 @@ pub fn emit_typed_c(ir: &HighLevelCir, model: &AnalysisModel) -> Result<String, 
         }
     }
     for (callee, (name, arity)) in &calls {
+        if !is_c11_identifier(name) || name.starts_with('_') {
+            return Err(
+                "typed C call target name is not a usable file-scope C11 identifier".to_owned(),
+            );
+        }
         if *callee != ir.entry && *name == ir.name {
             return Err("typed C call target collides with emitted function name".to_owned());
         }
