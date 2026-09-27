@@ -268,9 +268,19 @@ pub fn emit_pcode_exact_operation_llvm(
             "%result".to_owned()
         }
         PcodeExactOp::BooleanNegate => {
+            body.push_str(&format!("  %result = xor i8 {}, 1\n", operands[0]));
+            "%result".to_owned()
+        }
+        PcodeExactOp::BooleanXor | PcodeExactOp::BooleanAnd | PcodeExactOp::BooleanOr => {
+            let instruction = match kind {
+                PcodeExactOp::BooleanXor => "xor",
+                PcodeExactOp::BooleanAnd => "and",
+                PcodeExactOp::BooleanOr => "or",
+                _ => unreachable!(),
+            };
             body.push_str(&format!(
-                "  %comparison = icmp eq i8 {}, 0\n  %result = zext i1 %comparison to i8\n",
-                operands[0]
+                "  %result = {instruction} i8 {}, {}\n",
+                operands[0], operands[1]
             ));
             "%result".to_owned()
         }
@@ -337,6 +347,42 @@ pub fn emit_pcode_exact_operation_llvm(
             } else {
                 body.push_str(&format!(
                     "  %result = trunc i64 %pop_count to {result_type}\n"
+                ));
+                "%result".to_owned()
+            }
+        }
+        PcodeExactOp::LeadingZeroCount => {
+            let input_bits = operation.source.inputs[0].size * 8;
+            let wide_input = if input_bits == 64 {
+                operands[0].clone()
+            } else {
+                body.push_str(&format!(
+                    "  %lz_input = zext i{input_bits} {} to i64\n",
+                    operands[0]
+                ));
+                "%lz_input".to_owned()
+            };
+            // Each step shifts away a known-zero high region. The zero input
+            // needs one final count; subtract the zero-extension padding.
+            let mut current = wide_input.clone();
+            let mut total = "0".to_owned();
+            for (step, threshold) in [(32, 32), (16, 48), (8, 56), (4, 60), (2, 62), (1, 63)] {
+                body.push_str(&format!(
+                    "  %lz_small_{step} = icmp ult i64 {current}, {}\n  %lz_step_{step} = select i1 %lz_small_{step}, i64 {step}, i64 0\n  %lz_shifted_{step} = shl i64 {current}, %lz_step_{step}\n  %lz_total_{step} = add i64 {total}, %lz_step_{step}\n",
+                    1u64 << threshold
+                ));
+                current = format!("%lz_shifted_{step}");
+                total = format!("%lz_total_{step}");
+            }
+            body.push_str(&format!(
+                "  %lz_zero = icmp eq i64 {wide_input}, 0\n  %lz_zero_adjust = zext i1 %lz_zero to i64\n  %lz_count64 = add i64 {total}, %lz_zero_adjust\n  %lz_unpadded = sub i64 %lz_count64, {}\n",
+                64 - input_bits
+            ));
+            if result_bits == 64 {
+                "%lz_unpadded".to_owned()
+            } else {
+                body.push_str(&format!(
+                    "  %result = trunc i64 %lz_unpadded to {result_type}\n"
                 ));
                 "%result".to_owned()
             }
@@ -570,9 +616,13 @@ mod tests {
             31 => PcodeExactOp::ArithmeticShiftRight,
             32 => PcodeExactOp::Multiply,
             37 => PcodeExactOp::BooleanNegate,
+            38 => PcodeExactOp::BooleanXor,
+            39 => PcodeExactOp::BooleanAnd,
+            40 => PcodeExactOp::BooleanOr,
             62 => PcodeExactOp::Piece,
             63 => PcodeExactOp::Subpiece,
             72 => PcodeExactOp::PopCount,
+            73 => PcodeExactOp::LeadingZeroCount,
             _ => panic!("unexpected opcode"),
         };
         PcodeSemanticOperation {
@@ -658,10 +708,15 @@ mod tests {
             (31, "INT_SRIGHT", 1, vec![1, 8]),
             (32, "INT_MULT", 1, vec![1, 1]),
             (37, "BOOL_NEGATE", 1, vec![1]),
+            (38, "BOOL_XOR", 1, vec![1, 1]),
+            (39, "BOOL_AND", 1, vec![1, 1]),
+            (40, "BOOL_OR", 1, vec![1, 1]),
             (62, "PIECE", 8, vec![4, 4]),
             (63, "SUBPIECE", 4, vec![8, 1]),
             (72, "POPCOUNT", 1, vec![8]),
             (72, "POPCOUNT", 8, vec![1]),
+            (73, "LZCOUNT", 1, vec![8]),
+            (73, "LZCOUNT", 8, vec![1]),
         ] {
             let mut op = operation(opcode, mnemonic, output, &inputs);
             if opcode == 63 {
@@ -746,6 +801,13 @@ mod tests {
             (32, "INT_MULT", 1, &[1, 1], &[0x80, 3]),
             (37, "BOOL_NEGATE", 1, &[1], &[0]),
             (37, "BOOL_NEGATE", 1, &[1], &[1]),
+            (37, "BOOL_NEGATE", 1, &[1], &[2]),
+            (38, "BOOL_XOR", 1, &[1, 1], &[1, 0]),
+            (38, "BOOL_XOR", 1, &[1, 1], &[2, 1]),
+            (39, "BOOL_AND", 1, &[1, 1], &[2, 1]),
+            (39, "BOOL_AND", 1, &[1, 1], &[2, 0]),
+            (40, "BOOL_OR", 1, &[1, 1], &[0, 2]),
+            (40, "BOOL_OR", 1, &[1, 1], &[0, 0]),
             (62, "PIECE", 8, &[4, 4], &[0x1122_3344, 0x5566_7788]),
             (63, "SUBPIECE", 4, &[8, 1], &[0x1122_3344_5566_7788, 2]),
             (63, "SUBPIECE", 1, &[8, 1], &[0x1122_3344_5566_7788, 7]),
@@ -753,6 +815,11 @@ mod tests {
             (72, "POPCOUNT", 1, &[8], &[u64::MAX]),
             (72, "POPCOUNT", 8, &[1], &[0x81]),
             (72, "POPCOUNT", 1, &[8], &[0]),
+            (73, "LZCOUNT", 1, &[1], &[0]),
+            (73, "LZCOUNT", 8, &[1], &[1]),
+            (73, "LZCOUNT", 1, &[3], &[0x80_0000]),
+            (73, "LZCOUNT", 1, &[8], &[0]),
+            (73, "LZCOUNT", 8, &[8], &[1]),
         ];
         for &(opcode, mnemonic, output, inputs, values) in cases {
             let mut op = operation(opcode, mnemonic, output, inputs);

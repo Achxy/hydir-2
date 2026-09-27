@@ -1671,6 +1671,70 @@ mod tests {
     }
 
     #[test]
+    fn leading_zero_and_boolean_ops_execute_in_source_order() {
+        let f = function(vec![
+            operation(
+                73,
+                "LZCOUNT",
+                0,
+                Some(node("unique", "0x10", 1)),
+                vec![node("register", "0x0", 1)],
+            ),
+            operation(
+                37,
+                "BOOL_NEGATE",
+                1,
+                Some(node("unique", "0x11", 1)),
+                vec![node("const", "0x2", 1)],
+            ),
+            operation(
+                38,
+                "BOOL_XOR",
+                2,
+                Some(node("register", "0x1", 1)),
+                vec![node("unique", "0x10", 1), node("unique", "0x11", 1)],
+            ),
+            operation(
+                39,
+                "BOOL_AND",
+                3,
+                Some(node("register", "0x2", 1)),
+                vec![node("register", "0x1", 1), node("const", "0x1", 1)],
+            ),
+            operation(
+                40,
+                "BOOL_OR",
+                4,
+                Some(node("register", "0x3", 1)),
+                vec![node("register", "0x2", 1), node("const", "0x2", 1)],
+            ),
+        ]);
+        let mut seed = PcodeConcreteState::default();
+        seed.write_varnode(&node("register", "0x0", 1), 0x10)
+            .unwrap();
+        let trace = f.execute_exact_prefix(&seed, 8).unwrap();
+        assert_eq!(
+            trace
+                .executed
+                .iter()
+                .map(|op| op.output_value)
+                .collect::<Vec<_>>(),
+            vec![Some(3), Some(3), Some(0), Some(0), Some(2)]
+        );
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode(&node("register", "0x3", 1))
+                .unwrap(),
+            Some(2)
+        );
+        assert!(matches!(
+            trace.stop,
+            PcodeExecutionStop::EndOfListedInstructions
+        ));
+    }
+
+    #[test]
     fn overlapping_register_slices_and_read_before_write_are_little_endian() {
         let operations = vec![
             operation(

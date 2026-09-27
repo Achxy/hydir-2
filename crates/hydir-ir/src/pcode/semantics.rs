@@ -42,9 +42,13 @@ pub enum PcodeExactOp {
     ArithmeticShiftRight,
     Multiply,
     BooleanNegate,
+    BooleanXor,
+    BooleanAnd,
+    BooleanOr,
     Piece,
     Subpiece,
     PopCount,
+    LeadingZeroCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -242,7 +246,12 @@ impl PcodeSemanticOperation {
             PcodeExactOp::And => values[0] & values[1],
             PcodeExactOp::Or => values[0] | values[1],
             PcodeExactOp::Multiply => values[0].wrapping_mul(values[1]),
-            PcodeExactOp::BooleanNegate => u64::from(values[0] == 0),
+            // Ghidra's emulator applies these to the full byte. Canonical
+            // Boolean inputs still produce 0 or 1.
+            PcodeExactOp::BooleanNegate => values[0] ^ 1,
+            PcodeExactOp::BooleanXor => values[0] ^ values[1],
+            PcodeExactOp::BooleanAnd => values[0] & values[1],
+            PcodeExactOp::BooleanOr => values[0] | values[1],
             PcodeExactOp::Piece => (values[0] << widths[1]) | values[1],
             PcodeExactOp::Subpiece => values[0] >> (values[1] * 8),
             PcodeExactOp::Equal => u64::from(values[0] == values[1]),
@@ -278,6 +287,9 @@ impl PcodeSemanticOperation {
                 }
             }
             PcodeExactOp::PopCount => u64::from(values[0].count_ones()),
+            PcodeExactOp::LeadingZeroCount => {
+                u64::from(values[0].leading_zeros() - (64 - widths[0]))
+            }
         };
         Ok(Some(result & mask(result_width_bits)))
     }
@@ -323,9 +335,13 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         31 => (Op::ArithmeticShiftRight, "INT_SRIGHT"),
         32 => (Op::Multiply, "INT_MULT"),
         37 => (Op::BooleanNegate, "BOOL_NEGATE"),
+        38 => (Op::BooleanXor, "BOOL_XOR"),
+        39 => (Op::BooleanAnd, "BOOL_AND"),
+        40 => (Op::BooleanOr, "BOOL_OR"),
         62 => (Op::Piece, "PIECE"),
         63 => (Op::Subpiece, "SUBPIECE"),
         72 => (Op::PopCount, "POPCOUNT"),
+        73 => (Op::LeadingZeroCount, "LZCOUNT"),
         _ => return None,
     })
 }
@@ -398,6 +414,9 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
                 sizes.as_slice() == [output.size]
             }
             PcodeExactOp::BooleanNegate => output.size == 1 && sizes.as_slice() == [1],
+            PcodeExactOp::BooleanXor | PcodeExactOp::BooleanAnd | PcodeExactOp::BooleanOr => {
+                output.size == 1 && sizes.as_slice() == [1, 1]
+            }
             PcodeExactOp::Piece => sizes.len() == 2 && sizes[0] + sizes[1] == output.size,
             PcodeExactOp::Subpiece => {
                 sizes.len() == 2
@@ -409,7 +428,7 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
             }
             // Ghidra permits independent input and output widths. Within our
             // 64-bit bound the count (0..=64) fits even a one-byte output.
-            PcodeExactOp::PopCount => sizes.len() == 1,
+            PcodeExactOp::PopCount | PcodeExactOp::LeadingZeroCount => sizes.len() == 1,
             PcodeExactOp::ZeroExtend | PcodeExactOp::SignExtend => {
                 sizes.len() == 1 && sizes[0] < output.size
             }
@@ -777,6 +796,60 @@ mod tests {
             op(72, "POPCOUNT", Some(1), &[1, 1]),
             op(72, "POPCOUNT", Some(1), &[9]),
             op(72, "POPCOUNT", None, &[8]),
+        ] {
+            assert!(matches!(
+                lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn boolean_binary_and_lzcount_are_exact_only_for_valid_widths() {
+        for (opcode, mnemonic, inputs, expected) in [
+            (38, "BOOL_XOR", [1, 0], 1),
+            (38, "BOOL_XOR", [2, 1], 3),
+            (39, "BOOL_AND", [2, 1], 0),
+            (39, "BOOL_AND", [2, 0], 0),
+            (40, "BOOL_OR", [0, 2], 2),
+            (40, "BOOL_OR", [0, 0], 0),
+        ] {
+            let operation = lowered(op(opcode, mnemonic, Some(1), &[1, 1]));
+            assert!(matches!(operation.effect, PcodeEffect::Assign { .. }));
+            assert_eq!(operation.evaluate_exact(&inputs).unwrap(), Some(expected));
+        }
+        assert_eq!(
+            lowered(op(37, "BOOL_NEGATE", Some(1), &[1]))
+                .evaluate_exact(&[2])
+                .unwrap(),
+            Some(3)
+        );
+        for (input_bytes, output_bytes, input, expected) in [
+            (1, 1, 0, 8),
+            (1, 8, 1, 7),
+            (1, 1, 0x80, 0),
+            (3, 1, 0x0080_0000, 0),
+            (3, 8, 0x0000_0001, 23),
+            (8, 1, 0, 64),
+            (8, 8, 1, 63),
+        ] {
+            let operation = lowered(op(73, "LZCOUNT", Some(output_bytes), &[input_bytes]));
+            assert!(matches!(
+                operation.effect,
+                PcodeEffect::Assign {
+                    operation: PcodeExactOp::LeadingZeroCount,
+                    ..
+                }
+            ));
+            assert_eq!(operation.evaluate_exact(&[input]).unwrap(), Some(expected));
+        }
+        for source in [
+            op(38, "BOOL_XOR", Some(2), &[1, 1]),
+            op(39, "BOOL_AND", Some(1), &[2, 1]),
+            op(40, "BOOL_OR", Some(1), &[1]),
+            op(73, "LZCOUNT", Some(1), &[]),
+            op(73, "LZCOUNT", Some(1), &[9]),
+            op(73, "LZCOUNT", None, &[1]),
         ] {
             assert!(matches!(
                 lower_operation(&source),
