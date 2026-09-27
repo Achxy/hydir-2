@@ -80,6 +80,7 @@ for name, expected in (("match", 1), ("mismatch", 0)):
     assert any(
         event.get("kind") == "effect"
         and event["operation"]["source"]["source_address"]["offset"] == "0x2016f0"
+        and event["operation"].get("memory_access") is not None
         and event["operation"]["memory_access"]["byte_offset"] == 0x2001F0
         for event in trace["events"]
     )
