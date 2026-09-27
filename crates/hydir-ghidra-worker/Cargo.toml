@@ -12,3 +12,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile = "3.23"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

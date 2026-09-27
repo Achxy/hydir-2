@@ -70,13 +70,17 @@ use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tonic::{Request, metadata::MetadataValue, transport::Channel};
 
@@ -94,6 +98,26 @@ const CONSOLE_MAX_HEIGHT: f32 = 900.0;
 const MAIN_VIEW_MIN_HEIGHT: f32 = 120.0;
 const PINNED_OPT: &str = "/usr/bin/opt-14";
 const PINNED_CLANG: &str = "/usr/bin/clang-14";
+const GHIDRA_LOCAL_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+const GHIDRA_DOCKER_TIMEOUT: Duration = Duration::from_secs(46 * 60);
+const GHIDRA_MAX_CALLEES: u64 = 8;
+const GHIDRA_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+fn ghidra_task_timeout(mode: Option<&str>, trace_calls: bool) -> Duration {
+    let first_analysis = if mode == Some("local")
+        || (mode.is_none() && std::env::var_os("HYDIR_GHIDRA_HOME").is_some())
+    {
+        GHIDRA_LOCAL_TIMEOUT
+    } else {
+        GHIDRA_DOCKER_TIMEOUT
+    };
+    if trace_calls {
+        // Docker image setup happens once; each later callee has an analysis limit.
+        first_analysis + GHIDRA_LOCAL_TIMEOUT * GHIDRA_MAX_CALLEES as u32
+    } else {
+        first_analysis
+    }
+}
 
 fn resized_console_height(current: f32, drag_delta_y: f32, maximum: f32) -> f32 {
     (current - drag_delta_y).clamp(CONSOLE_MIN_HEIGHT, maximum)
@@ -152,12 +176,16 @@ enum Task {
         binary: PathBuf,
         binary_sha256: String,
         function: Option<String>,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
     },
     TraceGhidraCalls {
         binary: PathBuf,
         binary_sha256: String,
         function: String,
         seed_json: String,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
     },
     OpenRemote {
         endpoint: String,
@@ -1820,10 +1848,115 @@ fn ghidra_snapshot_path(binary_sha256: &str, function: Option<&str>) -> Result<P
     Ok(output_dir.join(format!("{key}.json")))
 }
 
+fn ghidra_output_tail(file: &mut fs::File) -> Result<Vec<u8>, String> {
+    const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(MAX_OUTPUT_BYTES)))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+fn kill_ghidra_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // The CLI is launched in its own group, which includes local Ghidra.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_ghidra_command(
+    command: &mut Command,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<Output, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("Ghidra task cancelled".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let cancel_path = scratch.path().join("cancel");
+    let mut stdout =
+        fs::File::create(scratch.path().join("stdout.log")).map_err(|error| error.to_string())?;
+    let mut stderr =
+        fs::File::create(scratch.path().join("stderr.log")).map_err(|error| error.to_string())?;
+    command
+        .env("HYDIR_GHIDRA_CANCEL_FILE", &cancel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            stdout.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().map_err(|error| error.to_string())?,
+        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let mut stopping: Option<(&str, Instant)> = None;
+    loop {
+        if stopping.is_none() {
+            let reason = if cancel.load(Ordering::Acquire) {
+                Some("Ghidra task cancelled")
+            } else if started.elapsed() >= timeout {
+                Some("Ghidra task timed out")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                // The worker removes Docker containers and local Java descendants.
+                // Keep a short fallback for a worker blocked outside its poll loop.
+                let _ = fs::write(&cancel_path, []);
+                stopping = Some((reason, Instant::now()));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if let Some((reason, _)) = stopping {
+                    return Err(reason.to_owned());
+                }
+                return Ok(Output {
+                    status,
+                    stdout: ghidra_output_tail(&mut stdout)?,
+                    stderr: ghidra_output_tail(&mut stderr)?,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                kill_ghidra_process_tree(&mut child);
+                return Err(format!("Could not monitor Ghidra task: {error}"));
+            }
+        }
+        if let Some((reason, requested_at)) = stopping
+            && requested_at.elapsed() >= Duration::from_secs(3)
+        {
+            kill_ghidra_process_tree(&mut child);
+            return Err(reason.to_owned());
+        }
+        thread::sleep(GHIDRA_POLL_INTERVAL);
+    }
+}
+
 fn run_ghidra_cli(
     binary: &Path,
     binary_sha256: &str,
     function: Option<&str>,
+    cancel: &AtomicBool,
+    timeout: Duration,
 ) -> Result<(GhidraSnapshot, Option<String>), String> {
     let snapshot_path = ghidra_snapshot_path(binary_sha256, function)?;
     {
@@ -1836,8 +1969,7 @@ fn run_ghidra_cli(
         if let Some(function) = function {
             command.arg("--function").arg(function);
         }
-        let output = command
-            .output()
+        let output = run_ghidra_command(&mut command, cancel, timeout)
             .map_err(|error| format!("Could not start automatic Ghidra analysis: {error}"))?;
         if !output.status.success() {
             let detail = if output.stderr.is_empty() {
@@ -1861,6 +1993,9 @@ fn run_ghidra_cli(
         let bytes = fs::read(&snapshot_path)
             .map_err(|error| format!("Could not read Ghidra snapshot: {error}"))?;
         let snapshot = parse_ghidra_snapshot(&bytes, binary_sha256)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("Ghidra task cancelled".to_owned());
+        }
         let persistence_warning = (|| {
             let database = default_db_path()?;
             persist_ghidra_snapshot(&database, binary, binary_sha256, &snapshot)
@@ -1876,6 +2011,8 @@ fn run_ghidra_call_trace(
     binary_sha256: &str,
     function: &str,
     seed_json: &str,
+    cancel: &AtomicBool,
+    timeout: Duration,
 ) -> Result<PcodeInterproceduralTrace, String> {
     if seed_json.len() > MAX_PCODE_SEED_BYTES {
         return Err("Ghidra call seed exceeds the JSON input limit".to_owned());
@@ -1884,7 +2021,8 @@ fn run_ghidra_call_trace(
     let seed_path = scratch.path().join("seed.json");
     let trace_path = scratch.path().join("calls.json");
     fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
-    let output = Command::new(hydirctl_path())
+    let mut command = Command::new(hydirctl_path());
+    command
         .args(["ghidra", "trace-calls"])
         .arg(binary)
         .arg(&seed_path)
@@ -1893,8 +2031,8 @@ fn run_ghidra_call_trace(
         .arg("--max-functions")
         .arg("8")
         .arg("--output")
-        .arg(&trace_path)
-        .output()
+        .arg(&trace_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)
         .map_err(|error| format!("Could not start Ghidra call tracing: {error}"))?;
     if !output.status.success() {
         let detail = if output.stderr.is_empty() {
@@ -2531,11 +2669,19 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 binary,
                 binary_sha256,
                 function,
+                cancel,
+                timeout,
             } => {
                 let completion = events.clone();
                 let repaint = ctx.clone();
                 thread::spawn(move || {
-                    let result = run_ghidra_cli(&binary, &binary_sha256, function.as_deref());
+                    let result = run_ghidra_cli(
+                        &binary,
+                        &binary_sha256,
+                        function.as_deref(),
+                        &cancel,
+                        timeout,
+                    );
                     let _ = completion.send(Event::GhidraAnalyzed {
                         binary_sha256,
                         result,
@@ -2549,6 +2695,8 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 binary_sha256,
                 function,
                 seed_json,
+                cancel,
+                timeout,
             } => {
                 let completion = events.clone();
                 let repaint = ctx.clone();
@@ -2558,6 +2706,8 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         &binary_sha256,
                         &function,
                         &seed_json,
+                        &cancel,
+                        timeout,
                     );
                     let _ = completion.send(Event::GhidraCallsTraced {
                         binary_sha256,
@@ -3342,6 +3492,31 @@ struct WorkbenchGraphEdge {
     unresolved: bool,
 }
 
+struct ActiveGhidraTask {
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+    timeout: Duration,
+}
+
+fn ghidra_progress(ui: &mut egui::Ui, task: &ActiveGhidraTask, label: &str) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        let elapsed = task.started.elapsed().as_secs();
+        let limit = task.timeout.as_secs();
+        let description = if task.cancel.load(Ordering::Acquire) {
+            "Stopping Ghidra…".to_owned()
+        } else {
+            format!(
+                "{label} · {}m {:02}s elapsed · {}m limit",
+                elapsed / 60,
+                elapsed % 60,
+                limit / 60
+            )
+        };
+        ui.label(description);
+    });
+}
+
 struct AnalystApp {
     tasks: SyncSender<Task>,
     events: Receiver<Event>,
@@ -3409,6 +3584,8 @@ struct AnalystApp {
     ghidra_call_lines: Vec<(Option<u64>, String)>,
     ghidra_call_busy: bool,
     ghidra_busy: bool,
+    ghidra_task: Option<ActiveGhidraTask>,
+    ghidra_call_task: Option<ActiveGhidraTask>,
     ghidra_runtime_status: Option<GhidraRuntimeStatus>,
     ghidra_cli_available: Option<bool>,
     ghidra_runtime_probe: Option<Receiver<(GhidraRuntimeStatus, bool)>>,
@@ -3549,6 +3726,8 @@ impl AnalystApp {
             ghidra_call_lines: Vec::new(),
             ghidra_call_busy: false,
             ghidra_busy: false,
+            ghidra_task: None,
+            ghidra_call_task: None,
             ghidra_runtime_status: None,
             ghidra_cli_available: None,
             ghidra_runtime_probe: Some(probe_ghidra_runtime(ctx)),
@@ -3622,13 +3801,27 @@ impl AnalystApp {
         if self.ghidra_busy {
             return;
         }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let timeout = ghidra_task_timeout(
+            self.ghidra_runtime_status
+                .as_ref()
+                .map(|status| status.mode),
+            false,
+        );
         match self.tasks.try_send(Task::AnalyzeGhidra {
             binary,
             binary_sha256,
             function,
+            cancel: Arc::clone(&cancel),
+            timeout,
         }) {
             Ok(()) => {
                 self.ghidra_busy = true;
+                self.ghidra_task = Some(ActiveGhidraTask {
+                    cancel,
+                    started: Instant::now(),
+                    timeout,
+                });
                 self.status = "Analyzing ELF with Ghidra…".to_owned();
                 self.failure = None;
             }
@@ -3696,6 +3889,17 @@ impl AnalystApp {
                     function_index,
                 } => {
                     let binary_sha256 = spec.binary_sha256.clone();
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_some_and(|old| old.binary_sha256 != binary_sha256)
+                        && let Some(task) = &self.ghidra_task
+                    {
+                        task.cancel.store(true, Ordering::Release);
+                    }
+                    if let Some(task) = &self.ghidra_call_task {
+                        task.cancel.store(true, Ordering::Release);
+                    }
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.current_local_path = if remote {
@@ -3849,6 +4053,10 @@ impl AnalystApp {
                     result,
                 } => {
                     self.ghidra_busy = false;
+                    let cancelled = self
+                        .ghidra_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
                     if self
                         .spec
                         .as_ref()
@@ -3935,9 +4143,15 @@ impl AnalystApp {
                             }
                         }
                         Err(error) => {
-                            self.status = "Ghidra analysis failed".to_owned();
-                            self.history.push(error.clone());
-                            self.failure = Some(error);
+                            if cancelled {
+                                self.status = "Ghidra analysis cancelled".to_owned();
+                                self.history.push(self.status.clone());
+                                self.failure = None;
+                            } else {
+                                self.status = "Ghidra analysis failed".to_owned();
+                                self.history.push(error.clone());
+                                self.failure = Some(error);
+                            }
                         }
                     }
                     if let Some((binary, digest)) = self.pending_ghidra.take() {
@@ -3950,6 +4164,10 @@ impl AnalystApp {
                     result,
                 } => {
                     self.ghidra_call_busy = false;
+                    let cancelled = self
+                        .ghidra_call_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
                     if self
                         .spec
                         .as_ref()
@@ -3958,6 +4176,12 @@ impl AnalystApp {
                             snapshot.selected_function.entry.offset != function
                         })
                     {
+                        continue;
+                    }
+                    if cancelled && result.is_err() {
+                        self.status = "Ghidra call tracing cancelled".to_owned();
+                        self.ghidra_call_trace = None;
+                        self.ghidra_call_lines.clear();
                         continue;
                     }
                     self.ghidra_call_lines = result
@@ -5003,6 +5227,20 @@ impl AnalystApp {
                         (self.current_local_path.clone(), self.spec.as_ref())
                 {
                     self.enqueue_ghidra(binary, spec.binary_sha256.clone(), None);
+                }
+                if let Some(task) = &self.ghidra_task {
+                    ghidra_progress(ui, task, "Analyzing ELF");
+                    if ui
+                        .add_enabled(
+                            !task.cancel.load(Ordering::Acquire),
+                            egui::Button::new("Cancel Ghidra analysis"),
+                        )
+                        .clicked()
+                    {
+                        task.cancel.store(true, Ordering::Release);
+                        self.status = "Stopping Ghidra analysis…".to_owned();
+                        self.pending_ghidra = None;
+                    }
                 }
                 if let Some(snapshot) = &self.ghidra_snapshot {
                     ui.label(
@@ -6476,15 +6714,27 @@ impl AnalystApp {
                             self.ghidra_call_lines.clear();
                         }
                         Ok(_) => {
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            let timeout = ghidra_task_timeout(
+                                self.ghidra_runtime_status.as_ref().map(|status| status.mode),
+                                true,
+                            );
                             let task = Task::TraceGhidraCalls {
                                 binary: self.current_local_path.clone().expect("checked above"),
                                 binary_sha256: snapshot.binary_sha256.clone(),
                                 function: snapshot.selected_function.entry.offset.clone(),
                                 seed_json: self.ghidra_trace_seed_json.clone(),
+                                cancel: Arc::clone(&cancel),
+                                timeout,
                             };
                             match self.tasks.try_send(task) {
                                 Ok(()) => {
                                     self.ghidra_call_busy = true;
+                                    self.ghidra_call_task = Some(ActiveGhidraTask {
+                                        cancel,
+                                        started: Instant::now(),
+                                        timeout,
+                                    });
                                     self.ghidra_call_trace = None;
                                     self.ghidra_call_lines.clear();
                                     self.status = "Collecting Ghidra callees and tracing…".to_owned();
@@ -6499,8 +6749,19 @@ impl AnalystApp {
                     }
                 }
                 if self.ghidra_call_busy {
-                    ui.spinner();
-                    ui.label("Analyzing callees…");
+                    if let Some(task) = &self.ghidra_call_task {
+                        ghidra_progress(ui, task, "Analyzing callees");
+                        if ui
+                            .add_enabled(
+                                !task.cancel.load(Ordering::Acquire),
+                                egui::Button::new("Cancel call trace"),
+                            )
+                            .clicked()
+                        {
+                            task.cancel.store(true, Ordering::Release);
+                            self.status = "Stopping Ghidra call trace…".to_owned();
+                        }
+                    }
                 }
                 match &self.ghidra_call_trace {
                     Some(Ok(trace)) => {
@@ -11444,7 +11705,7 @@ mod tests {
         ghidra_trace_start, high_pcode_varnode, indexed_function_action, ir_slice,
         local_region_artifacts, native_function_excerpt, native_instruction_count,
         native_opaque_instruction_count, pcode_display_lines, pcode_line_target, pcode_state_lines,
-        persist_ghidra_snapshot, preview_patch_local, resized_console_height,
+        persist_ghidra_snapshot, preview_patch_local, resized_console_height, run_ghidra_command,
         selected_ghidra_trace_address, valid_bearer_token, validate_endpoint,
         workbench_graph_layout,
     };
@@ -11462,7 +11723,77 @@ mod tests {
     use hydir_project::LocalProjectStore;
     use std::fs;
     use std::path::Path;
-    use std::sync::mpsc;
+    use std::process::Command;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn ghidra_subprocess_cancels_during_execution() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while (-not (Test-Path $env:HYDIR_GHIDRA_CANCEL_FILE)) { Start-Sleep -Milliseconds 50 }",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "while [ ! -e \"$HYDIR_GHIDRA_CANCEL_FILE\" ]; do sleep 0.05; done",
+            ]);
+            command
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            signal.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = run_ghidra_command(&mut command, &cancel, Duration::from_secs(20));
+        trigger.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ghidra_subprocess_times_out_and_is_reaped() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 10",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 10"]);
+            command
+        };
+        let started = Instant::now();
+        let result = run_ghidra_command(
+            &mut command,
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(7));
+    }
 
     #[test]
     fn ghidra_setup_explains_ready_and_missing_runtimes() {

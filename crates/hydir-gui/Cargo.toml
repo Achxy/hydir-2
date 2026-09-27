@@ -35,3 +35,6 @@ tokio.workspace = true
 tonic.workspace = true
 uuid.workspace = true
 tempfile = "3.23"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -372,10 +372,34 @@ fn run_bounded(
     log_path: &Path,
     container_name: Option<&str>,
 ) -> Result<(), String> {
+    let cancel_file = env::var_os("HYDIR_GHIDRA_CANCEL_FILE").map(PathBuf::from);
+    run_bounded_with_cancel_file(
+        command,
+        action,
+        timeout,
+        log_path,
+        container_name,
+        cancel_file.as_deref(),
+    )
+}
+
+fn run_bounded_with_cancel_file(
+    command: &mut Command,
+    action: &str,
+    timeout: Duration,
+    log_path: &Path,
+    container_name: Option<&str>,
+    cancel_file: Option<&Path>,
+) -> Result<(), String> {
     let log = File::create(log_path).map_err(|e| format!("cannot create Ghidra log: {e}"))?;
     let err = log
         .try_clone()
         .map_err(|e| format!("cannot clone Ghidra log: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -389,26 +413,12 @@ fn run_bounded(
             Ok(Some(status)) => {
                 return Err(format!("{action} exited {status}: {}", log_tail(log_path)));
             }
+            Ok(None) if cancel_file.is_some_and(|path| path.exists()) => {
+                stop_bounded_child(&mut child, container_name);
+                return Err(format!("{action} cancelled: {}", log_tail(log_path)));
+            }
             Ok(None) if Instant::now() >= deadline => {
-                if let Some(name) = container_name {
-                    let _ = Command::new("docker")
-                        .args(["rm", "--force", name])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-                #[cfg(windows)]
-                if container_name.is_none() {
-                    // analyzeHeadless.bat starts Java as a child process. Killing
-                    // only cmd.exe would leave an unbounded analyzer behind.
-                    let _ = Command::new("taskkill")
-                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_bounded_child(&mut child, container_name);
                 return Err(format!(
                     "{action} timed out after {}s: {}",
                     timeout.as_secs(),
@@ -423,6 +433,32 @@ fn run_bounded(
             }
         }
     }
+}
+
+fn stop_bounded_child(child: &mut std::process::Child, container_name: Option<&str>) {
+    if let Some(name) = container_name {
+        let _ = Command::new("docker")
+            .args(["rm", "--force", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    if container_name.is_none() {
+        // analyzeHeadless.bat starts Java as a child process. Killing
+        // only cmd.exe would leave an unbounded analyzer behind.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn image_tag() -> String {
@@ -813,6 +849,46 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_stops_a_running_worker_command() {
+        let scratch = tempfile::tempdir().unwrap();
+        let cancel = scratch.path().join("cancel");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 10",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 10"]);
+            command
+        };
+        let marker = cancel.clone();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            fs::write(marker, []).unwrap();
+        });
+        let started = Instant::now();
+        let result = run_bounded_with_cancel_file(
+            &mut command,
+            "test command",
+            Duration::from_secs(20),
+            &scratch.path().join("worker.log"),
+            None,
+            Some(&cancel),
+        );
+        trigger.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
 
     #[test]
     fn run_args_isolate_worker_and_preserve_selected_address() {
