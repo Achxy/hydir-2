@@ -489,8 +489,8 @@ public class HydIRSnapshot extends GhidraScript {
         }
     }
 
-    private Function selectFunction(List<Function> functions, String[] args) {
-        if (args.length == 2) {
+    private Function selectFunction(List<Function> functions, String entry) {
+        if (entry == null) {
             for (Function function : functions) {
                 if (function.getBody().getNumAddresses() > 0) {
                     return function;
@@ -498,21 +498,21 @@ public class HydIRSnapshot extends GhidraScript {
             }
             throw new IllegalStateException("No function with an analyzed body is available");
         }
-        if (!args[2].matches("0[xX][0-9a-fA-F]{1,16}")) {
+        if (!entry.matches("0[xX][0-9a-fA-F]{1,16}")) {
             throw new IllegalArgumentException("Function entry must be a 0x-prefixed hexadecimal offset");
         }
-        long offset = Long.parseUnsignedLong(args[2].substring(2), 16);
+        long offset = Long.parseUnsignedLong(entry.substring(2), 16);
         Function selected = null;
         for (Function function : functions) {
             if (function.getEntryPoint().getOffset() == offset) {
                 if (selected != null) {
-                    throw new IllegalArgumentException("Function entry is ambiguous across address spaces: " + args[2]);
+                    throw new IllegalArgumentException("Function entry is ambiguous across address spaces: " + entry);
                 }
                 selected = function;
             }
         }
         if (selected == null) {
-            throw new IllegalArgumentException("Function entry not found: " + args[2]);
+            throw new IllegalArgumentException("Function entry not found: " + entry);
         }
         return selected;
     }
@@ -540,9 +540,23 @@ public class HydIRSnapshot extends GhidraScript {
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length != 2 && args.length != 3) {
+        boolean projectImport = args.length >= 3
+            && args[args.length - 1].startsWith("domainPath=");
+        if (args.length < 2 || args.length > 4
+                || (args.length == 4 && !projectImport)) {
             throw new IllegalArgumentException(
-                "Usage: HydIRSnapshot.java <output.json> <original-binary-path> [function-entry-hex]");
+                "Usage: HydIRSnapshot.java <output.json> <original-binary-path> [function-entry-hex] [domainPath=/exact/project/path]");
+        }
+        String functionEntry = (args.length == 3 && !projectImport || args.length == 4)
+            ? args[2] : null;
+        if (projectImport) {
+            String expectedPath = args[args.length - 1].substring("domainPath=".length());
+            String actualPath = currentProgram.getDomainFile() == null
+                ? null : currentProgram.getDomainFile().getPathname();
+            if (!expectedPath.equals(actualPath)) {
+                throw new IllegalStateException("Selected Ghidra domain path mismatch: expected "
+                    + expectedPath + ", got " + actualPath);
+            }
         }
         Path binary = Path.of(args[1]);
         if (!Files.isRegularFile(binary)) {
@@ -574,7 +588,7 @@ public class HydIRSnapshot extends GhidraScript {
         if (functions.isEmpty()) {
             throw new IllegalStateException("Ghidra found no functions; run analysis before exporting");
         }
-        Function selected = selectFunction(functions, args);
+        Function selected = selectFunction(functions, functionEntry);
 
         Json json = new Json();
         json.raw("{\"schema_version\":2,\"source\":\"ghidra\","

@@ -5,8 +5,9 @@
 use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_space_id};
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
 use hydir_ir::pcode::{
-    GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeOperation,
-    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode, validate_ghidra_snapshot,
+    GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeExactOp,
+    PcodeOperation, PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode,
+    validate_ghidra_snapshot,
 };
 use hydir_ir::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -1513,6 +1514,62 @@ fn emit_pcode_cfg_llvm_semantic(
                                 };
                                 arguments.push(format!("i{bits} {value}"));
                             }
+                            if let PcodeEffect::Assign {
+                                operation: kind, ..
+                            } = &operation.effect
+                            {
+                                if matches!(
+                                    kind,
+                                    PcodeExactOp::UnsignedDivide
+                                        | PcodeExactOp::SignedDivide
+                                        | PcodeExactOp::UnsignedRemainder
+                                        | PcodeExactOp::SignedRemainder
+                                ) {
+                                    let typed_value =
+                                        |input_index: usize| -> Result<String, String> {
+                                            let input = &source.inputs[input_index];
+                                            let bits = input.size * 8;
+                                            if input.space == "const" {
+                                                let mask = if bits == 64 {
+                                                    u64::MAX
+                                                } else {
+                                                    (1u64 << bits) - 1
+                                                };
+                                                Ok(format!("{}", offset(&input.offset)? & mask))
+                                            } else if bits == 64 {
+                                                Ok(format!("%raw_{id}_{input_index}"))
+                                            } else {
+                                                Ok(format!("%typed_{id}_{input_index}"))
+                                            }
+                                        };
+                                    let divisor = typed_value(1)?;
+                                    let bits = source.inputs[1].size * 8;
+                                    body.push_str(&format!(
+                                        "  %divide_zero_{id} = icmp eq i{bits} {divisor}, 0\n"
+                                    ));
+                                    let invalid = if *kind == PcodeExactOp::SignedDivide {
+                                        let dividend = typed_value(0)?;
+                                        let minimum = 1u64 << (bits - 1);
+                                        body.push_str(&format!(
+                                            "  %divide_minimum_{id} = icmp eq i{bits} {dividend}, {minimum}\n  %divide_negative_one_{id} = icmp eq i{bits} {divisor}, -1\n  %divide_overflow_{id} = and i1 %divide_minimum_{id}, %divide_negative_one_{id}\n  %divide_invalid_{id} = or i1 %divide_zero_{id}, %divide_overflow_{id}\n"
+                                        ));
+                                        format!("%divide_invalid_{id}")
+                                    } else {
+                                        format!("%divide_zero_{id}")
+                                    };
+                                    stop_site(
+                                        &mut sites,
+                                        &source.source_address,
+                                        Some(operation_index),
+                                        PcodeCfgLlvmStatus::InvalidOperation,
+                                        "undefined P-code division: zero divisor or signed quotient overflow",
+                                    );
+                                    body.push_str(&format!(
+                                        "  br i1 {invalid}, label %{}, label %division_valid_{id}\ndivision_valid_{id}:\n",
+                                        stop_label(PcodeCfgLlvmStatus::InvalidOperation)
+                                    ));
+                                }
+                            }
                             let output = source
                                 .output
                                 .as_ref()
@@ -1707,6 +1764,35 @@ mod tests {
             "75f384ca5c4dc59d1af2f56e92d677fc7acae43b6faf0213bd203ef6426f2667",
         )
         .unwrap()
+    }
+
+    fn division_fixture(signed: bool) -> GhidraSnapshot {
+        let digest = "50b294c6ef92649165ac921b205a76f09e3b27fd6c20f7f72f9c2a507ed4db16";
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/ghidra_division.elf"
+                )))
+            ),
+            digest
+        );
+        let bytes: &[u8] = if signed {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_division_s32_v2.json"
+            ))
+        } else {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_division_u32_v2.json"
+            ))
+        };
+        let snapshot = parse_ghidra_snapshot(bytes, digest).unwrap();
+        assert_eq!(snapshot.program.ghidra_version, "12.1.4");
+        assert_eq!(snapshot.program.language_id, "x86:LE:64:default");
+        snapshot
     }
 
     fn calls_fixture() -> GhidraSnapshot {
@@ -2365,6 +2451,218 @@ mod tests {
             &[],
             None,
         );
+    }
+
+    #[test]
+    fn division_cfg_llvm_matches_concrete_path_and_stops_before_undefined_results() {
+        use hydir_ir::pcode::PcodeExecutionStop;
+
+        for (opcode, mnemonic, left, right, expected_low) in [
+            (33, "INT_DIV", u64::MAX, 2, 0xff),
+            (35, "INT_REM", u64::MAX, 2, 1),
+            (34, "INT_SDIV", (-7i64) as u64, 2, 0xfd),
+            (36, "INT_SREM", (-7i64) as u64, 2, 0xff),
+            (36, "INT_SREM", i64::MIN as u64, u64::MAX, 0),
+        ] {
+            let mut snapshot = fixture();
+            let source = &mut snapshot.selected_function.instructions[0].pcode[0];
+            source.mnemonic = mnemonic.to_owned();
+            source.opcode = opcode;
+            source.inputs = vec![register("0x38", 8), register("0x30", 8)];
+            let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+            verify(&artifact.llvm_ir);
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), left).unwrap();
+            seed.write_varnode(&register("0x30", 8), right).unwrap();
+            let rust = snapshot.execute_concrete_path(&seed, None, 1, 8).unwrap();
+            assert!(matches!(rust.stop, PcodePathStop::OperationBudget { .. }));
+            assert_eq!(
+                rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                Some(match opcode {
+                    33 => left / right,
+                    35 => left % right,
+                    34 => ((left as i64) / (right as i64)) as u64,
+                    36 => ((left as i64 as i128) % (right as i64 as i128)) as u64,
+                    _ => unreachable!(),
+                })
+            );
+            let events = source_event_ids(&artifact, &rust);
+            run_lli(
+                &artifact,
+                &seed,
+                1,
+                PcodeCfgLlvmStatus::StepBudget,
+                &events,
+                Some(expected_low),
+            );
+        }
+
+        for (opcode, mnemonic, left, right, reason_fragment) in [
+            (33, "INT_DIV", 17, 0, "zero"),
+            (35, "INT_REM", 17, 0, "zero"),
+            (34, "INT_SDIV", 17, 0, "zero"),
+            (36, "INT_SREM", 17, 0, "zero"),
+            (34, "INT_SDIV", i64::MIN as u64, u64::MAX, "overflows"),
+        ] {
+            let mut snapshot = fixture();
+            let source = &mut snapshot.selected_function.instructions[0].pcode[0];
+            source.mnemonic = mnemonic.to_owned();
+            source.opcode = opcode;
+            source.inputs = vec![register("0x38", 8), register("0x30", 8)];
+            let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+            verify(&artifact.llvm_ir);
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), left).unwrap();
+            seed.write_varnode(&register("0x30", 8), right).unwrap();
+            seed.write_varnode(&register("0x0", 8), 0x5a).unwrap();
+            let rust = snapshot.execute_concrete_path(&seed, None, 8, 8).unwrap();
+            assert!(matches!(rust.stop,
+                PcodePathStop::EffectBoundary {
+                    boundary: PcodeExecutionStop::InvalidOperation { ref reason, .. }
+                } if reason.contains(reason_fragment)));
+            assert_eq!(
+                rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                Some(0x5a)
+            );
+            assert!(rust.events.is_empty());
+            assert!(
+                artifact
+                    .stop_sites
+                    .iter()
+                    .any(|site| site.status == PcodeCfgLlvmStatus::InvalidOperation)
+            );
+            run_lli(
+                &artifact,
+                &seed,
+                8,
+                PcodeCfgLlvmStatus::InvalidOperation,
+                &[],
+                Some(0x5a),
+            );
+        }
+    }
+
+    #[test]
+    fn real_ghidra_division_paths_match_rust_llvm_and_quotient_remainder_oracles() {
+        use hydir_ir::pcode::PcodeExecutionStop;
+
+        for signed in [false, true] {
+            let snapshot = division_fixture(signed);
+            let operations = &snapshot.selected_function.instructions[0].pcode;
+            assert_eq!(operations.len(), 11);
+            assert_eq!(operations[5].opcode, if signed { 34 } else { 33 });
+            assert_eq!(operations[8].opcode, if signed { 36 } else { 35 });
+            assert_eq!(operations[5].output.as_ref().unwrap().size, 8);
+            assert_eq!(operations[8].output.as_ref().unwrap().size, 8);
+
+            let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+            assert_eq!(artifact.semantic_fidelity, SemanticFidelity::Unknown);
+            verify(&artifact.llvm_ir);
+            let cases: &[(u32, u32, u32)] = if signed {
+                &[
+                    (0xffff_fff5, 0xffff_ffff, 3),           // -11 / 3
+                    (11, 0, 0xffff_fffd),                    // 11 / -3
+                    (0xffff_fff5, 0xffff_ffff, 0xffff_fffd), // -11 / -3
+                    (7, 0, 2),
+                ]
+            } else {
+                &[(11, 0, 3), (0xffff_ffff, 0, 3), (0, 1, 3)]
+            };
+            for &(low, high, divisor) in cases {
+                let mut seed = PcodeConcreteState::default();
+                seed.write_varnode(&register("0x0", 4), u64::from(low))
+                    .unwrap();
+                seed.write_varnode(&register("0x10", 4), u64::from(high))
+                    .unwrap();
+                seed.write_varnode(&register("0x8", 4), u64::from(divisor))
+                    .unwrap();
+                let trace = snapshot.execute_concrete_path(&seed, None, 11, 8).unwrap();
+                assert!(matches!(trace.stop, PcodePathStop::OperationBudget { .. }));
+                assert_eq!(source_event_ids(&artifact, &trace).len(), 11);
+                let dividend = (u64::from(high) << 32) | u64::from(low);
+                let (quotient, remainder) = if signed {
+                    let divisor = i64::from(divisor as i32);
+                    let quotient = (dividend as i64) / divisor;
+                    let remainder = (dividend as i64) % divisor;
+                    assert!(i32::try_from(quotient).is_ok());
+                    (quotient as u32 as u64, remainder as u32 as u64)
+                } else {
+                    let quotient = dividend / u64::from(divisor);
+                    let remainder = dividend % u64::from(divisor);
+                    assert!(u32::try_from(quotient).is_ok());
+                    (quotient, remainder)
+                };
+                assert_eq!(
+                    trace.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                    Some(quotient)
+                );
+                assert_eq!(
+                    trace
+                        .final_state
+                        .read_varnode(&register("0x10", 8))
+                        .unwrap(),
+                    Some(remainder)
+                );
+                let mut expected_state = Vec::new();
+                for (base, value) in [(0u64, quotient), (0x10, remainder)] {
+                    for byte in 0..8 {
+                        expected_state.push((
+                            "register".to_owned(),
+                            format!("0x{:x}", base + byte),
+                            ((value >> (byte * 8)) & 0xff) as u8,
+                            true,
+                        ));
+                    }
+                }
+                run_lli_with_guest(
+                    &artifact,
+                    &seed,
+                    &GuestTestMemory {
+                        space_id: 433,
+                        base: 0,
+                        bytes: Vec::new(),
+                        expected: Vec::new(),
+                        expected_state,
+                    },
+                    11,
+                    PcodeCfgLlvmStatus::StepBudget,
+                    &source_event_ids(&artifact, &trace),
+                    Some(quotient as u8),
+                );
+            }
+
+            let boundaries: &[(u32, u32, u32, &str)] = if signed {
+                &[
+                    (11, 0, 0, "zero"),
+                    (0, 0x8000_0000, 0xffff_ffff, "overflows"),
+                ]
+            } else {
+                &[(11, 0, 0, "zero")]
+            };
+            for &(low, high, divisor, reason_fragment) in boundaries {
+                let mut seed = PcodeConcreteState::default();
+                seed.write_varnode(&register("0x0", 4), u64::from(low))
+                    .unwrap();
+                seed.write_varnode(&register("0x10", 4), u64::from(high))
+                    .unwrap();
+                seed.write_varnode(&register("0x8", 4), u64::from(divisor))
+                    .unwrap();
+                let trace = snapshot.execute_concrete_path(&seed, None, 11, 8).unwrap();
+                assert!(matches!(trace.stop,
+                    PcodePathStop::EffectBoundary {
+                        boundary: PcodeExecutionStop::InvalidOperation { ref reason, .. }
+                    } if reason.contains(reason_fragment)));
+                assert_eq!(source_event_ids(&artifact, &trace).len(), 5);
+                run_lli(
+                    &artifact,
+                    &seed,
+                    11,
+                    PcodeCfgLlvmStatus::InvalidOperation,
+                    &source_event_ids(&artifact, &trace),
+                    Some(low as u8),
+                );
+            }
+        }
     }
 
     #[test]

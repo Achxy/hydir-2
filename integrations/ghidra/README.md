@@ -80,6 +80,30 @@ cargo run -p hydir-cli -- ghidra-snapshot trace-prefix .\demo\hydir-prism.elf .\
 cargo run -p hydir-cli -- ghidra-snapshot trace-path .\demo\hydir-prism.elf .\snapshot.json .\seed.json --start 0x2013d9 --max-ops 4096 --max-visits 1024 --output .\path.json
 ```
 
+## Import a saved Ghidra project
+
+Experts can import one analyzed program from an existing, **closed** Ghidra
+project. Pass the original binary separately so Hydir can verify the project
+program's executable SHA-256. The `--program` value is the exact path inside
+the project, relative to its root; `--function` selects an entry from that
+program's function index.
+
+```powershell
+cargo run -p hydir-cli -- ghidra import-project .\tests\fixtures\ghidra_userop_rdtsc.elf `
+  'C:\path\to\Analyst.gpr' --program ghidra_userop_rdtsc.elf `
+  --function 0x201174 --output .\analyst-snapshot.json
+```
+
+Hydir copies the `.gpr` and matching `.rep` into isolated system scratch,
+opens only the selected program with analysis disabled and read-only access,
+then validates the domain path, binary digest, and snapshot before writing the
+result. It leaves the source project untouched and runs this expert route
+fresh on each request. The checked-in
+`tests/fixtures/ghidra_userop_rdtsc_project.zip` is a real Ghidra 12.1.4
+project with the selected function renamed to `hydir_analyst_rdtsc` through
+`tests/fixtures/HydIRRenameFixture.java`; the container smoke test imports it
+and rejects a mismatched binary.
+
 For manual exporter debugging (PowerShell, with Ghidra 12.1.4 installed):
 
 ```powershell

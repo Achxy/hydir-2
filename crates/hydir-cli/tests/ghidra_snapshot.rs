@@ -3,6 +3,27 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
+fn ghidra_project_import_cli_requires_exact_program_selector() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let scratch = tempfile::tempdir().unwrap();
+    let project = scratch.path().join("Expert.gpr");
+    fs::write(&project, b"project").unwrap();
+    let binary = root.join("tests/fixtures/ghidra_userop_rdtsc.elf");
+    let output = scratch.path().join("snapshot.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra", "import-project"])
+        .arg(&binary)
+        .arg(&project)
+        .args(["--program", "folder/*.elf", "--output"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("wildcard"));
+    assert!(!output.exists());
+}
+
+#[test]
 fn ghidra_simplification_cli_preserves_digest_and_raw_evidence() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let binary = root.join("demo/hydir-prism.elf");

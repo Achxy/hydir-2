@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 pub const PCODE_SEMANTIC_IR_VERSION: u32 = 1;
 
 /// A bitvector operation with its size and operands retained in `source`.
-/// Input operands are read before the output varnode is written. Arithmetic
-/// wraps modulo the output width; comparisons produce a byte containing 0/1.
+/// Input operands are read before the output varnode is written. Addition,
+/// subtraction, and multiplication wrap modulo the output width; comparisons
+/// produce a byte containing 0/1. Division is defined only on the checked
+/// input domain (nonzero divisor, representable signed quotient).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PcodeExactOp {
@@ -41,6 +43,10 @@ pub enum PcodeExactOp {
     LogicalShiftRight,
     ArithmeticShiftRight,
     Multiply,
+    UnsignedDivide,
+    SignedDivide,
+    UnsignedRemainder,
+    SignedRemainder,
     BooleanNegate,
     BooleanXor,
     BooleanAnd,
@@ -246,6 +252,38 @@ impl PcodeSemanticOperation {
             PcodeExactOp::And => values[0] & values[1],
             PcodeExactOp::Or => values[0] | values[1],
             PcodeExactOp::Multiply => values[0].wrapping_mul(values[1]),
+            PcodeExactOp::UnsignedDivide
+            | PcodeExactOp::SignedDivide
+            | PcodeExactOp::UnsignedRemainder
+            | PcodeExactOp::SignedRemainder => {
+                if values[1] == 0 {
+                    return Err("P-code division or remainder by zero is undefined".to_owned());
+                }
+                match operation {
+                    PcodeExactOp::UnsignedDivide => values[0] / values[1],
+                    PcodeExactOp::UnsignedRemainder => values[0] % values[1],
+                    PcodeExactOp::SignedDivide => {
+                        let left = i128::from(signed(values[0], widths[0]));
+                        let right = i128::from(signed(values[1], widths[1]));
+                        // Ghidra's reference gives no representable result
+                        // for MIN / -1 in the same-width signed output.
+                        // Keep it an explicit boundary instead of asserting
+                        // a wrap or depending on host signed overflow.
+                        if left == -(1i128 << (widths[0] - 1)) && right == -1 {
+                            return Err(
+                                "P-code signed division overflows its output width".to_owned()
+                            );
+                        }
+                        (left / right) as u64
+                    }
+                    PcodeExactOp::SignedRemainder => {
+                        let left = i128::from(signed(values[0], widths[0]));
+                        let right = i128::from(signed(values[1], widths[1]));
+                        (left % right) as u64
+                    }
+                    _ => unreachable!(),
+                }
+            }
             // Ghidra's emulator applies these to the full byte. Canonical
             // Boolean inputs still produce 0 or 1.
             PcodeExactOp::BooleanNegate => values[0] ^ 1,
@@ -334,6 +372,10 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         30 => (Op::LogicalShiftRight, "INT_RIGHT"),
         31 => (Op::ArithmeticShiftRight, "INT_SRIGHT"),
         32 => (Op::Multiply, "INT_MULT"),
+        33 => (Op::UnsignedDivide, "INT_DIV"),
+        34 => (Op::SignedDivide, "INT_SDIV"),
+        35 => (Op::UnsignedRemainder, "INT_REM"),
+        36 => (Op::SignedRemainder, "INT_SREM"),
         37 => (Op::BooleanNegate, "BOOL_NEGATE"),
         38 => (Op::BooleanXor, "BOOL_XOR"),
         39 => (Op::BooleanAnd, "BOOL_AND"),
@@ -588,6 +630,63 @@ mod tests {
                 .unwrap(),
             Some(128)
         );
+    }
+
+    #[test]
+    fn division_and_remainder_respect_width_sign_and_undefined_boundaries() {
+        for (opcode, mnemonic, width, left, right, expected) in [
+            (33, "INT_DIV", 1, 0xff, 2, 0x7f),
+            (35, "INT_REM", 1, 0xff, 2, 1),
+            (34, "INT_SDIV", 1, 0xf9, 2, 0xfd),
+            (36, "INT_SREM", 1, 0xf9, 2, 0xff),
+            (34, "INT_SDIV", 1, 7, 0xfe, 0xfd),
+            (36, "INT_SREM", 1, 7, 0xfe, 1),
+            (33, "INT_DIV", 8, u64::MAX, 2, i64::MAX as u64),
+            (35, "INT_REM", 8, u64::MAX, 2, 1),
+            (34, "INT_SDIV", 8, (-7i64) as u64, 2, (-3i64) as u64),
+            (36, "INT_SREM", 8, (-7i64) as u64, 2, u64::MAX),
+            (36, "INT_SREM", 8, i64::MIN as u64, u64::MAX, 0),
+        ] {
+            let operation = lowered(op(opcode, mnemonic, Some(width), &[width, width]));
+            assert!(matches!(operation.effect, PcodeEffect::Assign { .. }));
+            assert_eq!(
+                operation.evaluate_exact(&[left, right]).unwrap(),
+                Some(expected)
+            );
+            assert!(
+                operation
+                    .evaluate_exact(&[left, 0])
+                    .unwrap_err()
+                    .contains("zero")
+            );
+        }
+        for width in [1, 2, 4, 8] {
+            let minimum = 1u64 << (width * 8 - 1);
+            let negative_one = mask(width * 8);
+            let quotient = lowered(op(34, "INT_SDIV", Some(width), &[width, width]));
+            assert!(
+                quotient
+                    .evaluate_exact(&[minimum, negative_one])
+                    .unwrap_err()
+                    .contains("overflows")
+            );
+            let remainder = lowered(op(36, "INT_SREM", Some(width), &[width, width]));
+            assert_eq!(
+                remainder.evaluate_exact(&[minimum, negative_one]).unwrap(),
+                Some(0)
+            );
+        }
+        for source in [
+            op(33, "INT_DIV", Some(1), &[1, 2]),
+            op(34, "INT_SDIV", Some(2), &[1, 1]),
+            op(35, "INT_REM", Some(1), &[1]),
+            op(36, "INT_SREM", None, &[1, 1]),
+        ] {
+            assert!(matches!(
+                lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+        }
     }
 
     #[test]

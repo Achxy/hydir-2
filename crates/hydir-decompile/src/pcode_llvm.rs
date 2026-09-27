@@ -121,11 +121,16 @@ pub fn emit_pcode_linear_prefix_llvm(
                 effect: state_operation.effect.clone(),
             };
             let helper_name = format!("hydir_exact_{}", sources.len());
-            let helper = emit_pcode_exact_operation_llvm(&operation)?.replacen(
-                "@hydir_pcode_exact(",
-                &format!("@{helper_name}("),
-                1,
-            );
+            let helper = match emit_pcode_exact_operation_llvm(&operation) {
+                Ok(helper) => helper,
+                Err(reason) => {
+                    stop_reason =
+                        format!("invalid {} operation: {reason}", operation.source.mnemonic);
+                    stopped_at = Some(instruction.address.clone());
+                    break 'instructions;
+                }
+            }
+            .replacen("@hydir_pcode_exact(", &format!("@{helper_name}("), 1);
             helpers.push_str(&helper);
             helpers.push('\n');
             let mut arguments = Vec::new();
@@ -148,6 +153,52 @@ pub fn emit_pcode_linear_prefix_llvm(
                     name
                 };
                 arguments.push(format!("i{bits} {typed_name}"));
+            }
+            if let PcodeEffect::Assign {
+                operation: kind, ..
+            } = &operation.effect
+            {
+                if matches!(
+                    kind,
+                    PcodeExactOp::UnsignedDivide
+                        | PcodeExactOp::SignedDivide
+                        | PcodeExactOp::UnsignedRemainder
+                        | PcodeExactOp::SignedRemainder
+                ) {
+                    let input_operand = |input_index: usize| -> Result<String, String> {
+                        let input = &operation.source.inputs[input_index];
+                        let bits = input.size * 8;
+                        if input.space == "const" {
+                            Ok(format!(
+                                "{}",
+                                parse_constant(&input.offset)? & width_mask(bits)
+                            ))
+                        } else if bits == 64 {
+                            Ok(format!("%op{}_in{}_raw", sources.len(), input_index))
+                        } else {
+                            Ok(format!("%op{}_in{}", sources.len(), input_index))
+                        }
+                    };
+                    let divisor = input_operand(1)?;
+                    let bits = operation.source.inputs[1].size * 8;
+                    let id = sources.len();
+                    body.push_str(&format!(
+                        "  %division_zero_{id} = icmp eq i{bits} {divisor}, 0\n"
+                    ));
+                    let invalid = if *kind == PcodeExactOp::SignedDivide {
+                        let dividend = input_operand(0)?;
+                        let minimum = 1u64 << (bits - 1);
+                        body.push_str(&format!(
+                            "  %division_minimum_{id} = icmp eq i{bits} {dividend}, {minimum}\n  %division_negative_one_{id} = icmp eq i{bits} {divisor}, -1\n  %division_overflow_{id} = and i1 %division_minimum_{id}, %division_negative_one_{id}\n  %division_invalid_{id} = or i1 %division_zero_{id}, %division_overflow_{id}\n"
+                        ));
+                        format!("%division_invalid_{id}")
+                    } else {
+                        format!("%division_zero_{id}")
+                    };
+                    body.push_str(&format!(
+                        "  br i1 {invalid}, label %division_stop_{id}, label %division_valid_{id}\ndivision_stop_{id}:\n  ret i32 {id}\ndivision_valid_{id}:\n"
+                    ));
+                }
             }
             let output = operation
                 .source
@@ -198,7 +249,7 @@ pub fn emit_pcode_linear_prefix_llvm(
         source_operations: sources,
         stop_reason,
         stopped_at,
-        state_abi: "hydir-pcode-state-v1: opaque pointer; helper spaces 1=register,2=unique; byte offsets; little-endian exact-width reads/writes; clear unique at instruction start".to_owned(),
+        state_abi: "hydir-pcode-state-v1: opaque pointer; helper spaces 1=register,2=unique; byte offsets; little-endian exact-width reads/writes; clear unique at instruction start; runtime undefined division returns the number of completed source operations without writing its output".to_owned(),
         llvm_ir: ir,
         semantic_fidelity: SemanticFidelity::Unknown,
         verification: VerificationStatus::NotRun,
@@ -208,7 +259,10 @@ pub fn emit_pcode_linear_prefix_llvm(
 /// Emit a verifier-clean LLVM function for one exact operation (up to 64 bits).
 /// The function is named `hydir_pcode_exact` and has an integer return type
 /// equal to the output varnode width. Every non-constant source input is a
-/// width-typed parameter `%inN`, where N is its source-input index.
+/// width-typed parameter `%inN`, where N is its source-input index. Division
+/// by a dynamic zero divisor and signed MIN / -1 are totalized to zero and
+/// low quotient bits in this standalone helper to avoid LLVM poison. Those
+/// are not exact P-code results; stateful prefix/CFG emitters stop first.
 pub fn emit_pcode_exact_operation_llvm(
     operation: &PcodeSemanticOperation,
 ) -> Result<String, String> {
@@ -223,13 +277,25 @@ pub fn emit_pcode_exact_operation_llvm(
     // The public evaluator rechecks that the effect still matches the source
     // opcode, mnemonic, operand spaces, arity, and widths. Supply matching
     // values for constant varnodes so this also rejects forged artifacts.
+    let is_division = matches!(
+        kind,
+        PcodeExactOp::UnsignedDivide
+            | PcodeExactOp::SignedDivide
+            | PcodeExactOp::UnsignedRemainder
+            | PcodeExactOp::SignedRemainder
+    );
     let witness = operation
         .source
         .inputs
         .iter()
-        .map(|input| {
+        .enumerate()
+        .map(|(index, input)| {
             if input.space == "const" {
                 parse_constant(&input.offset)
+            } else if is_division && index == 1 {
+                // A zero witness would reject every otherwise valid dynamic
+                // division before LLVM has a chance to guard its divisor.
+                Ok(1)
             } else {
                 Ok(0)
             }
@@ -419,6 +485,43 @@ pub fn emit_pcode_exact_operation_llvm(
                 "  %result = {instruction} {result_type} {}, {}\n",
                 operands[0], operands[1]
             ));
+            "%result".to_owned()
+        }
+        PcodeExactOp::UnsignedDivide
+        | PcodeExactOp::SignedDivide
+        | PcodeExactOp::UnsignedRemainder
+        | PcodeExactOp::SignedRemainder => {
+            let signed = matches!(
+                kind,
+                PcodeExactOp::SignedDivide | PcodeExactOp::SignedRemainder
+            );
+            let remainder = matches!(
+                kind,
+                PcodeExactOp::UnsignedRemainder | PcodeExactOp::SignedRemainder
+            );
+            let instruction = match (signed, remainder) {
+                (false, false) => "udiv",
+                (false, true) => "urem",
+                (true, false) => "sdiv",
+                (true, true) => "srem",
+            };
+            body.push_str(&format!(
+                "  %zero_divisor = icmp eq {result_type} {}, 0\n",
+                operands[1]
+            ));
+            if signed {
+                let signed_minimum = 1u64 << (result_bits - 1);
+                body.push_str(&format!(
+                    "  %minimum_dividend = icmp eq {result_type} {}, {signed_minimum}\n  %negative_one_divisor = icmp eq {result_type} {}, -1\n  %signed_overflow = and i1 %minimum_dividend, %negative_one_divisor\n  %unsafe_division = or i1 %zero_divisor, %signed_overflow\n  %safe_dividend = select i1 %unsafe_division, {result_type} 0, {result_type} {}\n  %safe_divisor = select i1 %unsafe_division, {result_type} 1, {result_type} {}\n  %divided = {instruction} {result_type} %safe_dividend, %safe_divisor\n  %overflow_value = select i1 %signed_overflow, {result_type} {}, {result_type} %divided\n  %result = select i1 %zero_divisor, {result_type} 0, {result_type} %overflow_value\n",
+                    operands[0], operands[1], operands[0], operands[1],
+                    if remainder { 0 } else { signed_minimum }
+                ));
+            } else {
+                body.push_str(&format!(
+                    "  %safe_divisor = select i1 %zero_divisor, {result_type} 1, {result_type} {}\n  %divided = {instruction} {result_type} {}, %safe_divisor\n  %result = select i1 %zero_divisor, {result_type} 0, {result_type} %divided\n",
+                    operands[1], operands[0]
+                ));
+            }
             "%result".to_owned()
         }
         PcodeExactOp::UnsignedCarry | PcodeExactOp::SignedCarry | PcodeExactOp::SignedBorrow => {
@@ -615,6 +718,10 @@ mod tests {
             30 => PcodeExactOp::LogicalShiftRight,
             31 => PcodeExactOp::ArithmeticShiftRight,
             32 => PcodeExactOp::Multiply,
+            33 => PcodeExactOp::UnsignedDivide,
+            34 => PcodeExactOp::SignedDivide,
+            35 => PcodeExactOp::UnsignedRemainder,
+            36 => PcodeExactOp::SignedRemainder,
             37 => PcodeExactOp::BooleanNegate,
             38 => PcodeExactOp::BooleanXor,
             39 => PcodeExactOp::BooleanAnd,
@@ -707,6 +814,10 @@ mod tests {
             (30, "INT_RIGHT", 1, vec![1, 8]),
             (31, "INT_SRIGHT", 1, vec![1, 8]),
             (32, "INT_MULT", 1, vec![1, 1]),
+            (33, "INT_DIV", 1, vec![1, 1]),
+            (34, "INT_SDIV", 8, vec![8, 8]),
+            (35, "INT_REM", 2, vec![2, 2]),
+            (36, "INT_SREM", 4, vec![4, 4]),
             (37, "BOOL_NEGATE", 1, vec![1]),
             (38, "BOOL_XOR", 1, vec![1, 1]),
             (39, "BOOL_AND", 1, vec![1, 1]),
@@ -771,6 +882,122 @@ mod tests {
     }
 
     #[test]
+    fn division_llvm_matches_defined_inputs_and_totalizes_undefined_inputs_safely() {
+        if Command::new("lli").arg("--version").output().is_err() {
+            return;
+        }
+        let cases = [
+            (33, "INT_DIV", 1, 0xff, 2, 0x7f),
+            (35, "INT_REM", 1, 0xff, 2, 1),
+            (34, "INT_SDIV", 1, 0xf9, 2, 0xfd),
+            (36, "INT_SREM", 1, 0xf9, 2, 0xff),
+            (34, "INT_SDIV", 2, 0x8001, 0xffff, 0x7fff),
+            (36, "INT_SREM", 2, 0x8001, 0xffff, 0),
+            (33, "INT_DIV", 4, 0xffff_ffff, 2, 0x7fff_ffff),
+            (35, "INT_REM", 4, 0xffff_ffff, 2, 1),
+            (34, "INT_SDIV", 8, (-7i64) as u64, 2, (-3i64) as u64),
+            (36, "INT_SREM", 8, (-7i64) as u64, 2, u64::MAX),
+            // Ghidra leaves zero divisors without a result. Standalone LLVM
+            // totalizes them to zero; the stateful emitters stop beforehand.
+            (33, "INT_DIV", 8, 17, 0, 0),
+            (35, "INT_REM", 8, 17, 0, 0),
+            (34, "INT_SDIV", 8, 17, 0, 0),
+            (36, "INT_SREM", 8, 17, 0, 0),
+            // LLVM sdiv/srem are poison for MIN / -1; the helper never
+            // executes those operands and uses explicit fallback values.
+            (
+                34,
+                "INT_SDIV",
+                8,
+                i64::MIN as u64,
+                u64::MAX,
+                i64::MIN as u64,
+            ),
+            (36, "INT_SREM", 8, i64::MIN as u64, u64::MAX, 0),
+        ];
+        for (opcode, mnemonic, width, left, right, expected) in cases {
+            let op = operation(opcode, mnemonic, width, &[width, width]);
+            let llvm = emit_pcode_exact_operation_llvm(&op).unwrap();
+            let _ = run_opt(&llvm, &["-passes=verify", "-disable-output", "-"]);
+            let bits = width * 8;
+            let main = format!(
+                "define i32 @main() {{\nentry:\n  %value = call i{bits} @hydir_pcode_exact(i{bits} {left}, i{bits} {right})\n  %equal = icmp eq i{bits} %value, {expected}\n  %failed = xor i1 %equal, true\n  %status = zext i1 %failed to i32\n  ret i32 %status\n}}\n"
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), format!("{llvm}\n{main}")).unwrap();
+            let result = Command::new("lli").arg(file.path()).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{mnemonic} width {width} {left:#x} / {right:#x}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        let mut zero_constant = operation(33, "INT_DIV", 1, &[1, 1]);
+        zero_constant.source.inputs[1].space = "const".to_owned();
+        zero_constant.source.inputs[1].offset = "0x0".to_owned();
+        assert!(
+            emit_pcode_exact_operation_llvm(&zero_constant)
+                .unwrap_err()
+                .contains("zero")
+        );
+    }
+
+    #[test]
+    fn linear_prefix_stops_before_undefined_division() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
+        ));
+        let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
+        let mut snapshot = hydir_ir::pcode::parse_ghidra_snapshot(bytes, digest).unwrap();
+        let source = &mut snapshot.selected_function.instructions[0].pcode[0];
+        source.mnemonic = "INT_SDIV".to_owned();
+        source.opcode = 34;
+        source.inputs = vec![
+            PcodeVarnode {
+                space: "register".to_owned(),
+                offset: "0x38".to_owned(),
+                size: 8,
+            },
+            PcodeVarnode {
+                space: "register".to_owned(),
+                offset: "0x30".to_owned(),
+                size: 8,
+            },
+        ];
+        let dynamic = emit_pcode_linear_prefix_llvm(&snapshot).unwrap();
+        assert!(dynamic.llvm_ir.contains("division_stop_0"));
+        assert!(dynamic.llvm_ir.contains("%division_overflow_0"));
+        assert!(
+            dynamic
+                .state_abi
+                .contains("number of completed source operations")
+        );
+        let _ = run_opt(
+            &dynamic.llvm_ir,
+            &["-passes=verify", "-disable-output", "-"],
+        );
+
+        snapshot.selected_function.instructions[0].pcode[0].inputs[1] = PcodeVarnode {
+            space: "const".to_owned(),
+            offset: "0x0".to_owned(),
+            size: 8,
+        };
+        let static_zero = emit_pcode_linear_prefix_llvm(&snapshot).unwrap();
+        assert_eq!(static_zero.emitted_operations, 0);
+        assert!(static_zero.stop_reason.contains("zero"));
+        assert_eq!(
+            static_zero.stopped_at,
+            Some(snapshot.selected_function.entry.clone())
+        );
+        let _ = run_opt(
+            &static_zero.llvm_ir,
+            &["-passes=verify", "-disable-output", "-"],
+        );
+    }
+
+    #[test]
     fn optimized_llvm_matches_exact_evaluator_on_representative_values() {
         let cases: &[(u32, &str, u32, &[u32], &[u64])] = &[
             (1, "COPY", 1, &[1], &[0xff]),
@@ -799,6 +1026,12 @@ mod tests {
             (31, "INT_SRIGHT", 1, &[1, 8], &[0x80, 2]),
             (31, "INT_SRIGHT", 1, &[1, 8], &[0x7f, 8]),
             (32, "INT_MULT", 1, &[1, 1], &[0x80, 3]),
+            (33, "INT_DIV", 1, &[1, 1], &[0xff, 2]),
+            (35, "INT_REM", 2, &[2, 2], &[0xffff, 3]),
+            (34, "INT_SDIV", 1, &[1, 1], &[0xf9, 2]),
+            (36, "INT_SREM", 1, &[1, 1], &[0xf9, 2]),
+            (34, "INT_SDIV", 8, &[8, 8], &[(-7i64) as u64, 2]),
+            (36, "INT_SREM", 8, &[8, 8], &[(-7i64) as u64, 2]),
             (37, "BOOL_NEGATE", 1, &[1], &[0]),
             (37, "BOOL_NEGATE", 1, &[1], &[1]),
             (37, "BOOL_NEGATE", 1, &[1], &[2]),

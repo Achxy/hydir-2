@@ -268,6 +268,8 @@ pub struct GhidraCallTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GhidraHighVarnodeEvidence {
+    /// This may use Ghidra's `VARIABLE` namespace space, which is decompiler
+    /// evidence and is not a program address space or raw P-code storage.
     pub varnode: PcodeVarnode,
     pub ssa_id: i32,
     pub is_input: bool,
@@ -517,7 +519,7 @@ fn validate_high_varnode(
     space_names: &BTreeSet<&str>,
 ) -> Result<(), String> {
     validate_varnode(&node.varnode)?;
-    if !space_names.contains(node.varnode.space.as_str()) {
+    if !space_names.contains(node.varnode.space.as_str()) && node.varnode.space != "VARIABLE" {
         return Err("high P-code varnode references an unknown address space".to_owned());
     }
     if let Some(name) = &node.high_name {
@@ -911,6 +913,7 @@ impl GhidraSnapshot {
 mod tests {
     use super::*;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn fixture() -> serde_json::Value {
         json!({
@@ -985,6 +988,47 @@ mod tests {
             Some("result")
         );
         assert_eq!(snapshot.pcode_function_ir().unwrap(), raw);
+
+        // Ghidra can describe a decompiler variable in its VARIABLE namespace
+        // without listing that namespace among the program's address spaces.
+        let mut pseudo_variable = value.clone();
+        pseudo_variable["selected_function"]["high_pcode"]["operations"][0]["output"]["varnode"]
+            ["space"] = json!("VARIABLE");
+        pseudo_variable["selected_function"]["high_pcode"]["operations"][0]["output"]["varnode"]
+            ["size"] = json!(16);
+        let pseudo_snapshot = parse_ghidra_snapshot(
+            &serde_json::to_vec(&pseudo_variable).unwrap(),
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert_eq!(pseudo_snapshot.pcode_function_ir().unwrap(), raw);
+        assert!(
+            !pseudo_snapshot
+                .address_spaces
+                .iter()
+                .any(|space| space.name == "VARIABLE")
+        );
+
+        let mut raw_variable = pseudo_variable.clone();
+        raw_variable["selected_function"]["instructions"][0]["pcode"][0]["inputs"][0]["space"] =
+            json!("VARIABLE");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&raw_variable).unwrap(), &"a".repeat(64))
+                .unwrap_err()
+                .contains("P-code input references an unknown address space")
+        );
+
+        let mut source_variable = pseudo_variable;
+        source_variable["selected_function"]["high_pcode"]["operations"][0]["source_address"]["space"] =
+            json!("VARIABLE");
+        assert!(
+            parse_ghidra_snapshot(
+                &serde_json::to_vec(&source_variable).unwrap(),
+                &"a".repeat(64)
+            )
+            .unwrap_err()
+            .contains("high P-code source references an unknown address space")
+        );
 
         let mut wrong_source = value.clone();
         wrong_source["selected_function"]["high_pcode"]["source"] = json!("ghidra_raw_pcode");
@@ -1397,6 +1441,59 @@ mod tests {
             raw.semantic_fidelity,
             super::super::SemanticFidelity::Unknown
         );
+    }
+
+    #[test]
+    fn real_division_high_pcode_variable_space_stays_analysis_evidence() {
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_division.elf"
+        ));
+        let digest = format!("{:x}", Sha256::digest(binary));
+        for bytes in [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_division_u32_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_division_s32_v2.json"
+            ))
+            .as_slice(),
+        ] {
+            let snapshot = parse_ghidra_snapshot(bytes, &digest).unwrap();
+            let high = snapshot.selected_function.high_pcode.as_ref().unwrap();
+            assert_eq!(high.status, GhidraHighPcodeStatus::Complete);
+            assert!(high.operations.iter().any(|operation| {
+                operation
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.varnode.space == "VARIABLE")
+                    || operation
+                        .inputs
+                        .iter()
+                        .any(|input| input.varnode.space == "VARIABLE")
+            }));
+            let raw = snapshot.pcode_function_ir().unwrap();
+            assert_eq!(raw.source, "ghidra_raw_pcode");
+            assert!(
+                !raw.address_spaces
+                    .iter()
+                    .any(|space| space.name == "VARIABLE")
+            );
+            assert!(
+                raw.instructions
+                    .iter()
+                    .flat_map(|instruction| &instruction.pcode)
+                    .all(|op| {
+                        op.output
+                            .as_ref()
+                            .is_none_or(|output| output.space != "VARIABLE")
+                            && op.inputs.iter().all(|input| input.space != "VARIABLE")
+                    })
+            );
+        }
     }
 
     #[test]

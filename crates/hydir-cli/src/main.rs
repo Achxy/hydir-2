@@ -69,6 +69,7 @@ Usage:
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
+  hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
   hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
@@ -556,6 +557,50 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 print!("{llvm}");
             }
+        }
+        Some("ghidra") if args.len() >= 4 && args[1] == "import-project" => {
+            let mut program = None;
+            let mut selected = None;
+            let mut output = None;
+            let mut options = args[4..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--program" if program.is_none() && !pair[1].is_empty() => {
+                        program = Some(pair[1].as_str());
+                    }
+                    "--function" if selected.is_none() => {
+                        selected = Some(parse_u64_auto(&pair[1], "Ghidra function entry")?);
+                    }
+                    "--output" if output.is_none() && !pair[1].is_empty() => {
+                        output = Some(pair[1].as_str());
+                    }
+                    _ => return Err("invalid Ghidra project import option".into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err("Ghidra project import options require values".into());
+            }
+            let program = program.ok_or("Ghidra project import requires --program")?;
+            let output = output.ok_or("Ghidra project import requires --output")?;
+            let snapshot = ghidra_worker::import_project(
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                program,
+                selected,
+                Path::new(output),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "snapshot_path": output,
+                    "binary_sha256": snapshot.binary_sha256,
+                    "functions": snapshot.functions.len(),
+                    "selected_function": snapshot.selected_function.entry,
+                    "instructions": snapshot.selected_function.instructions.len(),
+                    "flow_edges": snapshot.selected_function.flow_edges.len(),
+                    "call_targets": snapshot.selected_function.call_targets.len(),
+                }))?
+            );
         }
         Some("ghidra") if args.len() >= 5 && args[1] == "analyze" => {
             let mut selected = None;

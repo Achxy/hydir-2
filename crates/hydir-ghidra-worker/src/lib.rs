@@ -21,6 +21,213 @@ const EXPORTER: &str = include_str!("../../../integrations/ghidra/HydIRSnapshot.
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DOCKER_LOG_BYTES: u64 = 16 * 1024;
+const MAX_PROJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_PROJECT_ENTRIES: usize = 100_000;
+const MAX_PROJECT_DEPTH: usize = 32;
+
+#[derive(Debug)]
+struct ProjectSelector {
+    headless_name: String,
+    leaf: String,
+    domain_path: String,
+}
+
+fn project_selector(project_name: &str, program: &str) -> Result<ProjectSelector, String> {
+    if project_name.is_empty()
+        || program.is_empty()
+        || program.starts_with('/')
+        || program.contains('\\')
+        || program.contains(':')
+    {
+        return Err("program must be a project-relative path separated by /".into());
+    }
+    let parts: Vec<_> = program.split('/').collect();
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || *part == "."
+            || *part == ".."
+            || part
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '*' | '?' | '[' | ']'))
+    }) {
+        return Err(
+            "program selector contains traversal, a wildcard, or an empty component".into(),
+        );
+    }
+    let leaf = parts.last().unwrap().to_string();
+    let headless_name = if parts.len() == 1 {
+        project_name.to_owned()
+    } else {
+        format!("{project_name}/{}", parts[..parts.len() - 1].join("/"))
+    };
+    Ok(ProjectSelector {
+        headless_name,
+        leaf,
+        domain_path: format!("/{program}"),
+    })
+}
+
+fn checked_source_metadata(path: &Path) -> Result<fs::Metadata, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect project entry {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Ghidra project contains a link: {}",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(format!(
+                "Ghidra project contains a reparse point: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+fn check_project_ancestors(path: &Path) -> Result<(), String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("cannot resolve project path: {e}"))?
+            .join(path)
+    };
+    for ancestor in absolute.ancestors() {
+        checked_source_metadata(ancestor)?;
+    }
+    Ok(())
+}
+
+fn copy_project_file(source: &Path, target: &Path, remaining: &mut u64) -> Result<(), String> {
+    let metadata = checked_source_metadata(source)?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "project entry is not a regular file: {}",
+            source.display()
+        ));
+    }
+    if metadata.len() > *remaining {
+        return Err("Ghidra project exceeds 2 GiB staging limit".into());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut input = options
+        .open(source)
+        .map_err(|e| format!("cannot open project entry {}: {e}", source.display()))?;
+    if !input.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!(
+            "project entry changed while staging: {}",
+            source.display()
+        ));
+    }
+    let mut output = File::create(target)
+        .map_err(|e| format!("cannot stage project entry {}: {e}", target.display()))?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|e| format!("cannot read project entry {}: {e}", source.display()))?;
+        if count == 0 {
+            break;
+        }
+        if count as u64 > *remaining {
+            return Err("Ghidra project exceeds 2 GiB staging limit".into());
+        }
+        *remaining -= count as u64;
+        output
+            .write_all(&buffer[..count])
+            .map_err(|e| format!("cannot stage project entry {}: {e}", target.display()))?;
+    }
+    if metadata.len() != input.metadata().map_err(|e| e.to_string())?.len() {
+        return Err(format!(
+            "project entry changed while staging: {}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+fn stage_closed_project(project_file: &Path, staging: &Path) -> Result<String, String> {
+    if !project_file
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("gpr"))
+    {
+        return Err("Ghidra project must be a .gpr file".into());
+    }
+    let name = project_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("Ghidra project name must be valid UTF-8")?;
+    let repository = project_file.with_extension("rep");
+    check_project_ancestors(project_file)?;
+    check_project_ancestors(&repository)?;
+    if !checked_source_metadata(project_file)?.is_file()
+        || !checked_source_metadata(&repository)?.is_dir()
+    {
+        return Err("Ghidra project needs a regular .gpr and matching .rep directory".into());
+    }
+    fs::create_dir(staging)
+        .map_err(|e| format!("cannot create isolated Ghidra project staging: {e}"))?;
+    let mut remaining = MAX_PROJECT_BYTES;
+    copy_project_file(
+        project_file,
+        &staging.join(project_file.file_name().unwrap()),
+        &mut remaining,
+    )?;
+    let staged_repository = staging.join(repository.file_name().unwrap());
+    fs::create_dir(&staged_repository)
+        .map_err(|e| format!("cannot stage Ghidra repository: {e}"))?;
+    let mut entries = 1usize;
+    let mut dirs = vec![(repository, staged_repository, 0usize)];
+    while let Some((source, target, depth)) = dirs.pop() {
+        checked_source_metadata(&source)?;
+        for entry in fs::read_dir(&source)
+            .map_err(|e| format!("cannot list project folder {}: {e}", source.display()))?
+        {
+            let entry = entry.map_err(|e| format!("cannot list project entry: {e}"))?;
+            entries += 1;
+            if entries > MAX_PROJECT_ENTRIES {
+                return Err("Ghidra project exceeds 100,000 staging entries".into());
+            }
+            let source_path = entry.path();
+            let target_path = target.join(entry.file_name());
+            let metadata = checked_source_metadata(&source_path)?;
+            if metadata.is_dir() {
+                if depth >= MAX_PROJECT_DEPTH {
+                    return Err("Ghidra project exceeds staging depth 32".into());
+                }
+                fs::create_dir(&target_path)
+                    .map_err(|e| format!("cannot stage project folder: {e}"))?;
+                dirs.push((source_path, target_path, depth + 1));
+            } else if metadata.is_file() {
+                copy_project_file(&source_path, &target_path, &mut remaining)?;
+            } else {
+                return Err(format!(
+                    "unsupported Ghidra project entry: {}",
+                    source_path.display()
+                ));
+            }
+        }
+    }
+    Ok(name.to_owned())
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct GhidraRuntimeStatus {
@@ -582,6 +789,22 @@ fn docker_run_args(
     args
 }
 
+fn docker_project_args(
+    mut args: Vec<String>,
+    tag: &str,
+    selector: &ProjectSelector,
+) -> Vec<String> {
+    let image_index = args
+        .iter()
+        .position(|arg| arg == tag)
+        .expect("image tag argument");
+    args[image_index + 2] = selector.headless_name.clone();
+    args.insert(image_index + 4, selector.leaf.clone());
+    args.insert(image_index + 6, "-readOnly".into());
+    args.push(format!("domainPath={}", selector.domain_path));
+    args
+}
+
 fn local_analyze(
     home: &Path,
     binary: &Path,
@@ -589,6 +812,7 @@ fn local_analyze(
     project: &Path,
     reuse_project: bool,
     selected_entry: Option<u64>,
+    project_import: Option<&ProjectSelector>,
 ) -> Result<(), String> {
     let script_dir = work.join("scripts");
     fs::create_dir(&script_dir)
@@ -605,8 +829,15 @@ fn local_analyze(
     }
     let snapshot = work.join("snapshot.json");
     let mut command = Command::new(&executable);
-    command.arg(project).arg("HydirAuto");
-    if reuse_project {
+    command
+        .arg(project)
+        .arg(project_import.map_or("HydirAuto", |s| s.headless_name.as_str()));
+    if let Some(selector) = project_import {
+        command
+            .arg("-process")
+            .arg(&selector.leaf)
+            .args(["-noanalysis", "-readOnly"]);
+    } else if reuse_project {
         command.args(["-process", "-noanalysis"]);
     } else {
         command.arg("-import").arg(binary);
@@ -617,6 +848,9 @@ fn local_analyze(
         &snapshot.display().to_string(),
         &binary.display().to_string(),
     ));
+    if let Some(selector) = project_import {
+        command.arg(format!("domainPath={}", selector.domain_path));
+    }
     run_bounded(
         &mut command,
         "Ghidra headless analysis",
@@ -632,6 +866,7 @@ fn docker_analyze(
     project: &Path,
     reuse_project: bool,
     selected_entry: Option<u64>,
+    project_import: Option<&ProjectSelector>,
 ) -> Result<(), String> {
     let tag = provision_image(work)?;
     let staging = work.join("container-work");
@@ -668,7 +903,7 @@ fn docker_analyze(
             .filter(char::is_ascii_alphanumeric)
             .collect::<String>()
     );
-    let args = docker_run_args(
+    let mut args = docker_run_args(
         &tag,
         &name,
         binary,
@@ -678,6 +913,9 @@ fn docker_analyze(
         selected_entry,
         run_as.as_deref(),
     );
+    if let Some(selector) = project_import {
+        args = docker_project_args(args, &tag, selector);
+    }
     let mut command = Command::new("docker");
     command.args(&args);
     let result = run_bounded(
@@ -788,6 +1026,7 @@ pub fn analyze(
             project,
             reuse_project,
             selected_entry,
+            None,
         )?;
     } else {
         docker_analyze(
@@ -796,6 +1035,7 @@ pub fn analyze(
             project,
             reuse_project,
             selected_entry,
+            None,
         )?;
     }
     let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
@@ -846,9 +1086,261 @@ pub fn analyze(
     Ok(snapshot)
 }
 
+/// Export one program from an expert-supplied, closed Ghidra project. The
+/// source project is copied into system scratch before headless opens it.
+/// This route deliberately has no cache: every call checks current project
+/// contents and the original binary binding afresh.
+pub fn import_project(
+    binary: &Path,
+    project_file: &Path,
+    program: &str,
+    selected_entry: Option<u64>,
+    output: &Path,
+) -> Result<GhidraSnapshot, String> {
+    check_project_ancestors(project_file)?;
+    let project_file = fs::canonicalize(project_file)
+        .map_err(|e| format!("cannot resolve Ghidra project: {e}"))?;
+    let project_name = project_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("Ghidra project name must be valid UTF-8")?;
+    let selector = project_selector(project_name, program)?;
+    let repository = project_file.with_extension("rep");
+    check_project_ancestors(&repository)?;
+    let repository = fs::canonicalize(&repository)
+        .map_err(|e| format!("cannot resolve matching Ghidra repository: {e}"))?;
+    let binary = fs::canonicalize(binary)
+        .map_err(|e| format!("cannot resolve binary {}: {e}", binary.display()))?;
+    if !binary.is_file() {
+        return Err("input is not a regular binary file".into());
+    }
+    let size = fs::metadata(&binary).map_err(|e| e.to_string())?.len();
+    if size == 0 || size > MAX_BINARY_BYTES as u64 {
+        return Err(format!(
+            "binary size {size} exceeds Hydir's 64 MiB input limit"
+        ));
+    }
+    let binary_digest = digest_file(&binary)?;
+    let output_abs = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        env::current_dir().map_err(|e| e.to_string())?.join(output)
+    };
+    let parent = output_abs
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("snapshot output needs a filename")?;
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create output directory: {e}"))?;
+    let output_abs = fs::canonicalize(parent)
+        .map_err(|e| format!("cannot resolve output directory: {e}"))?
+        .join(
+            output_abs
+                .file_name()
+                .ok_or("snapshot output needs a filename")?,
+        );
+    let resolved_output = if output_abs.exists() {
+        fs::canonicalize(&output_abs).map_err(|e| e.to_string())?
+    } else {
+        output_abs.clone()
+    };
+    if resolved_output == binary
+        || resolved_output == project_file
+        || resolved_output.starts_with(&repository)
+    {
+        return Err("snapshot output must not replace the binary or source project".into());
+    }
+    let _output_lock = lock_output(&output_abs)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("hydir-ghidra-project-")
+        .tempdir()
+        .map_err(|e| format!("cannot create system Ghidra scratch directory: {e}"))?;
+    let staged_project = scratch.path().join("project");
+    stage_closed_project(&project_file, &staged_project)?;
+    if let Some(home) = env::var_os("HYDIR_GHIDRA_HOME") {
+        local_analyze(
+            Path::new(&home),
+            &binary,
+            scratch.path(),
+            &staged_project,
+            true,
+            selected_entry,
+            Some(&selector),
+        )?;
+    } else {
+        docker_analyze(
+            &binary,
+            scratch.path(),
+            &staged_project,
+            true,
+            selected_entry,
+            Some(&selector),
+        )?;
+    }
+    let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
+        format!(
+            "{e}; headless log: {}",
+            log_tail(&scratch.path().join("analysis.log"))
+        )
+    })?;
+    let snapshot = validate_output(&bytes, &binary_digest, selected_entry).map_err(|e| {
+        format!(
+            "{e}; headless log: {}",
+            log_tail(&scratch.path().join("analysis.log"))
+        )
+    })?;
+    if digest_file(&binary)? != binary_digest {
+        return Err("original binary changed during Ghidra project import".into());
+    }
+    match fs::remove_file(cache_path(&output_abs)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot clear stale Ghidra output cache: {error}")),
+    }
+    atomic_write(&output_abs, &bytes)?;
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_selector_is_exact_and_rejects_ambiguous_paths() {
+        let selector = project_selector("Expert", "firmware/main.elf").unwrap();
+        assert_eq!(selector.headless_name, "Expert/firmware");
+        assert_eq!(selector.leaf, "main.elf");
+        assert_eq!(selector.domain_path, "/firmware/main.elf");
+        for invalid in [
+            "",
+            "/main.elf",
+            "../main.elf",
+            "foo/../main.elf",
+            "foo//main.elf",
+            "foo/./main.elf",
+            "foo/*.elf",
+            "foo/?.elf",
+            "foo/[ab].elf",
+            "foo\\main.elf",
+            "C:main.elf",
+            "foo/main.elf/",
+        ] {
+            assert!(project_selector("Expert", invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn closed_project_staging_copies_only_matching_pair_and_caps_size() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Expert.gpr");
+        let repository = root.path().join("Expert.rep");
+        fs::write(&project, b"project").unwrap();
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(repository.join("folder")).unwrap();
+        fs::write(repository.join("folder/main.elf.gbf"), b"program").unwrap();
+        fs::write(root.path().join("unrelated.txt"), b"secret").unwrap();
+        let staged = root.path().join("staged");
+        assert_eq!(stage_closed_project(&project, &staged).unwrap(), "Expert");
+        assert_eq!(fs::read(staged.join("Expert.gpr")).unwrap(), b"project");
+        assert_eq!(
+            fs::read(staged.join("Expert.rep/folder/main.elf.gbf")).unwrap(),
+            b"program"
+        );
+        assert!(!staged.join("unrelated.txt").exists());
+
+        let large = repository.join("oversize");
+        File::create(&large)
+            .unwrap()
+            .set_len(MAX_PROJECT_BYTES + 1)
+            .unwrap();
+        assert!(
+            stage_closed_project(&project, &root.path().join("too-large"))
+                .unwrap_err()
+                .contains("2 GiB")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_project_staging_rejects_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Expert.gpr");
+        let repository = root.path().join("Expert.rep");
+        fs::write(&project, b"project").unwrap();
+        fs::create_dir(&repository).unwrap();
+        symlink(root.path().join("elsewhere"), repository.join("escape")).unwrap();
+        assert!(
+            stage_closed_project(&project, &root.path().join("staged"))
+                .unwrap_err()
+                .contains("link")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn closed_project_staging_rejects_reparse_links_when_supported() {
+        use std::os::windows::fs::symlink_file;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Expert.gpr");
+        let repository = root.path().join("Expert.rep");
+        fs::write(&project, b"project").unwrap();
+        fs::create_dir(&repository).unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        if symlink_file(&outside, repository.join("escape")).is_err() {
+            return; // Creating symlinks requires developer mode on some Windows hosts.
+        }
+        assert!(
+            stage_closed_project(&project, &root.path().join("staged"))
+                .unwrap_err()
+                .contains("link")
+        );
+    }
+
+    #[test]
+    fn project_import_refuses_output_inside_source_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Expert.gpr");
+        let repository = root.path().join("Expert.rep");
+        let binary = root.path().join("binary.elf");
+        fs::write(&project, b"project").unwrap();
+        fs::create_dir(&repository).unwrap();
+        fs::write(&binary, b"binary").unwrap();
+        let output = repository.join("snapshot.json");
+        let error = import_project(&binary, &project, "program", None, &output).unwrap_err();
+        assert!(error.contains("source project"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn project_container_args_process_one_leaf_read_only() {
+        let selector = project_selector("Expert", "firmware/main.elf").unwrap();
+        let args = docker_run_args(
+            "image:tag",
+            "hydir-test",
+            Path::new("/tmp/binary"),
+            Path::new("/tmp/work"),
+            Path::new("/tmp/project"),
+            true,
+            Some(0x401000),
+            None,
+        );
+        let args = docker_project_args(args, "image:tag", &selector);
+        assert!(args.windows(5).any(|w| w
+            == [
+                "Expert/firmware",
+                "-process",
+                "main.elf",
+                "-noanalysis",
+                "-readOnly"
+            ]));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "domainPath=/firmware/main.elf")
+        );
+        assert!(!args.iter().any(|arg| arg == "-import"));
+        assert!(args.windows(2).any(|w| w == ["--network", "none"]));
+    }
 
     #[test]
     fn cancellation_stops_a_running_worker_command() {
