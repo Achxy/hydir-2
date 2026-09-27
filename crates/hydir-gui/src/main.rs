@@ -28,11 +28,11 @@ use hydir_core::{
     overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_decompile::{
-    NativeCoverageReport, NativeDecompilation, PcodeCfgLlvmArtifact,
+    NativeCoverageReport, NativeDecompilation, PCODE_CFG_ELF_IMAGE_MAX_BYTES, PcodeCfgLlvmArtifact,
     PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
     PcodeStandalonePrefixArtifact, decompile_function_at, decompile_symbol, discover_functions,
-    emit_pcode_cfg_llvm, emit_pcode_exact_operation_llvm, emit_pcode_simplified_cfg_llvm,
-    emit_pcode_standalone_prefix_llvm, measure_native_coverage,
+    emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_image, emit_pcode_exact_operation_llvm,
+    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
@@ -2341,6 +2341,18 @@ fn trace_ghidra_path(
     }
 }
 
+fn emit_ghidra_image_cfg_llvm(
+    snapshot: &GhidraSnapshot,
+    start_text: &str,
+    binary_path: &Path,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    let start = ghidra_trace_start(snapshot, start_text)?;
+    let binary = bounded_read(binary_path)?;
+    let image = PcodeReadOnlyElfImage::from_elf(&binary, snapshot)?;
+    let window = image.materialize_window(PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+    emit_pcode_cfg_llvm_with_image(snapshot, Some(&start), &window)
+}
+
 /// Translate Ghidra's imported RAM image back to linked ELF virtual addresses.
 /// The GUI's shared selection uses linked addresses; P-code and trace inputs
 /// continue to use the addresses in the Ghidra snapshot.
@@ -3928,6 +3940,7 @@ struct AnalystApp {
     ghidra_llvm_operation: Option<String>,
     ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
     ghidra_llvm_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
+    ghidra_llvm_image_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
     ghidra_llvm_simplified: Option<Result<PcodeSimplifiedCfgLlvmArtifact, String>>,
     ghidra_simplification: Option<Result<PcodeSimplificationArtifact, String>>,
     ghidra_trace_seed_json: String,
@@ -4075,6 +4088,7 @@ impl AnalystApp {
             ghidra_llvm_operation: None,
             ghidra_llvm_prefix: None,
             ghidra_llvm_cfg: None,
+            ghidra_llvm_image_cfg: None,
             ghidra_llvm_simplified: None,
             ghidra_simplification: None,
             ghidra_trace_seed_json: String::new(),
@@ -4312,6 +4326,7 @@ impl AnalystApp {
                     self.ghidra_llvm_operation = None;
                     self.ghidra_llvm_prefix = None;
                     self.ghidra_llvm_cfg = None;
+                    self.ghidra_llvm_image_cfg = None;
                     self.ghidra_llvm_simplified = None;
                     self.ghidra_simplification = None;
                     self.ghidra_trace_seed_json.clear();
@@ -4515,6 +4530,7 @@ impl AnalystApp {
                                 &snapshot,
                                 Some(&snapshot.selected_function.entry),
                             ));
+                            self.ghidra_llvm_image_cfg = None;
                             self.ghidra_llvm_simplified = None;
                             self.ghidra_simplification = None;
                             self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
@@ -7141,6 +7157,7 @@ impl AnalystApp {
                         self.ghidra_path_trace = None;
                         self.ghidra_path_lines.clear();
                         self.ghidra_llvm_cfg = None;
+                        self.ghidra_llvm_image_cfg = None;
                         self.ghidra_llvm_simplified = None;
                     }
                     if let Some(address) = selected_ghidra_trace_address(
@@ -7152,6 +7169,7 @@ impl AnalystApp {
                             self.ghidra_path_trace = None;
                             self.ghidra_path_lines.clear();
                             self.ghidra_llvm_cfg = None;
+                            self.ghidra_llvm_image_cfg = None;
                             self.ghidra_llvm_simplified = None;
                         }
                 });
@@ -7583,6 +7601,70 @@ impl AnalystApp {
                         ui.label(RichText::new(error).size(11.0).color(BAD));
                     }
                     None => {}
+                }
+                if let Some(path) = self.current_local_path.as_ref() {
+                    ui.separator();
+                    ui.label(RichText::new("Embed the matching ELF's validated read-only bytes in a v3 LLVM module. Mutable guest RAM remains a separate window; unresolved reads and effects stop explicitly.")
+                        .size(11.0).color(MUTED));
+                    if ui.button("Generate image-backed CFG LLVM").clicked() {
+                        self.ghidra_llvm_image_cfg = Some(emit_ghidra_image_cfg_llvm(
+                            snapshot,
+                            &self.ghidra_trace_start,
+                            path,
+                        ));
+                    }
+                    match &self.ghidra_llvm_image_cfg {
+                        Some(Ok(artifact)) => {
+                            ui.label(RichText::new(format!(
+                                "LLVM v{} · {} source operations · {} static stop sites · fidelity: {:?}",
+                                artifact.schema_version,
+                                artifact.source_operations.len(),
+                                artifact.stop_sites.len(),
+                                artifact.semantic_fidelity,
+                            )).size(11.0).color(ACCENT));
+                            ui.label(RichText::new(format!("Binary SHA-256: {}", artifact.binary_sha256))
+                                .monospace().size(11.0).color(MUTED));
+                            if let Some(image) = &artifact.read_only_image {
+                                ui.label(RichText::new(format!(
+                                    "Read-only ELF image: {} 0x{:x} · {} byte window · {} known bytes · contents SHA-256 {}",
+                                    image.space, image.base, image.byte_len,
+                                    image.known_byte_count, image.contents_sha256,
+                                )).monospace().size(11.0).color(MUTED));
+                            }
+                            egui::ScrollArea::vertical().id_salt("ghidra_llvm_image_cfg_stops")
+                                .max_height(130.0)
+                                .show_rows(ui, 18.0, artifact.stop_sites.len(), |ui, range| {
+                                    for row in range {
+                                        let site = &artifact.stop_sites[row];
+                                        let address = address_map.as_ref().and_then(|map| {
+                                            map.to_linked(&site.address.space, &site.address.offset)
+                                        });
+                                        let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
+                                        if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                            RichText::new(label).monospace().size(11.0)).clicked()
+                                            && address.is_some() {
+                                            self.selected_address = address;
+                                        }
+                                    }
+                                });
+                            if ui.button("Copy image-backed CFG LLVM").clicked() {
+                                ui.ctx().copy_text(artifact.llvm_ir.clone());
+                            }
+                            if ui.button("Copy image-backed CFG artifact JSON").clicked()
+                                && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                ui.ctx().copy_text(json);
+                            }
+                            egui::ScrollArea::both().id_salt("ghidra_llvm_image_cfg_source")
+                                .max_height(200.0).show(ui, |ui| {
+                                    ui.label(RichText::new(&artifact.llvm_ir).monospace().size(11.0));
+                                });
+                        }
+                        Some(Err(error)) => {
+                            ui.label(RichText::new(format!("Image-backed CFG LLVM failed: {error}"))
+                                .size(11.0).color(BAD));
+                        }
+                        None => {}
+                    }
                 }
             });
         egui::CollapsingHeader::new("LLVM after checked P-code simplification")
@@ -12680,14 +12762,14 @@ mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
         ModelRenameTarget, NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode,
-        captured_code_elf_address, ghidra_composite_evidence, ghidra_readiness_copy,
-        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
-        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
-        native_instruction_count, native_opaque_instruction_count, pcode_display_lines,
-        pcode_line_target, pcode_state_lines, persist_ghidra_snapshot, persist_local_model_rename,
-        preview_patch_local, resized_console_height, run_ghidra_command,
-        selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
-        workbench_graph_layout,
+        captured_code_elf_address, emit_ghidra_image_cfg_llvm, ghidra_composite_evidence,
+        ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start,
+        high_pcode_varnode, indexed_function_action, ir_slice, local_region_artifacts,
+        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
+        pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
+        persist_local_model_rename, preview_patch_local, resized_console_height,
+        run_ghidra_command, selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token,
+        validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
@@ -12695,7 +12777,8 @@ mod tests {
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
     use hydir_decompile::{
-        decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
+        PCODE_CFG_ELF_IMAGE_MAX_BYTES, decompile_function_at, decompile_symbol, discover_functions,
+        measure_native_coverage,
     };
     use hydir_execution::StopPoint;
     use hydir_ghidra_worker::GhidraRuntimeStatus;
@@ -12707,6 +12790,7 @@ mod tests {
         TypeDefinitionKind, TypeRef, init_model,
     };
     use hydir_project::LocalProjectStore;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -13006,6 +13090,34 @@ mod tests {
                 .unwrap(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn gui_image_cfg_llvm_binds_the_selected_local_elf() {
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let digest = format!("{:x}", Sha256::digest(binary));
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json"),
+            &digest,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("password.elf");
+        fs::write(&path, binary).unwrap();
+
+        let artifact = emit_ghidra_image_cfg_llvm(&snapshot, "0x2016d0", &path).unwrap();
+        assert_eq!(artifact.schema_version, 3);
+        assert_eq!(artifact.binary_sha256, digest);
+        assert_eq!(artifact.start, snapshot.selected_function.entry);
+        let image = artifact.read_only_image.as_ref().unwrap();
+        assert!(image.known_byte_count > 0);
+        assert!(image.byte_len <= PCODE_CFG_ELF_IMAGE_MAX_BYTES);
+        assert!(artifact.llvm_ir.contains("define "));
+
+        let mut changed = binary.to_vec();
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&path, changed).unwrap();
+        assert!(emit_ghidra_image_cfg_llvm(&snapshot, "0x2016d0", &path).is_err());
     }
 
     #[test]
