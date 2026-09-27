@@ -1746,7 +1746,8 @@ fn emit_pcode_cfg_llvm_semantic(
 mod tests {
     use super::*;
     use hydir_ir::pcode::{
-        PcodeConcreteState, PcodePathEvent, PcodePathStop, parse_ghidra_snapshot,
+        PcodeConcreteState, PcodePathEvent, PcodePathStop, PcodeReadOnlyElfImage,
+        parse_ghidra_snapshot,
     };
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1835,6 +1836,17 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.selected_function.entry.offset, "0x2015d0");
         snapshot
+    }
+
+    fn stripped_password_secure_equals_fixture() -> GhidraSnapshot {
+        parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json"
+            )),
+            "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288",
+        )
+        .unwrap()
     }
 
     fn calls_fixture() -> GhidraSnapshot {
@@ -1940,6 +1952,100 @@ mod tests {
                     expected_state,
                 },
                 256,
+                PcodeCfgLlvmStatus::Return,
+                &source_event_ids(&artifact, &rust),
+                Some(expected as u8),
+            );
+        }
+    }
+
+    #[test]
+    fn stripped_password_secure_equals_uses_file_backed_bytes_in_llvm_replay() {
+        let snapshot = stripped_password_secure_equals_fixture();
+        let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        verify(&artifact.llvm_ir);
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let spec = hydir_loader::import_elf(binary).unwrap();
+        let phrase_address = 0x2001f0_u64;
+        let segment = spec
+            .mapped_segments
+            .iter()
+            .find(|segment| {
+                segment.readable
+                    && !segment.writable
+                    && phrase_address >= segment.virtual_address.0
+                    && phrase_address + 12 <= segment.virtual_address.0 + segment.file_size
+            })
+            .expect("password phrase is in a file-backed read-only segment");
+        let file_offset =
+            (segment.file_offset.0 + phrase_address - segment.virtual_address.0) as usize;
+        let phrase = &binary[file_offset..file_offset + 12];
+        assert_eq!(phrase, b"HYDIR-ACCESS");
+        let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshot).unwrap();
+        let stack = 0x210000_u64;
+        let input = 0x210100_u64;
+        for first_byte in [b'H', b'h'] {
+            let mut candidate = *b"HYDIR-ACCESS";
+            candidate[0] = first_byte;
+            let expected = u64::from(first_byte == b'H');
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), input).unwrap();
+            seed.write_varnode(&register("0x30", 8), 12).unwrap();
+            seed.write_varnode(&register("0x20", 8), stack).unwrap();
+            seed.write_varnode(&register("0x0", 8), 0).unwrap();
+            seed.write_varnode(&register("0x8", 8), 0).unwrap();
+            seed.write_memory("ram", stack, 8, 0xdeadbeef).unwrap();
+            seed.write_memory(
+                "ram",
+                input,
+                8,
+                u64::from_le_bytes(candidate[..8].try_into().unwrap()),
+            )
+            .unwrap();
+            seed.write_memory(
+                "ram",
+                input + 8,
+                4,
+                u32::from_le_bytes(candidate[8..12].try_into().unwrap()) as u64,
+            )
+            .unwrap();
+            let rust = snapshot
+                .execute_concrete_path_with_image(&seed, &image, None, 1024, 256)
+                .unwrap();
+            assert!(
+                matches!(rust.stop, PcodePathStop::Return { .. }),
+                "{:?}",
+                rust.stop
+            );
+            assert_eq!(
+                rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                Some(expected)
+            );
+            let mut bytes = vec![None; (input + 12 - phrase_address) as usize];
+            let return_bytes = 0xdeadbeefu64.to_le_bytes();
+            for (address, source) in [
+                (phrase_address, phrase),
+                (stack, return_bytes.as_slice()),
+                (input, candidate.as_slice()),
+            ] {
+                for (index, byte) in source.iter().enumerate() {
+                    bytes[(address - phrase_address) as usize + index] = Some(*byte);
+                }
+            }
+            run_lli_with_guest(
+                &artifact,
+                &seed,
+                &GuestTestMemory {
+                    space_id: 433,
+                    base: phrase_address,
+                    bytes,
+                    expected: Vec::new(),
+                    expected_state: Vec::new(),
+                },
+                1024,
                 PcodeCfgLlvmStatus::Return,
                 &source_event_ids(&artifact, &rust),
                 Some(expected as u8),
@@ -2388,7 +2494,9 @@ mod tests {
                %guest_mask = getelementptr [{guest_size} x i8], ptr %guest_known_array, i64 0, i64 0\n\
                %events_array = alloca [{event_capacity} x i32]\n\
                %events = getelementptr [{event_capacity} x i32], ptr %events_array, i64 0, i64 0\n\
-               %event_count = alloca i32\n"
+                %event_count = alloca i32\n\
+                call void @llvm.memset.p0.i64(ptr %guest, i8 0, i64 {guest_size}, i1 false)\n\
+                call void @llvm.memset.p0.i64(ptr %guest_mask, i8 0, i64 {guest_size}, i1 false)\n"
         );
         for byte in &artifact.byte_map {
             let known = seed
@@ -2412,12 +2520,11 @@ mod tests {
             ));
         }
         for index in 0..guest_size {
-            let known = guest.bytes.get(index).copied().flatten();
-            main.push_str(&format!(
-                "  %guest_s_{index} = getelementptr i8, ptr %guest, i64 {index}\n  store i8 {}, ptr %guest_s_{index}\n  %guest_k_{index} = getelementptr i8, ptr %guest_mask, i64 {index}\n  store i8 {}, ptr %guest_k_{index}\n",
-                known.unwrap_or(0),
-                if known.is_some() { 255 } else { 0 }
-            ));
+            if let Some(known) = guest.bytes.get(index).copied().flatten() {
+                main.push_str(&format!(
+                    "  %guest_s_{index} = getelementptr i8, ptr %guest, i64 {index}\n  store i8 {known}, ptr %guest_s_{index}\n  %guest_k_{index} = getelementptr i8, ptr %guest_mask, i64 {index}\n  store i8 -1, ptr %guest_k_{index}\n",
+                ));
+            }
         }
         main.push_str(&format!(
             "  %status = call i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 {}, ptr %guest, ptr %guest_mask, i64 {}, i64 {}, ptr %events, ptr %event_count, i32 {event_capacity}, i32 {max_steps})\n\
@@ -2479,11 +2586,15 @@ mod tests {
             "  %failed = xor i1 {previous}, true\n  %result = zext i1 %failed to i32\n  ret i32 %result\n}}\n"
         ));
         let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), format!("{}\n{main}", artifact.llvm_ir)).unwrap();
+        let module = format!(
+            "{}\ndeclare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n",
+            artifact.llvm_ir
+        );
+        std::fs::write(file.path(), format!("{module}\n{main}")).unwrap();
         let output = Command::new("lli").arg(file.path()).output().unwrap();
         if !output.status.success() {
             let status_main = main.replace("ret i32 %result\n}", "ret i32 %status\n}");
-            std::fs::write(file.path(), format!("{}\n{status_main}", artifact.llvm_ir)).unwrap();
+            std::fs::write(file.path(), format!("{module}\n{status_main}")).unwrap();
             let status = Command::new("lli")
                 .arg(file.path())
                 .output()
@@ -2491,7 +2602,7 @@ mod tests {
                 .status
                 .code();
             let count_main = main.replace("ret i32 %result\n}", "ret i32 %count\n}");
-            std::fs::write(file.path(), format!("{}\n{count_main}", artifact.llvm_ir)).unwrap();
+            std::fs::write(file.path(), format!("{module}\n{count_main}")).unwrap();
             let count = Command::new("lli")
                 .arg(file.path())
                 .output()

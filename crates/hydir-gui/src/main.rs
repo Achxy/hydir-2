@@ -47,7 +47,7 @@ use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeBackwardSlice,
     PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace, PcodePathDestination,
-    PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeSemanticFunctionIr,
+    PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage, PcodeSemanticFunctionIr,
     PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
     parse_ghidra_snapshot, parse_pcode_seed,
 };
@@ -180,6 +180,11 @@ enum Task {
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
+    TraceGhidraPath {
+        snapshot: Box<GhidraSnapshot>,
+        seed_json: String,
+        start_text: String,
+    },
     TraceGhidraCalls {
         binary: PathBuf,
         binary_sha256: String,
@@ -311,6 +316,13 @@ enum Event {
     GhidraAnalyzed {
         binary_sha256: String,
         result: Result<(GhidraSnapshot, Option<String>), String>,
+    },
+    GhidraPathTraced {
+        binary_sha256: String,
+        function: PcodeAddress,
+        seed_json: String,
+        start_text: String,
+        result: Result<PcodePathTrace, String>,
     },
     GhidraCallsTraced {
         binary_sha256: String,
@@ -2311,6 +2323,24 @@ fn ghidra_trace_start(snapshot: &GhidraSnapshot, text: &str) -> Result<PcodeAddr
     })
 }
 
+fn trace_ghidra_path(
+    snapshot: &GhidraSnapshot,
+    seed_json: &str,
+    start_text: &str,
+    binary: Option<&[u8]>,
+) -> Result<PcodePathTrace, String> {
+    let initial = parse_pcode_seed(seed_json.as_bytes(), snapshot)?;
+    let start = ghidra_trace_start(snapshot, start_text)?;
+    if let Some(binary) = binary
+        && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
+    {
+        let image = PcodeReadOnlyElfImage::from_elf(binary, snapshot)?;
+        snapshot.execute_concrete_path_with_image(&initial, &image, Some(&start), 4096, 1024)
+    } else {
+        snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024)
+    }
+}
+
 /// Translate Ghidra's imported RAM image back to linked ELF virtual addresses.
 /// The GUI's shared selection uses linked addresses; P-code and trace inputs
 /// continue to use the addresses in the Ghidra snapshot.
@@ -2805,6 +2835,24 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     repaint.request_repaint();
                 });
                 continue;
+            },
+            Task::TraceGhidraPath {
+                snapshot,
+                seed_json,
+                start_text,
+            } => {
+                let binary = match &source {
+                    Source::Local(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                };
+                let result = trace_ghidra_path(&snapshot, &seed_json, &start_text, binary);
+                Event::GhidraPathTraced {
+                    binary_sha256: snapshot.binary_sha256.clone(),
+                    function: snapshot.selected_function.entry.clone(),
+                    seed_json,
+                    start_text,
+                    result,
+                }
             },
             Task::TraceGhidraCalls {
                 binary,
@@ -4501,6 +4549,32 @@ impl AnalystApp {
                     if let Some((binary, digest)) = self.pending_ghidra.take() {
                         self.enqueue_ghidra(binary, digest, None);
                     }
+                }
+                Event::GhidraPathTraced {
+                    binary_sha256,
+                    function,
+                    seed_json,
+                    start_text,
+                    result,
+                } => {
+                    if self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                        snapshot.binary_sha256 != binary_sha256
+                            || snapshot.selected_function.entry != function
+                    }) || self.ghidra_trace_seed_json != seed_json
+                        || self.ghidra_trace_start != start_text
+                    {
+                        continue;
+                    }
+                    self.ghidra_path_lines =
+                        result.as_ref().map(ghidra_trace_lines).unwrap_or_default();
+                    self.status = match &result {
+                        Ok(trace) => format!(
+                            "Traced {} Ghidra instruction visits",
+                            trace.instruction_visits.len()
+                        ),
+                        Err(_) => "Ghidra path trace failed".to_owned(),
+                    };
+                    self.ghidra_path_trace = Some(result);
                 }
                 Event::GhidraCallsTraced {
                     binary_sha256,
@@ -6742,6 +6816,7 @@ impl AnalystApp {
         ui.separator();
         ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
         let mut requested = None;
+        let mut path_trace_task = None;
         egui::ScrollArea::vertical()
             .id_salt("ghidra_function_index")
             .max_height(150.0)
@@ -7054,6 +7129,12 @@ impl AnalystApp {
             .show(ui, |ui| {
                 ui.label(RichText::new("Seed known register or RAM bytes, then follow one bounded path. Unknown values and unsupported effects stop explicitly; the trace is not a whole-function proof.")
                     .size(11.0).color(MUTED));
+                if self.current_local_path.is_some()
+                    && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
+                {
+                    ui.label(RichText::new("File-backed read-only ELF bytes are loaded automatically; seed input and mutable RAM bytes.")
+                        .size(11.0).color(MUTED));
+                }
                 ui.horizontal(|ui| {
                     ui.label("Start instruction");
                     if ui.text_edit_singleline(&mut self.ghidra_trace_start).changed() {
@@ -7087,18 +7168,14 @@ impl AnalystApp {
                             task.cancel.store(true, Ordering::Release);
                         }
                     }
-                if ui.button("Trace path").clicked() {
-                    let result: Result<PcodePathTrace, String> = (|| {
-                        let initial = parse_pcode_seed(
-                            self.ghidra_trace_seed_json.as_bytes(), snapshot)?;
-                        let start = ghidra_trace_start(snapshot, &self.ghidra_trace_start)?;
-                        snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024)
-                    })();
-                    self.ghidra_path_lines = result
-                        .as_ref()
-                        .map(ghidra_trace_lines)
-                        .unwrap_or_default();
-                    self.ghidra_path_trace = Some(result);
+                if ui.add_enabled(!self.busy && !self.ghidra_busy, egui::Button::new("Trace path")).clicked() {
+                    self.ghidra_path_trace = None;
+                    self.ghidra_path_lines.clear();
+                    path_trace_task = Some(Task::TraceGhidraPath {
+                        snapshot: Box::new(snapshot.clone()),
+                        seed_json: self.ghidra_trace_seed_json.clone(),
+                        start_text: self.ghidra_trace_start.clone(),
+                    });
                 }
                 match &self.ghidra_path_trace {
                     Some(Ok(trace)) => {
@@ -7951,6 +8028,9 @@ impl AnalystApp {
                         ui.label(RichText::new(error).color(BAD));
                     }
                 });
+        }
+        if let Some(task) = path_trace_task {
+            self.enqueue(task, "Tracing Ghidra path with linked ELF bytes…");
         }
         if let Some(function) = requested
             && let (Some(binary), Some(spec)) =
@@ -11874,6 +11954,7 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
         .ok_or("Selected function has no backward P-code slice")?;
     let slice_steps = slice.steps.len();
     let binary_sha256 = spec.binary_sha256.clone();
+    let selected_ghidra_entry = snapshot.selected_function.entry.offset.clone();
     let function_count = snapshot.functions.len();
     let pcode_rows = app.ghidra_pcode_lines.len();
     let state_rows = app.ghidra_state_lines.len();
@@ -11903,13 +11984,69 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
     {
         return Err("Desktop disassembly does not link to the selected function".to_owned());
     }
+    let disassembly_count = report.instructions.len();
+    let mut image_trace_visits = None;
+    if binary_sha256 == "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288"
+        && selected_ghidra_entry == "0x2016d0"
+    {
+        let snapshot = app.ghidra_snapshot.as_ref().ok_or("No Ghidra snapshot")?;
+        let mut seed: serde_json::Value =
+            serde_json::from_str(&ghidra_seed_template(snapshot)).map_err(|e| e.to_string())?;
+        seed["registers"] = serde_json::json!([
+            {"offset": "0x38", "size": 8, "value": "0x210100"},
+            {"offset": "0x30", "size": 8, "value": "0xc"},
+            {"offset": "0x20", "size": 8, "value": "0x210000"},
+            {"offset": "0x0", "size": 8, "value": "0x0"},
+            {"offset": "0x8", "size": 8, "value": "0x0"}
+        ]);
+        seed["memory"] = serde_json::json!([
+            {"space": "ram", "byte_offset": "0x210000", "size": 8, "value": "0xdeadbeef"},
+            {"space": "ram", "byte_offset": "0x210100", "size": 8, "value": "0x43412d5249445948"},
+            {"space": "ram", "byte_offset": "0x210108", "size": 4, "value": "0x53534543"}
+        ]);
+        let seed_json = seed.to_string();
+        let start_text = "0x2016d0".to_owned();
+        let task = Task::TraceGhidraPath {
+            snapshot: Box::new(snapshot.clone()),
+            seed_json: seed_json.clone(),
+            start_text: start_text.clone(),
+        };
+        app.ghidra_trace_seed_json = seed_json;
+        app.ghidra_trace_start = start_text;
+        app.enqueue(task, "Checking image-backed Ghidra path trace…");
+        let started = Instant::now();
+        loop {
+            app.poll();
+            if let Some(result) = &app.ghidra_path_trace {
+                let trace = result
+                    .as_ref()
+                    .map_err(|error| format!("Desktop path trace failed: {error}"))?;
+                let rax = trace.final_state.read_varnode(&PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x0".to_owned(),
+                    size: 8,
+                })?;
+                if !matches!(trace.stop, PcodePathStop::Return { .. }) || rax != Some(1) {
+                    return Err("Desktop image-backed password path did not return 1".to_owned());
+                }
+                image_trace_visits = Some(trace.instruction_visits.len());
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(30) {
+                return Err("Desktop image-backed path trace timed out".to_owned());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
     Ok(format!(
-        "{} Ghidra functions, selected 0x{entry:x}, {} P-code rows, {} state rows, {} CFG LLVM source operations, {slice_steps} slice steps, {} disassembly instructions",
+        "{} Ghidra functions, selected 0x{entry:x}, {} P-code rows, {} state rows, {} CFG LLVM source operations, {slice_steps} slice steps, {disassembly_count} disassembly instructions{}",
         function_count,
         pcode_rows,
         state_rows,
         llvm_operations,
-        report.instructions.len()
+        image_trace_visits.map_or(String::new(), |visits| format!(
+            ", {visits} image-backed path visits"
+        ))
     ))
 }
 
@@ -12549,7 +12686,7 @@ mod tests {
         native_instruction_count, native_opaque_instruction_count, pcode_display_lines,
         pcode_line_target, pcode_state_lines, persist_ghidra_snapshot, persist_local_model_rename,
         preview_patch_local, resized_console_height, run_ghidra_command,
-        selected_ghidra_trace_address, valid_bearer_token, validate_endpoint,
+        selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
         workbench_graph_layout,
     };
     use egui_graph::NodeId;
@@ -12562,7 +12699,9 @@ mod tests {
     };
     use hydir_execution::StopPoint;
     use hydir_ghidra_worker::GhidraRuntimeStatus;
-    use hydir_ir::pcode::{GhidraSnapshot, PcodeEffect, parse_ghidra_snapshot, parse_pcode_seed};
+    use hydir_ir::pcode::{
+        GhidraSnapshot, PcodeEffect, PcodePathStop, parse_ghidra_snapshot, parse_pcode_seed,
+    };
     use hydir_model::{
         ModelConflict, ModelEvidence, ModelSource, PrimitiveType, TypeDefinition,
         TypeDefinitionKind, TypeRef, init_model,
@@ -12826,6 +12965,47 @@ mod tests {
         let lines = ghidra_trace_lines(&trace);
         assert_eq!(lines[0].0, Some(0x2013d9));
         assert!(lines[0].1.contains("0x2013e2"));
+    }
+
+    #[test]
+    fn gui_path_trace_reads_password_phrase_from_bound_elf() {
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let digest = "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288";
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json"),
+            digest,
+        )
+        .unwrap();
+        let mut seed: serde_json::Value =
+            serde_json::from_str(&ghidra_seed_template(&snapshot)).unwrap();
+        seed["registers"] = serde_json::json!([
+            {"offset": "0x38", "size": 8, "value": "0x210100"},
+            {"offset": "0x30", "size": 8, "value": "0xc"},
+            {"offset": "0x20", "size": 8, "value": "0x210000"},
+            {"offset": "0x0", "size": 8, "value": "0x0"},
+            {"offset": "0x8", "size": 8, "value": "0x0"}
+        ]);
+        seed["memory"] = serde_json::json!([
+            {"space": "ram", "byte_offset": "0x210000", "size": 8, "value": "0xdeadbeef"},
+            {"space": "ram", "byte_offset": "0x210100", "size": 8, "value": "0x43412d5249445948"},
+            {"space": "ram", "byte_offset": "0x210108", "size": 4, "value": "0x53534543"}
+        ]);
+        let json = seed.to_string();
+        let plain = trace_ghidra_path(&snapshot, &json, "0x2016d0", None).unwrap();
+        assert!(!matches!(plain.stop, PcodePathStop::Return { .. }));
+        let traced = trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary)).unwrap();
+        assert!(matches!(traced.stop, PcodePathStop::Return { .. }));
+        assert_eq!(
+            traced
+                .final_state
+                .read_varnode(&hydir_ir::pcode::PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x0".to_owned(),
+                    size: 8,
+                })
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
