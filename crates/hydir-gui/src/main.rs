@@ -227,7 +227,9 @@ enum Task {
         native: Box<NativeDecompilation>,
         key: String,
     },
-    Disassemble,
+    Disassemble {
+        automatic: bool,
+    },
     Triton {
         path: PathBuf,
         symbol: String,
@@ -341,7 +343,10 @@ enum Event {
         revision: u64,
         typed: Box<Result<TypedNativeView, String>>,
     },
-    Disassembled(Result<DisassemblyReport, String>),
+    Disassembled {
+        result: Result<DisassemblyReport, String>,
+        automatic: bool,
+    },
     Triton(Result<serde_json::Value, String>),
     TritonConsole {
         commands: Vec<String>,
@@ -3046,13 +3051,18 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     Err(error) => Event::Failed(format!("Could not save model rename: {error}")),
                 }
             }
-            Task::Disassemble => Event::Disassembled(match &source {
-                Source::Local(bytes) => disassemble_elf(bytes).map_err(|error| error.to_string()),
-                Source::Remote(_) => {
-                    Err("Whole-ELF disassembly is currently local-only.".to_owned())
-                }
-                Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
-            }),
+            Task::Disassemble { automatic } => Event::Disassembled {
+                result: match &source {
+                    Source::Local(bytes) => {
+                        disassemble_elf(bytes).map_err(|error| error.to_string())
+                    }
+                    Source::Remote(_) => {
+                        Err("Whole-ELF disassembly is currently local-only.".to_owned())
+                    }
+                    Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
+                },
+                automatic,
+            },
             Task::Triton { path, symbol } => Event::Triton(run_triton_cli(&path, &symbol)),
             Task::TritonConsole { commands } => Event::TritonConsole {
                 result: run_triton_console_cli(&commands),
@@ -4310,6 +4320,10 @@ impl AnalystApp {
                         {
                             self.enqueue_ghidra(binary, digest, None);
                         }
+                        self.enqueue(
+                            Task::Disassemble { automatic: true },
+                            "Preparing linked ELF disassembly…",
+                        );
                     } else {
                         self.pending_ghidra = None;
                     }
@@ -4381,6 +4395,17 @@ impl AnalystApp {
                     }
                     match result {
                         Ok((snapshot, persistence_warning)) => {
+                            if (self.selected_address.is_none() || self.tab == Tab::GhidraPcode)
+                                && let Some(spec) = self.spec.as_ref()
+                            {
+                                self.selected_address = GhidraAddressMap::new(&snapshot, spec)
+                                    .and_then(|map| {
+                                        map.to_linked(
+                                            &snapshot.selected_function.entry.space,
+                                            &snapshot.selected_function.entry.offset,
+                                        )
+                                    });
+                            }
                             if self.ghidra_snapshot.is_none() && self.tab == Tab::Overview {
                                 self.tab = Tab::GhidraPcode;
                             }
@@ -4748,7 +4773,7 @@ impl AnalystApp {
                     self.status = format!("Saved model rename in local revision {revision}");
                     self.history.push(self.status.clone());
                 }
-                Event::Disassembled(result) => match result {
+                Event::Disassembled { result, automatic } => match result {
                     Ok(report) => {
                         let digest_matches = self
                             .spec
@@ -4771,8 +4796,10 @@ impl AnalystApp {
                             if let Some(address) = self.pending_recipe_address.take() {
                                 self.selected_address = Some(address);
                             }
-                            self.console_json = false;
-                            self.tab = Tab::Bytes;
+                            if !automatic {
+                                self.console_json = false;
+                                self.tab = Tab::Bytes;
+                            }
                             self.failure = None;
                         }
                     }
@@ -5368,7 +5395,7 @@ impl AnalystApp {
             } else {
                 self.pending_recipe_address = Some(address);
                 self.enqueue(
-                    Task::Disassemble,
+                    Task::Disassemble { automatic: false },
                     "Locating recipe site in ELF disassembly…",
                 );
             }
@@ -5416,7 +5443,7 @@ impl AnalystApp {
         } else {
             self.pending_recipe_address = Some(address);
             self.enqueue(
-                Task::Disassemble,
+                Task::Disassemble { automatic: false },
                 "Locating recipe site in ELF disassembly…",
             );
         }
@@ -5522,7 +5549,10 @@ impl AnalystApp {
             egui::Button::new("Disassemble ELF"),
         );
         if disassemble.clicked() {
-            self.enqueue(Task::Disassemble, "Disassembling executable ELF sections…");
+            self.enqueue(
+                Task::Disassemble { automatic: false },
+                "Disassembling executable ELF sections…",
+            );
         }
         disassemble.on_disabled_hover_text(
             "Open a local ELF first. Whole-ELF disassembly is currently local-only.",
@@ -5799,17 +5829,21 @@ impl AnalystApp {
                 }
             });
         ui.separator();
-        if let Some(spec) = &self.spec {
-            ui.label(
-                RichText::new(format!("FUNCTIONS  ·  {}", spec.functions.len()))
-                    .size(11.0)
-                    .strong()
-                    .color(MUTED),
-            );
+        if self.spec.is_some() {
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search functions")
                     .desired_width(f32::INFINITY),
+            );
+        }
+        if let Some(spec) = &self.spec
+            && !spec.functions.is_empty()
+        {
+            ui.label(
+                RichText::new(format!("SYMBOL FUNCTIONS  ·  {}", spec.functions.len()))
+                    .size(11.0)
+                    .strong()
+                    .color(MUTED),
             );
             let query = self.search.to_lowercase();
             let filtered: Vec<usize> = spec
@@ -5840,7 +5874,7 @@ impl AnalystApp {
             if let Some(name) = clicked {
                 self.select(name);
             }
-        } else {
+        } else if self.spec.is_none() {
             ui.add_space(16.0);
             ui.label(RichText::new("No functions yet").strong());
             ui.label(
@@ -5851,13 +5885,10 @@ impl AnalystApp {
         if let Some(index) = &self.function_index {
             ui.separator();
             ui.label(
-                RichText::new(format!(
-                    "NATIVE FUNCTION INDEX  ·  {}",
-                    index.functions.len()
-                ))
-                .size(11.0)
-                .strong()
-                .color(ACCENT),
+                RichText::new(format!("RECOVERED FUNCTIONS  ·  {}", index.functions.len()))
+                    .size(11.0)
+                    .strong()
+                    .color(ACCENT),
             );
             let query = self.search.to_lowercase();
             let candidates = index
@@ -7932,7 +7963,10 @@ impl AnalystApp {
             if self.disassembly_report.is_some() {
                 self.tab = Tab::Bytes;
             } else {
-                self.enqueue(Task::Disassemble, "Disassembling selected Ghidra function…");
+                self.enqueue(
+                    Task::Disassemble { automatic: false },
+                    "Disassembling selected Ghidra function…",
+                );
             }
         }
     }
@@ -8337,7 +8371,7 @@ impl AnalystApp {
             }
         } else if open_disassembly {
             self.enqueue(
-                Task::Disassemble,
+                Task::Disassemble { automatic: false },
                 "Disassembling executable ELF sections...",
             );
         } else if run_coverage {
@@ -11843,7 +11877,6 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
     let pcode_rows = app.ghidra_pcode_lines.len();
     let state_rows = app.ghidra_state_lines.len();
     let llvm_operations = llvm.source_operations.len();
-    app.enqueue(Task::Disassemble, "Checking linked demo disassembly…");
     let started = Instant::now();
     while app.disassembly_report.is_none() {
         app.poll();
@@ -11860,6 +11893,8 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
     }
     let report = app.disassembly_report.as_ref().expect("checked above");
     if report.binary_sha256 != binary_sha256
+        || app.selected_address != Some(entry)
+        || app.tab != Tab::GhidraPcode
         || !report
             .instructions
             .iter()
@@ -12517,7 +12552,7 @@ mod tests {
         workbench_graph_layout,
     };
     use egui_graph::NodeId;
-    use hydir_backend::{import_elf, lift_symbol};
+    use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
@@ -12994,6 +13029,15 @@ mod tests {
         app.poll();
         assert!(matches!(app.tab, Tab::GhidraPcode));
         assert_eq!(app.ghidra_snapshot.as_ref(), Some(&snapshot));
+        assert_eq!(
+            app.selected_address,
+            GhidraAddressMap::new(&snapshot, &spec).and_then(|map| {
+                map.to_linked(
+                    &snapshot.selected_function.entry.space,
+                    &snapshot.selected_function.entry.offset,
+                )
+            })
+        );
         assert!(!app.ghidra_pcode_lines.is_empty());
         assert!(!app.ghidra_state_lines.is_empty());
         let llvm = app.ghidra_llvm_cfg.as_ref().unwrap().as_ref().unwrap();
@@ -13001,6 +13045,17 @@ mod tests {
         assert_eq!(llvm.start, snapshot.selected_function.entry);
         assert!(!llvm.source_operations.is_empty());
         assert!(llvm.llvm_ir.contains("define "));
+
+        let report = disassemble_elf(bytes).unwrap();
+        sender
+            .send(Event::Disassembled {
+                result: Ok(report),
+                automatic: true,
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::GhidraPcode));
+        assert!(app.disassembly_report.is_some());
 
         app.tab = Tab::Bytes;
         sender
