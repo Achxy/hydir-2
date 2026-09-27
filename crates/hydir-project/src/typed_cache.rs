@@ -218,6 +218,48 @@ struct CacheRow {
     calls: BTreeSet<Location>,
 }
 
+fn type_output_changed(
+    old: &hydir_model::TypeDefinition,
+    new: &hydir_model::TypeDefinition,
+) -> bool {
+    if old.name != new.name
+        || old.size_bytes != new.size_bytes
+        || old.size_is_lower_bound != new.size_is_lower_bound
+    {
+        return true;
+    }
+    match (&old.kind, &new.kind) {
+        (
+            TypeDefinitionKind::Struct { fields: old_fields },
+            TypeDefinitionKind::Struct { fields: new_fields },
+        )
+        | (
+            TypeDefinitionKind::Union { fields: old_fields },
+            TypeDefinitionKind::Union { fields: new_fields },
+        ) => {
+            old_fields.len() != new_fields.len()
+                || old_fields.iter().zip(new_fields).any(|(old, new)| {
+                    old.name != new.name || old.offset_bytes != new.offset_bytes || old.ty != new.ty
+                })
+        }
+        (
+            TypeDefinitionKind::Enum {
+                underlying: old_underlying,
+                variants: old_variants,
+            },
+            TypeDefinitionKind::Enum {
+                underlying: new_underlying,
+                variants: new_variants,
+            },
+        ) => old_underlying != new_underlying || old_variants != new_variants,
+        (
+            TypeDefinitionKind::Alias { target: old_target },
+            TypeDefinitionKind::Alias { target: new_target },
+        ) => old_target != new_target,
+        _ => true,
+    }
+}
+
 fn changed_model_facts(
     old: &AnalysisModel,
     new: &AnalysisModel,
@@ -235,7 +277,10 @@ fn changed_model_facts(
     let type_ids = old_types
         .keys()
         .chain(new_types.keys())
-        .filter(|id| old_types.get(**id) != new_types.get(**id))
+        .filter(|id| match (old_types.get(**id), new_types.get(**id)) {
+            (Some(old), Some(new)) => type_output_changed(old, new),
+            _ => true,
+        })
         .map(|id| (*id).to_owned())
         .collect();
     let old_functions = old
@@ -251,7 +296,16 @@ fn changed_model_facts(
     let mut functions: BTreeSet<Location> = old_functions
         .keys()
         .chain(new_functions.keys())
-        .filter(|entry| old_functions.get(entry) != new_functions.get(entry))
+        .filter(
+            |entry| match (old_functions.get(entry), new_functions.get(entry)) {
+                (Some(old), Some(new)) => {
+                    old.name != new.name
+                        || old.prototype != new.prototype
+                        || old.inferred_parameters != new.inferred_parameters
+                }
+                _ => true,
+            },
+        )
         .copied()
         .collect();
     let old_stack = old
@@ -268,7 +322,10 @@ fn changed_model_facts(
         old_stack
             .keys()
             .chain(new_stack.keys())
-            .filter(|key| old_stack.get(key) != new_stack.get(key))
+            .filter(|key| match (old_stack.get(key), new_stack.get(key)) {
+                (Some(old), Some(new)) => old.size_bytes != new.size_bytes || old.ty != new.ty,
+                _ => true,
+            })
             .map(|key| key.0),
     );
     (type_ids, functions)
@@ -311,6 +368,12 @@ pub(super) fn carry_typed_c_cache(
         .map_err(db_error)?;
     let mut cached = Vec::new();
     for row in rows {
+        // Every row participates in the caller graph, including entries
+        // emitted with different options. A partial graph could preserve a
+        // caller whose changed transitive callee was omitted or corrupt.
+        if cached.len() == MAX_CACHE_ROWS {
+            return Ok(());
+        }
         let (
             address_space,
             value,
@@ -321,7 +384,7 @@ pub(super) fn carry_typed_c_cache(
             calls_json,
         ) = match row {
             Ok(row) => row,
-            Err(_) => continue,
+            Err(_) => return Ok(()),
         };
         if content.len() > MAX_C_BYTES
             || type_ids_json.len() > 1024 * 1024
@@ -329,23 +392,23 @@ pub(super) fn carry_typed_c_cache(
             || content_sha256 != cache_digest(&content, &type_ids_json, &calls_json)
             || options_sha256.len() != 64
         {
-            continue;
+            return Ok(());
         }
         let Ok(value) = u64::from_str_radix(&value, 16) else {
-            continue;
+            return Ok(());
         };
         let entry = Location {
             address_space,
             value: Address(value),
         };
         let Ok(type_ids) = serde_json::from_slice::<BTreeSet<String>>(&type_ids_json) else {
-            continue;
+            return Ok(());
         };
         let Ok(calls) = serde_json::from_slice::<BTreeSet<Location>>(&calls_json) else {
-            continue;
+            return Ok(());
         };
         if type_ids.len() > 16_384 || calls.len() > 512 {
-            continue;
+            return Ok(());
         }
         cached.push(CacheRow {
             entry,
@@ -359,9 +422,6 @@ pub(super) fn carry_typed_c_cache(
         });
     }
     drop(statement);
-    if cached.len() > MAX_CACHE_ROWS {
-        return Ok(());
-    }
     let mut dirty = changed_functions;
     dirty.extend(
         cached
@@ -396,7 +456,10 @@ mod tests {
     use hydir_decompile::decompile_symbol;
     use hydir_hlc::lower_high_level_cir;
     use hydir_loader::import_elf;
-    use hydir_model::{TypeDefinitionKind, import_dwarf, init_model};
+    use hydir_model::{
+        ANALYSIS_MODEL_VERSION, ModelEvidence, ModelField, ModelFunction, ModelSource,
+        PrimitiveType, TypeDefinition, TypeDefinitionKind, TypeRef, import_dwarf, init_model,
+    };
     use std::{fs, path::Path, process::Command};
 
     #[test]
@@ -574,6 +637,166 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn insert_dependency_row(
+        conn: &rusqlite::Connection,
+        project: &LocalProject,
+        revision: u64,
+        entry: Location,
+        calls: &[Location],
+        malformed_calls: bool,
+    ) {
+        let content = b"/* cache sentinel */";
+        let type_ids_json = b"[]";
+        let calls_json = if malformed_calls {
+            vec![0xff]
+        } else {
+            serde_json::to_vec(calls).unwrap()
+        };
+        let digest = cache_digest(content, type_ids_json, &calls_json);
+        conn.execute(
+            "INSERT INTO local_typed_c_cache(project_id,binary_sha256,model_revision,analysis_version,options_sha256,entry_address_space,entry_value,content_sha256,content,type_ids_json,calls_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![project.id, project.binary_sha256, revision as i64, ANALYSIS_VERSION, options_hash("").unwrap(), entry.address_space, entry_value(entry), digest, content, type_ids_json, calls_json],
+        )
+        .unwrap();
+    }
+
+    fn rows_at_revision(conn: &rusqlite::Connection, revision: u64) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM local_typed_c_cache WHERE model_revision=?1",
+            [revision as i64],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_carry_requires_a_complete_dependency_graph() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("cache.sqlite")).unwrap();
+        let project = LocalProject {
+            id: "dependency-test".to_owned(),
+            path: directory.path().join("unused.elf"),
+            revision: 1,
+            binary_sha256: "a".repeat(64),
+        };
+        store.conn.execute(
+            "INSERT INTO local_projects(id,canonical_path,current_revision,binary_sha256) VALUES(?1,?2,1,?3)",
+            params![project.id, project.path.to_str().unwrap(), project.binary_sha256],
+        ).unwrap();
+        let location = |value| Location {
+            address_space: 0,
+            value: Address(value),
+        };
+        let caller = location(0x10);
+        let intermediate = location(0x20);
+        let changed_callee = location(0x30);
+        let independent = location(0x40);
+        let old = AnalysisModel {
+            schema_version: ANALYSIS_MODEL_VERSION,
+            binary_sha256: project.binary_sha256.clone(),
+            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            revision: 1,
+            types: vec![],
+            functions: vec![ModelFunction {
+                entry: changed_callee,
+                name: "callee".to_owned(),
+                prototype: None,
+                inferred_parameters: BTreeMap::new(),
+                evidence: vec![],
+            }],
+            stack_objects: vec![],
+            conflicts: vec![],
+            high_pcode_hints: vec![],
+        };
+        let mut evidence_only = old.clone();
+        evidence_only.functions[0].evidence.push(ModelEvidence {
+            source: ModelSource::AnalystAssertion,
+            detail: "new observation".to_owned(),
+            site: None,
+        });
+        assert_eq!(changed_model_facts(&old, &evidence_only).1.len(), 0);
+        let mut type_with_evidence = TypeDefinition {
+            id: "struct_1".to_owned(),
+            name: "struct_1".to_owned(),
+            size_bytes: 8,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Struct {
+                fields: vec![ModelField {
+                    name: "value".to_owned(),
+                    offset_bytes: 0,
+                    ty: TypeRef::Primitive {
+                        name: PrimitiveType::U64,
+                    },
+                    evidence: vec![],
+                }],
+            },
+            evidence: vec![],
+        };
+        let original_type = type_with_evidence.clone();
+        type_with_evidence.evidence = evidence_only.functions[0].evidence.clone();
+        let TypeDefinitionKind::Struct { fields } = &mut type_with_evidence.kind else {
+            unreachable!()
+        };
+        fields[0].evidence = evidence_only.functions[0].evidence.clone();
+        assert!(!type_output_changed(&original_type, &type_with_evidence));
+        let TypeDefinitionKind::Struct { fields } = &mut type_with_evidence.kind else {
+            unreachable!()
+        };
+        fields[0].name = "renamed_value".to_owned();
+        assert!(type_output_changed(&original_type, &type_with_evidence));
+        let mut renamed = old.clone();
+        renamed.revision = 2;
+        renamed.functions[0].name = "renamed_callee".to_owned();
+        insert_dependency_row(&store.conn, &project, 1, caller, &[intermediate], false);
+        insert_dependency_row(
+            &store.conn,
+            &project,
+            1,
+            intermediate,
+            &[changed_callee],
+            false,
+        );
+        insert_dependency_row(&store.conn, &project, 1, independent, &[], false);
+        let tx = store.conn.transaction().unwrap();
+        carry_typed_c_cache(&tx, &project, &old, &renamed).unwrap();
+        tx.commit().unwrap();
+        // Transitive callers are dirty; an unrelated function survives.
+        assert_eq!(rows_at_revision(&store.conn, 2), 1);
+
+        let mut renamed_again = renamed.clone();
+        renamed_again.revision = 3;
+        renamed_again.functions[0].name = "renamed_again".to_owned();
+        insert_dependency_row(&store.conn, &project, 2, caller, &[intermediate], false);
+        insert_dependency_row(&store.conn, &project, 2, intermediate, &[], true);
+        let tx = store.conn.transaction().unwrap();
+        carry_typed_c_cache(&tx, &project, &renamed, &renamed_again).unwrap();
+        tx.commit().unwrap();
+        // The malformed intermediate could conceal a path to the changed
+        // callee, so even the otherwise independent row is not copied.
+        assert_eq!(rows_at_revision(&store.conn, 3), 0);
+
+        let tx = store.conn.transaction().unwrap();
+        for index in 0..=MAX_CACHE_ROWS {
+            insert_dependency_row(
+                &tx,
+                &project,
+                3,
+                location(0x1000 + index as u64),
+                &[],
+                index == MAX_CACHE_ROWS,
+            );
+        }
+        tx.commit().unwrap();
+        let mut final_model = renamed_again.clone();
+        final_model.revision = 4;
+        final_model.functions[0].name = "final_name".to_owned();
+        let tx = store.conn.transaction().unwrap();
+        carry_typed_c_cache(&tx, &project, &renamed_again, &final_model).unwrap();
+        tx.commit().unwrap();
+        // A bounded read must not copy a subset of more than 4096 rows.
+        assert_eq!(rows_at_revision(&store.conn, 4), 0);
     }
 
     #[test]
