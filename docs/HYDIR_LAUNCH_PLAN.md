@@ -12,6 +12,8 @@ The first competitive reason to use Hydir should be concrete: **open one binary,
 
 ## Where the code stands today
 
+The v3 `BuildGhidraCallCfgLlvm` RPC runs the bounded call lift through the isolated worker, retains loaded snapshot hashes, and stores the module under a checked project revision. The remote Python SDK validates the artifact's identity. The desktop app can request the automatic lift, cancel it, and navigate source operations and stop sites. A real Ghidra 12.1.4 `RDTSC` export adds `CALLOTHER(rdtsc)` coverage: Rust and LLVM stop explicitly at the user operation, retaining its name and address. Native semantics for such user operations remain future work.
+
 | Component | Current role | Remaining contract |
 | --- | --- | --- |
 | Native x86-64 ELF loader, discovery, MachineIR, StateIR, FunctionIR, CIR, model, C output | Native frontend, semantic reference, and regression corpus | Cross-check more functions against the Ghidra-backed path |
@@ -86,7 +88,7 @@ Native ELF frontend -> existing MachineIR/StateIR path (retained)
 
 **First end-to-end demo:** start Hydir and open a stripped x86-64 ELF. Hydir automatically runs containerized Ghidra analysis and fills the function list. Select a function and inspect its linked raw P-code, state IR, LLVM, slice, and source instructions inside Hydir. Repeat the analysis through the CLI/SDK. Show one unsupported instruction whose effect remains visible. The presenter does not launch or operate Ghidra. CTF binaries can stress the same path later.
 
-The test matrix starts with straight-line arithmetic, branches, loops, calls, stack/global memory, indirect flow, and at least one `CALLOTHER` case. Use stripped and DWARF-bearing builds at several optimization levels. Record coverage by opcode and artifact fidelity. LLVM verification alone is never a semantic test.
+The test matrix starts with straight-line arithmetic, branches, loops, calls, stack/global memory, indirect flow, and at least one `CALLOTHER` case. A real `RDTSC` user operation now checks the explicit unsupported boundary. Use stripped and DWARF-bearing builds at several optimization levels. Record coverage by opcode and artifact fidelity. LLVM verification alone is never a semantic test.
 
 ### Reuse decisions from the 2026-09-26 research pass
 

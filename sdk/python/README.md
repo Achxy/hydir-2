@@ -33,6 +33,10 @@ fidelity claim remains unknown until a concrete path is compared with an
 execution oracle.
 `LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
 managed worker and collects only callees reached by the seed before lifting.
+`HydirClient.build_ghidra_call_cfg_llvm(project_id, revision, seed,
+function_entry=...)` runs that bounded lift for an uploaded ELF through the
+v3 service and returns a revision-bound LLVM artifact. The returned module
+exposes source operations and explicit stops; it is not a whole-program lift.
 
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,

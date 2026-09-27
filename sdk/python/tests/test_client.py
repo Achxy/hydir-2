@@ -360,6 +360,55 @@ class ClientBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual(len(requests), 1)
 
+    def test_v3_call_cfg_llvm_checks_artifact_identity(self):
+        digest = "a" * 64
+        seed = json.dumps({
+            "schema_version": 1, "binary_sha256": digest,
+            "entry": {"space": "ram", "offset": "0x2013a9"},
+            "registers": [], "memory": [],
+        }).encode()
+        artifact = {
+            "schema_version": 1, "binary_sha256": digest,
+            "function_entries": [{"space": "ram", "offset": "0x2013a9"}],
+            "snapshot_sha256": ["b" * 64], "snapshot_diagnostics": [],
+            "llvm": {
+                "schema_version": 2, "binary_sha256": digest,
+                "start": {"space": "ram", "offset": "0x2013a9"},
+                "llvm_ir": "define void @f() { ret void }",
+            },
+        }
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request, **kwargs):
+                self.assertIs(method, client._stub_v3.BuildGhidraCallCfgLlvm)
+                requests.append((request, kwargs))
+                content = json.dumps(artifact).encode()
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1",
+                    content=content, project_revision=4,
+                )
+            client._call = call
+            self.assertEqual(
+                client.build_ghidra_call_cfg_llvm(
+                    "project", 4, seed, function_entry=0x2013a9, max_functions=2,
+                )["function_entries"][0]["offset"],
+                "0x2013a9",
+            )
+            self.assertEqual(requests[0][0].seed_json, seed)
+            self.assertEqual(requests[0][0].max_functions, 2)
+            self.assertEqual(requests[0][1]["timeout"], 180.0)
+            artifact["llvm"]["binary_sha256"] = "0" * 64
+            with self.assertRaises(RuntimeError):
+                client.build_ghidra_call_cfg_llvm(
+                    "project", 4, seed, function_entry=0x2013a9,
+                )
+            with self.assertRaises(ValueError):
+                client.build_ghidra_call_cfg_llvm(
+                    "project", 4, seed, function_entry=0x2013a2,
+                )
+            self.assertEqual(len(requests), 2)
+
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):

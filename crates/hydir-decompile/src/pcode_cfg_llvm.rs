@@ -68,6 +68,8 @@ pub struct PcodeCfgLlvmSourceOperation {
     pub instruction_index: usize,
     pub operation_index: usize,
     pub mnemonic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userop_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1166,6 +1168,7 @@ fn emit_pcode_cfg_llvm_semantic(
                 instruction_index,
                 operation_index,
                 mnemonic: source.mnemonic.clone(),
+                userop_name: source.userop_name.clone(),
             });
             let next_label = if operation_index + 1 == instruction.operations.len() {
                 format!("end_{instruction_index}")
@@ -1691,6 +1694,17 @@ mod tests {
                 "/../../tests/fixtures/ghidra_add_zero_v2.json"
             )),
             "8e68f73f3d55b242d4c968446a9b011aaad4032443dab3d3b678ca7be10e1874",
+        )
+        .unwrap()
+    }
+
+    fn rdtsc_userop_fixture() -> GhidraSnapshot {
+        parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_userop_rdtsc_v2.json"
+            )),
+            "75f384ca5c4dc59d1af2f56e92d677fc7acae43b6faf0213bd203ef6426f2667",
         )
         .unwrap()
     }
@@ -2315,6 +2329,41 @@ mod tests {
             Some(0),
             "{}\n{main}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn real_ghidra_rdtsc_userop_stops_rust_and_llvm_explicitly() {
+        let snapshot = rdtsc_userop_fixture();
+        let userop = &snapshot.selected_function.instructions[0].pcode[0];
+        assert_eq!(userop.mnemonic, "CALLOTHER");
+        assert_eq!(userop.userop_name.as_deref(), Some("rdtsc"));
+        assert_eq!(userop.source_address.offset, "0x201174");
+
+        let seed = PcodeConcreteState::default();
+        let rust = snapshot.execute_concrete_path(&seed, None, 8, 8).unwrap();
+        assert!(matches!(rust.stop, PcodePathStop::EffectBoundary { .. }));
+        assert!(rust.events.is_empty());
+
+        let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        assert_eq!(artifact.semantic_fidelity, SemanticFidelity::Unknown);
+        assert_eq!(
+            artifact.source_operations[0].userop_name.as_deref(),
+            Some("rdtsc")
+        );
+        assert!(artifact.stop_sites.iter().any(|site| {
+            site.address == userop.source_address
+                && site.operation_index == Some(0)
+                && site.status == PcodeCfgLlvmStatus::OpaqueEffect
+        }));
+        verify(&artifact.llvm_ir);
+        run_lli(
+            &artifact,
+            &seed,
+            8,
+            PcodeCfgLlvmStatus::OpaqueEffect,
+            &[],
+            None,
         );
     }
 

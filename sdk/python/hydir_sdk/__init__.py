@@ -398,6 +398,47 @@ class HydirClient:
         timeout: float | None = None,
     ) -> dict:
         """Trace a seeded direct-call path through the uploaded ELF."""
+        return self._ghidra_call_artifact(
+            project_id, revision, seed, function_entry=function_entry, llvm=False,
+            max_functions=max_functions, max_operations=max_operations,
+            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+        )
+
+    def build_ghidra_call_cfg_llvm(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Emit bounded interprocedural CFG LLVM from an uploaded ELF and seed."""
+        return self._ghidra_call_artifact(
+            project_id, revision, seed, function_entry=function_entry, llvm=True,
+            max_functions=max_functions, max_operations=max_operations,
+            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+        )
+
+    def _ghidra_call_artifact(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        llvm: bool,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Validate and request a seeded Ghidra call artifact."""
         if isinstance(function_entry, bool):
             raise ValueError("Function entry must be a 64-bit address")
         if isinstance(function_entry, int):
@@ -461,19 +502,36 @@ class HydirClient:
             if value is not None:
                 setattr(request, name, value)
         reply = self._call(
-            self._stub_v3.TraceGhidraCalls, request,
+            self._stub_v3.BuildGhidraCallCfgLlvm if llvm else self._stub_v3.TraceGhidraCalls,
+            request,
             timeout=max(self._timeout, 180.0) if timeout is None else timeout,
         )
         artifact = self._checked_json_artifact(
             reply, revision=revision,
-            media_type="application/vnd.hydir.pcode-call-trace+json;version=1",
+            media_type=(
+                "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
+                if llvm else "application/vnd.hydir.pcode-call-trace+json;version=1"
+            ),
             schema_version=1,
         )
-        if (
-            artifact.get("binary_sha256") != seed_json["binary_sha256"]
-            or artifact.get("root_entry", {}).get("offset") != function_hex
-        ):
-            raise RuntimeError("Ghidra call trace differs from the requested binary or function")
+        if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
+            raise RuntimeError("Ghidra call artifact belongs to another binary")
+        if llvm:
+            entries = artifact.get("function_entries")
+            module = artifact.get("llvm")
+            if (
+                not isinstance(entries, list) or not entries
+                or not isinstance(entries[0], dict)
+                or entries[0] != seed_json["entry"]
+                or not isinstance(module, dict)
+                or module.get("binary_sha256") != seed_json["binary_sha256"]
+                or module.get("schema_version") != 2
+                or module.get("start") != seed_json["entry"]
+                or not isinstance(module.get("llvm_ir"), str)
+            ):
+                raise RuntimeError("Ghidra call LLVM artifact differs from the requested binary or function")
+        elif artifact.get("root_entry", {}).get("offset") != function_hex:
+            raise RuntimeError("Ghidra call trace differs from the requested function")
         return artifact
 
     def start_program_analysis(

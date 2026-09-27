@@ -29,9 +29,10 @@ use hydir_core::{
 };
 use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, PcodeCfgLlvmArtifact,
-    PcodeSimplifiedCfgLlvmArtifact, PcodeStandalonePrefixArtifact, decompile_function_at,
-    decompile_symbol, discover_functions, emit_pcode_cfg_llvm, emit_pcode_exact_operation_llvm,
-    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
+    PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
+    PcodeStandalonePrefixArtifact, decompile_function_at, decompile_symbol, discover_functions,
+    emit_pcode_cfg_llvm, emit_pcode_exact_operation_llvm, emit_pcode_simplified_cfg_llvm,
+    emit_pcode_standalone_prefix_llvm, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
@@ -187,6 +188,14 @@ enum Task {
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
+    EmitGhidraCallLlvm {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: String,
+        seed_json: String,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
     OpenRemote {
         endpoint: String,
         token_file: PathBuf,
@@ -296,6 +305,11 @@ enum Event {
         binary_sha256: String,
         function: String,
         result: Result<PcodeInterproceduralTrace, String>,
+    },
+    GhidraCallLlvmEmitted {
+        binary_sha256: String,
+        function: String,
+        result: Result<PcodeInterproceduralCfgLlvmArtifact, String>,
     },
     RemoteProjectCreated(String),
     Selected {
@@ -2068,6 +2082,73 @@ fn run_ghidra_call_trace(
     Ok(trace)
 }
 
+fn run_ghidra_call_llvm(
+    binary: &Path,
+    binary_sha256: &str,
+    function: &str,
+    seed_json: &str,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    if seed_json.len() > MAX_PCODE_SEED_BYTES {
+        return Err("Ghidra call seed exceeds the JSON input limit".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let seed_path = scratch.path().join("seed.json");
+    let artifact_path = scratch.path().join("call-cfg-llvm.json");
+    fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let mut command = Command::new(hydirctl_path());
+    command
+        .args(["ghidra", "llvm-cfg-calls"])
+        .arg(binary)
+        .arg(&seed_path)
+        .arg("--function")
+        .arg(function)
+        .arg("--max-functions")
+        .arg("8")
+        .arg("--output")
+        .arg(&artifact_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)
+        .map_err(|error| format!("Could not start Ghidra call LLVM generation: {error}"))?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Ghidra call LLVM generation failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(detail)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+                .trim()
+        ));
+    }
+    let size = fs::metadata(&artifact_path)
+        .map_err(|error| format!("Ghidra call LLVM produced no artifact: {error}"))?
+        .len();
+    if size == 0 || size > 32 * 1024 * 1024 {
+        return Err("Ghidra call LLVM exceeds the GUI artifact limit".to_owned());
+    }
+    let artifact: PcodeInterproceduralCfgLlvmArtifact =
+        serde_json::from_slice(&fs::read(&artifact_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("Invalid Ghidra call LLVM artifact: {error}"))?;
+    if artifact.schema_version != 1
+        || artifact.binary_sha256 != binary_sha256
+        || artifact.llvm.binary_sha256 != binary_sha256
+        || artifact
+            .function_entries
+            .first()
+            .map(|entry| entry.offset.as_str())
+            != Some(function)
+    {
+        return Err("Ghidra call LLVM differs from the opened binary or function".to_owned());
+    }
+    Ok(artifact)
+}
+
 fn persist_ghidra_snapshot(
     database: &Path,
     binary: &Path,
@@ -2710,6 +2791,34 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         timeout,
                     );
                     let _ = completion.send(Event::GhidraCallsTraced {
+                        binary_sha256,
+                        function,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::EmitGhidraCallLlvm {
+                binary,
+                binary_sha256,
+                function,
+                seed_json,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_call_llvm(
+                        &binary,
+                        &binary_sha256,
+                        &function,
+                        &seed_json,
+                        &cancel,
+                        timeout,
+                    );
+                    let _ = completion.send(Event::GhidraCallLlvmEmitted {
                         binary_sha256,
                         function,
                         result,
@@ -3583,9 +3692,12 @@ struct AnalystApp {
     ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
     ghidra_call_lines: Vec<(Option<u64>, String)>,
     ghidra_call_busy: bool,
+    ghidra_call_llvm: Option<Result<PcodeInterproceduralCfgLlvmArtifact, String>>,
+    ghidra_call_llvm_busy: bool,
     ghidra_busy: bool,
     ghidra_task: Option<ActiveGhidraTask>,
     ghidra_call_task: Option<ActiveGhidraTask>,
+    ghidra_call_llvm_task: Option<ActiveGhidraTask>,
     ghidra_runtime_status: Option<GhidraRuntimeStatus>,
     ghidra_cli_available: Option<bool>,
     ghidra_runtime_probe: Option<Receiver<(GhidraRuntimeStatus, bool)>>,
@@ -3725,9 +3837,12 @@ impl AnalystApp {
             ghidra_call_trace: None,
             ghidra_call_lines: Vec::new(),
             ghidra_call_busy: false,
+            ghidra_call_llvm: None,
+            ghidra_call_llvm_busy: false,
             ghidra_busy: false,
             ghidra_task: None,
             ghidra_call_task: None,
+            ghidra_call_llvm_task: None,
             ghidra_runtime_status: None,
             ghidra_cli_available: None,
             ghidra_runtime_probe: Some(probe_ghidra_runtime(ctx)),
@@ -3846,7 +3961,9 @@ impl AnalystApp {
         while let Ok(event) = self.events.try_recv() {
             if !matches!(
                 &event,
-                Event::GhidraAnalyzed { .. } | Event::GhidraCallsTraced { .. }
+                Event::GhidraAnalyzed { .. }
+                    | Event::GhidraCallsTraced { .. }
+                    | Event::GhidraCallLlvmEmitted { .. }
             ) {
                 self.busy = false;
             }
@@ -3954,6 +4071,10 @@ impl AnalystApp {
                     self.ghidra_path_lines.clear();
                     self.ghidra_call_trace = None;
                     self.ghidra_call_lines.clear();
+                    self.ghidra_call_llvm = None;
+                    if let Some(task) = &self.ghidra_call_llvm_task {
+                        task.cancel.store(true, Ordering::Release);
+                    }
                     self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
@@ -4136,6 +4257,10 @@ impl AnalystApp {
                             self.ghidra_path_lines.clear();
                             self.ghidra_call_trace = None;
                             self.ghidra_call_lines.clear();
+                            self.ghidra_call_llvm = None;
+                            if let Some(task) = &self.ghidra_call_llvm_task {
+                                task.cancel.store(true, Ordering::Release);
+                            }
                             self.ghidra_snapshot = Some(snapshot);
                             self.failure = persistence_warning.clone();
                             if let Some(warning) = persistence_warning {
@@ -4197,6 +4322,41 @@ impl AnalystApp {
                         Err(_) => "Ghidra call tracing failed".to_owned(),
                     };
                     self.ghidra_call_trace = Some(result);
+                }
+                Event::GhidraCallLlvmEmitted {
+                    binary_sha256,
+                    function,
+                    result,
+                } => {
+                    self.ghidra_call_llvm_busy = false;
+                    let cancelled = self
+                        .ghidra_call_llvm_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.selected_function.entry.offset != function
+                        })
+                    {
+                        continue;
+                    }
+                    if cancelled {
+                        self.status = "Ghidra call LLVM generation cancelled".to_owned();
+                        self.ghidra_call_llvm = None;
+                        continue;
+                    }
+                    self.status = match &result {
+                        Ok(artifact) => format!(
+                            "Ghidra call LLVM: {} functions, {} source operations",
+                            artifact.function_entries.len(),
+                            artifact.llvm.source_operations.len()
+                        ),
+                        Err(_) => "Ghidra call LLVM generation failed".to_owned(),
+                    };
+                    self.ghidra_call_llvm = Some(result);
                 }
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
@@ -6639,12 +6799,16 @@ impl AnalystApp {
                 });
                 ui.label(RichText::new("Seed JSON · offsets and values use 0x hexadecimal")
                     .size(11.0).color(MUTED));
-                if ui.add(egui::TextEdit::multiline(&mut self.ghidra_trace_seed_json)
+                    if ui.add(egui::TextEdit::multiline(&mut self.ghidra_trace_seed_json)
                     .code_editor().desired_rows(8).desired_width(f32::INFINITY)).changed() {
                         self.ghidra_path_trace = None;
                         self.ghidra_path_lines.clear();
                         self.ghidra_call_trace = None;
                         self.ghidra_call_lines.clear();
+                        self.ghidra_call_llvm = None;
+                        if let Some(task) = &self.ghidra_call_llvm_task {
+                            task.cancel.store(true, Ordering::Release);
+                        }
                     }
                 if ui.button("Trace path").clicked() {
                     let result: Result<PcodePathTrace, String> = (|| {
@@ -6703,6 +6867,7 @@ impl AnalystApp {
                     .size(11.0).color(MUTED));
                 let can_trace = !self.ghidra_busy
                     && !self.ghidra_call_busy
+                    && !self.ghidra_call_llvm_busy
                     && self.current_local_path.is_some();
                 if ui.add_enabled(can_trace, egui::Button::new("Trace calls")).clicked() {
                     let result = parse_pcode_seed(
@@ -6799,6 +6964,150 @@ impl AnalystApp {
                                         self.selected_address = linked;
                                     }
                                 }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("LLVM across analyzed calls")
+            .id_salt("ghidra_call_llvm")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Uses the seed JSON above to collect reached callees, then emits a bounded LLVM CFG across those functions. Unknown calls, unsupported effects, recursion, and budget limits remain explicit stops. Binary equivalence is unverified.")
+                    .size(11.0).color(MUTED));
+                let can_generate = !self.ghidra_busy
+                    && !self.ghidra_call_busy
+                    && !self.ghidra_call_llvm_busy
+                    && self.current_local_path.is_some();
+                if ui.add_enabled(can_generate, egui::Button::new("Generate call CFG LLVM")).clicked() {
+                    match parse_pcode_seed(self.ghidra_trace_seed_json.as_bytes(), snapshot) {
+                        Err(error) => self.ghidra_call_llvm = Some(Err(error)),
+                        Ok(_) => {
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            let timeout = ghidra_task_timeout(
+                                self.ghidra_runtime_status.as_ref().map(|status| status.mode),
+                                true,
+                            );
+                            let task = Task::EmitGhidraCallLlvm {
+                                binary: self.current_local_path.clone().expect("checked above"),
+                                binary_sha256: snapshot.binary_sha256.clone(),
+                                function: snapshot.selected_function.entry.offset.clone(),
+                                seed_json: self.ghidra_trace_seed_json.clone(),
+                                cancel: Arc::clone(&cancel),
+                                timeout,
+                            };
+                            match self.tasks.try_send(task) {
+                                Ok(()) => {
+                                    self.ghidra_call_llvm_busy = true;
+                                    self.ghidra_call_llvm_task = Some(ActiveGhidraTask {
+                                        cancel,
+                                        started: Instant::now(),
+                                        timeout,
+                                    });
+                                    self.ghidra_call_llvm = None;
+                                    self.status = "Collecting Ghidra callees and generating LLVM…".to_owned();
+                                }
+                                Err(_) => self.ghidra_call_llvm = Some(Err(
+                                    "Analysis queue is full. Retry call CFG LLVM generation.".to_owned(),
+                                )),
+                            }
+                        }
+                    }
+                }
+                if self.ghidra_call_llvm_busy
+                    && let Some(task) = &self.ghidra_call_llvm_task {
+                        ghidra_progress(ui, task, "Generating call CFG LLVM");
+                        if ui.add_enabled(
+                            !task.cancel.load(Ordering::Acquire),
+                            egui::Button::new("Cancel call CFG LLVM"),
+                        ).clicked() {
+                            task.cancel.store(true, Ordering::Release);
+                            self.status = "Stopping Ghidra call LLVM generation…".to_owned();
+                        }
+                    }
+                match &self.ghidra_call_llvm {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!(
+                            "{} loaded functions · {} source operations · {} static stop sites · max call depth {} · fidelity: {:?} · verification: {:?}",
+                            artifact.function_entries.len(),
+                            artifact.llvm.source_operations.len(),
+                            artifact.llvm.stop_sites.len(),
+                            artifact.max_call_depth,
+                            artifact.semantic_fidelity,
+                            artifact.verification,
+                        )).size(11.0).color(ACCENT));
+                        ui.label(RichText::new("Runnable path module; execution can stop at the listed boundaries. The generated code has not been verified against the binary.")
+                            .size(11.0).color(MUTED));
+                        for diagnostic in &artifact.snapshot_diagnostics {
+                            ui.label(RichText::new(diagnostic).size(11.0).color(BAD));
+                        }
+                        egui::CollapsingHeader::new(format!("Loaded functions ({})", artifact.function_entries.len()))
+                            .id_salt("ghidra_call_llvm_functions")
+                            .show(ui, |ui| {
+                                for entry in &artifact.function_entries {
+                                    let address = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&entry.space, &entry.offset));
+                                    if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                        RichText::new(&entry.offset).monospace().size(11.0)).clicked()
+                                        && address.is_some() {
+                                            self.selected_address = address;
+                                        }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy call CFG artifact JSON").clicked()
+                                && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                    ui.ctx().copy_text(json);
+                                }
+                            if ui.button("Copy call CFG LLVM").clicked() {
+                                ui.ctx().copy_text(artifact.llvm.llvm_ir.clone());
+                            }
+                        });
+                        egui::CollapsingHeader::new(format!("Linked source operations ({})", artifact.llvm.source_operations.len()))
+                            .id_salt("ghidra_call_llvm_operations")
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(180.0)
+                                    .id_salt("ghidra_call_llvm_operation_rows")
+                                    .show_rows(ui, 18.0, artifact.llvm.source_operations.len(), |ui, range| {
+                                        for row in range {
+                                            let operation = &artifact.llvm.source_operations[row];
+                                            let address = address_map.as_ref().and_then(|map|
+                                                map.to_linked(&operation.address.space, &operation.address.offset));
+                                            let label = format!("{} #{}:{} {}{}", operation.address.offset,
+                                                operation.instruction_index, operation.operation_index, operation.mnemonic,
+                                                operation.userop_name.as_ref().map(|name| format!(" ({name})")).unwrap_or_default());
+                                            if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                                RichText::new(label).monospace().size(11.0)).clicked()
+                                                && address.is_some() {
+                                                    self.selected_address = address;
+                                                }
+                                        }
+                                    });
+                            });
+                        egui::CollapsingHeader::new(format!("Linked stop sites ({})", artifact.llvm.stop_sites.len()))
+                            .id_salt("ghidra_call_llvm_stops")
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(180.0)
+                                    .id_salt("ghidra_call_llvm_stop_rows")
+                                    .show_rows(ui, 18.0, artifact.llvm.stop_sites.len(), |ui, range| {
+                                        for row in range {
+                                            let site = &artifact.llvm.stop_sites[row];
+                                            let address = address_map.as_ref().and_then(|map|
+                                                map.to_linked(&site.address.space, &site.address.offset));
+                                            let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
+                                            if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                                RichText::new(label).monospace().size(11.0)).clicked()
+                                                && address.is_some() {
+                                                    self.selected_address = address;
+                                                }
+                                        }
+                                    });
+                            });
+                        egui::ScrollArea::both().id_salt("ghidra_call_llvm_source")
+                            .max_height(220.0).show(ui, |ui| {
+                                ui.label(RichText::new(&artifact.llvm.llvm_ir).monospace().size(11.0));
                             });
                     }
                     Some(Err(error)) => {

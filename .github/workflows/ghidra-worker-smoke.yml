@@ -16,6 +16,7 @@ on:
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
       - tests/fixtures/ghidra_add_zero_v2.json
+      - 'tests/fixtures/ghidra_userop_rdtsc*'
       - tests/fixtures/ghidra_indirect_jump.S
       - tests/fixtures/ghidra_indirect_jump.elf
       - tests/fixtures/ghidra_indirect_jump_v2.json
@@ -34,6 +35,7 @@ on:
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
       - tests/fixtures/ghidra_add_zero_v2.json
+      - 'tests/fixtures/ghidra_userop_rdtsc*'
       - tests/fixtures/ghidra_indirect_jump.S
       - tests/fixtures/ghidra_indirect_jump.elf
       - tests/fixtures/ghidra_indirect_jump_v2.json
@@ -119,6 +121,39 @@ jobs:
           pathlib.Path(sys.argv[3]).write_text(transformed['llvm']['llvm_ir'])
           PY
           clang -x ir -c "$RUNNER_TEMP/ghidra-add-zero.ll" -o "$RUNNER_TEMP/ghidra-add-zero.o"
+      - name: Stop explicitly at a real Ghidra user operation
+        run: |
+          clang -nostdlib -no-pie tests/fixtures/ghidra_userop_rdtsc.S \
+            -o "$RUNNER_TEMP/ghidra-userop.elf"
+          entry="0x$(nm -g "$RUNNER_TEMP/ghidra-userop.elf" | awk '$3 == "hydir_rdtsc" { print $1 }')"
+          test "$entry" != 0x
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            "$RUNNER_TEMP/ghidra-userop.elf" \
+            --output "$RUNNER_TEMP/ghidra-userop-snapshot.json" \
+            --function "$entry"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg \
+            "$RUNNER_TEMP/ghidra-userop.elf" \
+            "$RUNNER_TEMP/ghidra-userop-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-userop-llvm.json"
+          python3 - "$RUNNER_TEMP/ghidra-userop-snapshot.json" "$RUNNER_TEMP/ghidra-userop-llvm.json" "$RUNNER_TEMP/ghidra-userop.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          llvm = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          userop = snapshot['selected_function']['instructions'][0]['pcode'][0]
+          assert userop['mnemonic'] == 'CALLOTHER'
+          assert userop['userop_name'] == 'rdtsc'
+          assert llvm['semantic_fidelity'] == 'unknown'
+          assert llvm['source_operations'][0]['userop_name'] == 'rdtsc'
+          assert any(site['status'] == 'opaque_effect' and
+                     site['address'] == userop['source_address'] and
+                     site['operation_index'] == 0 for site in llvm['stop_sites'])
+          pathlib.Path(sys.argv[3]).write_text(llvm['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/ghidra-userop.ll" \
+            -o "$RUNNER_TEMP/ghidra-userop.o"
       - name: Follow a direct call with automatic callee export
         run: |
           cargo run --locked -p hydir-cli -- ghidra trace-calls \
