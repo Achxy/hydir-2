@@ -18,6 +18,11 @@ ret_instruction = next(
     for row in snapshot["selected_function"]["instructions"]
     if row["mnemonic"] == "RET"
 )
+observed_instruction = (
+    int(os.environ["HYDIR_NATIVE_OBSERVE_INSTRUCTION"], 16)
+    if "HYDIR_NATIVE_OBSERVE_INSTRUCTION" in os.environ else None
+)
+observed_flags = None
 
 # The kernel maps this exact ELF before starti stops, including when GDB
 # initially stops in its dynamic loader. Install a valid SysV call frame on
@@ -45,6 +50,12 @@ for _ in range(len(instructions) + 1):
         raise RuntimeError("native bytes at 0x%x differ from Ghidra snapshot" % pc)
     visits.append(pc)
     gdb.execute("si", to_string=True)
+    if pc == observed_instruction:
+        observed_eflags = int(gdb.parse_and_eval("$eflags"))
+        observed_flags = {
+            "cf": observed_eflags & 1,
+            "of": (observed_eflags >> 11) & 1,
+        }
 else:
     raise RuntimeError("native execution exceeded selected-function instruction budget")
 
@@ -60,5 +71,9 @@ result = {
     "flags": {name: (flags >> bit) & 1 for name, bit in
               (("cf", 0), ("zf", 6), ("sf", 7), ("of", 11))},
 }
+if observed_instruction is not None:
+    if observed_flags is None:
+        raise RuntimeError("requested native instruction was not visited")
+    result["observed_flags"] = observed_flags
 print("HYDIR_NATIVE_RESULT=" + json.dumps(result, sort_keys=True))
 end

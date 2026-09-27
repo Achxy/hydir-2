@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PCODE_CALL_PATH_VERSION: u32 = 1;
+pub const PCODE_CALL_PATH_VERSION: u32 = 2;
 const MAX_SNAPSHOTS: usize = 128;
 const MAX_SEGMENTS: usize = 128;
 const MAX_CALL_DEPTH: usize = 16;

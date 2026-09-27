@@ -41,7 +41,7 @@ pub(crate) fn node_bytes(
     if node.space == "const" {
         return Ok(());
     }
-    if !matches!(node.space.as_str(), "register" | "unique") || !(1..=8).contains(&node.size) {
+    if !matches!(node.space.as_str(), "register" | "unique") || !(1..=16).contains(&node.size) {
         return Err("standalone P-code state requires a bounded register or unique varnode".into());
     }
     let offset = u64::from_str_radix(
@@ -139,6 +139,38 @@ pub(crate) fn helper_definitions(byte_map: &[PcodeStateByte]) -> String {
            br i1 %continue, label %loop, label %done\n\
          done:\n  ret void\n}\n\n"
     );
+    ir.push_str(
+        "define i128 @hydir_read_varnode_wide(ptr %state, i32 %space, i64 %offset, i32 %size) {\n\
+         entry:\n  %length = zext i32 %size to i64\n  br label %loop\n\
+         loop:\n  %i = phi i64 [ 0, %entry ], [ %next, %loop ]\n\
+           %acc = phi i128 [ 0, %entry ], [ %acc_next, %loop ]\n\
+           %address = add i64 %offset, %i\n\
+           %byte = call i8 @hydir_load_byte(ptr %state, i32 %space, i64 %address)\n\
+           %wide = zext i8 %byte to i128\n\
+           %shift64 = mul i64 %i, 8\n\
+           %shift = zext i64 %shift64 to i128\n\
+           %part = shl i128 %wide, %shift\n\
+           %acc_next = or i128 %acc, %part\n\
+           %next = add i64 %i, 1\n\
+           %continue = icmp ult i64 %next, %length\n\
+           br i1 %continue, label %loop, label %done\n\
+         done:\n  ret i128 %acc_next\n}\n\n",
+    );
+    ir.push_str(
+        "define void @hydir_write_varnode_wide(ptr %state, i32 %space, i64 %offset, i32 %size, i128 %value) {\n\
+         entry:\n  %length = zext i32 %size to i64\n  br label %loop\n\
+         loop:\n  %i = phi i64 [ 0, %entry ], [ %next, %loop ]\n\
+           %shift64 = mul i64 %i, 8\n\
+           %shift = zext i64 %shift64 to i128\n\
+           %shifted = lshr i128 %value, %shift\n\
+           %byte = trunc i128 %shifted to i8\n\
+           %address = add i64 %offset, %i\n\
+           call void @hydir_store_byte(ptr %state, i32 %space, i64 %address, i8 %byte)\n\
+           %next = add i64 %i, 1\n\
+           %continue = icmp ult i64 %next, %length\n\
+           br i1 %continue, label %loop, label %done\n\
+         done:\n  ret void\n}\n\n"
+    );
     ir.push_str("define void @hydir_clear_unique(ptr %state) {\nentry:\n");
     for byte in byte_map.iter().filter(|byte| byte.space == "unique") {
         ir.push_str(&format!(
@@ -185,6 +217,8 @@ pub fn emit_pcode_standalone_prefix_llvm(
     let declarations = [
         "declare i64 @hydir_read_varnode(ptr, i32, i64, i32)\n",
         "declare void @hydir_write_varnode(ptr, i32, i64, i32, i64)\n",
+        "declare i128 @hydir_read_varnode_wide(ptr, i32, i64, i32)\n",
+        "declare void @hydir_write_varnode_wide(ptr, i32, i64, i32, i128)\n",
         "declare void @hydir_clear_unique(ptr)\n",
     ];
     let mut llvm_ir = prefix.llvm_ir.clone();

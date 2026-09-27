@@ -248,14 +248,21 @@ fn known_check(
     }
     let id = pcode_space_id(&node.space)?;
     let byte_offset = pcode_offset(node)?;
-    let mask = if node.size == 8 {
-        u64::MAX
+    let (bits, helper, mask) = if node.size > 8 {
+        let mask = if node.size == 16 {
+            u128::MAX
+        } else {
+            (1u128 << (node.size * 8)) - 1
+        };
+        (128, "hydir_read_varnode_wide", mask)
+    } else if node.size == 8 {
+        (64, "hydir_read_varnode", u128::from(u64::MAX))
     } else {
-        (1u64 << (node.size * 8)) - 1
+        (64, "hydir_read_varnode", (1u128 << (node.size * 8)) - 1)
     };
     body.push_str(&format!(
-        "  %{stem}_mask = call i64 @hydir_read_varnode(ptr %known, i32 {id}, i64 {byte_offset}, i32 {})\n\
-           %{stem}_ok = icmp eq i64 %{stem}_mask, {mask}\n",
+        "  %{stem}_mask = call i{bits} @{helper}(ptr %known, i32 {id}, i64 {byte_offset}, i32 {})\n\
+           %{stem}_ok = icmp eq i{bits} %{stem}_mask, {mask}\n",
         node.size
     ));
     Ok(Some(format!("%{stem}_ok")))
@@ -1499,16 +1506,21 @@ fn emit_pcode_cfg_llvm_semantic(
                                 }
                                 let bits = input.size * 8;
                                 let raw = format!("%raw_{id}_{input_index}");
+                                let (raw_bits, read_helper) = if bits > 64 {
+                                    (128, "hydir_read_varnode_wide")
+                                } else {
+                                    (64, "hydir_read_varnode")
+                                };
                                 body.push_str(&format!(
-                                    "  {raw} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                                    "  {raw} = call i{raw_bits} @{read_helper}(ptr %state, i32 {}, i64 {}, i32 {})\n",
                                     pcode_space_id(&input.space)?, pcode_offset(input)?, input.size
                                 ));
-                                let value = if bits == 64 {
+                                let value = if bits == raw_bits {
                                     raw
                                 } else {
                                     let typed = format!("%typed_{id}_{input_index}");
                                     body.push_str(&format!(
-                                        "  {typed} = trunc i64 {raw} to i{bits}\n"
+                                        "  {typed} = trunc i{raw_bits} {raw} to i{bits}\n"
                                     ));
                                     typed
                                 };
@@ -1579,19 +1591,25 @@ fn emit_pcode_cfg_llvm_semantic(
                                 "  %result_{id} = call i{bits} @{helper_name}({})\n",
                                 arguments.join(", ")
                             ));
-                            let raw = if bits == 64 {
+                            let raw_bits = if bits > 64 { 128 } else { 64 };
+                            let raw = if bits == raw_bits {
                                 format!("%result_{id}")
                             } else {
                                 body.push_str(&format!(
-                                    "  %result_raw_{id} = zext i{bits} %result_{id} to i64\n"
+                                    "  %result_raw_{id} = zext i{bits} %result_{id} to i{raw_bits}\n"
                                 ));
                                 format!("%result_raw_{id}")
                             };
                             let space_id = pcode_space_id(&output.space)?;
                             let output_offset = pcode_offset(output)?;
+                            let write_helper = if bits > 64 {
+                                "hydir_write_varnode_wide"
+                            } else {
+                                "hydir_write_varnode"
+                            };
                             body.push_str(&format!(
-                                "  call void @hydir_write_varnode(ptr %state, i32 {space_id}, i64 {output_offset}, i32 {}, i64 {raw})\n\
-                                   call void @hydir_write_varnode(ptr %known, i32 {space_id}, i64 {output_offset}, i32 {}, i64 -1)\n",
+                                "  call void @{write_helper}(ptr %state, i32 {space_id}, i64 {output_offset}, i32 {}, i{raw_bits} {raw})\n\
+                                   call void @{write_helper}(ptr %known, i32 {space_id}, i64 {output_offset}, i32 {}, i{raw_bits} -1)\n",
                                 output.size, output.size
                             ));
                             body.push_str(&log_event(
@@ -1795,6 +1813,30 @@ mod tests {
         snapshot
     }
 
+    fn stripped_password_mix_fixture() -> GhidraSnapshot {
+        let digest = "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288";
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+                )))
+            ),
+            digest
+        );
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_password_mix_o1_v2.json"
+            )),
+            digest,
+        )
+        .unwrap();
+        assert_eq!(snapshot.selected_function.entry.offset, "0x2015d0");
+        snapshot
+    }
+
     fn calls_fixture() -> GhidraSnapshot {
         parse_ghidra_snapshot(
             include_bytes!(concat!(
@@ -1851,6 +1893,58 @@ mod tests {
             );
         }
         ids
+    }
+
+    #[test]
+    fn stripped_password_mix_wide_imul_matches_rust_and_llvm() {
+        let snapshot = stripped_password_mix_fixture();
+        let artifact = emit_pcode_cfg_llvm(&snapshot, None).unwrap();
+        assert!(artifact.llvm_ir.contains("mul i128"));
+        assert!(artifact.llvm_ir.contains("@hydir_read_varnode_wide"));
+        assert!(!artifact.stop_sites.iter().any(|site| {
+            site.address.offset == "0x2015ee" && site.status == PcodeCfgLlvmStatus::OpaqueEffect
+        }));
+        verify(&artifact.llvm_ir);
+        for (value, salt) in [(0, 0), (7, 5), (u64::MAX, u64::MAX)] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), value).unwrap();
+            seed.write_varnode(&register("0x30", 8), salt).unwrap();
+            seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+            seed.write_memory("ram", 0x700000, 8, 0xdeadbeef).unwrap();
+            let rust = snapshot
+                .execute_concrete_path(&seed, None, 256, 64)
+                .unwrap();
+            assert!(matches!(rust.stop, PcodePathStop::Return { .. }));
+            let expected = (value ^ salt.wrapping_add(0x9e3779b97f4a7c15))
+                .rotate_left(13)
+                .wrapping_mul(0xbf58476d1ce4e5b9);
+            let expected = expected ^ (expected >> 29);
+            assert_eq!(
+                rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                Some(expected)
+            );
+            let expected_state = expected
+                .to_le_bytes()
+                .into_iter()
+                .enumerate()
+                .map(|(index, byte)| ("register".to_owned(), format!("0x{index:x}"), byte, true))
+                .collect();
+            run_lli_with_guest(
+                &artifact,
+                &seed,
+                &GuestTestMemory {
+                    space_id: 433,
+                    base: 0x700000,
+                    bytes: 0xdeadbeefu64.to_le_bytes().into_iter().map(Some).collect(),
+                    expected: Vec::new(),
+                    expected_state,
+                },
+                256,
+                PcodeCfgLlvmStatus::Return,
+                &source_event_ids(&artifact, &rust),
+                Some(expected as u8),
+            );
+        }
     }
 
     #[test]

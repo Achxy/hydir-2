@@ -510,9 +510,9 @@ class HydirClient:
             reply, revision=revision,
             media_type=(
                 "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
-                if llvm else "application/vnd.hydir.pcode-call-trace+json;version=1"
+                if llvm else "application/vnd.hydir.pcode-call-trace+json;version=2"
             ),
-            schema_version=1,
+            schema_version=1 if llvm else 2,
         )
         if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
             raise RuntimeError("Ghidra call artifact belongs to another binary")

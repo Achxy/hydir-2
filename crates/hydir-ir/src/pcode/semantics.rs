@@ -191,10 +191,34 @@ impl PcodeFunctionIr {
 }
 
 impl PcodeSemanticOperation {
-    /// Evaluate an already lowered exact operation for concrete values up to
-    /// 64 bits. Used by tests and later differential checks; this does not
-    /// execute memory, control flow, or the enclosing machine instruction.
+    /// Compatibility evaluator for concrete varnodes no wider than 64 bits.
+    /// Wider values require `evaluate_exact_wide` so no result is truncated.
     pub fn evaluate_exact(&self, inputs: &[u64]) -> Result<Option<u64>, String> {
+        if lower_operation(&self.source) != self.effect {
+            return Err("exact P-code artifact has invalid opcode, arity, or width".to_owned());
+        }
+        if self
+            .source
+            .output
+            .as_ref()
+            .is_some_and(|node| node.size > 8)
+            || self.source.inputs.iter().any(|node| node.size > 8)
+        {
+            return Err("64-bit P-code evaluator cannot represent a wide varnode".to_owned());
+        }
+        self.evaluate_exact_wide(
+            &inputs
+                .iter()
+                .map(|&value| u128::from(value))
+                .collect::<Vec<_>>(),
+        )?
+        .map(|value| u64::try_from(value).map_err(|_| "64-bit P-code result overflow".to_owned()))
+        .transpose()
+    }
+
+    /// Evaluate one validated raw P-code scalar operation up to 128 bits.
+    /// This does not execute memory, control flow, or a machine instruction.
+    pub fn evaluate_exact_wide(&self, inputs: &[u128]) -> Result<Option<u128>, String> {
         let PcodeEffect::Assign {
             operation,
             result_width_bits,
@@ -210,8 +234,9 @@ impl PcodeSemanticOperation {
         }
         for (input, &value) in self.source.inputs.iter().zip(inputs) {
             if input.space == "const" {
-                let expected = super::hex_u64(&input.offset)? & mask(input.size * 8);
-                if value & mask(input.size * 8) != expected {
+                let expected =
+                    u128::from(super::hex_u64(&input.offset)?) & mask_wide(input.size * 8);
+                if value & mask_wide(input.size * 8) != expected {
                     return Err("concrete input differs from constant varnode".to_owned());
                 }
             }
@@ -225,26 +250,35 @@ impl PcodeSemanticOperation {
         let values = inputs
             .iter()
             .zip(&widths)
-            .map(|(&value, &bits)| value & mask(bits))
+            .map(|(&value, &bits)| value & mask_wide(bits))
             .collect::<Vec<_>>();
         let result = match operation {
             PcodeExactOp::Copy | PcodeExactOp::ZeroExtend => values[0],
-            PcodeExactOp::SignExtend => signed(values[0], widths[0]) as u64,
+            PcodeExactOp::SignExtend => signed_wide(values[0], widths[0]) as u128,
             PcodeExactOp::Add => values[0].wrapping_add(values[1]),
             PcodeExactOp::Sub => values[0].wrapping_sub(values[1]),
-            PcodeExactOp::UnsignedCarry => u64::from(
-                u128::from(values[0]) + u128::from(values[1]) > u128::from(mask(widths[0])),
-            ),
+            PcodeExactOp::UnsignedCarry => {
+                let (sum, overflow) = values[0].overflowing_add(values[1]);
+                u128::from(overflow || sum > mask_wide(widths[0]))
+            }
             PcodeExactOp::SignedCarry | PcodeExactOp::SignedBorrow => {
-                let left = i128::from(signed(values[0], widths[0]));
-                let right = i128::from(signed(values[1], widths[1]));
-                let result = if operation == PcodeExactOp::SignedCarry {
-                    left + right
+                let left = signed_wide(values[0], widths[0]);
+                let right = signed_wide(values[1], widths[1]);
+                let (result, host_overflow) = if operation == PcodeExactOp::SignedCarry {
+                    left.overflowing_add(right)
                 } else {
-                    left - right
+                    left.overflowing_sub(right)
                 };
-                let limit = 1i128 << (widths[0] - 1);
-                u64::from(result < -limit || result >= limit)
+                let sign_bit = 1u128 << (widths[0] - 1);
+                let left_sign = values[0] & sign_bit != 0;
+                let right_sign = values[1] & sign_bit != 0;
+                let result_sign = (result as u128) & sign_bit != 0;
+                let overflow = if operation == PcodeExactOp::SignedCarry {
+                    left_sign == right_sign && result_sign != left_sign
+                } else {
+                    left_sign != right_sign && result_sign != left_sign
+                };
+                u128::from(host_overflow || overflow)
             }
             PcodeExactOp::TwosComplement => values[0].wrapping_neg(),
             PcodeExactOp::BitwiseNegate => !values[0],
@@ -263,23 +297,29 @@ impl PcodeSemanticOperation {
                     PcodeExactOp::UnsignedDivide => values[0] / values[1],
                     PcodeExactOp::UnsignedRemainder => values[0] % values[1],
                     PcodeExactOp::SignedDivide => {
-                        let left = i128::from(signed(values[0], widths[0]));
-                        let right = i128::from(signed(values[1], widths[1]));
+                        let left = signed_wide(values[0], widths[0]);
+                        let right = signed_wide(values[1], widths[1]);
                         // Ghidra's reference gives no representable result
                         // for MIN / -1 in the same-width signed output.
                         // Keep it an explicit boundary instead of asserting
                         // a wrap or depending on host signed overflow.
-                        if left == -(1i128 << (widths[0] - 1)) && right == -1 {
+                        if left == signed_min(widths[0]) && right == -1 {
                             return Err(
                                 "P-code signed division overflows its output width".to_owned()
                             );
                         }
-                        (left / right) as u64
+                        (left / right) as u128
                     }
                     PcodeExactOp::SignedRemainder => {
-                        let left = i128::from(signed(values[0], widths[0]));
-                        let right = i128::from(signed(values[1], widths[1]));
-                        (left % right) as u64
+                        let left = signed_wide(values[0], widths[0]);
+                        let right = signed_wide(values[1], widths[1]);
+                        // MIN % -1 is mathematically zero, but Rust's i128
+                        // remainder overflows for that operand pair.
+                        if left == i128::MIN && right == -1 {
+                            0
+                        } else {
+                            (left % right) as u128
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -292,58 +332,75 @@ impl PcodeSemanticOperation {
             PcodeExactOp::BooleanOr => values[0] | values[1],
             PcodeExactOp::Piece => (values[0] << widths[1]) | values[1],
             PcodeExactOp::Subpiece => values[0] >> (values[1] * 8),
-            PcodeExactOp::Equal => u64::from(values[0] == values[1]),
-            PcodeExactOp::NotEqual => u64::from(values[0] != values[1]),
-            PcodeExactOp::UnsignedLess => u64::from(values[0] < values[1]),
-            PcodeExactOp::UnsignedLessEqual => u64::from(values[0] <= values[1]),
+            PcodeExactOp::Equal => u128::from(values[0] == values[1]),
+            PcodeExactOp::NotEqual => u128::from(values[0] != values[1]),
+            PcodeExactOp::UnsignedLess => u128::from(values[0] < values[1]),
+            PcodeExactOp::UnsignedLessEqual => u128::from(values[0] <= values[1]),
             PcodeExactOp::SignedLess => {
-                u64::from(signed(values[0], widths[0]) < signed(values[1], widths[1]))
+                u128::from(signed_wide(values[0], widths[0]) < signed_wide(values[1], widths[1]))
             }
             PcodeExactOp::SignedLessEqual => {
-                u64::from(signed(values[0], widths[0]) <= signed(values[1], widths[1]))
+                u128::from(signed_wide(values[0], widths[0]) <= signed_wide(values[1], widths[1]))
             }
             PcodeExactOp::ShiftLeft => {
-                if values[1] >= u64::from(result_width_bits) {
+                if values[1] >= u128::from(result_width_bits) {
                     0
                 } else {
                     values[0] << values[1]
                 }
             }
             PcodeExactOp::LogicalShiftRight => {
-                if values[1] >= u64::from(result_width_bits) {
+                if values[1] >= u128::from(result_width_bits) {
                     0
                 } else {
                     values[0] >> values[1]
                 }
             }
             PcodeExactOp::ArithmeticShiftRight => {
-                let value = signed(values[0], widths[0]);
-                if values[1] >= u64::from(result_width_bits) {
-                    if value < 0 { u64::MAX } else { 0 }
+                let value = signed_wide(values[0], widths[0]);
+                if values[1] >= u128::from(result_width_bits) {
+                    if value < 0 { u128::MAX } else { 0 }
                 } else {
-                    (value >> values[1]) as u64
+                    (value >> values[1]) as u128
                 }
             }
-            PcodeExactOp::PopCount => u64::from(values[0].count_ones()),
+            PcodeExactOp::PopCount => u128::from(values[0].count_ones()),
             PcodeExactOp::LeadingZeroCount => {
-                u64::from(values[0].leading_zeros() - (64 - widths[0]))
+                u128::from(values[0].leading_zeros() - (128 - widths[0]))
             }
         };
-        Ok(Some(result & mask(result_width_bits)))
+        Ok(Some(result & mask_wide(result_width_bits)))
     }
 }
 
+fn mask_wide(bits: u32) -> u128 {
+    if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+fn signed_wide(value: u128, bits: u32) -> i128 {
+    let shift = 128 - bits;
+    ((value << shift) as i128) >> shift
+}
+
+fn signed_min(bits: u32) -> i128 {
+    if bits == 128 {
+        i128::MIN
+    } else {
+        -(1i128 << (bits - 1))
+    }
+}
+
+#[cfg(test)]
 fn mask(bits: u32) -> u64 {
     if bits == 64 {
         u64::MAX
     } else {
         (1u64 << bits) - 1
     }
-}
-
-fn signed(value: u64, bits: u32) -> i64 {
-    let shift = 64 - bits;
-    ((value << shift) as i64) >> shift
 }
 
 fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
@@ -431,21 +488,21 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
                 true,
             );
         }
-        if output.size == 0 || output.size > 8 {
+        if output.size == 0 || output.size > 16 {
             return opaque(
                 PcodeOpaqueClass::UnmodelledValue,
-                "output must be a varnode of 1..=8 bytes".to_owned(),
+                "output must be a varnode of 1..=16 bytes".to_owned(),
                 true,
             );
         }
         if source
             .inputs
             .iter()
-            .any(|input| input.size == 0 || input.size > 8)
+            .any(|input| input.size == 0 || input.size > 16)
         {
             return opaque(
                 PcodeOpaqueClass::UnmodelledValue,
-                "input exceeds supported 1..=8 byte bitvector width".to_owned(),
+                "input exceeds supported 1..=16 byte bitvector width".to_owned(),
                 true,
             );
         }
@@ -469,7 +526,7 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
                         .is_some_and(|end| end <= u64::from(sizes[0]))
             }
             // Ghidra permits independent input and output widths. Within our
-            // 64-bit bound the count (0..=64) fits even a one-byte output.
+            // 128-bit bound the count (0..=128) fits even a one-byte output.
             PcodeExactOp::PopCount | PcodeExactOp::LeadingZeroCount => sizes.len() == 1,
             PcodeExactOp::ZeroExtend | PcodeExactOp::SignExtend => {
                 sizes.len() == 1 && sizes[0] < output.size
@@ -690,6 +747,95 @@ mod tests {
     }
 
     #[test]
+    fn wide_signed_multiply_and_high_half_match_ghidra_imul_shape() {
+        let extend = lowered(op(18, "INT_SEXT", Some(16), &[8]));
+        let multiply = lowered(op(32, "INT_MULT", Some(16), &[16, 16]));
+        let mut source = op(63, "SUBPIECE", Some(8), &[16, 4]);
+        source.inputs[1].space = "const".to_owned();
+        source.inputs[1].offset = "0x8".to_owned();
+        let high_half = lowered(source);
+        let compare = lowered(op(12, "INT_NOTEQUAL", Some(1), &[16, 16]));
+
+        let negative_three = extend
+            .evaluate_exact_wide(&[u64::MAX as u128 - 2])
+            .unwrap()
+            .unwrap();
+        assert_eq!(negative_three, u128::MAX - 2);
+        let negative_twenty_one = multiply
+            .evaluate_exact_wide(&[negative_three, 7])
+            .unwrap()
+            .unwrap();
+        assert_eq!(negative_twenty_one, u128::MAX - 20);
+        assert_eq!(
+            high_half
+                .evaluate_exact_wide(&[negative_twenty_one, 8])
+                .unwrap(),
+            Some(u64::MAX as u128)
+        );
+        assert_eq!(
+            compare
+                .evaluate_exact_wide(&[negative_twenty_one, negative_twenty_one])
+                .unwrap(),
+            Some(0)
+        );
+
+        let overflowing = multiply
+            .evaluate_exact_wide(&[i64::MAX as u128, 2])
+            .unwrap()
+            .unwrap();
+        assert_eq!(overflowing, 0xffff_ffff_ffff_fffe);
+        assert_eq!(
+            compare
+                .evaluate_exact_wide(&[overflowing, u128::MAX - 1])
+                .unwrap(),
+            Some(1)
+        );
+        assert!(
+            multiply
+                .evaluate_exact(&[1, 2])
+                .unwrap_err()
+                .contains("wide")
+        );
+        assert!(matches!(
+            lower_operation(&op(32, "INT_MULT", Some(17), &[17, 17])),
+            PcodeEffect::Opaque { .. }
+        ));
+    }
+
+    #[test]
+    fn wide_arithmetic_boundaries_do_not_overflow_the_host() {
+        let carry = lowered(op(21, "INT_CARRY", Some(1), &[16, 16]));
+        assert_eq!(carry.evaluate_exact_wide(&[u128::MAX, 1]).unwrap(), Some(1));
+        let signed_carry = lowered(op(22, "INT_SCARRY", Some(1), &[16, 16]));
+        assert_eq!(
+            signed_carry
+                .evaluate_exact_wide(&[i128::MAX as u128, 1])
+                .unwrap(),
+            Some(1)
+        );
+        let quotient = lowered(op(34, "INT_SDIV", Some(16), &[16, 16]));
+        assert!(
+            quotient
+                .evaluate_exact_wide(&[i128::MIN as u128, u128::MAX])
+                .unwrap_err()
+                .contains("overflows")
+        );
+        assert!(
+            quotient
+                .evaluate_exact_wide(&[1, 0])
+                .unwrap_err()
+                .contains("zero")
+        );
+        let remainder = lowered(op(36, "INT_SREM", Some(16), &[16, 16]));
+        assert_eq!(
+            remainder
+                .evaluate_exact_wide(&[i128::MIN as u128, u128::MAX])
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn shifts_do_not_apply_machine_shift_count_masking() {
         let left = lowered(op(29, "INT_LEFT", Some(1), &[1, 8]));
         let right = lowered(op(30, "INT_RIGHT", Some(1), &[1, 8]));
@@ -893,7 +1039,7 @@ mod tests {
         for source in [
             op(72, "POPCOUNT", Some(1), &[]),
             op(72, "POPCOUNT", Some(1), &[1, 1]),
-            op(72, "POPCOUNT", Some(1), &[9]),
+            op(72, "POPCOUNT", Some(1), &[17]),
             op(72, "POPCOUNT", None, &[8]),
         ] {
             assert!(matches!(
@@ -947,7 +1093,7 @@ mod tests {
             op(39, "BOOL_AND", Some(1), &[2, 1]),
             op(40, "BOOL_OR", Some(1), &[1]),
             op(73, "LZCOUNT", Some(1), &[]),
-            op(73, "LZCOUNT", Some(1), &[9]),
+            op(73, "LZCOUNT", Some(1), &[17]),
             op(73, "LZCOUNT", None, &[1]),
         ] {
             assert!(matches!(

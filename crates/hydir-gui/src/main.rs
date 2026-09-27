@@ -1915,12 +1915,21 @@ fn run_ghidra_command(
     if cancel.load(Ordering::Acquire) {
         return Err("Ghidra task cancelled".to_owned());
     }
-    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let scratch = tempfile::tempdir()
+        .map_err(|error| format!("Could not create Ghidra task scratch: {error}"))?;
     let cancel_path = scratch.path().join("cancel");
-    let mut stdout =
-        fs::File::create(scratch.path().join("stdout.log")).map_err(|error| error.to_string())?;
-    let mut stderr =
-        fs::File::create(scratch.path().join("stderr.log")).map_err(|error| error.to_string())?;
+    let mut stdout = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(scratch.path().join("stdout.log"))
+        .map_err(|error| format!("Could not create Ghidra stdout log: {error}"))?;
+    let mut stderr = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(scratch.path().join("stderr.log"))
+        .map_err(|error| format!("Could not create Ghidra stderr log: {error}"))?;
     command
         .env("HYDIR_GHIDRA_CANCEL_FILE", &cancel_path)
         .stdin(Stdio::null())
@@ -1935,7 +1944,12 @@ fn run_ghidra_command(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Could not spawn {}: {error}",
+            command.get_program().to_string_lossy()
+        )
+    })?;
     let started = Instant::now();
     let mut stopping: Option<(&str, Instant)> = None;
     loop {
@@ -2089,7 +2103,7 @@ fn run_ghidra_call_trace(
     let trace: PcodeInterproceduralTrace =
         serde_json::from_slice(&fs::read(&trace_path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("Invalid Ghidra call trace: {error}"))?;
-    if trace.schema_version != 1
+    if trace.schema_version != hydir_ir::pcode::PCODE_CALL_PATH_VERSION
         || trace.binary_sha256 != binary_sha256
         || trace.root_entry.offset != function
     {
@@ -4424,7 +4438,10 @@ impl AnalystApp {
                                 .unwrap_or_default();
                             self.ghidra_llvm_operation = None;
                             self.ghidra_llvm_prefix = None;
-                            self.ghidra_llvm_cfg = None;
+                            self.ghidra_llvm_cfg = Some(emit_pcode_cfg_llvm(
+                                &snapshot,
+                                Some(&snapshot.selected_function.entry),
+                            ));
                             self.ghidra_llvm_simplified = None;
                             self.ghidra_simplification = None;
                             self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
@@ -6931,6 +6948,7 @@ impl AnalystApp {
         }
         egui::CollapsingHeader::new(format!("Ordered state effects ({})", self.ghidra_state_lines.len()))
             .id_salt("ghidra_ordered_state")
+            .default_open(true)
             .show(ui, |ui| {
                 ui.label(RichText::new("Reads and writes follow source P-code order. Possible effects and unlisted clobbers remain explicit.")
                     .size(11.0).color(MUTED));
@@ -7415,6 +7433,7 @@ impl AnalystApp {
             });
         egui::CollapsingHeader::new("LLVM CFG path")
             .id_salt("ghidra_llvm_cfg")
+            .default_open(true)
             .show(ui, |ui| {
                 ui.label(RichText::new("A bounded runnable LLVM path from the selected instruction. Stops retain source addresses; memory, calls, and unsupported effects remain explicit boundaries.")
                     .size(11.0).color(MUTED));
@@ -11706,8 +11725,175 @@ impl eframe::App for AnalystApp {
     }
 }
 
+/// Exercise the desktop's automatic import and selected-function event path without a window.
+/// The caller supplies a private HYDIR_LOCAL_DB so this does not touch the user's workbench.
+fn wait_for_demo_ghidra_snapshot(
+    app: &mut AnalystApp,
+    selected: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        app.poll();
+        if !app.ghidra_busy
+            && app.ghidra_snapshot.as_ref().is_some_and(|snapshot| {
+                selected.is_none_or(|entry| snapshot.selected_function.entry.offset == entry)
+            })
+        {
+            return Ok(());
+        }
+        if !app.busy
+            && !app.ghidra_busy
+            && app.workbench_loaded
+            && app.pending_ghidra.is_none()
+            && let Some(error) = &app.failure
+        {
+            return Err(error.clone());
+        }
+        if started.elapsed() >= timeout {
+            if let Some(task) = &app.ghidra_task {
+                task.cancel.store(true, Ordering::Release);
+            }
+            return Err(format!("Desktop Ghidra analysis exceeded {timeout:?}"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, String> {
+    if std::env::var_os("HYDIR_LOCAL_DB").is_none() {
+        return Err("Set HYDIR_LOCAL_DB to a private absolute test database path".to_owned());
+    }
+    let ctx = egui::Context::default();
+    let mut app = AnalystApp::new(&ctx);
+    app.startup_open_local = Some(binary.to_path_buf());
+    app.enqueue(Task::LoadWorkbench, "Loading demo workbench…");
+    let timeout = ghidra_task_timeout(None, false) + Duration::from_secs(30);
+    wait_for_demo_ghidra_snapshot(&mut app, None, timeout)?;
+    if let Some(entry) = selector {
+        let snapshot = app.ghidra_snapshot.as_ref().expect("checked above");
+        if !snapshot
+            .functions
+            .iter()
+            .any(|function| function.entry.offset == entry)
+        {
+            return Err(format!("Function {entry} is absent from Ghidra's index"));
+        }
+        if snapshot.selected_function.entry.offset != entry {
+            let path = app.current_local_path.clone().expect("opened local ELF");
+            let digest = snapshot.binary_sha256.clone();
+            app.enqueue_ghidra(path, digest, Some(entry.to_owned()));
+            wait_for_demo_ghidra_snapshot(&mut app, Some(entry), timeout)?;
+        }
+    }
+    let spec = app.spec.as_ref().ok_or("Desktop did not import the ELF")?;
+    if let Some(error) = &app.failure {
+        return Err(format!(
+            "Desktop Ghidra import did not persist cleanly: {error}"
+        ));
+    }
+    let snapshot = app.ghidra_snapshot.as_ref().ok_or("No Ghidra snapshot")?;
+    if snapshot.binary_sha256 != spec.binary_sha256 || snapshot.functions.is_empty() {
+        return Err("Desktop Ghidra function index differs from the open ELF".to_owned());
+    }
+    let map = GhidraAddressMap::new(snapshot, spec)
+        .ok_or("Desktop cannot map Ghidra addresses to the opened ELF")?;
+    let entry = map
+        .to_linked(
+            &snapshot.selected_function.entry.space,
+            &snapshot.selected_function.entry.offset,
+        )
+        .ok_or("Selected Ghidra function has no linked ELF address")?;
+    if app.ghidra_pcode_lines.is_empty()
+        || app.ghidra_state_lines.is_empty()
+        || app.ghidra_semantics.is_none()
+        || app.ghidra_coverage.is_none()
+        || !app
+            .ghidra_pcode_lines
+            .iter()
+            .any(|(address, _)| address.and_then(|raw| map.to_linked_raw(raw)).is_some())
+    {
+        return Err("Desktop did not populate linked P-code, state, and coverage".to_owned());
+    }
+    let llvm = app
+        .ghidra_llvm_cfg
+        .as_ref()
+        .ok_or("Desktop did not automatically generate CFG LLVM")?
+        .as_ref()
+        .map_err(|error| format!("Desktop CFG LLVM generation failed: {error}"))?;
+    if llvm.binary_sha256 != spec.binary_sha256
+        || llvm.start != snapshot.selected_function.entry
+        || llvm.source_operations.is_empty()
+        || !llvm.llvm_ir.contains("define ")
+        || !llvm.source_operations.iter().any(|operation| {
+            map.to_linked(&operation.address.space, &operation.address.offset)
+                .is_some()
+        })
+    {
+        return Err("Desktop CFG LLVM lacks matching linked source operations".to_owned());
+    }
+    let slice = (0..app.ghidra_pcode_lines.len())
+        .filter_map(|row| pcode_line_target(snapshot, row))
+        .take(64)
+        .find_map(|target| snapshot.backward_pcode_slice(target).ok())
+        .ok_or("Selected function has no backward P-code slice")?;
+    let slice_steps = slice.steps.len();
+    let binary_sha256 = spec.binary_sha256.clone();
+    let function_count = snapshot.functions.len();
+    let pcode_rows = app.ghidra_pcode_lines.len();
+    let state_rows = app.ghidra_state_lines.len();
+    let llvm_operations = llvm.source_operations.len();
+    app.enqueue(Task::Disassemble, "Checking linked demo disassembly…");
+    let started = Instant::now();
+    while app.disassembly_report.is_none() {
+        app.poll();
+        if app.status == "Whole-ELF disassembly failed" || app.status == "Disassembly discarded" {
+            return Err(app
+                .failure
+                .clone()
+                .unwrap_or_else(|| "Desktop did not produce disassembly".to_owned()));
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err("Desktop disassembly timed out".to_owned());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let report = app.disassembly_report.as_ref().expect("checked above");
+    if report.binary_sha256 != binary_sha256
+        || !report
+            .instructions
+            .iter()
+            .any(|instruction| instruction.address.0 == entry)
+    {
+        return Err("Desktop disassembly does not link to the selected function".to_owned());
+    }
+    Ok(format!(
+        "{} Ghidra functions, selected 0x{entry:x}, {} P-code rows, {} state rows, {} CFG LLVM source operations, {slice_steps} slice steps, {} disassembly instructions",
+        function_count,
+        pcode_rows,
+        state_rows,
+        llvm_operations,
+        report.instructions.len()
+    ))
+}
+
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [probe, binary] | [probe, binary, _] = arguments.as_slice()
+        && probe == "--probe-ghidra-demo"
+    {
+        let selector = arguments.get(2).map(String::as_str);
+        match probe_ghidra_demo(Path::new(binary), selector) {
+            Ok(summary) => {
+                println!("HydIR desktop Ghidra demo probe passed: {summary}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR desktop Ghidra demo probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if arguments.as_slice() == ["--probe-triton-console"] {
         let commands = [
             "from triton import *",
@@ -12289,7 +12475,7 @@ fn main() -> eframe::Result<()> {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-ghidra-demo <elf> [0xfunction-entry] (requires HYDIR_LOCAL_DB) | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -12355,6 +12541,35 @@ mod tests {
         mpsc,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn ghidra_subprocess_success_reads_output_tail() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output 'hydir stdout'; [Console]::Error.WriteLine('hydir stderr')",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "printf 'hydir stdout\\n'; printf 'hydir stderr\\n' >&2",
+            ]);
+            command
+        };
+        let cancel = AtomicBool::new(false);
+        let output = run_ghidra_command(&mut command, &cancel, Duration::from_secs(20)).unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hydir stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("hydir stderr"));
+    }
 
     #[test]
     fn ghidra_subprocess_cancels_during_execution() {
@@ -12779,6 +12994,13 @@ mod tests {
         app.poll();
         assert!(matches!(app.tab, Tab::GhidraPcode));
         assert_eq!(app.ghidra_snapshot.as_ref(), Some(&snapshot));
+        assert!(!app.ghidra_pcode_lines.is_empty());
+        assert!(!app.ghidra_state_lines.is_empty());
+        let llvm = app.ghidra_llvm_cfg.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(llvm.binary_sha256, spec.binary_sha256);
+        assert_eq!(llvm.start, snapshot.selected_function.entry);
+        assert!(!llvm.source_operations.is_empty());
+        assert!(llvm.llvm_ir.contains("define "));
 
         app.tab = Tab::Bytes;
         sender

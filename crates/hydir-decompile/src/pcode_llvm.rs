@@ -141,15 +141,22 @@ pub fn emit_pcode_linear_prefix_llvm(
                 let space_id = pcode_space_id(&input.space)?;
                 let bits = input.size * 8;
                 let raw_name = format!("%op{}_in{}_raw", sources.len(), input_index);
+                let (raw_bits, read_helper) = if bits > 64 {
+                    (128, "hydir_read_varnode_wide")
+                } else {
+                    (64, "hydir_read_varnode")
+                };
                 body.push_str(&format!(
-                    "  {raw_name} = call i64 @hydir_read_varnode(ptr %state, i32 {space_id}, i64 {}, i32 {})\n",
+                    "  {raw_name} = call i{raw_bits} @{read_helper}(ptr %state, i32 {space_id}, i64 {}, i32 {})\n",
                     pcode_offset(input)?, input.size
                 ));
-                let typed_name = if bits == 64 {
+                let typed_name = if bits == raw_bits {
                     raw_name
                 } else {
                     let name = format!("%op{}_in{}", sources.len(), input_index);
-                    body.push_str(&format!("  {name} = trunc i64 {raw_name} to i{bits}\n"));
+                    body.push_str(&format!(
+                        "  {name} = trunc i{raw_bits} {raw_name} to i{bits}\n"
+                    ));
                     name
                 };
                 arguments.push(format!("i{bits} {typed_name}"));
@@ -211,17 +218,23 @@ pub fn emit_pcode_linear_prefix_llvm(
                 "  {result_name} = call i{result_bits} @{helper_name}({})\n",
                 arguments.join(", ")
             ));
-            let raw_result = if result_bits == 64 {
+            let raw_bits = if result_bits > 64 { 128 } else { 64 };
+            let raw_result = if result_bits == raw_bits {
                 result_name
             } else {
                 let name = format!("%op{}_result_raw", sources.len());
                 body.push_str(&format!(
-                    "  {name} = zext i{result_bits} {result_name} to i64\n"
+                    "  {name} = zext i{result_bits} {result_name} to i{raw_bits}\n"
                 ));
                 name
             };
+            let write_helper = if result_bits > 64 {
+                "hydir_write_varnode_wide"
+            } else {
+                "hydir_write_varnode"
+            };
             body.push_str(&format!(
-                "  call void @hydir_write_varnode(ptr %state, i32 {}, i64 {}, i32 {}, i64 {raw_result})\n",
+                "  call void @{write_helper}(ptr %state, i32 {}, i64 {}, i32 {}, i{raw_bits} {raw_result})\n",
                 pcode_space_id(&output.space)?, pcode_offset(output)?, output.size
             ));
             sources.push(PcodeLlvmSourceOperation {
@@ -237,6 +250,8 @@ pub fn emit_pcode_linear_prefix_llvm(
          ; state ABI: space 1=register, 2=unique; byte offsets, little-endian widths.\n\
          declare i64 @hydir_read_varnode(ptr, i32, i64, i32)\n\
          declare void @hydir_write_varnode(ptr, i32, i64, i32, i64)\n\n\
+         declare i128 @hydir_read_varnode_wide(ptr, i32, i64, i32)\n\
+         declare void @hydir_write_varnode_wide(ptr, i32, i64, i32, i128)\n\n\
          declare void @hydir_clear_unique(ptr)\n\n\
          {helpers}define i32 @hydir_pcode_prefix(ptr %state) {{\nentry:\n{body}  ret i32 {}\n}}\n",
         sources.len()
@@ -256,7 +271,9 @@ pub fn emit_pcode_linear_prefix_llvm(
     })
 }
 
-/// Emit a verifier-clean LLVM function for one exact operation (up to 64 bits).
+/// Emit a verifier-clean LLVM function for one exact operation. The selected
+/// 128-bit extension/multiply/subpiece/comparison subset covers x86-64 IMUL
+/// overflow-flag P-code; other wide operations remain explicit boundaries.
 /// The function is named `hydir_pcode_exact` and has an integer return type
 /// equal to the output varnode width. Every non-constant source input is a
 /// width-typed parameter `%inN`, where N is its source-input index. Division
@@ -273,6 +290,18 @@ pub fn emit_pcode_exact_operation_llvm(
     else {
         return Err("opaque P-code effect cannot be emitted as exact LLVM".to_owned());
     };
+    let wide = result_bits > 64 || operation.source.inputs.iter().any(|input| input.size > 8);
+    if wide
+        && !matches!(
+            kind,
+            PcodeExactOp::SignExtend
+                | PcodeExactOp::Multiply
+                | PcodeExactOp::Subpiece
+                | PcodeExactOp::NotEqual
+        )
+    {
+        return Err("wide P-code operation lacks checked LLVM lowering".to_owned());
+    }
 
     // The public evaluator rechecks that the effect still matches the source
     // opcode, mnemonic, operand spaces, arity, and widths. Supply matching
@@ -291,17 +320,17 @@ pub fn emit_pcode_exact_operation_llvm(
         .enumerate()
         .map(|(index, input)| {
             if input.space == "const" {
-                parse_constant(&input.offset)
+                parse_constant(&input.offset).map(u128::from)
             } else if is_division && index == 1 {
                 // A zero witness would reject every otherwise valid dynamic
                 // division before LLVM has a chance to guard its divisor.
-                Ok(1)
+                Ok(1u128)
             } else {
-                Ok(0)
+                Ok(0u128)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if operation.evaluate_exact(&witness)?.is_none() {
+    if operation.evaluate_exact_wide(&witness)?.is_none() {
         return Err("P-code operation is not exact".to_owned());
     }
 
@@ -310,7 +339,7 @@ pub fn emit_pcode_exact_operation_llvm(
     for (index, input) in operation.source.inputs.iter().enumerate() {
         let bits = input.size * 8;
         if input.space == "const" {
-            operands.push(format!("{}", witness[index] & width_mask(bits)));
+            operands.push(format!("{}", witness[index] & wide_mask(bits)));
         } else {
             let name = format!("%in{index}");
             parameters.push(format!("i{bits} {name}"));
@@ -654,6 +683,14 @@ fn width_mask(bits: u32) -> u64 {
         u64::MAX
     } else {
         (1u64 << bits) - 1
+    }
+}
+
+fn wide_mask(bits: u32) -> u128 {
+    if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
     }
 }
 

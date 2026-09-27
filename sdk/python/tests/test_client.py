@@ -330,7 +330,7 @@ class ClientBoundaryTests(unittest.TestCase):
             "registers": [], "memory": [],
         }).encode()
         trace = json.dumps({
-            "schema_version": 1, "binary_sha256": digest,
+            "schema_version": 2, "binary_sha256": digest,
             "root_entry": {"space": "ram", "offset": "0x2013a9"},
             "segments": [], "calls": [],
         }).encode()
@@ -341,7 +341,7 @@ class ClientBoundaryTests(unittest.TestCase):
                 requests.append((request, kwargs))
                 return proto_v3.ArtifactReply(
                     sha256=hashlib.sha256(trace).hexdigest(),
-                    media_type="application/vnd.hydir.pcode-call-trace+json;version=1",
+                    media_type="application/vnd.hydir.pcode-call-trace+json;version=2",
                     content=trace, project_revision=4,
                 )
             client._call = call

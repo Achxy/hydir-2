@@ -24,7 +24,7 @@ use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PCODE_EXECUTION_TRACE_VERSION: u32 = 2;
+pub const PCODE_EXECUTION_TRACE_VERSION: u32 = 3;
 const MAX_KNOWN_STATE_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,9 +44,17 @@ impl PcodeConcreteState {
             .saturating_add(self.memory_bytes.values().map(BTreeMap::len).sum::<usize>())
     }
 
-    /// Set a complete 1..=8 byte register or unique varnode. The write is
-    /// little-endian and preserves all bytes outside the addressed range.
+    /// Compatibility writer for 1..=8 byte register or unique varnodes.
     pub fn write_varnode(&mut self, node: &PcodeVarnode, value: u64) -> Result<(), String> {
+        if !(1..=8).contains(&node.size) {
+            return Err("64-bit concrete varnode width must be 1..=8 bytes".to_owned());
+        }
+        self.write_varnode_wide(node, u128::from(value))
+    }
+
+    /// Write a complete 1..=16 byte scalar in little-endian byte order.
+    /// Bytes outside the addressed register or unique slice are preserved.
+    pub fn write_varnode_wide(&mut self, node: &PcodeVarnode, value: u128) -> Result<(), String> {
         let offset = checked_range(node)?;
         let current_bytes = self.known_byte_count();
         let bytes = match node.space.as_str() {
@@ -66,19 +74,31 @@ impl PcodeConcreteState {
         Ok(())
     }
 
-    /// Read a fully known varnode. `None` means at least one required byte is
-    /// unknown; it must not be silently replaced with zero. Constants are
-    /// immediate values and are not stored in mutable state.
+    /// Compatibility reader for 1..=8 byte varnodes.
     pub fn read_varnode(&self, node: &PcodeVarnode) -> Result<Option<u64>, String> {
+        if !(1..=8).contains(&node.size) {
+            return Err("64-bit concrete varnode width must be 1..=8 bytes".to_owned());
+        }
+        self.read_varnode_wide(node)?
+            .map(|value| {
+                u64::try_from(value).map_err(|_| "64-bit concrete varnode overflow".to_owned())
+            })
+            .transpose()
+    }
+
+    /// Read a complete scalar. Unknown bytes produce `None`, never zero.
+    /// Ghidra constant offsets are bounded to u64 by snapshot validation and
+    /// are zero-extended when their declared varnode size exceeds eight bytes.
+    pub fn read_varnode_wide(&self, node: &PcodeVarnode) -> Result<Option<u128>, String> {
         if node.space == "const" {
-            if !(1..=8).contains(&node.size) {
-                return Err("concrete varnode width must be 1..=8 bytes".to_owned());
+            if !(1..=16).contains(&node.size) {
+                return Err("concrete varnode width must be 1..=16 bytes".to_owned());
             }
-            let offset = hex_u64(&node.offset)?;
-            let mask = if node.size == 8 {
-                u64::MAX
+            let offset = u128::from(hex_u64(&node.offset)?);
+            let mask = if node.size == 16 {
+                u128::MAX
             } else {
-                (1u64 << (node.size * 8)) - 1
+                (1u128 << (node.size * 8)) - 1
             };
             return Ok(Some(offset & mask));
         }
@@ -88,12 +108,12 @@ impl PcodeConcreteState {
             "unique" => &self.unique_bytes,
             _ => return Err("concrete input must use register, unique or const space".to_owned()),
         };
-        let mut value = 0u64;
+        let mut value = 0u128;
         for index in 0..node.size {
             let Some(byte) = bytes.get(&(offset + u64::from(index))) else {
                 return Ok(None);
             };
-            value |= u64::from(*byte) << (index * 8);
+            value |= u128::from(*byte) << (index * 8);
         }
         Ok(Some(value))
     }
@@ -163,8 +183,8 @@ fn checked_memory_range(byte_offset: u64, size: u32) -> Result<(), String> {
 }
 
 fn checked_range(node: &PcodeVarnode) -> Result<u64, String> {
-    if !(1..=8).contains(&node.size) {
-        return Err("concrete varnode width must be 1..=8 bytes".to_owned());
+    if !(1..=16).contains(&node.size) {
+        return Err("concrete varnode width must be 1..=16 bytes".to_owned());
     }
     let offset = hex_u64(&node.offset)?;
     if offset.checked_add(u64::from(node.size - 1)).is_none() {
@@ -223,11 +243,64 @@ pub enum PcodeMemoryBoundaryKind {
 pub struct PcodeExecutedOperation {
     /// Full source provenance and varnode ranges.
     pub source: PcodeOperation,
-    /// Values in source input order, read before the output is written.
-    pub input_values: Vec<u64>,
+    /// Full-precision values in source input order, read before output write.
+    /// Versioned trace JSON uses exact 0x-prefixed strings for these values.
+    #[serde(with = "trace_input_values")]
+    pub input_values: Vec<u128>,
     /// STORE has no output varnode; its written value is in `memory_access`.
-    pub output_value: Option<u64>,
+    #[serde(with = "trace_output_value")]
+    pub output_value: Option<u128>,
     pub memory_access: Option<PcodeConcreteMemoryAccess>,
+}
+
+mod trace_input_values {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(values: &[u128], serializer: S) -> Result<S::Ok, S::Error> {
+        values
+            .iter()
+            .map(|value| format!("0x{value:x}"))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u128>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| super::parse_trace_value(&value).map_err(D::Error::custom))
+            .collect()
+    }
+}
+
+mod trace_output_value {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<u128>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .map(|value| format!("0x{value:x}"))
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u128>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| super::parse_trace_value(&value).map_err(D::Error::custom))
+            .transpose()
+    }
+}
+
+fn parse_trace_value(value: &str) -> Result<u128, &'static str> {
+    let digits = value
+        .strip_prefix("0x")
+        .ok_or("trace value requires 0x prefix")?;
+    if digits.is_empty() || digits.len() > 32 || digits.starts_with('0') && digits.len() > 1 {
+        return Err("trace value has invalid hexadecimal width");
+    }
+    u128::from_str_radix(digits, 16).map_err(|_| "trace value is invalid hexadecimal")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -273,7 +346,7 @@ pub struct PcodeExecutionTrace {
     pub verification: VerificationStatus,
 }
 
-pub const PCODE_PATH_TRACE_VERSION: u32 = 1;
+pub const PCODE_PATH_TRACE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -573,7 +646,7 @@ impl PcodeSemanticFunctionIr {
                 reason,
             )
         })?;
-        let mut input_values = vec![id, pointer_offset];
+        let mut input_values = vec![u128::from(id), u128::from(pointer_offset)];
         let value = match kind {
             PcodeMemoryAccessKind::Load => match state.read_memory(&space.name, byte_offset, width)
             {
@@ -601,7 +674,7 @@ impl PcodeSemanticFunctionIr {
                 let data = &source.inputs[2];
                 match state.read_varnode(data) {
                     Ok(Some(value)) => {
-                        input_values.push(value);
+                        input_values.push(u128::from(value));
                         value
                     }
                     Ok(None) => {
@@ -653,7 +726,7 @@ impl PcodeSemanticFunctionIr {
         Ok(PcodeExecutedOperation {
             source: source.clone(),
             input_values,
-            output_value: (kind == PcodeMemoryAccessKind::Load).then_some(value),
+            output_value: (kind == PcodeMemoryAccessKind::Load).then_some(u128::from(value)),
             memory_access: Some(PcodeConcreteMemoryAccess {
                 kind,
                 space: space.name.clone(),
@@ -692,7 +765,7 @@ impl PcodeSemanticFunctionIr {
         }
         let mut input_values = Vec::with_capacity(source.inputs.len());
         for (index, varnode) in source.inputs.iter().enumerate() {
-            match state.read_varnode(varnode) {
+            match state.read_varnode_wide(varnode) {
                 Ok(Some(value)) => input_values.push(value),
                 Ok(None) => {
                     return Err(Box::new(PcodeExecutionStop::MissingInput {
@@ -709,7 +782,7 @@ impl PcodeSemanticFunctionIr {
                 }
             }
         }
-        let value = match operation.evaluate_exact(&input_values) {
+        let value = match operation.evaluate_exact_wide(&input_values) {
             Ok(Some(value)) => value,
             Ok(None) => {
                 return Err(Box::new(PcodeExecutionStop::InvalidOperation {
@@ -730,7 +803,7 @@ impl PcodeSemanticFunctionIr {
                 reason: "exact operation has no output varnode".to_owned(),
             }));
         };
-        state.write_varnode(output, value).map_err(|reason| {
+        state.write_varnode_wide(output, value).map_err(|reason| {
             Box::new(PcodeExecutionStop::InvalidOperation {
                 source: source.clone(),
                 reason,
@@ -1868,6 +1941,113 @@ mod tests {
         let roundtrip: PcodeExecutionTrace =
             serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
         assert_eq!(roundtrip, trace);
+    }
+
+    #[test]
+    fn real_password_imul_uses_full_128_bit_temporaries() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_password_mix_o1_v2.json"
+        ));
+        let digest = "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288";
+        let mut function = parse_ghidra_snapshot(bytes, digest)
+            .unwrap()
+            .pcode_function_ir()
+            .unwrap();
+        function
+            .instructions
+            .retain(|instruction| instruction.address.offset == "0x2015ee");
+        assert_eq!(function.instructions.len(), 1);
+        assert_eq!(function.instructions[0].mnemonic, "IMUL");
+        let mut state = PcodeConcreteState::default();
+        state
+            .write_varnode(&node("register", "0x0", 8), i64::MAX as u64)
+            .unwrap();
+        state.write_varnode(&node("register", "0x8", 8), 2).unwrap();
+        let trace = function.execute_exact_prefix(&state, 16).unwrap();
+        assert_eq!(trace.executed.len(), 8);
+        assert!(matches!(
+            trace.stop,
+            PcodeExecutionStop::EndOfListedInstructions
+        ));
+        assert_eq!(trace.executed[2].output_value, Some(0xffff_ffff_ffff_fffe));
+        assert_eq!(trace.executed[4].output_value, Some(0));
+        assert_eq!(trace.executed[6].output_value, Some(1));
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode(&node("register", "0x8", 8))
+                .unwrap(),
+            Some(0xffff_ffff_ffff_fffe)
+        );
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode(&node("register", "0x200", 1))
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode_wide(&node("unique", "0x92f00", 16))
+                .unwrap(),
+            Some(0xffff_ffff_ffff_fffe)
+        );
+        assert!(
+            trace
+                .final_state
+                .read_varnode(&node("unique", "0x92f00", 16))
+                .is_err()
+        );
+        let roundtrip: PcodeExecutionTrace =
+            serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
+        assert_eq!(roundtrip, trace);
+
+        let mut non_overflowing = PcodeConcreteState::default();
+        non_overflowing
+            .write_varnode(&node("register", "0x0", 8), (-3i64) as u64)
+            .unwrap();
+        non_overflowing
+            .write_varnode(&node("register", "0x8", 8), 7)
+            .unwrap();
+        let trace = function.execute_exact_prefix(&non_overflowing, 16).unwrap();
+        assert_eq!(trace.executed.len(), 8);
+        assert_eq!(trace.executed[2].output_value, Some(u128::MAX - 20));
+        assert_eq!(trace.executed[4].output_value, Some(u64::MAX as u128));
+        assert_eq!(trace.executed[6].output_value, Some(0));
+        let roundtrip: PcodeExecutionTrace =
+            serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
+        assert_eq!(roundtrip, trace);
+    }
+
+    #[test]
+    fn wide_state_preserves_byte_aliases_and_old_json_shape() {
+        let wide = node("unique", "0x10", 16);
+        let mut state = PcodeConcreteState::default();
+        assert_eq!(state.read_varnode_wide(&wide).unwrap(), None);
+        state
+            .write_varnode_wide(&wide, 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00)
+            .unwrap();
+        assert_eq!(
+            state.read_varnode(&node("unique", "0x18", 8)).unwrap(),
+            Some(0x1122_3344_5566_7788)
+        );
+        state
+            .write_varnode(&node("unique", "0x18", 1), 0xff)
+            .unwrap();
+        assert_eq!(
+            state.read_varnode_wide(&wide).unwrap(),
+            Some(0x1122_3344_5566_77ff_99aa_bbcc_ddee_ff00)
+        );
+        let old: PcodeConcreteState = serde_json::from_str(
+            r#"{"register_bytes":{"0":42},"unique_bytes":{},"memory_bytes":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.read_varnode(&node("register", "0x0", 1)).unwrap(),
+            Some(42)
+        );
     }
 
     #[test]

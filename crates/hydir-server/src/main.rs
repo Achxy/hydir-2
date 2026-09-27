@@ -2122,7 +2122,7 @@ struct GhidraCallTraceSelector {
     max_depth: usize,
 }
 
-const GHIDRA_CALL_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.pcode-call-trace+json;version=1";
+const GHIDRA_CALL_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.pcode-call-trace+json;version=2";
 const GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1";
 
@@ -4465,9 +4465,12 @@ async fn ghidra_call_artifact(
         let envelope = pack_ghidra_call_trace_input(&input.seed_json, &snapshots)
             .map_err(Status::resource_exhausted)?;
         let raw = run_worker("ghidra-call-trace", Some(&selector), envelope).await?;
-        let trace: PcodeInterproceduralTrace = serde_json::from_slice(&raw)
-            .map_err(|_| Status::internal("Ghidra call worker returned invalid artifact"))?;
-        if trace.schema_version != 1
+        let trace: PcodeInterproceduralTrace = serde_json::from_slice(&raw).map_err(|error| {
+            Status::internal(format!(
+                "Ghidra call worker returned invalid artifact: {error}"
+            ))
+        })?;
+        if trace.schema_version != hydir_ir::pcode::PCODE_CALL_PATH_VERSION
             || trace.binary_sha256 != project.binary_sha256
             || trace.root_entry.offset != format!("0x{root_entry:x}")
         {

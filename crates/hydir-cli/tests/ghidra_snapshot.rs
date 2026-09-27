@@ -112,7 +112,10 @@ fn real_prism_call_trace_uses_two_binary_bound_snapshots() {
         String::from_utf8_lossy(&result.stderr)
     );
     let trace: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
-    assert_eq!(trace["schema_version"], 1);
+    assert_eq!(
+        trace["schema_version"],
+        hydir_ir::pcode::PCODE_CALL_PATH_VERSION
+    );
     assert_eq!(trace["stop"]["kind"], "return");
     assert_eq!(trace["segments"].as_array().unwrap().len(), 3);
     assert_eq!(trace["calls"][0]["callee_entry"]["offset"], "0x2013a2");
@@ -695,7 +698,10 @@ fn concrete_trace_prefix_uses_binary_bound_seed_and_reports_boundary() {
     );
     let trace: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(trace["executed"].as_array().unwrap().len(), 10);
-    assert_eq!(trace["schema_version"], 2);
+    assert_eq!(
+        trace["schema_version"],
+        hydir_ir::pcode::PCODE_EXECUTION_TRACE_VERSION
+    );
     assert_eq!(trace["verification"], "not_run");
     assert_eq!(trace["stop"]["kind"], "opaque_boundary");
     assert_eq!(trace["stop"]["source"]["mnemonic"], "CBRANCH");
