@@ -141,7 +141,7 @@ class TransformedPcodeNativeTests(unittest.TestCase):
                         if not visits or visits[-1] != address:
                             visits.append(address)
                     self.assertEqual(visits, observed["instruction_visits"])
-                    self.assertEqual(observed["return_pc"], return_address)
+                    self.assertEqual(int(observed["return_pc"], 16), return_address)
                     self.assertEqual(observed["stack_delta"], 8)
                     self.assertEqual(register_bytes(byte_map, state, known, 0x0),
                                      observed["registers"]["rax"])

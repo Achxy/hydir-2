@@ -2,6 +2,7 @@
 """Compare image-backed P-code paths with the stripped ELF's CPU behavior."""
 
 import hashlib
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,20 @@ CASES = (
     ("mismatch", b"hYDIR-ACCESS", 12, 0),
     ("wrong-length", b"HYDIR-ACCESS", 11, 0),
 )
+
+
+def seed_register(byte_map, state, known, offset, value):
+    for byte in range(8):
+        index = byte_map[("register", offset + byte)]
+        state[index] = (value >> (byte * 8)) & 0xFF
+        known[index] = 0xFF
+
+
+def read_register(byte_map, state, known, offset):
+    indexes = [byte_map[("register", offset + byte)] for byte in range(8)]
+    if any(known[index] != 0xFF for index in indexes):
+        raise AssertionError(f"register 0x{offset:x} contains unknown bytes")
+    return int.from_bytes(bytes(state[index] for index in indexes), "little")
 
 
 class PasswordSecureEqualsNativeTests(unittest.TestCase):
@@ -131,6 +146,94 @@ class PasswordSecureEqualsNativeTests(unittest.TestCase):
                 self.assertEqual(native["registers"]["rax"], expected)
                 self.assertEqual(native["return_pc"], hex(self.return_address))
                 self.assertEqual(native["stack_delta"], 8)
+
+    def test_image_backed_llvm_matches_rust_and_native(self):
+        if sys.platform != "linux":
+            self.skipTest("native transformed LLVM replay requires Linux")
+        self.assertEqual(platform.machine(), "x86_64")
+        self.assertTrue(shutil.which("clang"), "Clang is required")
+        hydirctl = os.environ.get("HYDIRCTL_BIN", str(ROOT / "target/debug/hydirctl"))
+        emitted = subprocess.run(
+            [hydirctl, "ghidra-snapshot", "llvm-cfg-image", str(BINARY),
+             str(SNAPSHOT)],
+            cwd=ROOT, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(emitted.returncode, 0, emitted.stderr)
+        artifact = json.loads(emitted.stdout)
+        self.assertEqual(artifact["schema_version"], 3)
+        self.assertEqual(artifact["binary_sha256"], self.digest)
+        self.assertEqual(artifact["read_only_image"]["space"], "ram")
+        self.assertGreater(artifact["read_only_image"]["known_byte_count"], 0)
+        byte_map = {
+            (entry["space"], int(entry["offset"], 16)): entry["index"]
+            for entry in artifact["byte_map"]
+        }
+        self.assertEqual(len(byte_map), artifact["state_bytes"])
+        with tempfile.TemporaryDirectory(prefix="hydir-password-llvm-") as scratch:
+            module = Path(scratch) / "image.ll"
+            library = Path(scratch) / "image.so"
+            module.write_text(artifact["llvm_ir"], encoding="utf-8")
+            compiled = subprocess.run(
+                ["clang", "-shared", "-fPIC", "-x", "ir", str(module),
+                 "-o", str(library)],
+                cwd=ROOT, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            lifted = ctypes.CDLL(str(library)).hydir_pcode_cfg
+            u8p = ctypes.POINTER(ctypes.c_uint8)
+            lifted.argtypes = [
+                u8p, u8p, ctypes.c_int32, u8p, u8p, ctypes.c_uint64,
+                ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32), ctypes.c_int32, ctypes.c_int32,
+            ]
+            lifted.restype = ctypes.c_int32
+
+            for name, candidate, length, expected in CASES:
+                with self.subTest(case=name):
+                    rust = self.rust_trace(name, candidate, length)
+                    native = self.native_trace(candidate, length)
+                    state = (ctypes.c_uint8 * max(1, artifact["state_bytes"]))()
+                    known = (ctypes.c_uint8 * max(1, artifact["state_bytes"]))()
+                    seed_register(byte_map, state, known, 0x38, 0x700100)  # RDI
+                    seed_register(byte_map, state, known, 0x30, length)  # RSI
+                    seed_register(byte_map, state, known, 0x20, 0x700000)  # RSP
+                    seed_register(byte_map, state, known, 0x0, 0)  # RAX
+                    seed_register(byte_map, state, known, 0x8, 0)
+                    guest = (ctypes.c_uint8 * 0x110)()
+                    guest_known = (ctypes.c_uint8 * 0x110)()
+                    for address, source in ((0, self.return_address.to_bytes(8, "little")),
+                                            (0x100, candidate)):
+                        for index, value in enumerate(source):
+                            guest[address + index] = value
+                            guest_known[address + index] = 0xFF
+                    events = (ctypes.c_uint32 * 2048)()
+                    event_count = ctypes.c_uint32(0)
+                    status = lifted(
+                        state, known, 433, guest, guest_known, 0x700000,
+                        len(guest), events, ctypes.byref(event_count), 2048, 2048,
+                    )
+                    self.assertEqual(status, 1)  # PcodeCfgLlvmStatus::Return
+                    self.assertGreater(event_count.value, 0)
+                    self.assertLessEqual(event_count.value, 2048)
+                    visits = []
+                    for operation_id in events[:event_count.value]:
+                        self.assertLess(operation_id, len(artifact["source_operations"]))
+                        address = artifact["source_operations"][operation_id][
+                            "instruction_address"]["offset"]
+                        if not visits or visits[-1] != address:
+                            visits.append(address)
+                    self.assertEqual(
+                        visits,
+                        [visit["offset"] for visit in rust["instruction_visits"]],
+                    )
+                    self.assertEqual(visits, native["instruction_visits"])
+                    self.assertEqual(read_register(byte_map, state, known, 0x0), expected)
+                    self.assertEqual(read_register(byte_map, state, known, 0x0),
+                                     native["registers"]["rax"])
+                    self.assertEqual(read_register(byte_map, state, known, 0x20),
+                                     0x700000 + native["stack_delta"])
+                    self.assertEqual(bytes(guest[:8]),
+                                     self.return_address.to_bytes(8, "little"))
 
 
 if __name__ == "__main__":
