@@ -20,9 +20,12 @@ on:
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
+      - scripts/check-ghidra-frame-holdout.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/hydir_aggregate_walk.c
       - tests/fixtures/ghidra_float_compare.S
+      - tests/fixtures/hydir_frame_holdout.c
+      - tests/fixtures/ghidra_frame_holdout_native.gdb
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -56,9 +59,12 @@ on:
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
+      - scripts/check-ghidra-frame-holdout.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/hydir_aggregate_walk.c
       - tests/fixtures/ghidra_float_compare.S
+      - tests/fixtures/hydir_frame_holdout.c
+      - tests/fixtures/ghidra_frame_holdout_native.gdb
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -234,6 +240,10 @@ jobs:
           sudo apt-get install -y llvm-18
           PATH="/usr/lib/llvm-18/bin:$PATH" python3 scripts/check-ghidra-float-compare.py \
             --output-dir "$RUNNER_TEMP/ghidra-float-compare"
+      - name: Differential stripped frame parser holdout
+        run: |
+          python3 scripts/check-ghidra-frame-holdout.py \
+            --output-dir "$RUNNER_TEMP/ghidra-frame-holdout"
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"
@@ -511,3 +521,4 @@ jobs:
             target/demo-ghidra-password-lift/run.*/
             ${{ runner.temp }}/ghidra-opt-matrix/report.json
             ${{ runner.temp }}/ghidra-float-compare/report.json
+            ${{ runner.temp }}/ghidra-frame-holdout/report.json
