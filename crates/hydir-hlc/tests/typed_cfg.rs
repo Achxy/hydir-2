@@ -52,8 +52,37 @@ fn dwarf_linked_list_loop_compiles_and_matches_wrapping_oracle() {
     assert_eq!(node.size_bytes, 16);
     let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
     assert!(ir.blocks.len() > 2);
+    let fields = ir
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            HighCfgStatement::Load { field_view, .. }
+            | HighCfgStatement::Store { field_view, .. } => field_view.as_ref(),
+            HighCfgStatement::Assign { .. } => None,
+        })
+        .map(|view| view.field.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(fields, ["value", "next"]);
     let c = emit_typed_cfg_c(&ir, &model).unwrap();
     assert!(c.contains("* hydir_rsi"));
+    assert!(c.contains(&format!("offsetof(struct {}, value)", node.name)));
+    assert!(c.contains(&format!("offsetof(struct {}, next)", node.name)));
+    let mut unproven = ir.clone();
+    let next = unproven
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| {
+            matches!(statement, HighCfgStatement::Load { field_view: Some(view), .. }
+                if view.field == "next")
+        })
+        .unwrap();
+    let HighCfgStatement::Load { field_view, .. } = next else {
+        unreachable!()
+    };
+    *field_view = None;
+    assert!(emit_typed_cfg_c(&unproven, &model).is_err());
     assert!(c.contains("while (") || c.contains("goto hydir_bb_"));
     let expected = (u64::MAX)
         .wrapping_add(0x8000_0000_0000_0000)

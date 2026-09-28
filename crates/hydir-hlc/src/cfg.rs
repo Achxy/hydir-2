@@ -413,9 +413,63 @@ fn derived_pointer_origin(expression: &Expression) -> Option<(&str, i64)> {
     ))
 }
 
+fn recursive_pointer_step(
+    instruction: &ExpressionInstruction,
+    component: &str,
+    type_id: &str,
+    model: &AnalysisModel,
+) -> bool {
+    if instruction.residual.is_some()
+        || !instruction.memory_writes.is_empty()
+        || instruction.assignments.len() != 1
+        || instruction.assignments[0].target.component != component
+        || instruction
+            .output_components
+            .iter()
+            .filter(|output| output.component == component)
+            .count()
+            != 1
+    {
+        return false;
+    }
+    let Expression::MemoryRead {
+        address,
+        width_bits: 64,
+        byte_order: MemoryByteOrder::Little,
+        ..
+    } = &instruction.assignments[0].value
+    else {
+        return false;
+    };
+    if address.absolute.is_some()
+        || address.index.is_some()
+        || !matches!(address.base.as_deref(),
+            Some(Expression::Read { source, width_bits: 64 })
+                if source.component == component)
+    {
+        return false;
+    }
+    let Some(definition) = model.types.iter().find(|row| row.id == type_id) else {
+        return false;
+    };
+    let TypeDefinitionKind::Struct { fields } = &definition.kind else {
+        return false;
+    };
+    fields
+        .iter()
+        .filter(|field| {
+            i64::try_from(field.offset_bytes) == Ok(address.displacement)
+                && matches!(&field.ty, TypeRef::Pointer { to }
+                    if matches!(to.as_ref(), TypeRef::Named { id } if id == type_id))
+        })
+        .count()
+        == 1
+}
+
 fn stable_field_roots(
     parameters: &[HighParameter],
     expression: &ExpressionFunctionIr,
+    model: &AnalysisModel,
 ) -> BTreeMap<String, FieldRoot> {
     let mut writes = BTreeMap::<&str, usize>::new();
     for component in expression
@@ -436,7 +490,19 @@ fn stable_field_roots(
             let TypeRef::Named { id } = to.as_ref() else {
                 return None;
             };
-            (!writes.contains_key(format!("register:{}", parameter.location).as_str())).then(|| {
+            let component = format!("register:{}", parameter.location);
+            let recursively_updated = expression
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter(|instruction| {
+                    instruction
+                        .output_components
+                        .iter()
+                        .any(|output| output.component == component)
+                })
+                .all(|instruction| recursive_pointer_step(instruction, &component, id, model));
+            (!writes.contains_key(component.as_str()) || recursively_updated).then(|| {
                 (
                     parameter.location.clone(),
                     FieldRoot {
@@ -1831,7 +1897,7 @@ fn lower_high_level_cfg_cir_from_expression(
         });
     let flag_input = flag_inputs(machine)?;
     let flag_snapshots = flag_snapshot_sites(machine)?;
-    let field_roots = stable_field_roots(&parameters, expression);
+    let field_roots = stable_field_roots(&parameters, expression, model);
     let index_roots = stable_index_roots(&parameters, expression);
     let mut blocks = Vec::with_capacity(machine.blocks.len());
     for (block, expression_block) in machine.blocks.iter().zip(&expression.blocks) {
@@ -2415,6 +2481,52 @@ fn c_label(address: Location) -> String {
     format!("hydir_bb_{}_{:x}", address.address_space, address.value.0)
 }
 
+fn has_only_recursive_pointer_writes(
+    ir: &HighLevelCfgCir,
+    model: &AnalysisModel,
+    base: &str,
+    type_id: &str,
+) -> bool {
+    let Some(definition) = model.types.iter().find(|row| row.id == type_id) else {
+        return false;
+    };
+    let TypeDefinitionKind::Struct { fields } = &definition.kind else {
+        return false;
+    };
+    let mut count = 0;
+    for statement in ir.blocks.iter().flat_map(|block| &block.statements) {
+        match statement {
+            HighCfgStatement::Assign { target, .. } if target == base => return false,
+            HighCfgStatement::Load {
+                target, field_view, ..
+            } if target == base => {
+                count += 1;
+                let Some(view) = field_view else { return false };
+                if view.type_id != type_id
+                    || view.base != (HighExpr::Variable { name: base.to_owned() })
+                    || view.derived_base.is_some()
+                    || view.array_index.is_some()
+                    || view.array_element.is_some()
+                    || fields
+                        .iter()
+                        .filter(|field| {
+                            field.name == view.field
+                                && field.offset_bytes == view.offset_bytes
+                                && matches!(&field.ty, TypeRef::Pointer { to }
+                                    if matches!(to.as_ref(), TypeRef::Named { id } if id == type_id))
+                        })
+                        .count()
+                        != 1
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    count > 0
+}
+
 fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Result<(), String> {
     let model_row = model.functions.iter().find(|row| row.entry == ir.entry);
     let mut writes = BTreeMap::<&str, Vec<(Location, Option<&HighExpr>)>>::new();
@@ -2584,7 +2696,9 @@ fn validate_model_field_views(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Re
             let HighExpr::Variable { name: base } = &view.base else {
                 return Err("typed CFG field base is not an invariant parameter".to_owned());
             };
-            if writes.contains_key(base.as_str()) {
+            if writes.contains_key(base.as_str())
+                && !has_only_recursive_pointer_writes(ir, model, base, &view.type_id)
+            {
                 return Err("typed CFG modeled field base is modified".to_owned());
             }
             let (index, parameter) = ir

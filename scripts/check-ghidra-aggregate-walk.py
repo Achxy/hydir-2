@@ -154,8 +154,10 @@ def check_typed_walk(directory, client, binary):
                           "--model", model_path])
     if (f"struct {node_name} *" not in typed_c or
             "hydir_walk_nodes64" not in typed_c or
-            "hydir_rcx * hydir_rsi" not in typed_c):
-        raise AssertionError("typed C lost the recursive prototype or modular product")
+            "hydir_rcx * hydir_rsi" not in typed_c or
+            f"hydir_load_u64((hydir_rdi + (uint64_t)offsetof(struct {node_name}, value)))" not in typed_c or
+            f"hydir_load_u64((hydir_rdi + (uint64_t)offsetof(struct {node_name}, next)))" not in typed_c):
+        raise AssertionError("typed C lost the recursive prototype, fields, or modular product")
     output = directory / f"{binary.stem}-typed.c"
     output.write_text(typed_c, encoding="utf-8")
     wrap = ((1 << 63) + MASK64) * 3 & MASK64
