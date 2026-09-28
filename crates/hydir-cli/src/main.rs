@@ -69,6 +69,7 @@ Usage:
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
+  hydirctl ghidra llvm-cfg-image <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
   hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
@@ -658,6 +659,54 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "call_targets": snapshot.selected_function.call_targets.len(),
                 }))?
             );
+        }
+        Some("ghidra") if args.len() >= 3 && args[1] == "llvm-cfg-image" => {
+            let mut selected = None;
+            let mut start_address = None;
+            let mut output_path = None;
+            let mut options = args[3..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--function" if selected.is_none() => {
+                        selected = Some(parse_u64_auto(&pair[1], "Ghidra function entry")?);
+                    }
+                    "--start" if start_address.is_none() => {
+                        start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
+                    }
+                    "--output" if output_path.is_none() && !pair[1].is_empty() => {
+                        output_path = Some(pair[1].as_str());
+                    }
+                    _ => return Err("invalid automatic Ghidra image LLVM option".into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err("Ghidra image LLVM options require values".into());
+            }
+            let binary = read_binary(&args[2])?;
+            let scratch = tempfile::tempdir()?;
+            let snapshot = ghidra_worker::analyze(
+                Path::new(&args[2]),
+                selected,
+                &scratch.path().join("snapshot.json"),
+            )?;
+            let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot)?;
+            let window =
+                image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+            let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: format!("0x{address:x}"),
+            });
+            let artifact = hydir_decompile::emit_pcode_cfg_llvm_with_image(
+                &snapshot,
+                start.as_ref(),
+                &window,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&artifact)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
         }
         Some("ghidra-snapshot")
             if (args.len() == 4 || args.len() == 6 && args[4] == "--output")

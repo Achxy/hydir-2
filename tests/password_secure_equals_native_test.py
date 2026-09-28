@@ -148,9 +148,8 @@ class PasswordSecureEqualsNativeTests(unittest.TestCase):
                 self.assertEqual(native["stack_delta"], 8)
 
     def test_image_backed_llvm_matches_rust_and_native(self):
-        if sys.platform != "linux":
-            self.skipTest("native transformed LLVM replay requires Linux")
-        self.assertEqual(platform.machine(), "x86_64")
+        if sys.platform == "linux":
+            self.assertEqual(platform.machine(), "x86_64")
         self.assertTrue(shutil.which("clang"), "Clang is required")
         hydirctl = os.environ.get("HYDIRCTL_BIN", str(ROOT / "target/debug/hydirctl"))
         emitted = subprocess.run(
@@ -169,17 +168,21 @@ class PasswordSecureEqualsNativeTests(unittest.TestCase):
             for entry in artifact["byte_map"]
         }
         self.assertEqual(len(byte_map), artifact["state_bytes"])
-        with tempfile.TemporaryDirectory(prefix="hydir-password-llvm-") as scratch:
+        with tempfile.TemporaryDirectory(
+                prefix="hydir-password-llvm-",
+                ignore_cleanup_errors=sys.platform == "win32") as scratch:
             module = Path(scratch) / "image.ll"
-            library = Path(scratch) / "image.so"
+            library = Path(scratch) / ("image.dll" if sys.platform == "win32" else "image.so")
             module.write_text(artifact["llvm_ir"], encoding="utf-8")
+            link_options = (["-Wl,/export:hydir_pcode_cfg"] if sys.platform == "win32"
+                            else ["-fPIC", "-x", "ir"])
             compiled = subprocess.run(
-                ["clang", "-shared", "-fPIC", "-x", "ir", str(module),
-                 "-o", str(library)],
+                ["clang", "-shared", *link_options, str(module), "-o", str(library)],
                 cwd=ROOT, capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            lifted = ctypes.CDLL(str(library)).hydir_pcode_cfg
+            loaded_library = ctypes.CDLL(str(library))
+            lifted = loaded_library.hydir_pcode_cfg
             u8p = ctypes.POINTER(ctypes.c_uint8)
             lifted.argtypes = [
                 u8p, u8p, ctypes.c_int32, u8p, u8p, ctypes.c_uint64,
@@ -191,7 +194,8 @@ class PasswordSecureEqualsNativeTests(unittest.TestCase):
             for name, candidate, length, expected in CASES:
                 with self.subTest(case=name):
                     rust = self.rust_trace(name, candidate, length)
-                    native = self.native_trace(candidate, length)
+                    native = (self.native_trace(candidate, length)
+                              if sys.platform == "linux" else None)
                     state = (ctypes.c_uint8 * max(1, artifact["state_bytes"]))()
                     known = (ctypes.c_uint8 * max(1, artifact["state_bytes"]))()
                     seed_register(byte_map, state, known, 0x38, 0x700100)  # RDI
@@ -226,14 +230,25 @@ class PasswordSecureEqualsNativeTests(unittest.TestCase):
                         visits,
                         [visit["offset"] for visit in rust["instruction_visits"]],
                     )
-                    self.assertEqual(visits, native["instruction_visits"])
                     self.assertEqual(read_register(byte_map, state, known, 0x0), expected)
-                    self.assertEqual(read_register(byte_map, state, known, 0x0),
-                                     native["registers"]["rax"])
-                    self.assertEqual(read_register(byte_map, state, known, 0x20),
-                                     0x700000 + native["stack_delta"])
+                    if native is not None:
+                        self.assertEqual(visits, native["instruction_visits"])
+                        self.assertEqual(read_register(byte_map, state, known, 0x0),
+                                         native["registers"]["rax"])
+                        self.assertEqual(read_register(byte_map, state, known, 0x20),
+                                         0x700000 + native["stack_delta"])
+                    else:
+                        self.assertEqual(read_register(byte_map, state, known, 0x20),
+                                         0x700008)
                     self.assertEqual(bytes(guest[:8]),
                                      self.return_address.to_bytes(8, "little"))
+            if sys.platform == "win32":
+                del lifted
+                free_library = ctypes.windll.kernel32.FreeLibrary
+                free_library.argtypes = [ctypes.c_void_p]
+                free_library.restype = ctypes.c_int
+                self.assertTrue(free_library(loaded_library._handle))
+                loaded_library._handle = 0
 
 
 if __name__ == "__main__":

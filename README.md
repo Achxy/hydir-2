@@ -77,7 +77,7 @@ cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests
 cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
 cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c --max-functions 2
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
-cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-image tests/fixtures/hydir-password-gate-stripped.elf tests/fixtures/ghidra_password_secure_equals_o1_v2.json --output target/password-image-llvm.json
+cargo run --locked -p hydir-cli -- ghidra llvm-cfg-image tests/fixtures/hydir-password-gate-stripped.elf --function 0x2016d0 --output target/password-image-llvm.json
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
 ```
 
