@@ -153,7 +153,13 @@ jobs:
             --output-dir "$RUNNER_TEMP/ghidra-opt-matrix" \
             > "$RUNNER_TEMP/ghidra-opt-matrix.log" 2>&1; then
             cat "$RUNNER_TEMP/ghidra-opt-matrix.log"
-            echo "::error title=Ghidra optimization matrix failed::$(tail -n 1 "$RUNNER_TEMP/ghidra-opt-matrix.log")"
+            echo "::error::$(tail -n 1 "$RUNNER_TEMP/ghidra-opt-matrix.log")"
+            {
+              echo '### Ghidra optimization matrix failure'
+              echo '```text'
+              tail -n 30 "$RUNNER_TEMP/ghidra-opt-matrix.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           cat "$RUNNER_TEMP/ghidra-opt-matrix.log"
