@@ -19,6 +19,9 @@ client="${CARGO_TARGET_DIR:-$repo_dir/target}/debug/hydirctl"
 "$client" ghidra-snapshot llvm-cfg "$binary" \
   "$run_dir/secure-equals-snapshot.json" \
   --output "$run_dir/cfg-llvm.json"
+"$client" ghidra-snapshot llvm-cfg-image "$binary" \
+  "$run_dir/secure-equals-snapshot.json" \
+  --output "$run_dir/cfg-llvm-image.json"
 
 python3 - "$binary" "$run_dir" <<'PY'
 import hashlib
@@ -69,9 +72,15 @@ run_dir = pathlib.Path(sys.argv[1])
 snapshot = json.loads((run_dir / "secure-equals-snapshot.json").read_text())
 coverage = json.loads((run_dir / "coverage.json").read_text())
 llvm = json.loads((run_dir / "cfg-llvm.json").read_text())
+image_llvm = json.loads((run_dir / "cfg-llvm-image.json").read_text())
 assert snapshot["selected_function"]["entry"]["offset"] == "0x2016d0"
 assert snapshot["binary_sha256"] == llvm["binary_sha256"]
 assert "define " in llvm["llvm_ir"]
+assert image_llvm["schema_version"] == 3
+assert image_llvm["binary_sha256"] == snapshot["binary_sha256"]
+assert image_llvm["read_only_image"]["known_byte_count"] > 0
+assert "define " in image_llvm["llvm_ir"]
+(run_dir / "cfg-llvm-image.ll").write_text(image_llvm["llvm_ir"])
 assert coverage["binary_sha256"] == snapshot["binary_sha256"]
 for name, expected in (("match", 1), ("mismatch", 0)):
     trace = json.loads((run_dir / f"{name}-trace.json").read_text())
@@ -86,6 +95,7 @@ for name, expected in (("match", 1), ("mismatch", 0)):
     )
     print(f"{name}: return {expected}, {len(trace['instruction_visits'])} visits")
 PY
+clang -x ir -c "$run_dir/cfg-llvm-image.ll" -o "$run_dir/cfg-llvm-image.o"
 
 echo "Hydir bounded Ghidra-backed path demo passed; artifacts: $run_dir"
 echo "Open the binary in the Hydir GUI: cargo run --locked -p hydir-gui --bin hydir -- --open-local $binary"

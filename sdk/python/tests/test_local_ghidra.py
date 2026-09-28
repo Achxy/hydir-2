@@ -121,6 +121,15 @@ class LocalGhidraTests(unittest.TestCase):
         with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()) as run:
             self.client.llvm_cfg(self.binary, self.snapshot, simplified=True)
         self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-simplified"))
+        image_artifact = {**artifact, "schema_version": 3}
+        with patch.object(self.client, "_run", return_value=json.dumps(image_artifact).encode()) as run:
+            self.client.llvm_cfg(self.binary, self.snapshot, image=True)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-image"))
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.llvm_cfg(self.binary, self.snapshot, image=True)
+        with self.assertRaises(ValueError):
+            self.client.llvm_cfg(self.binary, self.snapshot, image=True, simplified=True)
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
 

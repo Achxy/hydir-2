@@ -77,6 +77,7 @@ cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests
 cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
 cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c --max-functions 2
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-image tests/fixtures/hydir-password-gate-stripped.elf tests/fixtures/ghidra_password_secure_equals_o1_v2.json --output target/password-image-llvm.json
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
 ```
 
@@ -89,7 +90,10 @@ Ghidra export, coverage and CFG LLVM artifacts, and matching versus mismatching
 password traces. The script writes its artifacts under
 `target/demo-ghidra-password-lift/` and reports both return values. It uses the
 same pinned worker as the GUI; `HYDIR_GHIDRA_HOME` can select a local Ghidra
-12.1.4 installation for development.
+12.1.4 installation for development. `llvm-cfg-image` emits a version 3 module
+with up to 64 KiB of validated read-only ELF bytes embedded beside a separate
+mutable guest-memory window. Unknown bytes and unsupported effects still stop
+explicitly; the existing version 2 LLVM path remains available.
 
 Replace the ELF path and function selector with your own. `discover` returns
 FunctionIndex IDs for entries without usable names. The GUI also opens an ELF

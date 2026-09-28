@@ -834,3 +834,56 @@ fn stripped_secure_equals_cli_uses_binary_rodata_without_manual_seed() {
         }
     }
 }
+
+#[test]
+fn stripped_secure_equals_cli_emits_versioned_binary_bound_image_llvm() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/hydir-password-gate-stripped.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+    let digest = format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()));
+    let image = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-image"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(
+        image.status.success(),
+        "{}",
+        String::from_utf8_lossy(&image.stderr)
+    );
+    let image: serde_json::Value = serde_json::from_slice(&image.stdout).unwrap();
+    assert_eq!(image["schema_version"], 3);
+    assert_eq!(image["binary_sha256"], digest);
+    assert_eq!(image["read_only_image"]["space"], "ram");
+    assert!(
+        image["read_only_image"]["known_byte_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(image["llvm_ir"].as_str().unwrap().contains("define i32"));
+
+    let legacy = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(legacy.status.success());
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(legacy["schema_version"], 2);
+    assert!(legacy.get("read_only_image").is_none());
+
+    let changed = tempfile::NamedTempFile::new().unwrap();
+    let mut tampered = fs::read(&binary).unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    fs::write(changed.path(), tampered).unwrap();
+    let wrong_binary = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-image"])
+        .arg(changed.path())
+        .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(!wrong_binary.status.success());
+}

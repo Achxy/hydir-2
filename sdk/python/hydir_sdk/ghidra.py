@@ -189,21 +189,30 @@ class LocalGhidra:
         *,
         start: int | None = None,
         simplified: bool = False,
+        image: bool = False,
     ) -> dict[str, Any]:
-        """Emit bounded CFG-aware LLVM with explicit stop status and provenance."""
+        """Emit bounded CFG-aware LLVM with explicit stop status and provenance.
+
+        ``image=True`` binds file-backed read-only ELF bytes into a version 3
+        module. The original version 2 ABI remains the default.
+        """
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("start must be a 64-bit address")
+        if image and simplified:
+            raise ValueError("image and simplified LLVM modes cannot be combined")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         digest = self._digest(binary_path)
         self._snapshot(snapshot_path, digest)
-        stage = "llvm-cfg-simplified" if simplified else "llvm-cfg"
+        stage = "llvm-cfg-image" if image else "llvm-cfg-simplified" if simplified else "llvm-cfg"
         args = ["ghidra-snapshot", stage, str(binary_path), str(snapshot_path)]
         if start is not None:
             args.extend(["--start", hex(start)])
         data = json.loads(self._run(*args))
         if not isinstance(data, dict) or data.get("binary_sha256") != digest:
             raise RuntimeError("Hydir CFG LLVM artifact belongs to another binary")
+        if image and data.get("schema_version") != 3:
+            raise RuntimeError("Hydir image-backed CFG LLVM artifact has the wrong version")
         return data
 
     def llvm_cfg_calls(

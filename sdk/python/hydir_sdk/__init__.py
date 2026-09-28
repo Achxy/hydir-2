@@ -283,12 +283,13 @@ class HydirClient:
             "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
             "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
+            "llvm-cfg-image": ("application/vnd.hydir.pcode-cfg-llvm+json;version=3", 3),
             "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
             "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
         if stage not in media_types:
             raise ValueError("Unsupported Ghidra snapshot artifact stage")
-        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-simplified"}:
+        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-simplified"}:
             raise ValueError("Start address is supported only for CFG LLVM stages")
         if stage == "slice":
             if instruction_index is None or operation_index is None:
@@ -359,6 +360,22 @@ class HydirClient:
         )
         if stage == "slice" and artifact.get("path_proven") is not False:
             raise RuntimeError("P-code slice has an unsupported path-proof claim")
+        if stage == "llvm-cfg-image":
+            image = artifact.get("read_only_image")
+            if (
+                not isinstance(image, dict)
+                or not isinstance(image.get("space"), str)
+                or type(image.get("base")) is not int
+                or type(image.get("byte_len")) is not int
+                or type(image.get("known_byte_count")) is not int
+                or not 0 <= image["base"] <= 0xFFFFFFFFFFFFFFFF
+                or not 1 <= image["known_byte_count"] <= image["byte_len"] <= 65_536
+                or not isinstance(image.get("contents_sha256"), str)
+                or len(image["contents_sha256"]) != 64
+                or any(character not in "0123456789abcdef"
+                       for character in image["contents_sha256"])
+            ):
+                raise RuntimeError("Image-backed CFG LLVM lacks a valid ELF image binding")
         return artifact
 
     def analyze_ghidra_binary(

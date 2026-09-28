@@ -84,6 +84,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-image <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
   hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
@@ -290,7 +291,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra-snapshot")
             if args.len() >= 4
-                && matches!(args[1].as_str(), "llvm-cfg" | "llvm-cfg-simplified") =>
+                && matches!(
+                    args[1].as_str(),
+                    "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-simplified"
+                ) =>
         {
             let mut start_address = None;
             let mut output_path = None;
@@ -317,16 +321,24 @@ fn run() -> Result<(), Box<dyn Error>> {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let bytes = if args[1] == "llvm-cfg-simplified" {
-                serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_simplified_cfg_llvm(
+            let bytes = match args[1].as_str() {
+                "llvm-cfg-simplified" => serde_json::to_vec_pretty(
+                    &hydir_decompile::emit_pcode_simplified_cfg_llvm(&snapshot, start.as_ref())?,
+                )?,
+                "llvm-cfg-image" => {
+                    let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot)?;
+                    let window =
+                        image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+                    serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm_with_image(
+                        &snapshot,
+                        start.as_ref(),
+                        &window,
+                    )?)?
+                }
+                _ => serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm(
                     &snapshot,
                     start.as_ref(),
-                )?)?
-            } else {
-                serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm(
-                    &snapshot,
-                    start.as_ref(),
-                )?)?
+                )?)?,
             };
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;

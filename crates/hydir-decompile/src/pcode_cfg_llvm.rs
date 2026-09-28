@@ -741,9 +741,7 @@ fn validate_image_window(
     snapshot: &GhidraSnapshot,
     image: &PcodeReadOnlyElfWindow,
 ) -> Result<PcodeCfgLlvmImageBinding, String> {
-    if image.binary_sha256() != snapshot.binary_sha256 {
-        return Err("read-only ELF image and Ghidra snapshot binary digests differ".into());
-    }
+    image.validate_for_snapshot(snapshot)?;
     let space = snapshot
         .address_spaces
         .iter()
@@ -2279,6 +2277,23 @@ mod tests {
                 Some(expected as u8),
             );
         }
+    }
+
+    #[test]
+    fn image_window_rejects_changed_ghidra_memory_permissions() {
+        let mut snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshot).unwrap();
+        let window = image
+            .materialize_window(PCODE_CFG_ELF_IMAGE_MAX_BYTES)
+            .unwrap();
+        assert!(emit_pcode_cfg_llvm_with_image(&snapshot, None, &window).is_ok());
+        snapshot.memory_blocks[0].write = !snapshot.memory_blocks[0].write;
+        let error = emit_pcode_cfg_llvm_with_image(&snapshot, None, &window).unwrap_err();
+        assert!(error.contains("window disagrees with Ghidra snapshot layout"));
     }
 
     #[test]

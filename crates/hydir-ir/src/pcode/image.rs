@@ -14,6 +14,16 @@ use std::sync::Arc;
 const MAX_LOAD_SEGMENTS: usize = 4096;
 const MAX_IMAGE_REGIONS: usize = 8192;
 
+fn snapshot_layout_sha256(snapshot: &GhidraSnapshot) -> Result<String, String> {
+    let layout = serde_json::to_vec(&(
+        &snapshot.program.image_base,
+        &snapshot.address_spaces,
+        &snapshot.memory_blocks,
+    ))
+    .map_err(|error| format!("cannot serialize Ghidra memory layout: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(layout)))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ImageRegion {
     start: u64,
@@ -27,6 +37,7 @@ struct ImageRegion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PcodeReadOnlyElfImage {
     binary_sha256: String,
+    snapshot_layout_sha256: String,
     pub(super) space: String,
     binary: Arc<[u8]>,
     regions: Vec<ImageRegion>,
@@ -38,6 +49,7 @@ pub struct PcodeReadOnlyElfImage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PcodeReadOnlyElfWindow {
     binary_sha256: String,
+    snapshot_layout_sha256: String,
     space: String,
     base: u64,
     bytes: Vec<u8>,
@@ -47,6 +59,21 @@ pub struct PcodeReadOnlyElfWindow {
 impl PcodeReadOnlyElfWindow {
     pub fn binary_sha256(&self) -> &str {
         &self.binary_sha256
+    }
+
+    pub fn snapshot_layout_sha256(&self) -> &str {
+        &self.snapshot_layout_sha256
+    }
+
+    /// The same ELF can be analyzed with different Ghidra block permissions.
+    /// The window is valid only for the memory layout used to construct it.
+    pub fn validate_for_snapshot(&self, snapshot: &GhidraSnapshot) -> Result<(), String> {
+        if self.binary_sha256 != snapshot.binary_sha256
+            || self.snapshot_layout_sha256 != snapshot_layout_sha256(snapshot)?
+        {
+            return Err("read-only ELF window disagrees with Ghidra snapshot layout".to_owned());
+        }
+        Ok(())
     }
 
     pub fn space(&self) -> &str {
@@ -120,6 +147,7 @@ impl PcodeReadOnlyElfImage {
         }
         Ok(PcodeReadOnlyElfWindow {
             binary_sha256: self.binary_sha256.clone(),
+            snapshot_layout_sha256: self.snapshot_layout_sha256.clone(),
             space: self.space.clone(),
             base: first.start,
             bytes,
@@ -256,6 +284,7 @@ impl PcodeReadOnlyElfImage {
         }
         Ok(Self {
             binary_sha256: digest,
+            snapshot_layout_sha256: snapshot_layout_sha256(snapshot)?,
             space: space.clone(),
             binary: Arc::from(binary),
             regions,
@@ -269,6 +298,7 @@ impl PcodeReadOnlyElfImage {
     ) -> Result<(), String> {
         if self.binary_sha256 != snapshot.binary_sha256
             || self.space != snapshot.program.image_base.space
+            || self.snapshot_layout_sha256 != snapshot_layout_sha256(snapshot)?
         {
             return Err("read-only ELF image disagrees with Ghidra snapshot".to_owned());
         }

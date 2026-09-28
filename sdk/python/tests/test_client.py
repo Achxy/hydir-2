@@ -211,6 +211,36 @@ class ClientBoundaryTests(unittest.TestCase):
             self.assertEqual(requests[0].expected_revision, 4)
             self.assertEqual(requests[0].stage, "llvm-cfg")
 
+            image_artifact = json.dumps({
+                "schema_version": 3,
+                "read_only_image": {
+                    "space": "ram", "base": 0x200000, "byte_len": 1,
+                    "known_byte_count": 1, "contents_sha256": "a" * 64,
+                },
+            }).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(image_artifact).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=3",
+                    content=image_artifact,
+                    project_revision=4,
+                )
+            )
+            image_result = client.analyze_ghidra_snapshot(
+                "project", 4, snapshot, "llvm-cfg-image", start_address=0x20137C
+            )
+            self.assertEqual(image_result["read_only_image"]["known_byte_count"], 1)
+            self.assertEqual(requests[-1].stage, "llvm-cfg-image")
+            self.assertEqual(requests[-1].start_address, "0x20137c")
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(artifact).hexdigest(),
+                media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=3",
+                content=artifact,
+                project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "llvm-cfg-image")
+
             simplified = json.dumps({"schema_version": 1, "rewrites": []}).encode()
             client._call = lambda *_: proto_v3.ArtifactReply(
                 sha256=hashlib.sha256(simplified).hexdigest(),
