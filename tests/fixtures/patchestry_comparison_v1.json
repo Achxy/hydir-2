@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "comparison_scope": "source-addressed Ghidra decompiler high P-code mnemonics",
+  "not_a_semantic_equivalence_proof": true,
+  "all_agree": false,
+  "ghidra_version": "12.1.4",
+  "patchestry_revision": "4acddb43de5662de00ba2e239f279159c2dbd609",
+  "compatibility_shim": "removed absent PcodeOp.EXTRACT/INSERT scalar classifier cases from temporary copy",
+  "results": [
+    {
+      "fixture": "add-zero",
+      "binary": "tests/fixtures/ghidra_add_zero.elf",
+      "binary_sha256": "8e68f73f3d55b242d4c968446a9b011aaad4032443dab3d3b678ca7be10e1874",
+      "hydir_snapshot": "tests/fixtures/ghidra_add_zero_v2.json",
+      "function": "hydir_add_zero",
+      "entry": "ram:0x201174",
+      "hydir_high_ops": 2,
+      "patchestry_source_ops": 2,
+      "matched_high_ops": 2,
+      "missing_from_patchestry": [],
+      "extra_in_patchestry": [],
+      "patchestry_synthetic_ops": {
+        "BRANCH": 1,
+        "DECLARE_PARAMETER": 1
+      },
+      "agree": true,
+      "patchestry_export": "add-zero.patchestry.json",
+      "ghidra_log": "add-zero.ghidra.log"
+    },
+    {
+      "fixture": "choose-branch",
+      "binary": "tests/fixtures/ghidra_choose_calls.elf",
+      "binary_sha256": "dc459793ce9edcc543c9ffcadbecc27c6a2e1976782f1da4d3adc2119dd27723",
+      "hydir_snapshot": "tests/fixtures/ghidra_choose_root_v2.json",
+      "function": "hydir_choose",
+      "entry": "ram:0x201174",
+      "hydir_high_ops": 6,
+      "patchestry_source_ops": 6,
+      "matched_high_ops": 6,
+      "missing_from_patchestry": [],
+      "extra_in_patchestry": [],
+      "patchestry_synthetic_ops": {
+        "BRANCH": 1,
+        "DECLARE_PARAMETER": 1
+      },
+      "agree": true,
+      "patchestry_export": "choose-branch.patchestry.json",
+      "ghidra_log": "choose-branch.ghidra.log"
+    },
+    {
+      "fixture": "prism-branch",
+      "binary": "demo/hydir-prism.elf",
+      "binary_sha256": "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0",
+      "hydir_snapshot": "tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json",
+      "function": "hydir_stage_bit_gate",
+      "entry": "ram:0x2013cf",
+      "hydir_high_ops": 4,
+      "patchestry_source_ops": 4,
+      "matched_high_ops": 4,
+      "missing_from_patchestry": [],
+      "extra_in_patchestry": [],
+      "patchestry_synthetic_ops": {
+        "BRANCH": 1,
+        "DECLARE_PARAMETER": 2
+      },
+      "agree": true,
+      "patchestry_export": "prism-branch.patchestry.json",
+      "ghidra_log": "prism-branch.ghidra.log"
+    },
+    {
+      "fixture": "password-memory",
+      "binary": "tests/fixtures/hydir-password-gate-stripped.elf",
+      "binary_sha256": "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288",
+      "hydir_snapshot": "tests/fixtures/ghidra_password_secure_equals_o1_v2.json",
+      "function": "FUN_002016d0",
+      "entry": "ram:0x2016d0",
+      "hydir_high_ops": 21,
+      "patchestry_source_ops": 19,
+      "matched_high_ops": 18,
+      "missing_from_patchestry": [
+        {
+          "space": "ram",
+          "address": "0x2016f0",
+          "mnemonic": "MULTIEQUAL"
+        },
+        {
+          "space": "ram",
+          "address": "0x2016f0",
+          "mnemonic": "MULTIEQUAL"
+        },
+        {
+          "space": "ram",
+          "address": "0x20170b",
+          "mnemonic": "MULTIEQUAL"
+        }
+      ],
+      "extra_in_patchestry": [
+        {
+          "space": "ram",
+          "address": "0x20170b",
+          "mnemonic": "COPY"
+        }
+      ],
+      "patchestry_synthetic_ops": {
+        "BRANCH": 3,
+        "DECLARE_LOCAL": 3,
+        "DECLARE_PARAMETER": 2
+      },
+      "agree": false,
+      "patchestry_export": "password-memory.patchestry.json",
+      "ghidra_log": "password-memory.ghidra.log"
+    }
+  ]
+}
