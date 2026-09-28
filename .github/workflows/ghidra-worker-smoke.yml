@@ -60,6 +60,9 @@ jobs:
   container-frontend:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
+      statuses: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -146,11 +149,12 @@ jobs:
       - name: Reproduce the stripped password lifting demo
         run: bash scripts/demo-ghidra-password-lift.sh
       - name: Differential Ghidra matrix across optimization and DWARF variants
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gdb
-          if ! python3 scripts/check-ghidra-opt-matrix.py \
-            --output-dir "$RUNNER_TEMP/ghidra-opt-matrix" \
+          if ! (sudo apt-get update && sudo apt-get install -y gdb && \
+            python3 scripts/check-ghidra-opt-matrix.py \
+              --output-dir "$RUNNER_TEMP/ghidra-opt-matrix") \
             > "$RUNNER_TEMP/ghidra-opt-matrix.log" 2>&1; then
             cat "$RUNNER_TEMP/ghidra-opt-matrix.log"
             echo "::error::$(tail -n 1 "$RUNNER_TEMP/ghidra-opt-matrix.log")"
@@ -160,6 +164,20 @@ jobs:
               tail -n 30 "$RUNNER_TEMP/ghidra-opt-matrix.log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            tail -n 1 "$RUNNER_TEMP/ghidra-opt-matrix.log" | python3 -c '
+          import json, os, sys, urllib.request
+          message = sys.stdin.read().strip()[:140] or "matrix step failed"
+          endpoint = "https://api.github.com/repos/{}/statuses/{}".format(
+              os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"])
+          body = json.dumps({"state": "failure", "description": message,
+                             "context": "hydir/ghidra-opt-matrix"}).encode()
+          request = urllib.request.Request(endpoint, data=body, method="POST", headers={
+              "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          })
+          urllib.request.urlopen(request, timeout=10).close()
+          ' || true
             exit 1
           fi
           cat "$RUNNER_TEMP/ghidra-opt-matrix.log"
