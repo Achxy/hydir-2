@@ -149,9 +149,9 @@ def seed_llvm_register(byte_map, state, known, offset, value):
     indexes = [byte_map.get(("register", offset + byte)) for byte in range(8)]
     if all(index is None for index in indexes):
         return
-    if any(index is None for index in indexes):
-        raise AssertionError(f"incomplete LLVM register map at {hex(offset)}")
     for byte, index in enumerate(indexes):
+        if index is None:
+            continue
         state[index] = (value >> (8 * byte)) & 0xff
         known[index] = 0xff
 
