@@ -230,7 +230,9 @@ jobs:
             --output-dir "$RUNNER_TEMP/ghidra-aggregate-walk"
       - name: Differential Ghidra floating-point comparisons
         run: |
-          python3 scripts/check-ghidra-float-compare.py \
+          sudo apt-get update
+          sudo apt-get install -y llvm-18
+          PATH="/usr/lib/llvm-18/bin:$PATH" python3 scripts/check-ghidra-float-compare.py \
             --output-dir "$RUNNER_TEMP/ghidra-float-compare"
       - name: Import a closed analyst-edited Ghidra project
         run: |
