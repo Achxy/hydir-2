@@ -22,7 +22,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/hydir_password_demo.c"
-GDB_SCRIPT = ROOT / "tests/fixtures/prism_bit_gate_native.gdb"
+GDB_SCRIPT = ROOT / "tests/fixtures/ghidra_matrix_native.gdb"
 MASK64 = (1 << 64) - 1
 CASES = {
     "add2": (("small", 7, 11, 18), ("wrap", MASK64, 2, 1)),
@@ -117,23 +117,21 @@ def seed_for(binary, entry, kind, case):
     }
 
 
-def native_result(binary, snapshot_path, return_address, kind, case):
+def native_result(binary, snapshot_path, kind, case):
     if sys.platform != "linux" or platform.machine() != "x86_64":
         return None
     if not shutil.which("gdb"):
         raise RuntimeError("GDB is required for the Linux native matrix")
     env = {**os.environ,
            "HYDIR_NATIVE_SNAPSHOT": str(snapshot_path),
-           "HYDIR_NATIVE_RETURN": hex(return_address),
-           "HYDIR_NATIVE_MAX_VISITS": "512",
-           "HYDIR_NATIVE_RAX": "0x0"}
+           "HYDIR_MATRIX_KIND": kind}
     if kind == "add2":
         _, rdi, rsi, _ = case
-        env.update(HYDIR_NATIVE_RDI=hex(rdi), HYDIR_NATIVE_RSI=hex(rsi))
+        env.update(HYDIR_MATRIX_ARG0=hex(rdi), HYDIR_MATRIX_ARG1=hex(rsi))
     else:
         _, candidate, length, _ = case
-        env.update(HYDIR_NATIVE_INPUT_HEX=candidate.hex(),
-                   HYDIR_NATIVE_RSI=hex(length))
+        env.update(HYDIR_MATRIX_INPUT_HEX=candidate.hex(),
+                   HYDIR_MATRIX_ARG1=hex(length))
     try:
         output = run(["gdb", "-nx", "-q", "--batch", "-x", GDB_SCRIPT, binary],
                      env=env, timeout=90)
@@ -301,15 +299,12 @@ def main():
                         if trace["final_state"]["register_bytes"]["0"] != expected:
                             raise AssertionError(f"wrong Rust result: {label}/{kind}/{name}")
                         native_result_row = native_result(
-                            binary, snapshot_path, struct.unpack_from("<Q", binary.read_bytes(), 24)[0],
-                            kind, case)
+                            binary, snapshot_path, kind, case)
                         if native_result_row is not None:
-                            visits = [row["offset"] for row in trace["instruction_visits"]]
-                            if (native_result_row["instruction_visits"] != visits or
-                                    native_result_row["registers"]["rax"] != expected or
-                                    native_result_row["stack_delta"] != 8):
+                            if (native_result_row["result"] != expected or
+                                    native_result_row["verified_instruction_bytes"] != len(selected["instructions"])):
                                 raise AssertionError(f"Rust/native mismatch: {label}/{kind}/{name}")
-                            native[name] = "matched"
+                            native[name] = "matched_output_and_code_bytes"
                     elif trace["stop"]["kind"] != "return":
                         if trace["stop"]["kind"] != "effect_boundary":
                             raise AssertionError(f"unexpected partial stop: {label}/{kind}/{name}")

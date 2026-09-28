@@ -9,8 +9,9 @@ the test program without a dynamic-loader startup step.
 
 For `hydir_triton_add2`, it checks two concrete inputs, including 64-bit
 wraparound, against Rust P-code execution and compiled image-backed LLVM. On
-Linux x86-64 it also steps the exact generated ELF under GDB and compares
-instruction visits and return values. For `hydir_secure_equals`, it checks
+Linux x86-64 it calls the exact generated ELF under GDB, verifies the selected
+code bytes, and compares return values. Rust and LLVM instruction visits are
+compared with each other. For `hydir_secure_equals`, it checks
 match, mismatch, and wrong-length paths the same way at O0. The O2
 wrong-length path returns exactly; O2 match and mismatch currently stop at
 explicit unsupported SIMD effects. The report records each stop and never

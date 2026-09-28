@@ -17,6 +17,7 @@ on:
       - scripts/check-ghidra-opt-matrix.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/prism_bit_gate_native.gdb
+      - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_prototype.elf
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
@@ -44,6 +45,7 @@ on:
       - scripts/check-ghidra-opt-matrix.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/prism_bit_gate_native.gdb
+      - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_prototype.elf
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
