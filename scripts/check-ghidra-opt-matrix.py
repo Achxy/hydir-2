@@ -73,10 +73,11 @@ def build_variants(directory):
             raise AssertionError(f"matrix ELF still has a program interpreter: {dwarf}")
         symbols = {}
         for row in run([nm, dwarf]).splitlines():
-            match = re.fullmatch(r"\s*([0-9a-fA-F]+)\s+[Tt]\s+(hydir_triton_add2|hydir_secure_equals)", row)
+            match = re.fullmatch(r"\s*([0-9a-fA-F]+)\s+[Tt]\s+(hydir_triton_add2|hydir_secure_equals|hydir_password_score|hydir_mix64)", row)
             if match:
                 symbols[match.group(2)] = int(match.group(1), 16)
-        if set(symbols) != {"hydir_triton_add2", "hydir_secure_equals"}:
+        if set(symbols) != {"hydir_triton_add2", "hydir_secure_equals",
+                            "hydir_password_score", "hydir_mix64"}:
             raise AssertionError(f"missing matrix symbols in {dwarf}: {symbols}")
         stripped = directory / f"password-{level}-stripped.elf"
         shutil.copy2(dwarf, stripped)
@@ -97,10 +98,10 @@ def seed_for(binary, entry, kind, case):
                  (0x28, 0x700200), (0, 0), (8, 0)]
     memory = [(0x700000, 8, return_address)]
     if candidate is not None:
-        memory.extend([
-            (0x700100, 8, int.from_bytes(candidate[:8], "little")),
-            (0x700108, 4, int.from_bytes(candidate[8:], "little")),
-        ])
+        for start in range(0, len(candidate), 8):
+            chunk = candidate[start:start + 8]
+            memory.append((0x700100 + start, len(chunk),
+                           int.from_bytes(chunk, "little")))
     return {
         "schema_version": 1,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -117,7 +118,7 @@ def seed_for(binary, entry, kind, case):
     }
 
 
-def native_result(binary, snapshot_path, kind, case):
+def native_result(binary, snapshot_path, kind, case, callee_snapshot=None):
     if sys.platform != "linux" or platform.machine() != "x86_64":
         return None
     if not shutil.which("gdb"):
@@ -125,6 +126,8 @@ def native_result(binary, snapshot_path, kind, case):
     env = {**os.environ,
            "HYDIR_NATIVE_SNAPSHOT": str(snapshot_path),
            "HYDIR_MATRIX_KIND": kind}
+    if callee_snapshot is not None:
+        env["HYDIR_NATIVE_CALLEE_SNAPSHOT"] = str(callee_snapshot)
     if kind == "add2":
         _, rdi, rsi, _ = case
         env.update(HYDIR_MATRIX_ARG0=hex(rdi), HYDIR_MATRIX_ARG1=hex(rsi))

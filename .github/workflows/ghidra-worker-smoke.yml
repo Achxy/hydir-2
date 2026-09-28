@@ -15,6 +15,7 @@ on:
       - integrations/ghidra/HydIRSnapshot.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
+      - scripts/check-ghidra-call-loop.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
@@ -43,6 +44,7 @@ on:
       - integrations/ghidra/HydIRSnapshot.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
+      - scripts/check-ghidra-call-loop.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
@@ -155,6 +157,10 @@ jobs:
           sudo apt-get install -y gdb
           python3 scripts/check-ghidra-opt-matrix.py \
             --output-dir "$RUNNER_TEMP/ghidra-opt-matrix"
+      - name: Differential Ghidra loop and repeated-call paths
+        run: |
+          python3 scripts/check-ghidra-call-loop.py \
+            --matrix-dir "$RUNNER_TEMP/ghidra-opt-matrix"
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"

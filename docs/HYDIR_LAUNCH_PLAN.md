@@ -96,6 +96,8 @@ The test matrix starts with straight-line arithmetic, branches, loops, calls, st
 
 The first fresh [optimization and debug-info matrix](GHIDRA_OPT_MATRIX.md) now runs O0/O2 × DWARF/stripped builds of the password fixture through the automatic worker. It checks raw P-code stability after stripping and exact Rust/LLVM paths for scalar addition and password comparison at both optimization levels. The vectorized O2 path now reads 16-byte direct RAM operands and executes Ghidra's named `packsswb` user operation with checked signed saturation. On Linux the gate also compares all selected paths and code bytes with the exact generated ELF under GDB. More source fixtures, compiler families, and SIMD operations are still needed for the launch gate.
 
+The same four binary variants now have a loop and repeated-call gate for `hydir_password_score` and `hydir_mix64`. Empty, one-byte, and 12-byte inputs check return values, one direct call per byte, and exact Rust/compiled-LLVM source P-code event order across call boundaries. Linux GDB executes the generated ELF and verifies both function bodies against the Ghidra snapshots; the optimized DWARF case also checks the automatic callee collector. This expands path coverage within one source fixture. Independent source programs, compiler families, and broader call/alias cases remain launch work.
+
 ### Reuse decisions from the 2026-09-26 research pass
 
 | Gap | Adopt or adapt | Boundary and reason |
