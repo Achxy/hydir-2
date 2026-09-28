@@ -125,24 +125,56 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 .ok_or("Local project has no saved analysis model")?;
             let selected = resolve_native_function(&bytes, selector)?;
             let native = decompile_native_selection(&bytes, &selected)?;
-            if let Some(cached) =
-                store.cached_typed_c(&project, &model, native.machine_ir.entry, "")?
-            {
+            if let Some(cached) = store.cached_typed_c(
+                &project,
+                &model,
+                &native.machine_ir,
+                &native.function_ir,
+                "",
+            )? {
                 print!("{cached}");
             } else {
                 match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
                     Ok(ir) => {
                         let c = emit_typed_c(&ir, &model)?;
-                        store.cache_typed_c(&project, &model, &ir, &native.function_ir, &c, "")?;
+                        store.cache_typed_c(
+                            &project,
+                            &model,
+                            &ir,
+                            &native.machine_ir,
+                            &native.function_ir,
+                            &c,
+                            "",
+                        )?;
                         print!("{c}");
                     }
                     Err(_) => {
-                        let ir = lower_high_level_cfg_cir(
+                        if let Some(cached) = store.cached_typed_cfg_c(
+                            &project,
+                            &model,
                             &native.machine_ir,
                             &native.function_ir,
-                            &model,
-                        )?;
-                        print!("{}", emit_typed_cfg_c(&ir, &model)?);
+                            "",
+                        )? {
+                            print!("{cached}");
+                        } else {
+                            let ir = lower_high_level_cfg_cir(
+                                &native.machine_ir,
+                                &native.function_ir,
+                                &model,
+                            )?;
+                            let c = emit_typed_cfg_c(&ir, &model)?;
+                            store.cache_typed_cfg_c(
+                                &project,
+                                &model,
+                                &ir,
+                                &native.machine_ir,
+                                &native.function_ir,
+                                &c,
+                                "",
+                            )?;
+                            print!("{c}");
+                        }
                     }
                 }
             }

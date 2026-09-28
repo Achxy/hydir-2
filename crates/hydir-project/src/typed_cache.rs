@@ -4,14 +4,19 @@
 
 use super::{LocalProject, LocalProjectStore, db_error};
 use hydir_core::{Address, Location};
-use hydir_hlc::{HIGH_LEVEL_CIR_VERSION, HighExpr, HighLevelCir, HighStatement, emit_typed_c};
-use hydir_ir::FunctionIr;
+use hydir_hlc::{
+    HIGH_LEVEL_CFG_CIR_VERSION, HIGH_LEVEL_CIR_VERSION, HighCfgStatement, HighExpr,
+    HighLevelCfgCir, HighLevelCir, HighStatement, emit_typed_c, emit_typed_cfg_c,
+};
+use hydir_ir::{FunctionIr, MachineFunctionIr};
 use hydir_model::{AnalysisModel, TypeDefinitionKind, TypeRef, validate_structure};
 use rusqlite::{OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-const ANALYSIS_VERSION: i64 = 1;
+// Bump when typed lowering/emission behavior changes without a CIR schema bump.
+// Version 2 also invalidates rows written before source IR fingerprints existed.
+const ANALYSIS_VERSION: i64 = 2;
 const MAX_C_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CACHE_ROWS: usize = 4096;
 
@@ -20,6 +25,25 @@ fn options_hash(options: &str) -> Result<String, String> {
         return Err("typed C cache options exceed 1024 bytes".to_owned());
     }
     Ok(format!("{:x}", Sha256::digest(options.as_bytes())))
+}
+
+fn source_options_hash(
+    options: &str,
+    machine: &MachineFunctionIr,
+    function: &FunctionIr,
+) -> Result<String, String> {
+    options_hash(options)?;
+    if machine.binary_sha256 != function.binary_sha256 || machine.entry != function.entry {
+        return Err("typed C cache source IR identities differ".to_owned());
+    }
+    let machine_json = serde_json::to_vec(machine).map_err(|error| error.to_string())?;
+    let function_json = serde_json::to_vec(function).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    for part in [options.as_bytes(), &machine_json, &function_json] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn entry_value(entry: Location) -> String {
@@ -113,17 +137,78 @@ fn used_type_ids(ir: &HighLevelCir, model: &AnalysisModel) -> Vec<String> {
     ids.into_iter().collect()
 }
 
+fn used_cfg_type_ids(ir: &HighLevelCfgCir, model: &AnalysisModel) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    collect_types(&ir.return_type, model, &mut ids);
+    for parameter in &ir.parameters {
+        collect_types(&parameter.ty, model, &mut ids);
+    }
+    for block in &ir.blocks {
+        for statement in &block.statements {
+            let field_view = match statement {
+                HighCfgStatement::Load { field_view, .. }
+                | HighCfgStatement::Store { field_view, .. } => field_view.as_ref(),
+                HighCfgStatement::Assign { .. } => None,
+            };
+            if let Some(view) = field_view {
+                collect_types(
+                    &TypeRef::Named {
+                        id: view.type_id.clone(),
+                    },
+                    model,
+                    &mut ids,
+                );
+                if let Some(element) = &view.array_element {
+                    collect_types(
+                        &TypeRef::Named {
+                            id: element.element_type_id.clone(),
+                        },
+                        model,
+                        &mut ids,
+                    );
+                }
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn cfg_cache_options(options: &str) -> String {
+    format!("typed-cfg-v{HIGH_LEVEL_CFG_CIR_VERSION}:{options}")
+}
+
 impl LocalProjectStore {
+    pub fn cached_typed_cfg_c(
+        &self,
+        project: &LocalProject,
+        model: &AnalysisModel,
+        machine: &MachineFunctionIr,
+        function: &FunctionIr,
+        options: &str,
+    ) -> Result<Option<String>, String> {
+        self.cached_typed_c(
+            project,
+            model,
+            machine,
+            function,
+            &cfg_cache_options(options),
+        )
+    }
+
     pub fn cached_typed_c(
         &self,
         project: &LocalProject,
         model: &AnalysisModel,
-        entry: Location,
+        machine: &MachineFunctionIr,
+        function: &FunctionIr,
         options: &str,
     ) -> Result<Option<String>, String> {
         self.verify_current(project)?;
         validate_structure(model)?;
-        if model.binary_sha256 != project.binary_sha256 {
+        if model.binary_sha256 != project.binary_sha256
+            || machine.binary_sha256 != model.binary_sha256
+            || function.binary_sha256 != model.binary_sha256
+        {
             return Err("typed C cache model belongs to another binary".to_owned());
         }
         let stored_model: Option<Vec<u8>> = self.conn.query_row(
@@ -140,10 +225,10 @@ impl LocalProjectStore {
         {
             return Err("typed C cache model differs from the saved project model".to_owned());
         }
-        let options_sha256 = options_hash(options)?;
+        let options_sha256 = source_options_hash(options, machine, function)?;
         let row: Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)> = self.conn.query_row(
             "SELECT content_sha256,content,type_ids_json,calls_json FROM local_typed_c_cache WHERE project_id=?1 AND binary_sha256=?2 AND model_revision=?3 AND analysis_version=?4 AND options_sha256=?5 AND entry_address_space=?6 AND entry_value=?7",
-            params![project.id, project.binary_sha256, model.revision as i64, ANALYSIS_VERSION, options_sha256, entry.address_space, entry_value(entry)],
+            params![project.id, project.binary_sha256, model.revision as i64, ANALYSIS_VERSION, options_sha256, machine.entry.address_space, entry_value(machine.entry)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional().map_err(db_error)?;
         let Some((digest, content, type_ids_json, calls_json)) = row else {
@@ -164,6 +249,7 @@ impl LocalProjectStore {
         project: &LocalProject,
         model: &AnalysisModel,
         ir: &HighLevelCir,
+        machine: &MachineFunctionIr,
         function: &FunctionIr,
         content: &str,
         options: &str,
@@ -174,6 +260,8 @@ impl LocalProjectStore {
             || ir.binary_sha256 != model.binary_sha256
             || ir.model_revision != model.revision
             || ir.schema_version != HIGH_LEVEL_CIR_VERSION
+            || machine.binary_sha256 != model.binary_sha256
+            || machine.entry != ir.entry
             || function.binary_sha256 != model.binary_sha256
             || function.entry != ir.entry
         {
@@ -182,7 +270,7 @@ impl LocalProjectStore {
         if content.len() > MAX_C_BYTES || emit_typed_c(ir, model)? != content {
             return Err("typed C cache content differs from validated emission".to_owned());
         }
-        let options_sha256 = options_hash(options)?;
+        let options_sha256 = source_options_hash(options, machine, function)?;
         let type_ids_json =
             serde_json::to_vec(&used_type_ids(ir, model)).map_err(|error| error.to_string())?;
         let calls = function
@@ -191,11 +279,64 @@ impl LocalProjectStore {
             .filter_map(|call| call.target)
             .collect::<BTreeSet<_>>();
         let calls_json = serde_json::to_vec(&calls).map_err(|error| error.to_string())?;
-        if let Some(existing) = self.cached_typed_c(project, model, ir.entry, options)? {
+        if let Some(existing) = self.cached_typed_c(project, model, machine, function, options)? {
             return if existing == content {
                 Ok(())
             } else {
                 Err("typed C cache key has a different emission".to_owned())
+            };
+        }
+        let content_sha256 = cache_digest(content.as_bytes(), &type_ids_json, &calls_json);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO local_typed_c_cache(project_id,binary_sha256,model_revision,analysis_version,options_sha256,entry_address_space,entry_value,content_sha256,content,type_ids_json,calls_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![project.id, project.binary_sha256, model.revision as i64, ANALYSIS_VERSION, options_sha256, ir.entry.address_space, entry_value(ir.entry), content_sha256, content.as_bytes(), type_ids_json, calls_json],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn cache_typed_cfg_c(
+        &mut self,
+        project: &LocalProject,
+        model: &AnalysisModel,
+        ir: &HighLevelCfgCir,
+        machine: &MachineFunctionIr,
+        function: &FunctionIr,
+        content: &str,
+        options: &str,
+    ) -> Result<(), String> {
+        self.verify_current(project)?;
+        validate_structure(model)?;
+        if model.binary_sha256 != project.binary_sha256
+            || ir.binary_sha256 != model.binary_sha256
+            || ir.model_revision != model.revision
+            || ir.schema_version != HIGH_LEVEL_CFG_CIR_VERSION
+            || machine.binary_sha256 != model.binary_sha256
+            || machine.entry != ir.entry
+            || function.binary_sha256 != model.binary_sha256
+            || function.entry != ir.entry
+        {
+            return Err("typed CFG cache artifact identity differs from model".to_owned());
+        }
+        if content.len() > MAX_C_BYTES || emit_typed_cfg_c(ir, model)? != content {
+            return Err("typed CFG cache content differs from validated emission".to_owned());
+        }
+        let keyed_options = cfg_cache_options(options);
+        let options_sha256 = source_options_hash(&keyed_options, machine, function)?;
+        let type_ids_json =
+            serde_json::to_vec(&used_cfg_type_ids(ir, model)).map_err(|error| error.to_string())?;
+        let calls = function
+            .calls
+            .iter()
+            .filter_map(|call| call.target)
+            .collect::<BTreeSet<_>>();
+        let calls_json = serde_json::to_vec(&calls).map_err(|error| error.to_string())?;
+        if let Some(existing) =
+            self.cached_typed_cfg_c(project, model, machine, function, options)?
+        {
+            return if existing == content {
+                Ok(())
+            } else {
+                Err("typed CFG cache key has a different emission".to_owned())
             };
         }
         let content_sha256 = cache_digest(content.as_bytes(), &type_ids_json, &calls_json);
@@ -422,7 +563,23 @@ pub(super) fn carry_typed_c_cache(
         });
     }
     drop(statement);
+    let cached_entries = cached.iter().map(|row| row.entry).collect::<BTreeSet<_>>();
     let mut dirty = changed_functions;
+    if !dirty.is_empty() {
+        // A missing intermediate cache row has no call summary. It could
+        // reach any changed function, so carry neither that caller nor its
+        // transitive callers across this model revision.
+        dirty.extend(
+            cached
+                .iter()
+                .filter(|row| {
+                    row.calls
+                        .iter()
+                        .any(|callee| !cached_entries.contains(callee))
+                })
+                .map(|row| row.entry),
+        );
+    }
     dirty.extend(
         cached
             .iter()
@@ -454,7 +611,7 @@ pub(super) fn carry_typed_c_cache(
 mod tests {
     use super::*;
     use hydir_decompile::decompile_symbol;
-    use hydir_hlc::lower_high_level_cir;
+    use hydir_hlc::{emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
     use hydir_loader::import_elf;
     use hydir_model::{
         ANALYSIS_MODEL_VERSION, ModelEvidence, ModelField, ModelFunction, ModelSource,
@@ -494,22 +651,57 @@ mod tests {
             let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
             let c = emit_typed_c(&ir, &model).unwrap();
             store
-                .cache_typed_c(&project, &model, &ir, &native.function_ir, &c, "default")
+                .cache_typed_c(
+                    &project,
+                    &model,
+                    &ir,
+                    &native.machine_ir,
+                    &native.function_ir,
+                    &c,
+                    "default",
+                )
                 .unwrap();
             assert_eq!(
                 store
-                    .cached_typed_c(&project, &model, ir.entry, "default")
+                    .cached_typed_c(
+                        &project,
+                        &model,
+                        &native.machine_ir,
+                        &native.function_ir,
+                        "default"
+                    )
                     .unwrap()
                     .as_deref(),
                 Some(c.as_str())
             );
             assert!(
                 store
-                    .cached_typed_c(&project, &model, ir.entry, "other")
+                    .cached_typed_c(
+                        &project,
+                        &model,
+                        &native.machine_ir,
+                        &native.function_ir,
+                        "other"
+                    )
                     .unwrap()
                     .is_none()
             );
         }
+        let mut changed_source = sum.machine_ir.clone();
+        changed_source.name.push_str("_rediscovered");
+        assert!(
+            store
+                .cached_typed_c(
+                    &project,
+                    &model,
+                    &changed_source,
+                    &sum.function_ir,
+                    "default",
+                )
+                .unwrap()
+                .is_none(),
+            "a changed source IR must not reuse the previous typed C"
+        );
         let mut edited = model.clone();
         edited
             .functions
@@ -521,13 +713,25 @@ mod tests {
         let edited = store.load_model(&project).unwrap().unwrap();
         assert!(
             store
-                .cached_typed_c(&project, &edited, sum.machine_ir.entry, "default")
+                .cached_typed_c(
+                    &project,
+                    &edited,
+                    &sum.machine_ir,
+                    &sum.function_ir,
+                    "default"
+                )
                 .unwrap()
                 .is_some()
         );
         assert!(
             store
-                .cached_typed_c(&project, &edited, xor.machine_ir.entry, "default")
+                .cached_typed_c(
+                    &project,
+                    &edited,
+                    &xor.machine_ir,
+                    &xor.function_ir,
+                    "default"
+                )
                 .unwrap()
                 .is_none()
         );
@@ -543,7 +747,13 @@ mod tests {
         let edited_again = store.load_model(&project).unwrap().unwrap();
         assert!(
             store
-                .cached_typed_c(&project, &edited_again, sum.machine_ir.entry, "default")
+                .cached_typed_c(
+                    &project,
+                    &edited_again,
+                    &sum.machine_ir,
+                    &sum.function_ir,
+                    "default"
+                )
                 .unwrap()
                 .is_none()
         );
@@ -557,6 +767,7 @@ mod tests {
                     &project,
                     &edited_again,
                     &ir,
+                    &native.machine_ir,
                     &native.function_ir,
                     &c,
                     "default",
@@ -589,7 +800,13 @@ mod tests {
         let renamed_callee = store.load_model(&project).unwrap().unwrap();
         assert!(
             store
-                .cached_typed_c(&project, &renamed_callee, sum.machine_ir.entry, "default")
+                .cached_typed_c(
+                    &project,
+                    &renamed_callee,
+                    &sum.machine_ir,
+                    &sum.function_ir,
+                    "default"
+                )
                 .unwrap()
                 .is_none()
         );
@@ -600,6 +817,7 @@ mod tests {
                 &project,
                 &renamed_callee,
                 &ir,
+                &sum.machine_ir,
                 &sum.function_ir,
                 &c,
                 "default",
@@ -611,7 +829,13 @@ mod tests {
         ).unwrap();
         assert!(
             store
-                .cached_typed_c(&project, &renamed_callee, sum.machine_ir.entry, "default")
+                .cached_typed_c(
+                    &project,
+                    &renamed_callee,
+                    &sum.machine_ir,
+                    &sum.function_ir,
+                    "default"
+                )
                 .unwrap()
                 .is_none()
         );
@@ -631,8 +855,166 @@ mod tests {
                 .cached_typed_c(
                     &project,
                     &edited_after_corruption,
-                    sum.machine_ir.entry,
+                    &sum.machine_ir,
+                    &sum.function_ir,
                     "default"
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cfg_typed_c_cache_carries_unaffected_rows_and_rejects_changed_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/hydir_aggregate_walk.c");
+        let binary = directory.path().join("walk.elf");
+        let mut build = Command::new("clang");
+        if cfg!(windows) {
+            build.args(["--target=x86_64-unknown-linux-gnu", "-fuse-ld=lld"]);
+        }
+        let output = build
+            .args([
+                "-O2",
+                "-g",
+                "-fno-stack-protector",
+                "-fno-builtin",
+                "-nostdlib",
+                "-static",
+                "-no-pie",
+                "-Wl,--build-id=none",
+                "-Wl,-e,_start",
+            ])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("Clang is required for the typed CFG cache fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&binary).unwrap();
+        let spec = import_elf(&bytes).unwrap();
+        let mut model = init_model(&bytes).unwrap();
+        import_dwarf(&bytes, &mut model).unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("cache.sqlite")).unwrap();
+        let initial = store.open_binary(&binary, &spec).unwrap();
+        let project = store
+            .save_model(&initial, &model, "initial-cfg-model")
+            .unwrap();
+        let model = store.load_model(&project).unwrap().unwrap();
+        let native = decompile_symbol(&bytes, "hydir_walk_nodes64").unwrap();
+        let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+        assert!(ir.blocks.len() > 2);
+        let c = emit_typed_cfg_c(&ir, &model).unwrap();
+        store
+            .cache_typed_cfg_c(
+                &project,
+                &model,
+                &ir,
+                &native.machine_ir,
+                &native.function_ir,
+                &c,
+                "",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .cached_typed_cfg_c(
+                    &project,
+                    &model,
+                    &native.machine_ir,
+                    &native.function_ir,
+                    "",
+                )
+                .unwrap()
+                .as_deref(),
+            Some(c.as_str())
+        );
+        assert!(
+            store
+                .cached_typed_c(
+                    &project,
+                    &model,
+                    &native.machine_ir,
+                    &native.function_ir,
+                    "",
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let mut changed_source = native.function_ir.clone();
+        changed_source.name.push_str("_rediscovered");
+        assert!(
+            store
+                .cached_typed_cfg_c(&project, &model, &native.machine_ir, &changed_source, "",)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut unrelated = model.clone();
+        unrelated.types.push(TypeDefinition {
+            id: "cache_unrelated".to_owned(),
+            name: "CacheUnrelated".to_owned(),
+            size_bytes: 8,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Struct {
+                fields: vec![ModelField {
+                    name: "other".to_owned(),
+                    offset_bytes: 0,
+                    ty: TypeRef::Primitive {
+                        name: PrimitiveType::U64,
+                    },
+                    evidence: vec![],
+                }],
+            },
+            evidence: vec![],
+        });
+        let project = store
+            .save_model(&project, &unrelated, "add-unrelated-type")
+            .unwrap();
+        let unrelated = store.load_model(&project).unwrap().unwrap();
+        assert_eq!(
+            store
+                .cached_typed_cfg_c(
+                    &project,
+                    &unrelated,
+                    &native.machine_ir,
+                    &native.function_ir,
+                    "",
+                )
+                .unwrap()
+                .as_deref(),
+            Some(c.as_str()),
+            "an unrelated model addition should preserve the CFG artifact"
+        );
+
+        let mut changed_layout = unrelated.clone();
+        let node = changed_layout
+            .types
+            .iter_mut()
+            .find(|ty| ty.name.starts_with("Node64_"))
+            .expect("DWARF Node64 layout");
+        let TypeDefinitionKind::Struct { fields } = &mut node.kind else {
+            panic!("Node64 struct")
+        };
+        fields[0].name = "payload".to_owned();
+        let project = store
+            .save_model(&project, &changed_layout, "rename-node-field")
+            .unwrap();
+        let changed_layout = store.load_model(&project).unwrap().unwrap();
+        assert!(
+            store
+                .cached_typed_cfg_c(
+                    &project,
+                    &changed_layout,
+                    &native.machine_ir,
+                    &native.function_ir,
+                    "",
                 )
                 .unwrap()
                 .is_none()
@@ -797,6 +1179,69 @@ mod tests {
         tx.commit().unwrap();
         // A bounded read must not copy a subset of more than 4096 rows.
         assert_eq!(rows_at_revision(&store.conn, 4), 0);
+    }
+
+    #[test]
+    fn cache_carry_drops_callers_when_an_intermediate_summary_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("cache.sqlite")).unwrap();
+        let project = LocalProject {
+            id: "missing-intermediate".to_owned(),
+            path: directory.path().join("unused.elf"),
+            revision: 1,
+            binary_sha256: "b".repeat(64),
+        };
+        store.conn.execute(
+            "INSERT INTO local_projects(id,canonical_path,current_revision,binary_sha256) VALUES(?1,?2,1,?3)",
+            params![project.id, project.path.to_str().unwrap(), project.binary_sha256],
+        ).unwrap();
+        let location = |value| Location {
+            address_space: 0,
+            value: Address(value),
+        };
+        let caller = location(0x10);
+        let uncached_intermediate = location(0x20);
+        let changed_callee = location(0x30);
+        let independent = location(0x40);
+        let old = AnalysisModel {
+            schema_version: ANALYSIS_MODEL_VERSION,
+            binary_sha256: project.binary_sha256.clone(),
+            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            revision: 1,
+            types: vec![],
+            functions: vec![ModelFunction {
+                entry: changed_callee,
+                name: "old_name".to_owned(),
+                prototype: None,
+                inferred_parameters: BTreeMap::new(),
+                evidence: vec![],
+            }],
+            stack_objects: vec![],
+            conflicts: vec![],
+            high_pcode_hints: vec![],
+        };
+        let mut edited = old.clone();
+        edited.revision = 2;
+        edited.functions[0].name = "new_name".to_owned();
+        insert_dependency_row(
+            &store.conn,
+            &project,
+            1,
+            caller,
+            &[uncached_intermediate],
+            false,
+        );
+        insert_dependency_row(&store.conn, &project, 1, independent, &[], false);
+        let tx = store.conn.transaction().unwrap();
+        carry_typed_c_cache(&tx, &project, &old, &edited).unwrap();
+        tx.commit().unwrap();
+        let carried: String = store.conn.query_row(
+            "SELECT entry_value FROM local_typed_c_cache WHERE project_id=?1 AND model_revision=2",
+            [&project.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(carried, entry_value(independent));
+        assert_eq!(rows_at_revision(&store.conn, 2), 1);
     }
 
     #[test]
