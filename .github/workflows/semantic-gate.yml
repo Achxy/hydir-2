@@ -26,6 +26,7 @@ jobs:
       - name: Remote GUI model edit over live RPC
         run: |
           set -euo pipefail
+          umask 077
           cargo build --locked --bin hydird --bin hydirctl --bin hydir
           probe_dir="$RUNNER_TEMP/remote-model-gui"
           mkdir -p "$probe_dir"
