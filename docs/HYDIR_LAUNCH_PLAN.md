@@ -94,6 +94,8 @@ Native ELF frontend -> existing MachineIR/StateIR path (retained)
 
 The test matrix starts with straight-line arithmetic, branches, loops, calls, stack/global memory, indirect flow, and at least one `CALLOTHER` case. A real `RDTSC` user operation now checks the explicit unsupported boundary. Use stripped and DWARF-bearing builds at several optimization levels. Record coverage by opcode and artifact fidelity. LLVM verification alone is never a semantic test.
 
+The first fresh [optimization and debug-info matrix](GHIDRA_OPT_MATRIX.md) now runs O0/O2 × DWARF/stripped builds of the password fixture through the automatic worker. It checks raw P-code stability after stripping, exact Rust/LLVM paths for scalar addition and O0 password comparison, and native GDB behavior on Linux. O2 SIMD comparison remains an explicit partial path. More source fixtures and compiler families are still needed for the launch gate.
+
 ### Reuse decisions from the 2026-09-26 research pass
 
 | Gap | Adopt or adapt | Boundary and reason |
