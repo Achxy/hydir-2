@@ -15,7 +15,8 @@ use hydir_api::v2::{
     VerifyPatchRequest, hydir_v2_client::HydirV2Client,
 };
 use hydir_api::v3::{
-    ArtifactReply as ArtifactReplyV3, ProgramArtifactRequest, hydir_v3_client::HydirV3Client,
+    AnalysisModelRequest, ArtifactReply as ArtifactReplyV3, ProgramArtifactRequest,
+    SaveAnalysisModelRequest, hydir_v3_client::HydirV3Client,
 };
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_physical_region, lift_symbol,
@@ -361,12 +362,14 @@ enum Event {
         binary_sha256: String,
         entry: Location,
         revision: u64,
+        remote: bool,
         typed: Box<Result<TypedNativeView, String>>,
     },
     ModelEdited {
         binary_sha256: String,
         entry: Location,
         revision: u64,
+        remote: bool,
         typed: Box<Result<TypedNativeView, String>>,
     },
     Disassembled {
@@ -680,6 +683,139 @@ async fn remote_function_index(access: &RemoteAccess) -> Result<FunctionIndex, S
         "application/vnd.hydir.function-index+json;version=1",
     )
     .await
+}
+
+async fn remote_analysis_model(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+) -> Result<AnalysisModel, String> {
+    let mut client = remote_v3_client(access).await?;
+    let artifact = client
+        .get_analysis_model(authorized(
+            AnalysisModelRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote analysis model recovery failed: {error}"))?
+        .into_inner();
+    let model: AnalysisModel = decode_v3_artifact(
+        artifact,
+        access,
+        "application/vnd.hydir.analysis-model+json;version=1",
+    )?;
+    hydir_model::validate_structure(&model)?;
+    if model.binary_sha256 != binary_sha256 {
+        return Err("Remote analysis model has the wrong binary".to_owned());
+    }
+    Ok(model)
+}
+
+enum RemoteModelSaveError {
+    Preflight(String),
+    Uncertain(String),
+}
+
+fn validate_remote_model_save(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+    displayed: &AnalysisModel,
+    candidate: &AnalysisModel,
+) -> Result<(), String> {
+    if displayed.binary_sha256 != binary_sha256
+        || candidate.binary_sha256 != binary_sha256
+        || candidate.revision
+            != displayed
+                .revision
+                .checked_add(1)
+                .ok_or("Analysis model revision overflow")?
+        || access.revision.checked_add(1).is_none()
+    {
+        return Err("Model edit binary or revision differs from the open project".to_owned());
+    }
+    Ok(())
+}
+
+async fn save_remote_analysis_model(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+    displayed: &AnalysisModel,
+    candidate: &AnalysisModel,
+    key: &str,
+) -> Result<(u64, Result<AnalysisModel, String>), RemoteModelSaveError> {
+    validate_remote_model_save(access, binary_sha256, displayed, candidate)
+        .map_err(RemoteModelSaveError::Preflight)?;
+    let current = remote_analysis_model(access, binary_sha256)
+        .await
+        .map_err(RemoteModelSaveError::Preflight)?;
+    if &current != displayed {
+        return Err(RemoteModelSaveError::Preflight(
+            "Model view is stale; reselect the function before editing".to_owned(),
+        ));
+    }
+    let payload = serde_json::to_vec(candidate)
+        .map_err(|error| RemoteModelSaveError::Preflight(error.to_string()))?;
+    let mut client = remote_v3_client(access)
+        .await
+        .map_err(RemoteModelSaveError::Preflight)?;
+    // Once dispatched, even a transport error may mean the server committed.
+    let reply = client
+        .save_analysis_model(authorized(
+            SaveAnalysisModelRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                idempotency_key: key.to_owned(),
+                model_json: payload,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| RemoteModelSaveError::Uncertain(error.to_string()))?
+        .into_inner();
+    if reply.project_id != access.project_id
+        || reply.binary_sha256 != binary_sha256
+        || Some(reply.revision) != access.revision.checked_add(1)
+    {
+        return Err(RemoteModelSaveError::Uncertain(
+            "Remote model save returned an unexpected project, binary, or revision".to_owned(),
+        ));
+    }
+    let updated = RemoteAccess {
+        revision: reply.revision,
+        ..access.clone()
+    };
+    let saved = remote_analysis_model(&updated, binary_sha256).await;
+    Ok((reply.revision, saved))
+}
+
+async fn persist_remote_model_change(
+    access: &mut RemoteAccess,
+    binary_sha256: &str,
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    mut candidate: AnalysisModel,
+    native: &NativeDecompilation,
+    key: &str,
+) -> Result<(u64, Result<TypedNativeView, String>), RemoteModelSaveError> {
+    if access.revision != expected_revision || native.machine_ir.binary_sha256 != binary_sha256 {
+        return Err(RemoteModelSaveError::Preflight(
+            "Model view is stale or belongs to a different binary; reselect the function"
+                .to_owned(),
+        ));
+    }
+    candidate.revision = displayed.revision.checked_add(1).ok_or_else(|| {
+        RemoteModelSaveError::Preflight("Analysis model revision overflow".to_owned())
+    })?;
+    hydir_model::validate_structure(&candidate).map_err(RemoteModelSaveError::Preflight)?;
+    let (revision, saved) =
+        save_remote_analysis_model(access, binary_sha256, displayed, &candidate, key).await?;
+    access.revision = revision;
+    Ok((
+        revision,
+        saved.and_then(|model| typed_view_with_model(model, native)),
+    ))
 }
 
 async fn remote_native_decompilation(
@@ -3069,7 +3205,12 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         local_project = Some(refreshed);
                         local_typed_view(bytes, local_project.as_ref(), native)
                     })(),
-                    (Source::Remote(_), _) => Err("Typed model view is local-only in this desktop release".to_owned()),
+                    (Source::Remote(access), Ok(native)) => {
+                        project_revision = Some(access.revision);
+                        runtime
+                            .block_on(remote_analysis_model(access, &native.machine_ir.binary_sha256))
+                            .and_then(|model| typed_view_with_model(model, native))
+                    }
                     (_, Err(error)) => Err(error.clone()),
                     _ => Err("Open a local ELF to inspect typed C".to_owned()),
                 };
@@ -3089,40 +3230,57 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 native,
                 key,
             } => {
-                let result = (|| {
-                    let Source::Local(bytes) = &source else {
-                        return Err("Model editing requires an open local ELF".to_owned());
-                    };
-                    let project = local_project
-                        .as_ref()
-                        .ok_or("Open a local project before editing its model")?;
-                    if project.binary_sha256 != binary_sha256 {
-                        return Err("Model edit binary differs from the open ELF".to_owned());
-                    }
-                    let mut store = LocalProjectStore::open_default()?;
-                    let (updated, _) = persist_local_model_rename(
-                        &mut store,
-                        project,
-                        bytes,
-                        expected_revision,
-                        &model,
-                        &target,
-                        &name,
-                        &key,
-                    )?;
-                    let typed = local_typed_view(bytes, Some(&updated), &native);
-                    let revision = updated.revision;
-                    local_project = Some(updated);
-                    Ok::<_, String>((revision, typed))
-                })();
+                let result = match &mut source {
+                    Source::Local(bytes) => (|| {
+                        let project = local_project
+                            .as_ref()
+                            .ok_or("Open a local project before editing its model")?;
+                        if project.binary_sha256 != binary_sha256 {
+                            return Err("Model edit binary differs from the open ELF".to_owned());
+                        }
+                        let mut store = LocalProjectStore::open_default()?;
+                        let (updated, _) = persist_local_model_rename(
+                            &mut store, project, bytes, expected_revision, &model, &target, &name,
+                            &key,
+                        )?;
+                        let typed = local_typed_view(bytes, Some(&updated), &native);
+                        let revision = updated.revision;
+                        local_project = Some(updated);
+                        Ok((revision, typed, false))
+                    })()
+                    .map_err(RemoteModelSaveError::Preflight),
+                    Source::Remote(access) => match prepare_model_rename(&model, &target, &name) {
+                        Ok(candidate) => runtime
+                            .block_on(persist_remote_model_change(
+                                access,
+                                &binary_sha256,
+                                expected_revision,
+                                &model,
+                                candidate,
+                                &native,
+                                &key,
+                            ))
+                            .map(|(revision, typed)| (revision, typed, true)),
+                        Err(error) => Err(RemoteModelSaveError::Preflight(error)),
+                    },
+                    Source::None => Err(RemoteModelSaveError::Preflight(
+                        "Open a local ELF or remote project before editing its model".to_owned(),
+                    )),
+                };
                 match result {
-                    Ok((revision, typed)) => Event::ModelRenamed {
+                    Ok((revision, typed, remote)) => Event::ModelRenamed {
                         binary_sha256,
                         entry: native.machine_ir.entry,
                         revision,
+                        remote,
                         typed: Box::new(typed),
                     },
-                    Err(error) => Event::Failed(format!("Could not save model rename: {error}")),
+                    Err(RemoteModelSaveError::Preflight(error)) => {
+                        Event::Failed(format!("Could not save model rename: {error}"))
+                    }
+                    Err(RemoteModelSaveError::Uncertain(error)) => Event::MutationUncertain(
+                        format!("{error} Mutation key {key}. Reopen the remote project before another mutation; the model save may have committed."),
+                    ),
                 }
             }
             Task::EditModel {
@@ -3133,32 +3291,55 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 native,
                 key,
             } => {
-                let result = (|| {
-                    let Source::Local(bytes) = &source else {
-                        return Err("Model editing requires an open local ELF".to_owned());
-                    };
-                    let project = local_project.as_ref()
-                        .ok_or("Open a local project before editing its model")?;
-                    if project.binary_sha256 != binary_sha256 {
-                        return Err("Model edit binary differs from the open ELF".to_owned());
-                    }
-                    let mut store = LocalProjectStore::open_default()?;
-                    let (updated, _) = persist_local_model_edit(
-                        &mut store, project, bytes, expected_revision, &model, &edit, &key,
-                    )?;
-                    let typed = local_typed_view(bytes, Some(&updated), &native);
-                    let revision = updated.revision;
-                    local_project = Some(updated);
-                    Ok::<_, String>((revision, typed))
-                })();
+                let result = match &mut source {
+                    Source::Local(bytes) => (|| {
+                        let project = local_project.as_ref()
+                            .ok_or("Open a local project before editing its model")?;
+                        if project.binary_sha256 != binary_sha256 {
+                            return Err("Model edit binary differs from the open ELF".to_owned());
+                        }
+                        let mut store = LocalProjectStore::open_default()?;
+                        let (updated, _) = persist_local_model_edit(
+                            &mut store, project, bytes, expected_revision, &model, &edit, &key,
+                        )?;
+                        let typed = local_typed_view(bytes, Some(&updated), &native);
+                        let revision = updated.revision;
+                        local_project = Some(updated);
+                        Ok((revision, typed, false))
+                    })()
+                    .map_err(RemoteModelSaveError::Preflight),
+                    Source::Remote(access) => match prepare_model_edit(&model, &edit) {
+                        Ok(candidate) => runtime
+                            .block_on(persist_remote_model_change(
+                                access,
+                                &binary_sha256,
+                                expected_revision,
+                                &model,
+                                candidate,
+                                &native,
+                                &key,
+                            ))
+                            .map(|(revision, typed)| (revision, typed, true)),
+                        Err(error) => Err(RemoteModelSaveError::Preflight(error)),
+                    },
+                    Source::None => Err(RemoteModelSaveError::Preflight(
+                        "Open a local ELF or remote project before editing its model".to_owned(),
+                    )),
+                };
                 match result {
-                    Ok((revision, typed)) => Event::ModelEdited {
+                    Ok((revision, typed, remote)) => Event::ModelEdited {
                         binary_sha256,
                         entry: native.machine_ir.entry,
                         revision,
+                        remote,
                         typed: Box::new(typed),
                     },
-                    Err(error) => Event::Failed(format!("Could not save model edit: {error}")),
+                    Err(RemoteModelSaveError::Preflight(error)) => {
+                        Event::Failed(format!("Could not save model edit: {error}"))
+                    }
+                    Err(RemoteModelSaveError::Uncertain(error)) => Event::MutationUncertain(
+                        format!("{error} Mutation key {key}. Reopen the remote project before another mutation; the model save may have committed."),
+                    ),
                 }
             }
             Task::Disassemble { automatic } => Event::Disassembled {
@@ -3751,27 +3932,13 @@ fn valid_model_rename(name: &str) -> bool {
         && hydir_model::is_c11_identifier(name)
 }
 
-fn persist_local_model_rename(
-    store: &mut LocalProjectStore,
-    project: &LocalProject,
-    bytes: &[u8],
-    expected_revision: u64,
+fn prepare_model_rename(
     displayed: &AnalysisModel,
     target: &ModelRenameTarget,
     name: &str,
-    key: &str,
-) -> Result<(LocalProject, AnalysisModel), String> {
-    if project.revision != expected_revision {
-        return Err("Model view is stale; reselect the function before editing".to_owned());
-    }
+) -> Result<AnalysisModel, String> {
     if name.len() > 128 || !valid_model_rename(name) {
         return Err("Model name must be a C identifier of at most 128 characters".to_owned());
-    }
-    hydir_model::validate_model(bytes, displayed)?;
-    if let Some(saved) = store.load_model(project)?
-        && saved != *displayed
-    {
-        return Err("Model view is stale; reselect the function before editing".to_owned());
     }
     let mut edited = displayed.clone();
     let previous_name = match target {
@@ -3795,21 +3962,18 @@ fn persist_local_model_rename(
     if previous_name == name {
         return Err("Choose a different name before saving".to_owned());
     }
-    hydir_model::validate_model(bytes, &edited)?;
-    let updated = store.save_model(project, &edited, key)?;
-    let saved = store
-        .load_model(&updated)?
-        .ok_or("Saved analysis model could not be reloaded")?;
-    Ok((updated, saved))
+    hydir_model::validate_structure(&edited)?;
+    Ok(edited)
 }
 
-fn persist_local_model_edit(
+fn persist_local_model_rename(
     store: &mut LocalProjectStore,
     project: &LocalProject,
     bytes: &[u8],
     expected_revision: u64,
     displayed: &AnalysisModel,
-    edit: &ModelEdit,
+    target: &ModelRenameTarget,
+    name: &str,
     key: &str,
 ) -> Result<(LocalProject, AnalysisModel), String> {
     if project.revision != expected_revision {
@@ -3821,6 +3985,19 @@ fn persist_local_model_edit(
     {
         return Err("Model view is stale; reselect the function before editing".to_owned());
     }
+    let edited = prepare_model_rename(displayed, target, name)?;
+    hydir_model::validate_model(bytes, &edited)?;
+    let updated = store.save_model(project, &edited, key)?;
+    let saved = store
+        .load_model(&updated)?
+        .ok_or("Saved analysis model could not be reloaded")?;
+    Ok((updated, saved))
+}
+
+fn prepare_model_edit(
+    displayed: &AnalysisModel,
+    edit: &ModelEdit,
+) -> Result<AnalysisModel, String> {
     let mut edited = displayed.clone();
     let conflict = match edit {
         ModelEdit::Prototype { entry, value } => {
@@ -3908,7 +4085,7 @@ fn persist_local_model_edit(
             field.ty = ty.clone();
             let assertion = ModelEvidence {
                 source: ModelSource::AnalystAssertion,
-                detail: "local field edit".to_owned(),
+                detail: "analyst field edit".to_owned(),
                 site: None,
             };
             if !field.evidence.contains(&assertion) {
@@ -3922,6 +4099,29 @@ fn persist_local_model_edit(
     {
         edited.conflicts.push(conflict);
     }
+    hydir_model::validate_structure(&edited)?;
+    Ok(edited)
+}
+
+fn persist_local_model_edit(
+    store: &mut LocalProjectStore,
+    project: &LocalProject,
+    bytes: &[u8],
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    edit: &ModelEdit,
+    key: &str,
+) -> Result<(LocalProject, AnalysisModel), String> {
+    if project.revision != expected_revision {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    hydir_model::validate_model(bytes, displayed)?;
+    if let Some(saved) = store.load_model(project)?
+        && saved != *displayed
+    {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    let edited = prepare_model_edit(displayed, edit)?;
     hydir_model::validate_model(bytes, &edited)?;
     let updated = store.save_model(project, &edited, key)?;
     let saved = store
@@ -3948,6 +4148,17 @@ fn local_typed_view(
         model
     };
     hydir_model::validate_model(bytes, &model)?;
+    typed_view_with_model(model, native)
+}
+
+fn typed_view_with_model(
+    model: AnalysisModel,
+    native: &NativeDecompilation,
+) -> Result<TypedNativeView, String> {
+    hydir_model::validate_structure(&model)?;
+    if model.binary_sha256 != native.machine_ir.binary_sha256 {
+        return Err("Analysis model binary differs from selected function".to_owned());
+    }
     let (ir, cfg_ir, c, diagnostic) =
         match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
             Ok(ir) => match emit_typed_c(&ir, &model) {
@@ -5337,9 +5548,7 @@ impl AnalystApp {
                     if self.symbol.as_deref() != Some(&label) {
                         continue;
                     }
-                    if !self.remote {
-                        self.project_revision = project_revision;
-                    }
+                    self.project_revision = project_revision;
                     self.model_rename_target = None;
                     self.model_rename_name.clear();
                     self.model_edit_draft = None;
@@ -5378,6 +5587,7 @@ impl AnalystApp {
                     binary_sha256,
                     entry,
                     revision,
+                    remote,
                     typed,
                 } => {
                     if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
@@ -5413,13 +5623,17 @@ impl AnalystApp {
                                 .to_owned(),
                         );
                     }
-                    self.status = format!("Saved model rename in local revision {revision}");
+                    self.status = format!(
+                        "Saved model rename in {} revision {revision}",
+                        if remote { "remote" } else { "local" }
+                    );
                     self.history.push(self.status.clone());
                 }
                 Event::ModelEdited {
                     binary_sha256,
                     entry,
                     revision,
+                    remote,
                     typed,
                 } => {
                     if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
@@ -5454,7 +5668,10 @@ impl AnalystApp {
                                 .to_owned(),
                         );
                     }
-                    self.status = format!("Saved analysis model edit in local revision {revision}");
+                    self.status = format!(
+                        "Saved analysis model edit in {} revision {revision}",
+                        if remote { "remote" } else { "local" }
+                    );
                     self.history.push(self.status.clone());
                 }
                 Event::Disassembled { result, automatic } => match result {
@@ -11421,7 +11638,7 @@ impl AnalystApp {
                                 }
                             }
                             ui.horizontal(|ui| {
-                                if ui.add_enabled(!self.busy && !self.remote, egui::Button::new("Save model edit")).clicked() {
+                                if ui.add_enabled(!self.busy, egui::Button::new("Save model edit")).clicked() {
                                     edit_save = Some((typed.model.clone(), native.clone()));
                                 }
                                 if ui.small_button("Cancel").clicked() {
@@ -11440,10 +11657,7 @@ impl AnalystApp {
                             });
                             ui.text_edit_singleline(&mut self.model_rename_name);
                             if ui
-                                .add_enabled(
-                                    !self.busy && !self.remote,
-                                    egui::Button::new("Save rename"),
-                                )
+                                .add_enabled(!self.busy, egui::Button::new("Save rename"))
                                 .clicked()
                             {
                                 rename_save = Some((typed.model.clone(), native.clone()));
@@ -11596,7 +11810,7 @@ impl AnalystApp {
                 ),
                 _ => {
                     self.failure = Some(
-                        "Open a local ELF and select a function before editing its model"
+                        "Open a local ELF or remote project and select a function before editing its model"
                             .to_owned(),
                     );
                 }
@@ -11623,7 +11837,7 @@ impl AnalystApp {
                 (_, _, Err(error)) => self.failure = Some(error),
                 _ => {
                     self.failure = Some(
-                        "Open a local ELF and select a function before editing its model"
+                        "Open a local ELF or remote project and select a function before editing its model"
                             .to_owned(),
                     )
                 }
@@ -13335,6 +13549,99 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    if let [probe, endpoint, token_file, binary, symbol] = arguments.as_slice()
+        && probe == "--probe-remote-model"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let token_file = PathBuf::from(token_file);
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                token_file.clone(),
+                "GUI model editor probe".to_owned(),
+            )
+            .await?;
+            let (mut access, spec) = upload_remote(
+                endpoint.clone(),
+                token_file,
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            let native = remote_native_decompilation(&access, symbol).await?;
+            let baseline = remote_analysis_model(&access, &spec.binary_sha256).await?;
+            let entry = native.machine_ir.entry;
+            let old_evidence = baseline
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .ok_or("Selected function is absent from remote model")?
+                .evidence
+                .clone();
+            let candidate = prepare_model_rename(
+                &baseline,
+                &ModelRenameTarget::Function(entry),
+                "hydir_gui_remote_renamed",
+            )?;
+            let expected_revision = access.revision;
+            let (revision, typed) = match persist_remote_model_change(
+                &mut access,
+                &spec.binary_sha256,
+                expected_revision,
+                &baseline,
+                candidate,
+                &native,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(
+                    RemoteModelSaveError::Preflight(error) | RemoteModelSaveError::Uncertain(error),
+                ) => return Err(error),
+            };
+            let typed = typed?;
+            let saved = remote_analysis_model(&access, &spec.binary_sha256).await?;
+            let function = saved
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .ok_or("Saved remote function is absent")?;
+            if revision != access.revision
+                || saved != typed.model
+                || saved.revision != baseline.revision + 1
+                || function.name != "hydir_gui_remote_renamed"
+                || !old_evidence
+                    .iter()
+                    .all(|evidence| function.evidence.contains(evidence))
+            {
+                return Err("Remote model edit lost revision, identity, or evidence".to_owned());
+            }
+            if !typed
+                .c
+                .as_ref()
+                .is_some_and(|c| c.contains("hydir_gui_remote_renamed"))
+            {
+                return Err("Typed C did not refresh after remote model rename".to_owned());
+            }
+            Ok::<_, String>((revision, saved.revision, typed.c.is_some()))
+        });
+        match result {
+            Ok((revision, model_revision, typed_c)) => {
+                println!(
+                    "HydIR GUI remote model probe passed: project revision {revision}, model revision {model_revision}, typed C available {typed_c}"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI remote model probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, endpoint, token_file, project_id, symbol] = arguments.as_slice()
         && probe == "--probe-remote"
     {
@@ -13437,7 +13744,7 @@ fn main() -> eframe::Result<()> {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-ghidra-demo <elf> [0xfunction-entry] (requires HYDIR_LOCAL_DB) | --render-ghidra-demo <elf> <0xfunction-entry> <output-dir> (requires HYDIR_LOCAL_DB) | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-ghidra-demo <elf> [0xfunction-entry] (requires HYDIR_LOCAL_DB) | --render-ghidra-demo <elf> <0xfunction-entry> <output-dir> (requires HYDIR_LOCAL_DB) | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-remote-model <endpoint> <token-file> <elf> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -13484,10 +13791,10 @@ mod tests {
         indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
         native_instruction_count, native_opaque_instruction_count, parse_model_edit_draft,
         pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
-        persist_local_model_edit, persist_local_model_rename, preview_patch_local,
-        resized_console_height, run_ghidra_command, save_render_smoke_png,
+        persist_local_model_edit, persist_local_model_rename, prepare_model_rename,
+        preview_patch_local, resized_console_height, run_ghidra_command, save_render_smoke_png,
         selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
-        workbench_graph_layout,
+        validate_remote_model_save, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
@@ -13898,6 +14205,80 @@ mod tests {
             persist_ghidra_snapshot(&database, &binary, "wrong", &snapshot)
                 .unwrap_err()
                 .contains("changed")
+        );
+    }
+
+    #[test]
+    fn remote_model_edit_uses_model_revision_independently_of_project_revision() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let displayed = init_model(bytes).unwrap();
+        let access = super::RemoteAccess {
+            endpoint: "http://127.0.0.1:50051".to_owned(),
+            token: String::new(),
+            project_id: "fixture".to_owned(),
+            revision: displayed.revision + 7,
+            source_offer: String::new(),
+            named_pass_transform: false,
+            whole_rebuild: false,
+        };
+        let mut candidate = prepare_model_rename(
+            &displayed,
+            &ModelRenameTarget::Function(displayed.functions[0].entry),
+            "analyst_function",
+        )
+        .unwrap();
+        candidate.revision += 1;
+        assert!(
+            validate_remote_model_save(&access, &displayed.binary_sha256, &displayed, &candidate,)
+                .is_ok()
+        );
+        assert!(validate_remote_model_save(&access, "wrong", &displayed, &candidate).is_err());
+        candidate.revision += 1;
+        assert!(
+            validate_remote_model_save(&access, &displayed.binary_sha256, &displayed, &candidate,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_model_save_event_refreshes_selected_typed_model() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let spec = import_elf(bytes).unwrap();
+        let initial = init_model(bytes).unwrap();
+        let entry = initial.functions[0].entry;
+        let native = decompile_function_at(bytes, entry).unwrap();
+        let mut edited = prepare_model_rename(
+            &initial,
+            &ModelRenameTarget::Function(entry),
+            "analyst_function",
+        )
+        .unwrap();
+        edited.revision += 1;
+        let typed = super::typed_view_with_model(edited, &native).unwrap();
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.events = receiver;
+        app.spec = Some(spec.clone());
+        app.remote = true;
+        app.project_revision = Some(8);
+        app.native_decompilation = Some(native);
+        app.model_rename_target = Some(ModelRenameTarget::Function(entry));
+        sender
+            .send(Event::ModelRenamed {
+                binary_sha256: spec.binary_sha256,
+                entry,
+                revision: 9,
+                remote: true,
+                typed: Box::new(Ok(typed)),
+            })
+            .unwrap();
+        app.poll();
+        assert_eq!(app.project_revision, Some(9));
+        assert!(app.status.contains("remote revision 9"));
+        assert!(app.model_rename_target.is_none());
+        assert_eq!(
+            app.typed_native_view.as_ref().unwrap().model.functions[0].name,
+            "analyst_function"
         );
     }
 

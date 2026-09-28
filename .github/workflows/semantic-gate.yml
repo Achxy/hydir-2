@@ -23,6 +23,35 @@ jobs:
           .venv/bin/python -m pip install triton-library==1.0.0rc4
       - name: Rust tests
         run: cargo test --locked --workspace
+      - name: Remote GUI model edit over live RPC
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin hydird --bin hydirctl --bin hydir
+          probe_dir="$RUNNER_TEMP/remote-model-gui"
+          mkdir -p "$probe_dir"
+          clang -O0 -no-pie -DHYDIR_FUNCTION=hydir_max2 \
+            tests/fixtures/max2.S tests/fixtures/scalar_main.c \
+            -o "$probe_dir/max2.elf"
+          target/debug/hydird identity create "$probe_dir/projects.sqlite" analyst \
+            | awk '/credential \(save securely/ {print $NF}' > "$probe_dir/analyst.token"
+          test "$(wc -c < "$probe_dir/analyst.token")" -eq 65
+          target/debug/hydird serve "$probe_dir/projects.sqlite" 127.0.0.1:50571 \
+            > "$probe_dir/server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          export HYDIR_ENDPOINT=http://127.0.0.1:50571
+          export HYDIR_TOKEN_FILE="$probe_dir/analyst.token"
+          for attempt in {1..40}; do
+            if target/debug/hydirctl remote discover > "$probe_dir/discovery.json" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          test -s "$probe_dir/discovery.json"
+          target/debug/hydir --probe-remote-model "$HYDIR_ENDPOINT" \
+            "$HYDIR_TOKEN_FILE" "$probe_dir/max2.elf" hydir_max2 \
+            > "$probe_dir/probe.txt"
+          grep -q 'typed C available true' "$probe_dir/probe.txt"
       - name: Python SDK tests
         run: |
           .venv/bin/python -m pip install -e sdk/python

@@ -2942,11 +2942,23 @@ fn validate_model_edit(
             | hydir_model::TypeDefinitionKind::Union { fields: new_fields },
         ) = (&old.kind, &new.kind)
         {
-            if old_fields.iter().any(|old_field| {
-                !new_fields
-                    .iter()
-                    .any(|new_field| new_field.offset_bytes == old_field.offset_bytes)
-            }) {
+            // A field's offset is editable. Preserve its row identity by
+            // position and evidence when its old offset no longer exists.
+            // Shrinking the field list still removes an observed row.
+            if new_fields.len() < old_fields.len()
+                || old_fields.iter().enumerate().any(|(index, old_field)| {
+                    !new_fields
+                        .iter()
+                        .any(|new_field| new_field.offset_bytes == old_field.offset_bytes)
+                        && new_fields.get(index).is_none_or(|replacement| {
+                            old_field.evidence.is_empty()
+                                || !old_field
+                                    .evidence
+                                    .iter()
+                                    .all(|evidence| replacement.evidence.contains(evidence))
+                        })
+                })
+            {
                 return Err(Status::invalid_argument(
                     "model edit removes an existing field",
                 ));
@@ -8368,6 +8380,98 @@ mod tests {
             .unwrap_err()
             .code(),
             tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn v3_model_field_move_preserves_observation_and_rejects_deletion() {
+        use hydir_model::{
+            ModelEvidence, ModelField, ModelSource, PrimitiveType, TypeDefinition,
+            TypeDefinitionKind, TypeRef,
+        };
+
+        let binary = include_bytes!("../../../demo/hydir-prism.elf");
+        let mut previous = hydir_model::init_model(binary).unwrap();
+        let observation = ModelEvidence {
+            source: ModelSource::Dwarf,
+            detail: "field at original offset".to_owned(),
+            site: None,
+        };
+        previous.types.push(TypeDefinition {
+            id: "remote_record".to_owned(),
+            name: "RemoteRecord".to_owned(),
+            size_bytes: 16,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Struct {
+                fields: vec![
+                    ModelField {
+                        name: "head".to_owned(),
+                        offset_bytes: 0,
+                        ty: TypeRef::Primitive {
+                            name: PrimitiveType::U32,
+                        },
+                        evidence: vec![observation.clone()],
+                    },
+                    ModelField {
+                        name: "tail".to_owned(),
+                        offset_bytes: 12,
+                        ty: TypeRef::Primitive {
+                            name: PrimitiveType::U32,
+                        },
+                        evidence: vec![observation.clone()],
+                    },
+                ],
+            },
+            evidence: vec![observation.clone()],
+        });
+        let mut moved = previous.clone();
+        moved.revision += 1;
+        let TypeDefinitionKind::Struct { fields } = &mut moved.types[0].kind else {
+            unreachable!()
+        };
+        fields[0].name = "counter".to_owned();
+        fields[0].offset_bytes = 4;
+        fields[0].ty = TypeRef::Primitive {
+            name: PrimitiveType::U64,
+        };
+        validate_model_edit(&previous, &mut moved, binary).unwrap();
+        let TypeDefinitionKind::Struct { fields } = &moved.types[0].kind else {
+            unreachable!()
+        };
+        assert!(fields[0].evidence.contains(&observation));
+
+        let mut removed = previous.clone();
+        removed.revision += 1;
+        let TypeDefinitionKind::Struct { fields } = &mut removed.types[0].kind else {
+            unreachable!()
+        };
+        fields.remove(0);
+        assert_eq!(
+            validate_model_edit(&previous, &mut removed, binary)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        // The positional fallback must not treat an empty evidence set as
+        // proof that an unrelated replacement preserves a field.
+        let mut no_evidence = previous.clone();
+        let TypeDefinitionKind::Struct { fields } = &mut no_evidence.types[0].kind else {
+            unreachable!()
+        };
+        fields[0].evidence.clear();
+        let mut replacement = no_evidence.clone();
+        replacement.revision += 1;
+        let TypeDefinitionKind::Struct { fields } = &mut replacement.types[0].kind else {
+            unreachable!()
+        };
+        fields[0].offset_bytes = 4;
+        fields[0].name = "unrelated".to_owned();
+        assert!(
+            validate_model_edit(&no_evidence, &mut replacement, binary)
+                .unwrap_err()
+                .message()
+                .contains("removes an existing field")
         );
     }
 
