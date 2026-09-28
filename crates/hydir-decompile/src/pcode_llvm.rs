@@ -399,6 +399,45 @@ pub fn emit_pcode_exact_operation_llvm(
             ));
             "%result".to_owned()
         }
+        PcodeExactOp::FloatEqual
+        | PcodeExactOp::FloatNotEqual
+        | PcodeExactOp::FloatLess
+        | PcodeExactOp::FloatLessEqual
+        | PcodeExactOp::FloatNan => {
+            let float_type = if operation.source.inputs[0].size == 4 {
+                "float"
+            } else {
+                "double"
+            };
+            let input_bits = operation.source.inputs[0].size * 8;
+            body.push_str(&format!(
+                "  %float_left = bitcast i{input_bits} {} to {float_type}\n",
+                operands[0]
+            ));
+            if kind != PcodeExactOp::FloatNan {
+                body.push_str(&format!(
+                    "  %float_right = bitcast i{input_bits} {} to {float_type}\n",
+                    operands[1]
+                ));
+            }
+            let predicate = match kind {
+                PcodeExactOp::FloatEqual => "oeq",
+                PcodeExactOp::FloatNotEqual => "one",
+                PcodeExactOp::FloatLess => "olt",
+                PcodeExactOp::FloatLessEqual => "ole",
+                PcodeExactOp::FloatNan => "uno",
+                _ => unreachable!(),
+            };
+            let right = if kind == PcodeExactOp::FloatNan {
+                "%float_left"
+            } else {
+                "%float_right"
+            };
+            body.push_str(&format!(
+                "  %comparison = fcmp {predicate} {float_type} %float_left, {right}\n  %result = zext i1 %comparison to {result_type}\n"
+            ));
+            "%result".to_owned()
+        }
         PcodeExactOp::Piece => {
             let high_bits = operation.source.inputs[0].size * 8;
             let low_bits = operation.source.inputs[1].size * 8;
@@ -804,6 +843,11 @@ mod tests {
             38 => PcodeExactOp::BooleanXor,
             39 => PcodeExactOp::BooleanAnd,
             40 => PcodeExactOp::BooleanOr,
+            41 => PcodeExactOp::FloatEqual,
+            42 => PcodeExactOp::FloatNotEqual,
+            43 => PcodeExactOp::FloatLess,
+            44 => PcodeExactOp::FloatLessEqual,
+            46 => PcodeExactOp::FloatNan,
             62 => PcodeExactOp::Piece,
             63 => PcodeExactOp::Subpiece,
             72 => PcodeExactOp::PopCount,
@@ -900,6 +944,11 @@ mod tests {
             (38, "BOOL_XOR", 1, vec![1, 1]),
             (39, "BOOL_AND", 1, vec![1, 1]),
             (40, "BOOL_OR", 1, vec![1, 1]),
+            (41, "FLOAT_EQUAL", 1, vec![4, 4]),
+            (42, "FLOAT_NOTEQUAL", 1, vec![8, 8]),
+            (43, "FLOAT_LESS", 1, vec![4, 4]),
+            (44, "FLOAT_LESSEQUAL", 1, vec![8, 8]),
+            (46, "FLOAT_NAN", 1, vec![8]),
             (62, "PIECE", 8, vec![4, 4]),
             (63, "SUBPIECE", 4, vec![8, 1]),
             (72, "POPCOUNT", 1, vec![8]),
@@ -1048,6 +1097,98 @@ mod tests {
         op.source.inputs[1].size = 1;
         op.source.mnemonic = "INT_SUB".to_owned();
         assert!(emit_pcode_exact_operation_llvm(&op).is_err());
+    }
+
+    #[test]
+    fn float_llvm_comparisons_match_rust_on_ordered_and_nan_inputs() {
+        let cases: &[(u32, &str, u32, &[u64], u64)] = &[
+            (
+                41,
+                "FLOAT_EQUAL",
+                4,
+                &[0.0f32.to_bits() as u64, (-0.0f32).to_bits() as u64],
+                1,
+            ),
+            (
+                42,
+                "FLOAT_NOTEQUAL",
+                4,
+                &[f32::NAN.to_bits() as u64, 1.0f32.to_bits() as u64],
+                0,
+            ),
+            (
+                43,
+                "FLOAT_LESS",
+                4,
+                &[1.25f32.to_bits() as u64, 2.5f32.to_bits() as u64],
+                1,
+            ),
+            (
+                44,
+                "FLOAT_LESSEQUAL",
+                4,
+                &[2.5f32.to_bits() as u64, 1.25f32.to_bits() as u64],
+                0,
+            ),
+            (46, "FLOAT_NAN", 4, &[f32::NAN.to_bits() as u64], 1),
+            (
+                41,
+                "FLOAT_EQUAL",
+                8,
+                &[0.0f64.to_bits(), (-0.0f64).to_bits()],
+                1,
+            ),
+            (
+                42,
+                "FLOAT_NOTEQUAL",
+                8,
+                &[f64::NAN.to_bits(), 1.0f64.to_bits()],
+                0,
+            ),
+            (
+                43,
+                "FLOAT_LESS",
+                8,
+                &[1.25f64.to_bits(), 2.5f64.to_bits()],
+                1,
+            ),
+            (
+                44,
+                "FLOAT_LESSEQUAL",
+                8,
+                &[2.5f64.to_bits(), 1.25f64.to_bits()],
+                0,
+            ),
+            (46, "FLOAT_NAN", 8, &[f64::NAN.to_bits()], 1),
+        ];
+        let has_lli = Command::new("lli").arg("--version").output().is_ok();
+        for &(opcode, mnemonic, bytes, inputs, expected) in cases {
+            let widths = vec![bytes; inputs.len()];
+            let operation = operation(opcode, mnemonic, 1, &widths);
+            assert_eq!(operation.evaluate_exact(inputs).unwrap(), Some(expected));
+            let llvm = emit_pcode_exact_operation_llvm(&operation).unwrap();
+            let _ = run_opt(&llvm, &["-passes=verify", "-disable-output", "-"]);
+            if !has_lli {
+                continue;
+            }
+            let arguments = inputs
+                .iter()
+                .map(|value| format!("i{} {value}", bytes * 8))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let main = format!(
+                "define i32 @main() {{\nentry:\n  %actual = call i8 @hydir_pcode_exact({arguments})\n  %correct = icmp eq i8 %actual, {expected}\n  %failed = xor i1 %correct, true\n  %status = zext i1 %failed to i32\n  ret i32 %status\n}}\n"
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), format!("{llvm}\n{main}")).unwrap();
+            let result = Command::new("lli").arg(file.path()).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{mnemonic} i{}: {}",
+                bytes * 8,
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 
     #[test]

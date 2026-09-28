@@ -51,6 +51,11 @@ pub enum PcodeExactOp {
     BooleanXor,
     BooleanAnd,
     BooleanOr,
+    FloatEqual,
+    FloatNotEqual,
+    FloatLess,
+    FloatLessEqual,
+    FloatNan,
     Piece,
     Subpiece,
     PopCount,
@@ -331,6 +336,36 @@ impl PcodeSemanticOperation {
             PcodeExactOp::BooleanXor => values[0] ^ values[1],
             PcodeExactOp::BooleanAnd => values[0] & values[1],
             PcodeExactOp::BooleanOr => values[0] | values[1],
+            PcodeExactOp::FloatEqual
+            | PcodeExactOp::FloatNotEqual
+            | PcodeExactOp::FloatLess
+            | PcodeExactOp::FloatLessEqual
+            | PcodeExactOp::FloatNan => {
+                let compare = |left: f64, right: f64| match operation {
+                    PcodeExactOp::FloatEqual => left == right,
+                    // Ghidra's FLOAT_NOTEQUAL is ordered: NaN compares false.
+                    PcodeExactOp::FloatNotEqual => {
+                        !left.is_nan() && !right.is_nan() && left != right
+                    }
+                    PcodeExactOp::FloatLess => left < right,
+                    PcodeExactOp::FloatLessEqual => left <= right,
+                    PcodeExactOp::FloatNan => left.is_nan(),
+                    _ => unreachable!(),
+                };
+                let left = if widths[0] == 32 {
+                    f64::from(f32::from_bits(values[0] as u32))
+                } else {
+                    f64::from_bits(values[0] as u64)
+                };
+                let right = if operation == PcodeExactOp::FloatNan {
+                    left
+                } else if widths[1] == 32 {
+                    f64::from(f32::from_bits(values[1] as u32))
+                } else {
+                    f64::from_bits(values[1] as u64)
+                };
+                u128::from(compare(left, right))
+            }
             PcodeExactOp::Piece => (values[0] << widths[1]) | values[1],
             PcodeExactOp::Subpiece => values[0] >> (values[1] * 8),
             PcodeExactOp::Equal => u128::from(values[0] == values[1]),
@@ -448,6 +483,11 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
         38 => (Op::BooleanXor, "BOOL_XOR"),
         39 => (Op::BooleanAnd, "BOOL_AND"),
         40 => (Op::BooleanOr, "BOOL_OR"),
+        41 => (Op::FloatEqual, "FLOAT_EQUAL"),
+        42 => (Op::FloatNotEqual, "FLOAT_NOTEQUAL"),
+        43 => (Op::FloatLess, "FLOAT_LESS"),
+        44 => (Op::FloatLessEqual, "FLOAT_LESSEQUAL"),
+        46 => (Op::FloatNan, "FLOAT_NAN"),
         62 => (Op::Piece, "PIECE"),
         63 => (Op::Subpiece, "SUBPIECE"),
         72 => (Op::PopCount, "POPCOUNT"),
@@ -561,6 +601,13 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
             PcodeExactOp::BooleanXor | PcodeExactOp::BooleanAnd | PcodeExactOp::BooleanOr => {
                 output.size == 1 && sizes.as_slice() == [1, 1]
             }
+            PcodeExactOp::FloatEqual
+            | PcodeExactOp::FloatNotEqual
+            | PcodeExactOp::FloatLess
+            | PcodeExactOp::FloatLessEqual => {
+                output.size == 1 && matches!(sizes.as_slice(), [4, 4] | [8, 8])
+            }
+            PcodeExactOp::FloatNan => output.size == 1 && matches!(sizes.as_slice(), [4] | [8]),
             PcodeExactOp::Piece => sizes.len() == 2 && sizes[0] + sizes[1] == output.size,
             PcodeExactOp::Subpiece => {
                 sizes.len() == 2
@@ -1184,6 +1231,73 @@ mod tests {
         ] {
             assert!(matches!(
                 lower_operation(&source),
+                PcodeEffect::Opaque { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn float_comparisons_preserve_ordered_nan_and_signed_zero_rules() {
+        let zero = u64::from(0.0f32.to_bits());
+        let negative_zero = u64::from((-0.0f32).to_bits());
+        let one = u64::from(1.25f32.to_bits());
+        let two = u64::from(2.5f32.to_bits());
+        let nan = u64::from(f32::NAN.to_bits());
+        for (opcode, mnemonic, left, right, expected) in [
+            (41, "FLOAT_EQUAL", zero, negative_zero, 1),
+            (42, "FLOAT_NOTEQUAL", zero, negative_zero, 0),
+            (43, "FLOAT_LESS", one, two, 1),
+            (44, "FLOAT_LESSEQUAL", two, one, 0),
+            (41, "FLOAT_EQUAL", nan, one, 0),
+            (42, "FLOAT_NOTEQUAL", nan, one, 0),
+            (43, "FLOAT_LESS", nan, one, 0),
+            (44, "FLOAT_LESSEQUAL", nan, one, 0),
+        ] {
+            let operation = lowered(op(opcode, mnemonic, Some(1), &[4, 4]));
+            assert!(matches!(operation.effect, PcodeEffect::Assign { .. }));
+            assert_eq!(
+                operation.evaluate_exact(&[left, right]).unwrap(),
+                Some(expected)
+            );
+        }
+        let nan_test = lowered(op(46, "FLOAT_NAN", Some(1), &[4]));
+        assert_eq!(nan_test.evaluate_exact(&[nan]).unwrap(), Some(1));
+        assert_eq!(nan_test.evaluate_exact(&[one]).unwrap(), Some(0));
+
+        let f64_nan = f64::NAN.to_bits();
+        let f64_one = 1.25f64.to_bits();
+        let f64_two = 2.5f64.to_bits();
+        assert_eq!(
+            lowered(op(43, "FLOAT_LESS", Some(1), &[8, 8]))
+                .evaluate_exact(&[f64_one, f64_two])
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            lowered(op(42, "FLOAT_NOTEQUAL", Some(1), &[8, 8]))
+                .evaluate_exact(&[f64_nan, f64_one])
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            lowered(op(46, "FLOAT_NAN", Some(1), &[8]))
+                .evaluate_exact(&[f64_nan])
+                .unwrap(),
+            Some(1)
+        );
+        for invalid in [
+            op(41, "FLOAT_EQUAL", Some(1), &[4, 8]),
+            op(41, "FLOAT_EQUAL", Some(2), &[4, 4]),
+            op(42, "FLOAT_NOTEQUAL", Some(1), &[2, 2]),
+            op(43, "FLOAT_LESS", Some(1), &[16, 16]),
+            op(44, "FLOAT_LESSEQUAL", Some(1), &[4]),
+            op(46, "FLOAT_NAN", Some(1), &[4, 4]),
+            op(46, "FLOAT_NAN", Some(2), &[8]),
+            op(46, "FLOAT_NAN", Some(1), &[16]),
+            op(46, "FLOAT_EQUAL", Some(1), &[8]),
+        ] {
+            assert!(matches!(
+                lower_operation(&invalid),
                 PcodeEffect::Opaque { .. }
             ));
         }
