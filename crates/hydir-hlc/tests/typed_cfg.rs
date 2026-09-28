@@ -3,8 +3,90 @@ use hydir_hlc::{
     HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, emit_typed_cfg_c,
     lower_high_level_cfg_cir, validate_high_level_cfg_cir,
 };
-use hydir_model::init_model;
+use hydir_model::{TypeDefinitionKind, import_dwarf, init_model};
 use std::{fs, path::PathBuf, process::Command};
+
+#[test]
+fn dwarf_linked_list_loop_compiles_and_matches_wrapping_oracle() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/hydir_aggregate_walk.c");
+    let temp = tempfile::tempdir().unwrap();
+    let elf = temp.path().join("walk.elf");
+    let mut build = Command::new("clang");
+    if cfg!(windows) {
+        build.args(["--target=x86_64-unknown-linux-gnu", "-fuse-ld=lld"]);
+    }
+    let build = build
+        .args([
+            "-O2",
+            "-g",
+            "-fno-stack-protector",
+            "-fno-builtin",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+            "-Wl,-e,_start",
+        ])
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&elf)
+        .output()
+        .expect("Clang is required for the linked-list fixture");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let bytes = fs::read(elf).unwrap();
+    let native = decompile_symbol(&bytes, "hydir_walk_nodes64").unwrap();
+    let mut model = init_model(&bytes).unwrap();
+    import_dwarf(&bytes, &mut model).unwrap();
+    let node = model
+        .types
+        .iter()
+        .find(|row| {
+            row.name.starts_with("Node64_") && matches!(row.kind, TypeDefinitionKind::Struct { .. })
+        })
+        .expect("DWARF Node64 layout");
+    assert_eq!(node.size_bytes, 16);
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    assert!(ir.blocks.len() > 2);
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(c.contains("* hydir_rsi"));
+    assert!(c.contains("while (") || c.contains("goto hydir_bb_"));
+    let expected = (u64::MAX)
+        .wrapping_add(0x8000_0000_0000_0000)
+        .wrapping_mul(3);
+    let harness = format!(
+        "{c}\nint main(void) {{\n  struct {} tail = {{ UINT64_C(3), 0 }};\n  struct {} head = {{ UINT64_C(2), &tail }};\n  if (hydir_walk_nodes64(0, 4) != 0) return 1;\n  if (hydir_walk_nodes64(&tail, 4) != 12) return 2;\n  if (hydir_walk_nodes64(&head, 4) != 20) return 3;\n  tail.value = UINT64_MAX;\n  head.value = UINT64_C(0x8000000000000000);\n  if (hydir_walk_nodes64(&head, 3) != UINT64_C({expected})) return 4;\n  return 0;\n}}\n",
+        node.name, node.name,
+    );
+    let source = temp.path().join("generated.c");
+    fs::write(&source, harness).unwrap();
+    for compiler in ["clang", "gcc"] {
+        if Command::new(compiler).arg("--version").output().is_err() {
+            continue;
+        }
+        let exe = temp.path().join(format!("generated_{compiler}.exe"));
+        let result = Command::new(compiler)
+            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{compiler}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            Command::new(exe).status().unwrap().success(),
+            "{compiler} result differs"
+        );
+    }
+}
 
 #[test]
 fn scalar_cfg_branches_and_loops_compile_and_match_oracles() {
@@ -133,7 +215,12 @@ fn scalar_cfg_rejects_unmodeled_widths_and_callee_saved_writes() {
     );
     let bytes = fs::read(&object).unwrap();
     let model = init_model(&bytes).unwrap();
-    for symbol in ["hydir_cfg_memory_byte", "hydir_cfg_callee_saved"] {
+    for symbol in [
+        "hydir_cfg_memory_byte",
+        "hydir_cfg_callee_saved",
+        "hydir_cfg_imul_observed_flags",
+        "hydir_cfg_xor32_observed_flags",
+    ] {
         let native = decompile_symbol(&bytes, symbol).unwrap();
         assert!(
             lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).is_err(),

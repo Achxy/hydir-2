@@ -38,7 +38,15 @@ their P-code event order and instruction visits must match. Linux GDB checks
 the generated ELF and selected code bytes. The DWARF model must recover a
 16-byte recursive `Node` with an `i32` field at offset 0 and a self pointer at
 offset 8. This fixture tests concrete aggregate access and DWARF layout
-import; it does not prove stripped type recovery or typed C for this loop.
+import; it does not prove stripped type recovery or typed C for the 32-bit walk.
+The same source also contains a 64-bit recursive `Node64` walk. With its
+DWARF model, Hydir emits typed C for the optimized loop. Clang and GCC must
+strict-compile and execute that C on empty, one-node, two-node, and wrapping
+cases; Linux GDB checks the corresponding native ELF results and code bytes.
+The same four paths also compare full 64-bit Rust and compiled LLVM results
+and ordered raw P-code events. All scalar result assertions read every byte
+of the declared return width from Rust's byte-addressed trace.
+The 32-bit walk remains outside this typed-C subset.
 
 Run after building `hydirctl`:
 

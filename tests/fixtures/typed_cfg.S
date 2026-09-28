@@ -579,3 +579,27 @@ hydir_cfg_zeroing:
     addq %rdi, %rax
     retq
 .size hydir_cfg_zeroing, .-hydir_cfg_zeroing
+
+.globl hydir_cfg_imul_observed_flags
+.type hydir_cfg_imul_observed_flags,@function
+hydir_cfg_imul_observed_flags:
+    movq %rdi, %rax
+    imulq %rsi, %rax
+    jo .Limul_overflow
+    retq
+.Limul_overflow:
+    movq $1, %rax
+    retq
+.size hydir_cfg_imul_observed_flags, .-hydir_cfg_imul_observed_flags
+
+.globl hydir_cfg_xor32_observed_flags
+.type hydir_cfg_xor32_observed_flags,@function
+hydir_cfg_xor32_observed_flags:
+    xorl %eax, %eax
+    jz .Lxor32_zero
+    movq $2, %rax
+    retq
+.Lxor32_zero:
+    movq $1, %rax
+    retq
+.size hydir_cfg_xor32_observed_flags, .-hydir_cfg_xor32_observed_flags

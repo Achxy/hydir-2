@@ -22,6 +22,8 @@ const MAX_EXPRESSION_INSTRUCTIONS: usize = 16 * 1024;
 pub enum BinaryOperator {
     Add,
     Subtract,
+    /// Low-width modular product; signed and unsigned multiply have the same low bits.
+    Multiply,
     And,
     Or,
     Xor,

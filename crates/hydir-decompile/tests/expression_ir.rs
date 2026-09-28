@@ -185,6 +185,7 @@ fn evaluate(expression: &Expression, inputs: &BTreeMap<&str, u64>) -> u64 {
             (match operator {
                 BinaryOperator::Add => left.wrapping_add(right),
                 BinaryOperator::Subtract => left.wrapping_sub(right),
+                BinaryOperator::Multiply => left.wrapping_mul(right),
                 BinaryOperator::And => left & right,
                 BinaryOperator::Or => left | right,
                 BinaryOperator::Xor => left ^ right,

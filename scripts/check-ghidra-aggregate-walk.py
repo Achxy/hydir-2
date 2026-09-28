@@ -27,6 +27,7 @@ CASES = (
     ("two", (2, 3), 4, 20),
     ("zero-scale", (2, 3), 0, 0),
 )
+MASK64 = (1 << 64) - 1
 
 
 def build_variants(directory):
@@ -84,7 +85,7 @@ def seed_for(binary, entry, nodes, scale):
     }
 
 
-def native_result(binary, snapshot_path, nodes, scale):
+def native_result(binary, snapshot_path, nodes, scale, return_bits=32):
     if sys.platform != "linux" or platform.machine() != "x86_64":
         return None
     if not shutil.which("gdb"):
@@ -92,7 +93,8 @@ def native_result(binary, snapshot_path, nodes, scale):
     env = {**os.environ,
            "HYDIR_NATIVE_SNAPSHOT": str(snapshot_path),
            "HYDIR_NATIVE_NODES": json.dumps(nodes),
-           "HYDIR_NATIVE_SCALE": str(scale)}
+           "HYDIR_NATIVE_SCALE": str(scale),
+           "HYDIR_NATIVE_RETURN_BITS": str(return_bits)}
     output = matrix.run(["gdb", "-nx", "-q", "--batch", "-x", GDB_SCRIPT, binary],
                         env=env, timeout=90)
     results = [json.loads(line.removeprefix("HYDIR_NATIVE_RESULT="))
@@ -112,7 +114,8 @@ def check_dwarf_layout(directory, client, binary):
     matrix.run([client, "model", "verify", binary, imported_path])
     model = matrix.load(imported_path)
     nodes = [row for row in model["types"]
-             if row["kind"]["kind"] == "struct" and
+             if row["name"].startswith("Node_") and
+             row["kind"]["kind"] == "struct" and
              {field["name"] for field in row["kind"]["fields"]} == {"value", "next"}]
     if len(nodes) != 1 or nodes[0]["size_bytes"] != 16:
         raise AssertionError(f"DWARF Node layout missing in {binary}")
@@ -129,6 +132,116 @@ def check_dwarf_layout(directory, client, binary):
         raise AssertionError(f"DWARF Node fields are wrong in {binary}")
     return {"size_bytes": 16, "value_offset": 0, "next_offset": 8,
             "recursive_pointer": True}
+
+
+def check_typed_walk(directory, client, binary):
+    model_path = directory / f"{binary.stem}-dwarf-model.json"
+    model = matrix.load(model_path)
+    nodes = [row for row in model["types"] if row["name"].startswith("Node64_")]
+    if len(nodes) != 1 or nodes[0]["size_bytes"] != 16:
+        raise AssertionError("DWARF Node64 layout is missing")
+    fields = {field["name"]: field for field in nodes[0]["kind"]["fields"]}
+    if (set(fields) != {"value", "next"} or
+            fields["value"]["offset_bytes"] != 0 or
+            fields["value"]["ty"] != {"kind": "primitive", "name": "u64"} or
+            fields["next"]["offset_bytes"] != 8 or
+            fields["next"]["ty"] !=
+            {"kind": "pointer", "to": {"kind": "named", "id": nodes[0]["id"]}}):
+        raise AssertionError("DWARF Node64 fields or recursive pointer are wrong")
+    node_name = nodes[0]["name"]
+    typed_c = matrix.run([client, "decompile", binary, "--function",
+                          "hydir_walk_nodes64", "--view", "typed",
+                          "--model", model_path])
+    if (f"struct {node_name} *" not in typed_c or
+            "hydir_walk_nodes64" not in typed_c or
+            "hydir_rcx * hydir_rsi" not in typed_c):
+        raise AssertionError("typed C lost the recursive prototype or modular product")
+    output = directory / f"{binary.stem}-typed.c"
+    output.write_text(typed_c, encoding="utf-8")
+    wrap = ((1 << 63) + MASK64) * 3 & MASK64
+    harness = output.with_name(f"{binary.stem}-typed-harness.c")
+    harness.write_text(
+        typed_c + f"\nint main(void) {{\n"
+        f"  struct {node_name} tail = {{ UINT64_C(3), 0 }};\n"
+        f"  struct {node_name} head = {{ UINT64_C(2), &tail }};\n"
+        "  if (hydir_walk_nodes64(0, 4) != 0) return 1;\n"
+        "  if (hydir_walk_nodes64(&tail, 4) != 12) return 2;\n"
+        "  if (hydir_walk_nodes64(&head, 4) != 20) return 3;\n"
+        "  tail.value = UINT64_MAX;\n"
+        "  head.value = UINT64_C(0x8000000000000000);\n"
+        f"  if (hydir_walk_nodes64(&head, 3) != UINT64_C({wrap})) return 4;\n"
+        "  return 0;\n}\n", encoding="utf-8")
+    compilers = []
+    for compiler in ("clang", "gcc"):
+        if not shutil.which(compiler):
+            continue
+        executable = directory / f"{binary.stem}-{compiler}-typed"
+        if sys.platform == "win32":
+            executable = executable.with_suffix(".exe")
+        matrix.run([compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                    harness, "-o", executable])
+        matrix.run([executable])
+        compilers.append(compiler)
+    if "clang" not in compilers or sys.platform == "linux" and "gcc" not in compilers:
+        raise AssertionError("strict C11 compiler coverage is incomplete")
+    nm = shutil.which("llvm-nm") or shutil.which("nm")
+    entries = []
+    for row in matrix.run([nm, binary]).splitlines():
+        match = re.fullmatch(r"\s*([0-9a-fA-F]+)\s+[Tt]\s+hydir_walk_nodes64", row)
+        if match:
+            entries.append(int(match.group(1), 16))
+    if len(entries) != 1:
+        raise AssertionError("missing unique hydir_walk_nodes64 symbol")
+    snapshot_path = directory / f"{binary.stem}-typed-snapshot.json"
+    matrix.run([client, "ghidra", "analyze", binary, "--function", hex(entries[0]),
+                "--output", snapshot_path], timeout=180)
+    snapshot = matrix.load(snapshot_path)
+    if (snapshot["binary_sha256"] != hashlib.sha256(binary.read_bytes()).hexdigest() or
+            snapshot["selected_function"]["entry"]["offset"] != hex(entries[0])):
+        raise AssertionError("typed native snapshot selected the wrong function")
+    cases = (
+        ("empty", (), 4, 0),
+        ("one", (3,), 4, 12),
+        ("two", (2, 3), 4, 20),
+        ("wrap", (1 << 63, MASK64), 3, wrap),
+    )
+    llvm_path = directory / f"{binary.stem}-typed-llvm.json"
+    matrix.run([client, "ghidra-snapshot", "llvm-cfg-image", binary,
+                snapshot_path, "--output", llvm_path])
+    artifact = matrix.load(llvm_path)
+    if artifact["schema_version"] != 3 or artifact["binary_sha256"] != snapshot["binary_sha256"]:
+        raise AssertionError("typed walk LLVM binding failed")
+    module_path = llvm_path.with_suffix(".ll")
+    module_path.write_text(artifact["llvm_ir"], encoding="utf-8")
+    seeds = {}
+    traces = {}
+    for name, values, scale, expected in cases:
+        seed = seed_for(binary, entries[0], values, scale)
+        seeds[name] = seed
+        seed_path = directory / f"{binary.stem}-typed-{name}-seed.json"
+        seed_path.write_text(json.dumps(seed, indent=2) + "\n", encoding="utf-8")
+        trace_path = directory / f"{binary.stem}-typed-{name}-trace.json"
+        matrix.run([client, "ghidra-snapshot", "trace-path", binary,
+                    snapshot_path, seed_path, "--max-ops", "8192",
+                    "--max-visits", "512", "--output", trace_path])
+        trace = matrix.load(trace_path)
+        if (trace["stop"]["kind"] != "return" or
+                matrix.read_trace_register(trace, 0, 8) != expected):
+            raise AssertionError(f"typed walk Rust path failed: {name}: {trace['stop']}")
+        traces[name] = trace
+    llvm = matrix.llvm_cases(artifact, module_path, "walk64", cases, seeds, traces)
+    native = {}
+    for name, values, scale, expected in cases:
+        result = native_result(binary, snapshot_path, values, scale, 64)
+        if result is not None:
+            if (result["result"] != expected or
+                    result["verified_instruction_bytes"] !=
+                    len(snapshot["selected_function"]["instructions"])):
+                raise AssertionError(f"typed/native mismatch: {name}: {result}")
+            native[name] = expected
+    return {"model_revision": model["revision"], "node_size_bytes": 16,
+            "strict_c11_compilers": compilers, "llvm": llvm,
+            "native_results": native}
 
 
 def check_variant(directory, client, binary, entry):
@@ -164,7 +277,7 @@ def check_variant(directory, client, binary, entry):
         trace = matrix.load(trace_path)
         traces[name] = trace
         if (trace["stop"]["kind"] != "return" or
-                trace["final_state"]["register_bytes"].get("0") != expected or
+                matrix.read_trace_register(trace, 0, 4) != expected or
                 len(trace["instruction_visits"]) < (1 if not nodes else 5)):
             raise AssertionError(f"aggregate Rust result failed: {label}/{name}: {trace['stop']}")
         native_row = native_result(binary, snapshot_path, nodes, scale)
@@ -197,7 +310,8 @@ def main():
         raise RuntimeError(f"build hydirctl first: {client}")
     report = {"schema_version": 1, "source": str(SOURCE.relative_to(ROOT)),
               "variants": {}}
-    for level, (dwarf, stripped, entry) in build_variants(directory).items():
+    variants = build_variants(directory)
+    for level, (dwarf, stripped, entry) in variants.items():
         pair = {}
         for binary, debug in ((dwarf, "dwarf"), (stripped, "stripped")):
             pair[debug] = check_variant(directory, client, binary, entry)
@@ -209,6 +323,9 @@ def main():
                                    for debug, row in pair.items()})
         (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n",
                                                encoding="utf-8")
+    report["typed_walk"] = check_typed_walk(directory, client, variants["o2"][0])
+    (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n",
+                                           encoding="utf-8")
     print(f"Ghidra aggregate walk gate passed: {directory / 'report.json'}")
 
 

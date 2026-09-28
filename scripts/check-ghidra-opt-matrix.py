@@ -51,6 +51,15 @@ def load(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_trace_register(trace, offset, size):
+    values = trace["final_state"]["register_bytes"]
+    try:
+        data = bytes(values[str(offset + index)] for index in range(size))
+    except KeyError as error:
+        raise AssertionError(f"Rust trace register {hex(offset)} has unknown bytes") from error
+    return int.from_bytes(data, "little")
+
+
 def build_variants(directory):
     clang = shutil.which("clang")
     strip = shutil.which("llvm-strip") or shutil.which("strip")
@@ -242,7 +251,7 @@ def llvm_cases(artifact, module_path, kind, cases, seeds, rust_traces):
                 continue
             if rust_traces[name]["stop"]["kind"] != "return":
                 raise AssertionError(f"LLVM returned through an unsupported Rust path: {kind}/{name}")
-            width = 8 if kind == "add2" else 4
+            width = 8 if kind in ("add2", "walk64") else 4
             value = read_llvm_register(byte_map, state, known, 0, width)
             if value != expected:
                 raise AssertionError(f"LLVM {kind}/{name}: {value} != {expected}")
@@ -318,7 +327,7 @@ def main():
                     traces[name] = trace
                     if trace["stop"]["kind"] != "return":
                         raise AssertionError(f"Rust stopped unexpectedly: {label}/{kind}/{name}: {trace['stop']}")
-                    if trace["final_state"]["register_bytes"]["0"] != expected:
+                    if read_trace_register(trace, 0, 8 if kind == "add2" else 4) != expected:
                         raise AssertionError(f"wrong Rust result: {label}/{kind}/{name}")
                     native_result_row = native_result(binary, snapshot_path, kind, case)
                     if native_result_row is not None:

@@ -235,6 +235,7 @@ fn scalar_expression(expression: &Expression) -> Result<HighExpr, String> {
             let op = match operator {
                 ExpressionBinaryOperator::Add => BinaryOp::Add,
                 ExpressionBinaryOperator::Subtract => BinaryOp::Sub,
+                ExpressionBinaryOperator::Multiply => BinaryOp::Mul,
                 ExpressionBinaryOperator::And => BinaryOp::And,
                 ExpressionBinaryOperator::Or => BinaryOp::Or,
                 ExpressionBinaryOperator::Xor => BinaryOp::Xor,
@@ -861,6 +862,68 @@ fn normalized_register_value(
         return Err("typed CFG register write has ambiguous ExpressionIR semantics".to_owned());
     }
     scalar_expression(&assignment.value)
+}
+
+fn normalized_xor_zero_32(
+    semantic: &ExpressionInstruction,
+    register_name: &str,
+) -> Result<(), String> {
+    let component = format!("register:{register_name}");
+    let mut writes = semantic
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.target.component == component);
+    let assignment = writes
+        .next()
+        .ok_or("typed CFG 32-bit XOR lacks a normalized register write")?;
+    if writes.next().is_some()
+        || !semantic.memory_writes.is_empty()
+        || semantic.assignments.iter().any(|assignment| {
+            assignment.target.component != component
+                && !assignment.target.component.starts_with("flag:")
+        })
+    {
+        return Err("typed CFG 32-bit XOR has ambiguous state writes".to_owned());
+    }
+    if semantic.residual.as_ref().is_some_and(|residual| {
+        residual.memory != MachineMemoryEffect::None
+            || residual
+                .outputs
+                .iter()
+                .any(|output| !output.component.starts_with("flag:"))
+            || residual
+                .undefined_outputs
+                .iter()
+                .any(|output| !output.starts_with("flag:"))
+    }) {
+        return Err("typed CFG 32-bit XOR has an unmodeled non-flag effect".to_owned());
+    }
+    let Expression::ZeroExtend {
+        value,
+        width_bits: 64,
+    } = &assignment.value
+    else {
+        return Err("typed CFG 32-bit XOR lacks zero-extension semantics".to_owned());
+    };
+    let Expression::Binary {
+        operator: ExpressionBinaryOperator::Xor,
+        width_bits: 32,
+        left,
+        right,
+    } = value.as_ref()
+    else {
+        return Err("typed CFG 32-bit XOR lacks normalized XOR semantics".to_owned());
+    };
+    if left != right
+        || !matches!(left.as_ref(),
+            Expression::Extract { value, lsb_bits: 0, width_bits: 32 }
+                if matches!(value.as_ref(),
+                    Expression::Read { source, width_bits: 64 }
+                        if source.component == component))
+    {
+        return Err("typed CFG 32-bit XOR is not a proven self-zeroing idiom".to_owned());
+    }
+    Ok(())
 }
 
 fn normalized_zero_flag(
@@ -1499,6 +1562,69 @@ fn lower_instruction(
             *flag_source = Some(FlagSource::Add);
             None
         }
+        (
+            "xor",
+            [
+                MachineOperand::Register {
+                    name: destination,
+                    width_bits: 32,
+                },
+                MachineOperand::Register {
+                    name: source,
+                    width_bits: 32,
+                },
+            ],
+        ) if destination == source
+            && instruction.effects.control == MachineControlEffect::Next
+            && instruction.effects.memory == MachineMemoryEffect::None
+            && !snapshot_flags =>
+        {
+            let target = local(destination)?;
+            normalized_xor_zero_32(semantic, destination)?;
+            push_assignment(statements, target, HighExpr::Constant { value: 0 }, site);
+            *flag_source = None;
+            None
+        }
+        ("imul", [destination, MachineOperand::Register { width_bits: 64, .. }])
+            if instruction.effects.control == MachineControlEffect::Next
+                && instruction.effects.memory == MachineMemoryEffect::None
+                && !snapshot_flags =>
+        {
+            let target = register(destination)?;
+            let register_name = target.strip_prefix("hydir_").unwrap();
+            if !semantic.memory_writes.is_empty()
+                || semantic.assignments.iter().any(|assignment| {
+                    assignment.target.component != format!("register:{register_name}")
+                        && !assignment.target.component.starts_with("flag:")
+                })
+                || semantic.residual.as_ref().is_some_and(|residual| {
+                    residual.memory != MachineMemoryEffect::None
+                        || residual
+                            .outputs
+                            .iter()
+                            .any(|output| !output.component.starts_with("flag:"))
+                        || residual
+                            .undefined_outputs
+                            .iter()
+                            .any(|output| !output.starts_with("flag:"))
+                })
+            {
+                return Err("typed CFG multiply has an unmodeled non-flag effect".to_owned());
+            }
+            let expression = normalized_register_value(semantic, register_name)?;
+            if !matches!(
+                expression,
+                HighExpr::Binary {
+                    op: BinaryOp::Mul,
+                    ..
+                }
+            ) {
+                return Err("typed CFG multiply lacks normalized modular product".to_owned());
+            }
+            push_assignment(statements, target, expression, site);
+            *flag_source = None;
+            None
+        }
         ("xor" | "and" | "or", [destination, _source])
             if instruction.effects.control == MachineControlEffect::Next =>
         {
@@ -1559,9 +1685,23 @@ fn lower_instruction(
             *flag_source = Some(FlagSource::Logical);
             None
         }
-        ("nop" | "endbr64", []) if instruction.effects.control == MachineControlEffect::Next => {
+        ("nop", _)
+            if instruction.effects.control == MachineControlEffect::Next
+                && instruction.effects.read_registers.is_empty()
+                && instruction.effects.written_registers.is_empty()
+                && instruction.effects.read_flags.is_empty()
+                && instruction.effects.written_flags.is_empty()
+                && instruction.effects.undefined_flags.is_empty()
+                && semantic.assignments.is_empty()
+                && semantic.memory_writes.is_empty()
+                && semantic
+                    .residual
+                    .as_ref()
+                    .is_none_or(|residual| residual.outputs.is_empty()) =>
+        {
             None
         }
+        ("endbr64", []) if instruction.effects.control == MachineControlEffect::Next => None,
         ("ret", []) if instruction.effects.control == MachineControlEffect::Return => {
             Some(HighCfgTerminator::Return {
                 value: HighExpr::Variable {

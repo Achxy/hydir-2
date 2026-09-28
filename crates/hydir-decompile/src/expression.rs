@@ -218,17 +218,21 @@ fn normalized_register_assignment(
     if !matches!(*width_bits, 8 | 16 | 32 | 64) {
         return None;
     }
+    if family == "imul" && *width_bits == 8 {
+        return None;
+    }
     let right = register_value(source, 1, instruction, inputs)?;
     if right.width_bits() != *width_bits {
         return None;
     }
     let narrow_value = match family {
         "mov" => right,
-        "add" | "sub" | "and" | "or" | "xor" => {
+        "add" | "sub" | "imul" | "and" | "or" | "xor" => {
             let left = register_value(&instruction.operands[0], 0, instruction, inputs)?;
             let operator = match family {
                 "add" => BinaryOperator::Add,
                 "sub" => BinaryOperator::Subtract,
+                "imul" => BinaryOperator::Multiply,
                 "and" => BinaryOperator::And,
                 "or" => BinaryOperator::Or,
                 _ => BinaryOperator::Xor,

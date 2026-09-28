@@ -215,7 +215,7 @@ def check_variant(directory, client, level, debug):
                     "--output", trace_path])
         trace = matrix.load(trace_path)
         if (trace["binary_sha256"] != digest or trace["stop"]["kind"] != "return" or
-                trace["final_state"]["register_bytes"].get("0") != expected or
+                matrix.read_trace_register(trace, 0, 8) != expected or
                 len(trace["calls"]) != len(candidate)):
             raise AssertionError(f"wrong Rust loop/call path: {label}/{name}: {trace['stop']}")
         native_case = (name, candidate, len(candidate), expected)
@@ -244,7 +244,7 @@ def check_variant(directory, client, level, debug):
                     "--output", auto_path], timeout=180)
         automatic = matrix.load(auto_path)
         if (automatic["stop"]["kind"] != "return" or
-                automatic["final_state"]["register_bytes"].get("0") !=
+                matrix.read_trace_register(automatic, 0, 8) !=
                 results["phrase"]["result"] or len(automatic["calls"]) != 12 or
                 automatic["snapshot_diagnostics"]):
             raise AssertionError("automatic Ghidra call collection regressed")

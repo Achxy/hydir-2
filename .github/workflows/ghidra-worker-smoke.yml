@@ -8,6 +8,8 @@ on:
       - crates/hydir-ghidra-worker/**
       - crates/hydir-cli/**
       - crates/hydir-decompile/**
+      - crates/hydir-hlc/**
+      - crates/hydir-model/**
       - crates/hydir-gui/**
       - crates/hydir-ir/**
       - crates/hydir-server/**
@@ -40,6 +42,8 @@ on:
       - crates/hydir-ghidra-worker/**
       - crates/hydir-cli/**
       - crates/hydir-decompile/**
+      - crates/hydir-hlc/**
+      - crates/hydir-model/**
       - crates/hydir-gui/**
       - crates/hydir-ir/**
       - crates/hydir-server/**
