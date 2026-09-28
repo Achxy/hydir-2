@@ -13,11 +13,13 @@ instructions = {
 }
 entry = int(snapshot["selected_function"]["entry"]["offset"], 16)
 ret_address = int(os.environ["HYDIR_NATIVE_RETURN"], 16)
-ret_instruction = next(
+return_instructions = {
     int(row["address"]["offset"], 16)
     for row in snapshot["selected_function"]["instructions"]
     if row["mnemonic"] == "RET"
-)
+}
+if not return_instructions:
+    raise RuntimeError("selected function has no RET instruction")
 observed_instruction = (
     int(os.environ["HYDIR_NATIVE_OBSERVE_INSTRUCTION"], 16)
     if "HYDIR_NATIVE_OBSERVE_INSTRUCTION" in os.environ else None
@@ -49,7 +51,7 @@ visits = []
 max_visits = int(os.environ.get("HYDIR_NATIVE_MAX_VISITS", str(len(instructions) + 1)))
 for _ in range(max_visits):
     pc = int(gdb.parse_and_eval("$rip"))
-    if pc == ret_address and visits and visits[-1] == ret_instruction:
+    if pc == ret_address and visits and visits[-1] in return_instructions:
         break
     if pc not in instructions:
         raise RuntimeError("native execution left selected function at 0x%x" % pc)
