@@ -64,9 +64,6 @@ jobs:
   container-frontend:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    permissions:
-      contents: read
-      statuses: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -153,43 +150,11 @@ jobs:
       - name: Reproduce the stripped password lifting demo
         run: bash scripts/demo-ghidra-password-lift.sh
       - name: Differential Ghidra matrix across optimization and DWARF variants
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if ! (echo 'matrix stage: install gdb' && \
-            sudo apt-get update && sudo apt-get install -y gdb && \
-            echo 'matrix stage: build and analyze' && \
-            python3 scripts/check-ghidra-opt-matrix.py \
-              --output-dir "$RUNNER_TEMP/ghidra-opt-matrix") \
-            > "$RUNNER_TEMP/ghidra-opt-matrix.log" 2>&1; then
-            cat "$RUNNER_TEMP/ghidra-opt-matrix.log"
-            echo "::error::$(tail -n 1 "$RUNNER_TEMP/ghidra-opt-matrix.log")"
-            {
-              echo '### Ghidra optimization matrix failure'
-              echo '```text'
-              tail -n 30 "$RUNNER_TEMP/ghidra-opt-matrix.log"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            python3 - "$RUNNER_TEMP/ghidra-opt-matrix.log" <<'PY' || true
-          import json, os, sys, urllib.request
-          from pathlib import Path
-          lines = [line.strip() for line in Path(sys.argv[1]).read_text(
-              encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          endpoint = "https://api.github.com/repos/{}/statuses/{}".format(
-              os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"])
-          for index, line in enumerate(lines[-8:] or ["matrix log empty"]):
-              body = json.dumps({"state": "failure", "description": line[:140],
-                                 "context": f"hydir/matrix/line-{index + 1}"}).encode()
-              request = urllib.request.Request(endpoint, data=body, method="POST", headers={
-                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              })
-              urllib.request.urlopen(request, timeout=10).close()
-          PY
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/ghidra-opt-matrix.log"
+          sudo apt-get update
+          sudo apt-get install -y gdb
+          python3 scripts/check-ghidra-opt-matrix.py \
+            --output-dir "$RUNNER_TEMP/ghidra-opt-matrix"
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"
