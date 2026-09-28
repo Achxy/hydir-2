@@ -56,8 +56,8 @@ use hydir_ir::{
     MachineOperation, StateFunctionIr,
 };
 use hydir_model::{
-    AnalysisModel, TypeDefinitionKind, import_dwarf, import_ghidra_functions, infer_model,
-    init_model,
+    AnalysisModel, ModelConflict, ModelEvidence, ModelPrototype, ModelSource, TypeDefinitionKind,
+    TypeRef, import_dwarf, import_ghidra_functions, infer_model, init_model,
 };
 use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
@@ -232,6 +232,14 @@ enum Task {
         native: Box<NativeDecompilation>,
         key: String,
     },
+    EditModel {
+        binary_sha256: String,
+        expected_revision: u64,
+        model: AnalysisModel,
+        edit: ModelEdit,
+        native: Box<NativeDecompilation>,
+        key: String,
+    },
     Disassemble {
         automatic: bool,
     },
@@ -350,6 +358,12 @@ enum Event {
         project_revision: Option<u64>,
     },
     ModelRenamed {
+        binary_sha256: String,
+        entry: Location,
+        revision: u64,
+        typed: Box<Result<TypedNativeView, String>>,
+    },
+    ModelEdited {
         binary_sha256: String,
         entry: Location,
         revision: u64,
@@ -3111,6 +3125,42 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     Err(error) => Event::Failed(format!("Could not save model rename: {error}")),
                 }
             }
+            Task::EditModel {
+                binary_sha256,
+                expected_revision,
+                model,
+                edit,
+                native,
+                key,
+            } => {
+                let result = (|| {
+                    let Source::Local(bytes) = &source else {
+                        return Err("Model editing requires an open local ELF".to_owned());
+                    };
+                    let project = local_project.as_ref()
+                        .ok_or("Open a local project before editing its model")?;
+                    if project.binary_sha256 != binary_sha256 {
+                        return Err("Model edit binary differs from the open ELF".to_owned());
+                    }
+                    let mut store = LocalProjectStore::open_default()?;
+                    let (updated, _) = persist_local_model_edit(
+                        &mut store, project, bytes, expected_revision, &model, &edit, &key,
+                    )?;
+                    let typed = local_typed_view(bytes, Some(&updated), &native);
+                    let revision = updated.revision;
+                    local_project = Some(updated);
+                    Ok::<_, String>((revision, typed))
+                })();
+                match result {
+                    Ok((revision, typed)) => Event::ModelEdited {
+                        binary_sha256,
+                        entry: native.machine_ir.entry,
+                        revision,
+                        typed: Box::new(typed),
+                    },
+                    Err(error) => Event::Failed(format!("Could not save model edit: {error}")),
+                }
+            }
             Task::Disassemble { automatic } => Event::Disassembled {
                 result: match &source {
                     Source::Local(bytes) => {
@@ -3546,6 +3596,145 @@ enum ModelRenameTarget {
     Type(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModelEditTarget {
+    Prototype(Location),
+    Field { type_id: String, field_index: usize },
+}
+
+#[derive(Clone, Debug)]
+enum ModelEditDraft {
+    Prototype {
+        entry: Location,
+        json: String,
+    },
+    Field {
+        type_id: String,
+        field_index: usize,
+        name: String,
+        offset: String,
+        type_json: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum ModelEdit {
+    Prototype {
+        entry: Location,
+        value: ModelPrototype,
+    },
+    Field {
+        type_id: String,
+        field_index: usize,
+        name: String,
+        offset_bytes: u64,
+        ty: TypeRef,
+    },
+}
+
+fn model_edit_draft(
+    model: &AnalysisModel,
+    target: ModelEditTarget,
+) -> Result<ModelEditDraft, String> {
+    match target {
+        ModelEditTarget::Prototype(entry) => {
+            let function = model
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .ok_or("Selected function is absent from the analysis model")?;
+            let value = function.prototype.clone().unwrap_or(ModelPrototype {
+                parameters: Vec::new(),
+                return_type: TypeRef::Primitive {
+                    name: hydir_model::PrimitiveType::U64,
+                },
+                calling_convention: "sysv_amd64".to_owned(),
+                variadic: false,
+            });
+            Ok(ModelEditDraft::Prototype {
+                entry,
+                json: serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?,
+            })
+        }
+        ModelEditTarget::Field {
+            type_id,
+            field_index,
+        } => {
+            let definition = model
+                .types
+                .iter()
+                .find(|ty| ty.id == type_id)
+                .ok_or("Selected type is absent from the analysis model")?;
+            let fields = match &definition.kind {
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
+                    fields
+                }
+                _ => return Err("Selected type has no editable fields".to_owned()),
+            };
+            let field = fields
+                .get(field_index)
+                .ok_or("Selected field is absent from the analysis model")?;
+            Ok(ModelEditDraft::Field {
+                type_id,
+                field_index,
+                name: field.name.clone(),
+                offset: format!("0x{:x}", field.offset_bytes),
+                type_json: serde_json::to_string_pretty(&field.ty)
+                    .map_err(|error| error.to_string())?,
+            })
+        }
+    }
+}
+
+fn parse_model_edit_draft(draft: &ModelEditDraft) -> Result<ModelEdit, String> {
+    match draft {
+        ModelEditDraft::Prototype { entry, json } => {
+            if json.len() > 16_384 {
+                return Err("Prototype JSON exceeds 16 KiB".to_owned());
+            }
+            let value = serde_json::from_str(json)
+                .map_err(|error| format!("Invalid prototype JSON: {error}"))?;
+            Ok(ModelEdit::Prototype {
+                entry: *entry,
+                value,
+            })
+        }
+        ModelEditDraft::Field {
+            type_id,
+            field_index,
+            name,
+            offset,
+            type_json,
+        } => {
+            if name.len() > 128 || !valid_model_rename(name) {
+                return Err(
+                    "Field name must be a C identifier of at most 128 characters".to_owned(),
+                );
+            }
+            if type_json.len() > 16_384 {
+                return Err("Field type JSON exceeds 16 KiB".to_owned());
+            }
+            let offset_bytes = if let Some(hex) = offset.trim().strip_prefix("0x") {
+                u64::from_str_radix(hex, 16)
+            } else {
+                offset.trim().parse()
+            }
+            .map_err(|_| {
+                "Field offset must be a nonnegative decimal or 0x hexadecimal integer".to_owned()
+            })?;
+            let ty = serde_json::from_str(type_json)
+                .map_err(|error| format!("Invalid field type JSON: {error}"))?;
+            Ok(ModelEdit::Field {
+                type_id: type_id.clone(),
+                field_index: *field_index,
+                name: name.clone(),
+                offset_bytes,
+                ty,
+            })
+        }
+    }
+}
+
 struct TypedNativeView {
     model: AnalysisModel,
     ir: Option<HighLevelCir>,
@@ -3605,6 +3794,133 @@ fn persist_local_model_rename(
     };
     if previous_name == name {
         return Err("Choose a different name before saving".to_owned());
+    }
+    hydir_model::validate_model(bytes, &edited)?;
+    let updated = store.save_model(project, &edited, key)?;
+    let saved = store
+        .load_model(&updated)?
+        .ok_or("Saved analysis model could not be reloaded")?;
+    Ok((updated, saved))
+}
+
+fn persist_local_model_edit(
+    store: &mut LocalProjectStore,
+    project: &LocalProject,
+    bytes: &[u8],
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    edit: &ModelEdit,
+    key: &str,
+) -> Result<(LocalProject, AnalysisModel), String> {
+    if project.revision != expected_revision {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    hydir_model::validate_model(bytes, displayed)?;
+    if let Some(saved) = store.load_model(project)?
+        && saved != *displayed
+    {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    let mut edited = displayed.clone();
+    let conflict = match edit {
+        ModelEdit::Prototype { entry, value } => {
+            let function = edited
+                .functions
+                .iter_mut()
+                .find(|function| function.entry == *entry)
+                .ok_or("Selected function is absent from the analysis model")?;
+            if function.prototype.as_ref() == Some(value) {
+                return Err("Choose a different prototype before saving".to_owned());
+            }
+            let machine = function
+                .evidence
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.source,
+                        ModelSource::Dwarf | ModelSource::GhidraAnalysis
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let conflict = function.prototype.as_ref().filter(|_| !machine.is_empty()).map(|previous| ModelConflict {
+                subject: format!("function:0x{:x}:prototype", entry.value.0),
+                detail: format!("analyst prototype {value:?} differs from prior model prototype {previous:?}; earlier evidence retained"),
+                evidence: machine,
+            });
+            function.prototype = Some(value.clone());
+            conflict
+        }
+        ModelEdit::Field {
+            type_id,
+            field_index,
+            name,
+            offset_bytes,
+            ty,
+        } => {
+            if name.len() > 128 || !valid_model_rename(name) {
+                return Err(
+                    "Field name must be a C identifier of at most 128 characters".to_owned(),
+                );
+            }
+            let definition = edited
+                .types
+                .iter_mut()
+                .find(|definition| definition.id == *type_id)
+                .ok_or("Selected type is absent from the analysis model")?;
+            let fields = match &mut definition.kind {
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
+                    fields
+                }
+                _ => return Err("Selected type has no editable fields".to_owned()),
+            };
+            let field = fields
+                .get_mut(*field_index)
+                .ok_or("Selected field is absent from the analysis model")?;
+            if field.name == *name && field.offset_bytes == *offset_bytes && field.ty == *ty {
+                return Err(
+                    "Choose a different field name, offset, or type before saving".to_owned(),
+                );
+            }
+            let old_offset = field.offset_bytes;
+            let old_type = field.ty.clone();
+            let machine = field
+                .evidence
+                .iter()
+                .filter(|item| item.source != ModelSource::AnalystAssertion)
+                .cloned()
+                .collect::<Vec<_>>();
+            let conflict = if !machine.is_empty()
+                && (old_offset != *offset_bytes || old_type != *ty)
+            {
+                Some(ModelConflict {
+                    subject: format!("type:{type_id}:field:{old_offset}"),
+                    detail: format!(
+                        "analyst field offset/type ({offset_bytes}, {ty:?}) differs from prior model ({old_offset}, {old_type:?}); earlier evidence retained"
+                    ),
+                    evidence: machine,
+                })
+            } else {
+                None
+            };
+            field.name = name.clone();
+            field.offset_bytes = *offset_bytes;
+            field.ty = ty.clone();
+            let assertion = ModelEvidence {
+                source: ModelSource::AnalystAssertion,
+                detail: "local field edit".to_owned(),
+                site: None,
+            };
+            if !field.evidence.contains(&assertion) {
+                field.evidence.push(assertion);
+            }
+            conflict
+        }
+    };
+    if let Some(conflict) = conflict
+        && !edited.conflicts.contains(&conflict)
+    {
+        edited.conflicts.push(conflict);
     }
     hydir_model::validate_model(bytes, &edited)?;
     let updated = store.save_model(project, &edited, key)?;
@@ -3734,7 +4050,11 @@ fn typed_types_view(
     ui: &mut egui::Ui,
     model: &AnalysisModel,
     function_entry: Location,
-) -> (Option<u64>, Option<ModelRenameTarget>) {
+) -> (
+    Option<u64>,
+    Option<ModelRenameTarget>,
+    Option<ModelEditTarget>,
+) {
     ui.label(format!(
         "Model revision {} · {} types · {} functions · {} unresolved conflicts",
         model.revision,
@@ -3744,6 +4064,7 @@ fn typed_types_view(
     ));
     let mut selected = None;
     let mut rename = None;
+    let mut edit = None;
     if let Some(function) = model
         .functions
         .iter()
@@ -3757,7 +4078,25 @@ fn typed_types_view(
             if ui.small_button("Rename").clicked() {
                 rename = Some(ModelRenameTarget::Function(function_entry));
             }
+            if ui.small_button("Edit prototype").clicked() {
+                edit = Some(ModelEditTarget::Prototype(function_entry));
+            }
         });
+        if let Some(prototype) = &function.prototype {
+            ui.label(format!(
+                "Prototype: {:?} -> {:?} · {}{}",
+                prototype.parameters,
+                prototype.return_type,
+                prototype.calling_convention,
+                if prototype.variadic {
+                    " · variadic"
+                } else {
+                    ""
+                }
+            ));
+        } else {
+            ui.label("Prototype: no assertion");
+        }
         for evidence in &function.evidence {
             ui.label(format!("  {:?}: {}", evidence.source, evidence.detail));
         }
@@ -3787,11 +4126,19 @@ fn typed_types_view(
                 match &ty.kind {
                     TypeDefinitionKind::Struct { fields }
                     | TypeDefinitionKind::Union { fields } => {
-                        for field in fields {
-                            ui.label(format!(
-                                "+0x{:x}  {}: {:?}",
-                                field.offset_bytes, field.name, field.ty
-                            ));
+                        for (field_index, field) in fields.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "+0x{:x}  {}: {:?}",
+                                    field.offset_bytes, field.name, field.ty
+                                ));
+                                if ui.small_button("Edit field").clicked() {
+                                    edit = Some(ModelEditTarget::Field {
+                                        type_id: ty.id.clone(),
+                                        field_index,
+                                    });
+                                }
+                            });
                             for evidence in &field.evidence {
                                 if let Some(site) = evidence.site {
                                     if ui
@@ -3822,7 +4169,7 @@ fn typed_types_view(
     for conflict in &model.conflicts {
         ui.colored_label(ACCENT, format!("{}: {}", conflict.subject, conflict.detail));
     }
-    (selected, rename)
+    (selected, rename, edit)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4023,6 +4370,7 @@ struct AnalystApp {
     typed_native_error: Option<String>,
     model_rename_target: Option<ModelRenameTarget>,
     model_rename_name: String,
+    model_edit_draft: Option<ModelEditDraft>,
     native_coverage: Option<NativeCoverageReport>,
     native_coverage_error: Option<String>,
     analysis: Option<AnalysisReport>,
@@ -4172,6 +4520,7 @@ impl AnalystApp {
             typed_native_error: None,
             model_rename_target: None,
             model_rename_name: String::new(),
+            model_edit_draft: None,
             native_coverage: None,
             native_coverage_error: None,
             analysis: None,
@@ -4993,6 +5342,7 @@ impl AnalystApp {
                     }
                     self.model_rename_target = None;
                     self.model_rename_name.clear();
+                    self.model_edit_draft = None;
                     match *native {
                         Ok(value) => {
                             self.selected_address = Some(value.machine_ir.entry.value.0);
@@ -5064,6 +5414,47 @@ impl AnalystApp {
                         );
                     }
                     self.status = format!("Saved model rename in local revision {revision}");
+                    self.history.push(self.status.clone());
+                }
+                Event::ModelEdited {
+                    binary_sha256,
+                    entry,
+                    revision,
+                    typed,
+                } => {
+                    if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
+                        != Some(binary_sha256.as_str())
+                    {
+                        continue;
+                    }
+                    self.project_revision = Some(revision);
+                    self.model_edit_draft = None;
+                    if self
+                        .native_decompilation
+                        .as_ref()
+                        .is_some_and(|native| native.machine_ir.entry == entry)
+                    {
+                        match *typed {
+                            Ok(view) => {
+                                self.typed_native_view = Some(view);
+                                self.typed_native_error = None;
+                            }
+                            Err(error) => {
+                                self.typed_native_view = None;
+                                self.typed_native_error = Some(error.clone());
+                                self.failure = Some(format!(
+                                    "Model saved, but typed C refresh failed: {error}"
+                                ));
+                            }
+                        }
+                    } else if self.native_decompilation.is_some() {
+                        self.typed_native_view = None;
+                        self.typed_native_error = Some(
+                            "Analysis model changed; reselect this function to refresh typed C"
+                                .to_owned(),
+                        );
+                    }
+                    self.status = format!("Saved analysis model edit in local revision {revision}");
                     self.history.push(self.status.clone());
                 }
                 Event::Disassembled { result, automatic } => match result {
@@ -5629,6 +6020,7 @@ impl AnalystApp {
         self.typed_native_error = None;
         self.model_rename_target = None;
         self.model_rename_name.clear();
+        self.model_edit_draft = None;
         self.region_studio_mode = RegionStudioMode::Contract;
         self.native_view_mode = NativeViewMode::Summary;
     }
@@ -10954,6 +11346,9 @@ impl AnalystApp {
 
         let mut rename_selection = None;
         let mut rename_save = None;
+        let mut edit_selection = None;
+        let mut edit_cancel = false;
+        let mut edit_save = None;
         let clicked_address = match self.native_view_mode {
             NativeViewMode::Summary => {
                 native_summary_view(ui, native);
@@ -11005,6 +11400,38 @@ impl AnalystApp {
             }
             NativeViewMode::Types => {
                 if let Some(typed) = &self.typed_native_view {
+                    if let Some(draft) = &mut self.model_edit_draft {
+                        ui.group(|ui| {
+                            match draft {
+                                ModelEditDraft::Prototype { entry, json } => {
+                                    ui.label(format!("Edit function 0x{:x} prototype · SysV AMD64", entry.value.0));
+                                    ui.label("Prototype JSON: return_type, parameters, calling_convention, variadic");
+                                    ui.add(egui::TextEdit::multiline(json).desired_rows(8).code_editor());
+                                }
+                                ModelEditDraft::Field { type_id, name, offset, type_json, .. } => {
+                                    ui.label(format!("Edit {type_id} field"));
+                                    ui.horizontal(|ui| {
+                                        ui.label("Name");
+                                        ui.text_edit_singleline(name);
+                                        ui.label("Byte offset");
+                                        ui.text_edit_singleline(offset);
+                                    });
+                                    ui.label("TypeRef JSON (primitive, named, pointer, array, or bytes)");
+                                    ui.add(egui::TextEdit::multiline(type_json).desired_rows(4).code_editor());
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!self.busy && !self.remote, egui::Button::new("Save model edit")).clicked() {
+                                    edit_save = Some((typed.model.clone(), native.clone()));
+                                }
+                                if ui.small_button("Cancel").clicked() {
+                                    edit_cancel = true;
+                                }
+                            });
+                            ui.label("Invalid layouts are rejected; prior machine evidence and conflicts remain visible.");
+                        });
+                        ui.separator();
+                    }
                     if let Some(target) = &self.model_rename_target {
                         ui.horizontal(|ui| {
                             ui.label(match target {
@@ -11028,11 +11455,12 @@ impl AnalystApp {
                         ui.label("Model evidence and unresolved conflicts remain visible after a rename.");
                         ui.separator();
                     }
-                    let (site, target) =
+                    let (site, target, edit_target) =
                         typed_types_view(ui, &typed.model, native.machine_ir.entry);
                     if let Some(target) = target {
                         rename_selection = Some(Some(target));
                     }
+                    edit_selection = edit_target;
                     site
                 } else {
                     ui.colored_label(
@@ -11103,7 +11531,24 @@ impl AnalystApp {
         if let Some(address) = clicked_address {
             self.selected_address = Some(address);
         }
+        if edit_cancel {
+            self.model_edit_draft = None;
+        }
+        if let Some(target) = edit_selection {
+            self.model_rename_target = None;
+            self.model_rename_name.clear();
+            match self
+                .typed_native_view
+                .as_ref()
+                .map(|view| model_edit_draft(&view.model, target))
+            {
+                Some(Ok(draft)) => self.model_edit_draft = Some(draft),
+                Some(Err(error)) => self.failure = Some(error),
+                None => {}
+            }
+        }
         if let Some(target) = rename_selection {
+            self.model_edit_draft = None;
             self.model_rename_name = match &target {
                 Some(ModelRenameTarget::Function(entry)) => self
                     .typed_native_view
@@ -11154,6 +11599,33 @@ impl AnalystApp {
                         "Open a local ELF and select a function before editing its model"
                             .to_owned(),
                     );
+                }
+            }
+        }
+        if let Some((model, native)) = edit_save {
+            let parsed = self
+                .model_edit_draft
+                .as_ref()
+                .ok_or("Choose a field or prototype before saving".to_owned())
+                .and_then(parse_model_edit_draft);
+            match (self.spec.as_ref(), self.project_revision, parsed) {
+                (Some(spec), Some(expected_revision), Ok(edit)) => self.enqueue(
+                    Task::EditModel {
+                        binary_sha256: spec.binary_sha256.clone(),
+                        expected_revision,
+                        model,
+                        edit,
+                        native: Box::new(native),
+                        key: uuid::Uuid::new_v4().to_string(),
+                    },
+                    "Saving revisioned analysis model edit…",
+                ),
+                (_, _, Err(error)) => self.failure = Some(error),
+                _ => {
+                    self.failure = Some(
+                        "Open a local ELF and select a function before editing its model"
+                            .to_owned(),
+                    )
                 }
             }
         }
@@ -13005,15 +13477,17 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
-        ModelRenameTarget, NativeViewMode, Tab, WorkbenchGraphEdge, WorkbenchGraphNode,
-        captured_code_elf_address, emit_ghidra_image_cfg_llvm, ghidra_composite_evidence,
-        ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start,
-        high_pcode_varnode, indexed_function_action, ir_slice, local_region_artifacts,
-        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
+        ModelEdit, ModelEditDraft, ModelEditTarget, ModelRenameTarget, NativeViewMode, Tab,
+        WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
+        emit_ghidra_image_cfg_llvm, ghidra_composite_evidence, ghidra_readiness_copy,
+        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
+        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
+        native_instruction_count, native_opaque_instruction_count, parse_model_edit_draft,
         pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
-        persist_local_model_rename, preview_patch_local, resized_console_height,
-        run_ghidra_command, save_render_smoke_png, selected_ghidra_trace_address,
-        trace_ghidra_path, valid_bearer_token, validate_endpoint, workbench_graph_layout,
+        persist_local_model_edit, persist_local_model_rename, preview_patch_local,
+        resized_console_height, run_ghidra_command, save_render_smoke_png,
+        selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
+        workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
@@ -13030,8 +13504,8 @@ mod tests {
         GhidraSnapshot, PcodeEffect, PcodePathStop, parse_ghidra_snapshot, parse_pcode_seed,
     };
     use hydir_model::{
-        ModelConflict, ModelEvidence, ModelSource, PrimitiveType, TypeDefinition,
-        TypeDefinitionKind, TypeRef, init_model,
+        ModelConflict, ModelEvidence, ModelField, ModelParameter, ModelPrototype, ModelSource,
+        PrimitiveType, TypeDefinition, TypeDefinitionKind, TypeRef, init_model,
     };
     use hydir_project::LocalProjectStore;
     use sha2::{Digest, Sha256};
@@ -13556,6 +14030,237 @@ mod tests {
             reopened.load_model(&updated_again).unwrap(),
             Some(saved_again.clone())
         );
+    }
+
+    #[test]
+    fn gui_field_editor_preserves_machine_evidence_and_rejects_invalid_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("analyst.sqlite")).unwrap();
+        let project = store.open_binary(&binary, &spec).unwrap();
+        let mut initial = init_model(bytes).unwrap();
+        let machine = ModelEvidence {
+            source: ModelSource::Dwarf,
+            detail: "fixture field at offset zero".to_owned(),
+            site: None,
+        };
+        initial.types.push(TypeDefinition {
+            id: "fixture_record".to_owned(),
+            name: "FixtureRecord".to_owned(),
+            size_bytes: 16,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Struct {
+                fields: vec![
+                    ModelField {
+                        name: "old_field".to_owned(),
+                        offset_bytes: 0,
+                        ty: TypeRef::Primitive {
+                            name: PrimitiveType::U32,
+                        },
+                        evidence: vec![machine.clone()],
+                    },
+                    ModelField {
+                        name: "tail".to_owned(),
+                        offset_bytes: 12,
+                        ty: TypeRef::Primitive {
+                            name: PrimitiveType::U32,
+                        },
+                        evidence: vec![machine.clone()],
+                    },
+                ],
+            },
+            evidence: vec![machine.clone()],
+        });
+        let project = store.save_model(&project, &initial, "seed-fields").unwrap();
+        let displayed = store.load_model(&project).unwrap().unwrap();
+        let draft = super::model_edit_draft(
+            &displayed,
+            ModelEditTarget::Field {
+                type_id: "fixture_record".to_owned(),
+                field_index: 0,
+            },
+        )
+        .unwrap();
+        let ModelEditDraft::Field {
+            type_id,
+            field_index,
+            ..
+        } = draft
+        else {
+            panic!("expected field editor")
+        };
+        let edit = ModelEdit::Field {
+            type_id,
+            field_index,
+            name: "counter".to_owned(),
+            offset_bytes: 4,
+            ty: TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            },
+        };
+        let (updated, saved) = persist_local_model_edit(
+            &mut store,
+            &project,
+            bytes,
+            project.revision,
+            &displayed,
+            &edit,
+            "edit-field",
+        )
+        .unwrap();
+        assert_eq!(updated.revision, project.revision + 1);
+        let TypeDefinitionKind::Struct { fields } = &saved
+            .types
+            .iter()
+            .find(|ty| ty.id == "fixture_record")
+            .unwrap()
+            .kind
+        else {
+            panic!("expected struct")
+        };
+        assert_eq!(fields[0].name, "counter");
+        assert_eq!(fields[0].offset_bytes, 4);
+        assert_eq!(
+            fields[0].ty,
+            TypeRef::Primitive {
+                name: PrimitiveType::U64
+            }
+        );
+        assert!(fields[0].evidence.contains(&machine));
+        assert!(
+            fields[0]
+                .evidence
+                .iter()
+                .any(|item| item.source == ModelSource::AnalystAssertion)
+        );
+        assert!(
+            saved
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.subject == "type:fixture_record:field:0"
+                    && conflict.evidence.contains(&machine))
+        );
+        assert!(
+            persist_local_model_edit(
+                &mut store,
+                &project,
+                bytes,
+                project.revision,
+                &displayed,
+                &edit,
+                "stale-field",
+            )
+            .unwrap_err()
+            .contains("Stale local project revision")
+        );
+        let invalid = ModelEdit::Field {
+            type_id: "fixture_record".to_owned(),
+            field_index: 0,
+            name: "counter".to_owned(),
+            offset_bytes: 8,
+            ty: TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            },
+        };
+        assert!(
+            persist_local_model_edit(
+                &mut store,
+                &updated,
+                bytes,
+                updated.revision,
+                &saved,
+                &invalid,
+                "overlap-field",
+            )
+            .unwrap_err()
+            .contains("overlapping or out-of-bounds")
+        );
+        assert_eq!(store.load_model(&updated).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn gui_prototype_editor_revises_model_and_retains_prior_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("analyst.sqlite")).unwrap();
+        let project = store.open_binary(&binary, &spec).unwrap();
+        let mut initial = init_model(bytes).unwrap();
+        let entry = initial.functions[0].entry;
+        let machine = ModelEvidence {
+            source: ModelSource::GhidraAnalysis,
+            detail: "fixture prior signature".to_owned(),
+            site: None,
+        };
+        initial.functions[0].evidence.push(machine.clone());
+        initial.functions[0].prototype = Some(ModelPrototype {
+            parameters: Vec::new(),
+            return_type: TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            },
+            calling_convention: "sysv_amd64".to_owned(),
+            variadic: false,
+        });
+        let project = store
+            .save_model(&project, &initial, "seed-prototype")
+            .unwrap();
+        let displayed = store.load_model(&project).unwrap().unwrap();
+        let draft = super::model_edit_draft(&displayed, ModelEditTarget::Prototype(entry)).unwrap();
+        assert!(matches!(
+            parse_model_edit_draft(&draft).unwrap(),
+            ModelEdit::Prototype { .. }
+        ));
+        let replacement = ModelPrototype {
+            parameters: vec![ModelParameter {
+                name: "input".to_owned(),
+                ty: TypeRef::Pointer {
+                    to: Box::new(TypeRef::Primitive {
+                        name: PrimitiveType::U8,
+                    }),
+                },
+            }],
+            return_type: TypeRef::Primitive {
+                name: PrimitiveType::U32,
+            },
+            calling_convention: "sysv_amd64".to_owned(),
+            variadic: false,
+        };
+        let edit = ModelEdit::Prototype {
+            entry,
+            value: replacement.clone(),
+        };
+        let (updated, saved) = persist_local_model_edit(
+            &mut store,
+            &project,
+            bytes,
+            project.revision,
+            &displayed,
+            &edit,
+            "edit-prototype",
+        )
+        .unwrap();
+        let function = saved
+            .functions
+            .iter()
+            .find(|function| function.entry == entry)
+            .unwrap();
+        assert_eq!(function.prototype, Some(replacement));
+        assert!(function.evidence.contains(&machine));
+        assert!(
+            function
+                .evidence
+                .iter()
+                .any(|item| item.source == ModelSource::AnalystAssertion)
+        );
+        assert!(saved.conflicts.iter().any(|conflict| conflict.subject
+            == format!("function:0x{:x}:prototype", entry.value.0)
+            && conflict.evidence.contains(&machine)));
+        assert_eq!(store.load_model(&updated).unwrap(), Some(saved));
     }
 
     #[test]
