@@ -169,7 +169,7 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb xauth libgl1-mesa-dri tesseract-ocr
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libxkbcommon-x11-0 tesseract-ocr
           xvfb-run -a -s "-screen 0 1600x1000x24" \
             target/debug/hydir \
               --render-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf \
