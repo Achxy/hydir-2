@@ -13,8 +13,10 @@ Linux x86-64 it calls the exact generated ELF under GDB, verifies the selected
 code bytes, and compares return values. Rust and LLVM instruction visits are
 compared with each other. For `hydir_secure_equals`, it checks
 match, mismatch, and wrong-length paths the same way at O0. The O2
-wrong-length path returns exactly; O2 match and mismatch currently stop at
-explicit unsupported SIMD effects. The report records each stop and never
+wrong-length path returns exactly. On the current vectorized O2 lift, match
+and mismatch execute a checked 128-bit zero extension in LLVM and then stop
+at a 16-byte direct RAM `COPY`, as Rust does. The matrix checks this boundary
+when that vectorized pattern occurs. The report records each stop and never
 calls these paths equivalent.
 
 Run after building `hydirctl`:
@@ -32,5 +34,7 @@ and `report.json` are written to `target/ghidra-opt-matrix/` by default.
 
 The matrix covers one source fixture and two selected functions. It does not
 establish whole-program equivalence or SIMD support. The optimized comparison
-currently exposes a 16-byte direct image operand, wide scalar lowering, and
-`CALLOTHER` as separate semantic work for the core.
+currently exposes a 16-byte direct image operand and `CALLOTHER` as separate
+semantic work for the core. The checked wide LLVM value subset includes
+extension, basic arithmetic and bitwise operations, comparisons, shifts,
+`PIECE`, and `SUBPIECE`; it does not imply complete SIMD instruction support.

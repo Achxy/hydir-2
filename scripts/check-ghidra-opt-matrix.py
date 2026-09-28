@@ -311,6 +311,32 @@ def main():
                     elif trace["final_state"]["register_bytes"]["0"] != expected:
                         raise AssertionError(f"wrong optimized Rust result: {label}/{kind}/{name}")
                 llvm = llvm_cases(artifact, module_path, kind, CASES[kind], seeds, traces)
+                if level == "o2" and kind == "equals":
+                    wide_zext = [(instruction["address"]["offset"], op["sequence_index"])
+                                 for instruction in selected["instructions"]
+                                 for op in instruction["pcode"]
+                                 if op["mnemonic"] == "INT_ZEXT"
+                                 and op["output"]["size"] > 8]
+                    wide_ram_copy = [(instruction["address"]["offset"], op["sequence_index"])
+                                     for instruction in selected["instructions"]
+                                     for op in instruction["pcode"]
+                                     if op["mnemonic"] == "COPY"
+                                     and op["output"]["size"] > 8
+                                     and op["inputs"][0]["space"] == "ram"]
+                    if wide_zext and wide_ram_copy:
+                        invalid = {(site["address"]["offset"], site["operation_index"])
+                                   for site in artifact["stop_sites"]
+                                   if site["status"] == "invalid_operation"}
+                        if any(site in invalid for site in wide_zext):
+                            raise AssertionError(f"wide INT_ZEXT still blocks LLVM: {label}")
+                        opaque = {(site["address"]["offset"], site["operation_index"])
+                                  for site in artifact["stop_sites"]
+                                  if site["status"] == "opaque_effect"}
+                        if wide_ram_copy[0] not in opaque:
+                            raise AssertionError(f"wide RAM COPY lost its explicit boundary: {label}")
+                        for name in ("match", "mismatch"):
+                            if llvm[name]["status"] != 3 or llvm[name]["completed_visits"] < 5:
+                                raise AssertionError(f"wide LLVM prefix regressed: {label}/{name}: {llvm[name]}")
                 pair[debug][kind] = {
                     "entry": entry, "binary_sha256": digest,
                     "instruction_count": len(selected["instructions"]),

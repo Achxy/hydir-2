@@ -272,8 +272,9 @@ pub fn emit_pcode_linear_prefix_llvm(
 }
 
 /// Emit a verifier-clean LLVM function for one exact operation. The selected
-/// 128-bit extension/multiply/subpiece/comparison subset covers x86-64 IMUL
-/// overflow-flag P-code; other wide operations remain explicit boundaries.
+/// Checked 128-bit value operations cover x86-64 scalar extension, arithmetic,
+/// and a bounded subset of SIMD bitvector P-code. User operations and memory
+/// effects remain explicit boundaries.
 /// The function is named `hydir_pcode_exact` and has an integer return type
 /// equal to the output varnode width. Every non-constant source input is a
 /// width-typed parameter `%inN`, where N is its source-input index. Division
@@ -294,10 +295,28 @@ pub fn emit_pcode_exact_operation_llvm(
     if wide
         && !matches!(
             kind,
-            PcodeExactOp::SignExtend
+            PcodeExactOp::Copy
+                | PcodeExactOp::ZeroExtend
+                | PcodeExactOp::SignExtend
+                | PcodeExactOp::TwosComplement
+                | PcodeExactOp::BitwiseNegate
+                | PcodeExactOp::Piece
                 | PcodeExactOp::Multiply
                 | PcodeExactOp::Subpiece
+                | PcodeExactOp::Add
+                | PcodeExactOp::Sub
+                | PcodeExactOp::Xor
+                | PcodeExactOp::And
+                | PcodeExactOp::Or
+                | PcodeExactOp::Equal
                 | PcodeExactOp::NotEqual
+                | PcodeExactOp::UnsignedLess
+                | PcodeExactOp::UnsignedLessEqual
+                | PcodeExactOp::SignedLess
+                | PcodeExactOp::SignedLessEqual
+                | PcodeExactOp::ShiftLeft
+                | PcodeExactOp::LogicalShiftRight
+                | PcodeExactOp::ArithmeticShiftRight
         )
     {
         return Err("wide P-code operation lacks checked LLVM lowering".to_owned());
@@ -873,6 +892,101 @@ mod tests {
             }
             let llvm = emit_pcode_exact_operation_llvm(&op).unwrap();
             let _ = run_opt(&llvm, &["-passes=verify", "-disable-output", "-"]);
+        }
+    }
+
+    #[test]
+    fn wide_bitvector_llvm_matches_concrete_pcode() {
+        let cases: &[(u32, &str, u32, &[u32], &[u128])] = &[
+            (
+                1,
+                "COPY",
+                16,
+                &[16],
+                &[0xfedc_ba98_7654_3210_0123_4567_89ab_cdef],
+            ),
+            (17, "INT_ZEXT", 16, &[8], &[0xfedc_ba98_7654_3210]),
+            (18, "INT_SEXT", 16, &[8], &[0xfedc_ba98_7654_3210]),
+            (19, "INT_ADD", 16, &[16, 16], &[u128::MAX, 2]),
+            (20, "INT_SUB", 16, &[16, 16], &[0, 1]),
+            (24, "INT_2COMP", 16, &[16], &[1]),
+            (25, "INT_NEGATE", 16, &[16], &[0]),
+            (26, "INT_XOR", 16, &[16, 16], &[u128::MAX, 0x55]),
+            (
+                27,
+                "INT_AND",
+                16,
+                &[16, 16],
+                &[u128::MAX, 0x00ff_00ff_00ff_00ff_00ff_00ff_00ff_00ff],
+            ),
+            (30, "INT_RIGHT", 16, &[16, 1], &[u128::MAX, 65]),
+            (30, "INT_RIGHT", 16, &[16, 1], &[u128::MAX, 128]),
+            (29, "INT_LEFT", 16, &[16, 1], &[1, 127]),
+            (31, "INT_SRIGHT", 16, &[16, 1], &[1u128 << 127, 128]),
+            (28, "INT_OR", 16, &[16, 16], &[1u128 << 127, 1]),
+            (32, "INT_MULT", 16, &[16, 16], &[u128::MAX, 2]),
+            (11, "INT_EQUAL", 1, &[16, 16], &[u128::MAX, u128::MAX]),
+            (12, "INT_NOTEQUAL", 1, &[16, 16], &[1u128 << 127, 0]),
+            (13, "INT_SLESS", 1, &[16, 16], &[1u128 << 127, 0]),
+            (
+                14,
+                "INT_SLESSEQUAL",
+                1,
+                &[16, 16],
+                &[1u128 << 127, 1u128 << 127],
+            ),
+            (15, "INT_LESS", 1, &[16, 16], &[0, 1u128 << 127]),
+            (16, "INT_LESSEQUAL", 1, &[16, 16], &[u128::MAX, u128::MAX]),
+            (
+                62,
+                "PIECE",
+                16,
+                &[8, 8],
+                &[0xfedc_ba98_7654_3210, 0x0123_4567_89ab_cdef],
+            ),
+            (
+                63,
+                "SUBPIECE",
+                8,
+                &[16, 1],
+                &[0xfedc_ba98_7654_3210_0123_4567_89ab_cdef, 8],
+            ),
+        ];
+        for &(opcode, mnemonic, output, inputs, values) in cases {
+            let mut op = operation(opcode, mnemonic, output, inputs);
+            if opcode == 63 {
+                op.source.inputs[1].space = "const".to_owned();
+                op.source.inputs[1].offset = "0x8".to_owned();
+            }
+            let expected = op.evaluate_exact_wide(values).unwrap().unwrap();
+            let llvm = emit_pcode_exact_operation_llvm(&op).unwrap();
+            let _ = run_opt(&llvm, &["-passes=verify", "-disable-output", "-"]);
+            if Command::new("lli").arg("--version").output().is_err() {
+                continue;
+            }
+            let arguments = op
+                .source
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| {
+                    (input.space != "const")
+                        .then(|| format!("i{} {}", input.size * 8, values[index]))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let bits = output * 8;
+            let main = format!(
+                "define i32 @main() {{\nentry:\n  %value = call i{bits} @hydir_pcode_exact({arguments})\n  %equal = icmp eq i{bits} %value, {expected}\n  %failed = xor i1 %equal, true\n  %status = zext i1 %failed to i32\n  ret i32 %status\n}}\n"
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), format!("{llvm}\n{main}")).unwrap();
+            let result = Command::new("lli").arg(file.path()).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{mnemonic}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
         }
     }
 
