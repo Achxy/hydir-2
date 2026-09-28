@@ -35,8 +35,10 @@ at O0 and O2, with and without DWARF. The selected function follows `next`
 pointers and reads integer fields from guest RAM. Empty, one-node, two-node,
 and zero-scale paths must return the source result in Rust and compiled LLVM;
 their P-code event order and instruction visits must match. Linux GDB checks
-the generated ELF and selected code bytes. This fixture tests concrete
-aggregate access, not recovered source-level struct types.
+the generated ELF and selected code bytes. The DWARF model must recover a
+16-byte recursive `Node` with an `i32` field at offset 0 and a self pointer at
+offset 8. This fixture tests concrete aggregate access and DWARF layout
+import; it does not prove stripped type recovery or typed C for this loop.
 
 Run after building `hydirctl`:
 

@@ -103,6 +103,34 @@ def native_result(binary, snapshot_path, nodes, scale):
     return results[0]
 
 
+def check_dwarf_layout(directory, client, binary):
+    model_path = directory / f"{binary.stem}-model.json"
+    imported_path = directory / f"{binary.stem}-dwarf-model.json"
+    matrix.run([client, "model", "init", binary, "--output", model_path])
+    matrix.run([client, "model", "import-dwarf", binary, model_path,
+                "--output", imported_path])
+    matrix.run([client, "model", "verify", binary, imported_path])
+    model = matrix.load(imported_path)
+    nodes = [row for row in model["types"]
+             if row["kind"]["kind"] == "struct" and
+             {field["name"] for field in row["kind"]["fields"]} == {"value", "next"}]
+    if len(nodes) != 1 or nodes[0]["size_bytes"] != 16:
+        raise AssertionError(f"DWARF Node layout missing in {binary}")
+    node = nodes[0]
+    fields = {field["name"]: field for field in node["kind"]["fields"]}
+    if (fields["value"]["offset_bytes"] != 0 or
+            fields["value"]["ty"] != {"kind": "primitive", "name": "i32"} or
+            fields["next"]["offset_bytes"] != 8 or
+            fields["next"]["ty"] !=
+            {"kind": "pointer", "to": {"kind": "named", "id": node["id"]}} or
+            any(not field["evidence"] or
+                any(evidence["source"] != "dwarf" for evidence in field["evidence"])
+                for field in fields.values())):
+        raise AssertionError(f"DWARF Node fields are wrong in {binary}")
+    return {"size_bytes": 16, "value_offset": 0, "next_offset": 8,
+            "recursive_pointer": True}
+
+
 def check_variant(directory, client, binary, entry):
     label = binary.stem
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -149,8 +177,11 @@ def check_variant(directory, client, binary, entry):
     print(f"{label}: " + ", ".join(
         f"{name}={traces[name]['stop']['kind']}/{llvm[name]['status']}"
         for name, *_ in CASES), flush=True)
-    return {"binary_sha256": digest, "entry": hex(entry),
+    result = {"binary_sha256": digest, "entry": hex(entry),
             "instructions": selected["instructions"], "llvm": llvm, "native": native}
+    if "dwarf" in label:
+        result["dwarf_layout"] = check_dwarf_layout(directory, client, binary)
+    return result
 
 
 def main():
