@@ -11,6 +11,10 @@ instructions = {
     int(row["address"]["offset"], 16): bytes.fromhex(row["parsed_bytes"])
     for row in snapshot["selected_function"]["instructions"]
 }
+mnemonics = {
+    int(row["address"]["offset"], 16): row["mnemonic"]
+    for row in snapshot["selected_function"]["instructions"]
+}
 entry = int(snapshot["selected_function"]["entry"]["offset"], 16)
 ret_address = int(os.environ["HYDIR_NATIVE_RETURN"], 16)
 return_instructions = {
@@ -55,9 +59,10 @@ for _ in range(max_visits):
         break
     if pc not in instructions:
         raise RuntimeError(
-            "left function pc=0x%x return=0x%x last=%s ret_sites=%s" % (
+            "pc=0x%x return=0x%x last=%s/%s ret=%s" % (
                 pc, ret_address,
                 ("0x%x" % visits[-1]) if visits else "none",
+                mnemonics.get(visits[-1], "none") if visits else "none",
                 ",".join("0x%x" % address for address in sorted(return_instructions)),
             )
         )
