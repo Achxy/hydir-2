@@ -510,3 +510,4 @@ jobs:
             ${{ runner.temp }}/ghidra-indirect-jump-llvm.json
             target/demo-ghidra-password-lift/run.*/
             ${{ runner.temp }}/ghidra-opt-matrix/report.json
+            ${{ runner.temp }}/ghidra-float-compare/report.json
