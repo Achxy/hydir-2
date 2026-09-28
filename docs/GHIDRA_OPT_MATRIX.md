@@ -10,9 +10,10 @@ the test program without a dynamic-loader startup step.
 For `hydir_triton_add2`, it checks two concrete inputs, including 64-bit
 wraparound, against Rust P-code execution and compiled image-backed LLVM. On
 Linux x86-64 it calls the exact generated ELF under GDB, verifies the selected
-code bytes, and compares return values. Rust and LLVM instruction visits are
-compared with each other. For `hydir_secure_equals`, it checks match,
-mismatch, and wrong-length paths at both O0 and O2. The vectorized O2 lift
+code bytes, and compares return values. Rust and LLVM source P-code event
+order and instruction visits are compared with each other. For
+`hydir_secure_equals`, it checks match, mismatch, and wrong-length paths at
+both O0 and O2. The vectorized O2 lift
 uses two 16-byte direct RAM reads and Ghidra's `packsswb` user operation.
 Hydir executes those reads from fully known guest or file-backed bytes and
 implements the 128-bit signed saturation operation in Rust and LLVM. Unknown

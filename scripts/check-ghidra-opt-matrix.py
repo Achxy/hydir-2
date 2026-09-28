@@ -179,6 +179,9 @@ def llvm_cases(artifact, module_path, kind, cases, seeds, rust_traces):
     lifted.restype = ctypes.c_int32
     byte_map = {(row["space"], int(row["offset"], 16)): row["index"]
                 for row in artifact["byte_map"]}
+    source_ids = {(row["instruction_address"]["space"],
+                   row["instruction_address"]["offset"], row["operation_index"]): index
+                  for index, row in enumerate(artifact["source_operations"])}
     results = {}
     try:
         for case in cases:
@@ -208,6 +211,23 @@ def llvm_cases(artifact, module_path, kind, cases, seeds, rust_traces):
                     "instruction_address"]["offset"]
                 if not visits or visits[-1] != address:
                     visits.append(address)
+            rust_events = []
+            for event in rust_traces[name]["events"]:
+                if event["kind"] == "fallthrough":
+                    continue
+                if event["kind"] == "effect":
+                    source = event["operation"]["source"]
+                elif event["kind"] == "branch":
+                    source = event["source"]
+                else:
+                    raise AssertionError(f"unexpected Rust event kind: {event['kind']}")
+                key = (source["source_address"]["space"],
+                       source["source_address"]["offset"], source["sequence_index"])
+                rust_events.append(source_ids[key])
+            llvm_events = list(events[:event_count.value])
+            if llvm_events != rust_events:
+                raise AssertionError(f"LLVM/Rust P-code event order differs: {kind}/{name}: "
+                                     f"LLVM {len(llvm_events)} Rust {len(rust_events)}")
             rust_visits = [row["offset"] for row in rust_traces[name]["instruction_visits"]]
             if status != 1:
                 if rust_traces[name]["stop"]["kind"] == "return":
