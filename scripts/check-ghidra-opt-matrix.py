@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fresh Ghidra lifts of one ELF at O0/O2, with and without DWARF.
 
-The scalar add function must execute exactly in Rust, LLVM, and (on Linux)
-the CPU. The password comparison is also checked where the current P-code
-subset can execute it. Unsupported optimized SIMD effects stay explicit.
+Both functions must execute the selected paths exactly in Rust, LLVM, and
+(on Linux) the CPU. The optimized comparison exercises a 16-byte direct RAM
+read and Ghidra's named packsswb operation when emitted by the compiler.
 """
 
 import argparse
@@ -293,23 +293,16 @@ def main():
                          "--max-visits", "512", "--output", trace_path])
                     trace = load(trace_path)
                     traces[name] = trace
-                    if kind == "add2" or level == "o0" or name == "wrong-length":
-                        if trace["stop"]["kind"] != "return":
-                            raise AssertionError(f"Rust stopped unexpectedly: {label}/{kind}/{name}: {trace['stop']}")
-                        if trace["final_state"]["register_bytes"]["0"] != expected:
-                            raise AssertionError(f"wrong Rust result: {label}/{kind}/{name}")
-                        native_result_row = native_result(
-                            binary, snapshot_path, kind, case)
-                        if native_result_row is not None:
-                            if (native_result_row["result"] != expected or
-                                    native_result_row["verified_instruction_bytes"] != len(selected["instructions"])):
-                                raise AssertionError(f"Rust/native mismatch: {label}/{kind}/{name}")
-                            native[name] = "matched_output_and_code_bytes"
-                    elif trace["stop"]["kind"] != "return":
-                        if trace["stop"]["kind"] != "effect_boundary":
-                            raise AssertionError(f"unexpected partial stop: {label}/{kind}/{name}")
-                    elif trace["final_state"]["register_bytes"]["0"] != expected:
-                        raise AssertionError(f"wrong optimized Rust result: {label}/{kind}/{name}")
+                    if trace["stop"]["kind"] != "return":
+                        raise AssertionError(f"Rust stopped unexpectedly: {label}/{kind}/{name}: {trace['stop']}")
+                    if trace["final_state"]["register_bytes"]["0"] != expected:
+                        raise AssertionError(f"wrong Rust result: {label}/{kind}/{name}")
+                    native_result_row = native_result(binary, snapshot_path, kind, case)
+                    if native_result_row is not None:
+                        if (native_result_row["result"] != expected or
+                                native_result_row["verified_instruction_bytes"] != len(selected["instructions"])):
+                            raise AssertionError(f"Rust/native mismatch: {label}/{kind}/{name}")
+                        native[name] = "matched_output_and_code_bytes"
                 llvm = llvm_cases(artifact, module_path, kind, CASES[kind], seeds, traces)
                 if level == "o2" and kind == "equals":
                     wide_zext = [(instruction["address"]["offset"], op["sequence_index"])
@@ -323,6 +316,10 @@ def main():
                                      if op["mnemonic"] == "COPY"
                                      and op["output"]["size"] > 8
                                      and op["inputs"][0]["space"] == "ram"]
+                    packed = [(instruction["address"]["offset"], op["sequence_index"])
+                              for instruction in selected["instructions"]
+                              for op in instruction["pcode"]
+                              if op.get("userop_name") == "packsswb"]
                     if wide_zext and wide_ram_copy:
                         invalid = {(site["address"]["offset"], site["operation_index"])
                                    for site in artifact["stop_sites"]
@@ -332,11 +329,11 @@ def main():
                         opaque = {(site["address"]["offset"], site["operation_index"])
                                   for site in artifact["stop_sites"]
                                   if site["status"] == "opaque_effect"}
-                        if wide_ram_copy[0] not in opaque:
-                            raise AssertionError(f"wide RAM COPY lost its explicit boundary: {label}")
+                        if any(site in opaque for site in wide_ram_copy + packed):
+                            raise AssertionError(f"checked wide memory or pack operation is still opaque: {label}")
                         for name in ("match", "mismatch"):
-                            if llvm[name]["status"] != 3 or llvm[name]["completed_visits"] < 5:
-                                raise AssertionError(f"wide LLVM prefix regressed: {label}/{name}: {llvm[name]}")
+                            if llvm[name]["status"] != 1 or llvm[name]["visits"] < 5:
+                                raise AssertionError(f"wide LLVM path regressed: {label}/{name}: {llvm[name]}")
                 pair[debug][kind] = {
                     "entry": entry, "binary_sha256": digest,
                     "instruction_count": len(selected["instructions"]),

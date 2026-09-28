@@ -55,6 +55,7 @@ pub enum PcodeExactOp {
     Subpiece,
     PopCount,
     LeadingZeroCount,
+    PackSignedWordsToBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -368,6 +369,16 @@ impl PcodeSemanticOperation {
             PcodeExactOp::LeadingZeroCount => {
                 u128::from(values[0].leading_zeros() - (128 - widths[0]))
             }
+            PcodeExactOp::PackSignedWordsToBytes => {
+                let mut packed = 0u128;
+                for lane in 0..16 {
+                    let source = values[if lane < 8 { 1 } else { 2 }];
+                    let word = (source >> ((lane % 8) * 16)) as u16 as i16;
+                    let byte = word.clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8 as u8;
+                    packed |= u128::from(byte) << (lane * 8);
+                }
+                packed
+            }
         };
         Ok(Some(result & mask_wide(result_width_bits)))
     }
@@ -446,6 +457,30 @@ fn exact_opcode(opcode: u32) -> Option<(PcodeExactOp, &'static str)> {
 }
 
 pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
+    if source.opcode == 9
+        && source.mnemonic == "CALLOTHER"
+        && source.userop_name.as_deref() == Some("packsswb")
+    {
+        let valid = source.output.as_ref().is_some_and(|output| {
+            output.size == 16 && matches!(output.space.as_str(), "register" | "unique")
+        }) && source.inputs.len() == 3
+            && source.inputs[0].space == "const"
+            && (1..=8).contains(&source.inputs[0].size)
+            && source.inputs[1..].iter().all(|input| {
+                input.size == 16 && matches!(input.space.as_str(), "register" | "unique")
+            });
+        if valid {
+            return PcodeEffect::Assign {
+                operation: PcodeExactOp::PackSignedWordsToBytes,
+                result_width_bits: 128,
+            };
+        }
+        return opaque(
+            PcodeOpaqueClass::UserOperation,
+            "packsswb requires two 128-bit register or unique inputs and output".to_owned(),
+            source.output.is_some(),
+        );
+    }
     if let Some((operation, expected_mnemonic)) = exact_opcode(source.opcode) {
         if source.mnemonic != expected_mnemonic {
             return opaque(
@@ -465,8 +500,8 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
             );
         };
         // Direct varnodes in RAM, stack, or other address spaces can read or
-        // write memory even for a COPY. Until the state-space model handles
-        // those effects, only register and unique storage is an exact target.
+        // write memory even for a COPY. Concrete COPY reads are handled by
+        // the bounded memory executor, not asserted as scalar Assign effects.
         if !matches!(output.space.as_str(), "register" | "unique") {
             return opaque(
                 PcodeOpaqueClass::Unknown,
@@ -482,6 +517,16 @@ pub(super) fn lower_operation(source: &PcodeOperation) -> PcodeEffect {
             .iter()
             .any(|input| !matches!(input.space.as_str(), "register" | "unique" | "const"))
         {
+            if operation == PcodeExactOp::Copy
+                && source.inputs.len() == 1
+                && source.inputs[0].size == output.size
+            {
+                return opaque(
+                    PcodeOpaqueClass::MemoryRead,
+                    "direct address-space COPY requires fully known concrete bytes".to_owned(),
+                    true,
+                );
+            }
             return opaque(
                 PcodeOpaqueClass::Unknown,
                 "input address space lacks exact state semantics".to_owned(),
@@ -687,6 +732,47 @@ mod tests {
                 .unwrap(),
             Some(128)
         );
+    }
+
+    #[test]
+    fn packsswb_saturates_signed_words_in_destination_then_source_order() {
+        let mut source = op(9, "CALLOTHER", Some(16), &[4, 16, 16]);
+        source.userop_name = Some("packsswb".to_owned());
+        source.inputs[0].space = "const".to_owned();
+        source.inputs[0].offset = "0xa2".to_owned();
+        let a = 0x7fff_0080_007f_0000_ffff_ff80_ff7f_8000_u128;
+        let b = 0x8000_ff7f_ff80_ffff_0000_007f_0080_7fff_u128;
+        let expected = u128::from_le_bytes([
+            0x80, 0x80, 0x80, 0xff, 0x00, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x00, 0xff, 0x80,
+            0x80, 0x80,
+        ]);
+        let exact = lowered(source.clone());
+        assert!(matches!(
+            exact.effect,
+            PcodeEffect::Assign {
+                operation: PcodeExactOp::PackSignedWordsToBytes,
+                result_width_bits: 128
+            }
+        ));
+        assert_eq!(
+            exact.evaluate_exact_wide(&[0xa2, a, b]).unwrap(),
+            Some(expected)
+        );
+        assert!(exact.evaluate_exact_wide(&[0xa3, a, b]).is_err());
+        source.userop_name = Some("unknown_pack".to_owned());
+        assert!(matches!(
+            lower_operation(&source),
+            PcodeEffect::Opaque {
+                class: PcodeOpaqueClass::UserOperation,
+                ..
+            }
+        ));
+        source.userop_name = Some("packsswb".to_owned());
+        source.inputs[2].size = 8;
+        assert!(matches!(
+            lower_operation(&source),
+            PcodeEffect::Opaque { .. }
+        ));
     }
 
     #[test]
@@ -1104,20 +1190,24 @@ mod tests {
     }
 
     #[test]
-    fn direct_ram_varnodes_are_opaque_even_for_copy() {
+    fn direct_ram_copy_is_a_bounded_memory_read_not_a_scalar_assign() {
         let mut memory_read = op(1, "COPY", Some(1), &[1]);
         memory_read.inputs[0].space = "ram".to_owned();
         assert!(matches!(
             lower_operation(&memory_read),
             PcodeEffect::Opaque {
-                class: PcodeOpaqueClass::Unknown,
+                class: PcodeOpaqueClass::MemoryRead,
                 may_read_memory: true,
-                may_write_memory: true,
-                may_change_control: true,
+                may_write_memory: false,
+                may_change_control: false,
                 may_write_output: true,
                 ..
             }
         ));
+        assert_eq!(
+            lowered(memory_read).evaluate_exact_wide(&[0]).unwrap(),
+            None
+        );
         let mut memory_write = op(1, "COPY", Some(1), &[1]);
         memory_write.output.as_mut().unwrap().space = "ram".to_owned();
         assert!(matches!(

@@ -65,7 +65,19 @@ impl PcodeConcreteState {
         image: Option<&PcodeReadOnlyElfImage>,
     ) -> Result<Option<u64>, String> {
         checked_memory_range(byte_offset, size)?;
-        let mut value = 0u64;
+        self.read_memory_with_image_wide(space, byte_offset, size, image)
+            .map(|value| value.map(|value| value as u64))
+    }
+
+    fn read_memory_with_image_wide(
+        &self,
+        space: &str,
+        byte_offset: u64,
+        size: u32,
+        image: Option<&PcodeReadOnlyElfImage>,
+    ) -> Result<Option<u128>, String> {
+        checked_memory_range_wide(byte_offset, size)?;
+        let mut value = 0u128;
         for index in 0..size {
             let address = byte_offset + u64::from(index);
             let byte = self
@@ -77,7 +89,7 @@ impl PcodeConcreteState {
             let Some(byte) = byte else {
                 return Ok(None);
             };
-            value |= u64::from(byte) << (index * 8);
+            value |= u128::from(byte) << (index * 8);
         }
         Ok(Some(value))
     }
@@ -221,6 +233,13 @@ fn checked_memory_range(byte_offset: u64, size: u32) -> Result<(), String> {
     if !(1..=8).contains(&size) {
         return Err("concrete memory access width must be 1..=8 bytes".to_owned());
     }
+    checked_memory_range_wide(byte_offset, size)
+}
+
+fn checked_memory_range_wide(byte_offset: u64, size: u32) -> Result<(), String> {
+    if !(1..=16).contains(&size) {
+        return Err("concrete memory read width must be 1..=16 bytes".to_owned());
+    }
     if byte_offset.checked_add(u64::from(size - 1)).is_none() {
         return Err("concrete memory byte range overflows u64".to_owned());
     }
@@ -296,6 +315,9 @@ pub struct PcodeExecutedOperation {
     /// STORE has no output varnode; its written value is in `memory_access`.
     #[serde(with = "trace_output_value")]
     pub output_value: Option<u128>,
+    /// Pointer-based LOAD/STORE accesses up to eight bytes. A direct RAM
+    /// COPY carries its absolute source varnode and full 128-bit value in
+    /// `source`, `input_values`, and `output_value` instead.
     pub memory_access: Option<PcodeConcreteMemoryAccess>,
 }
 
@@ -519,6 +541,133 @@ impl PcodeSemanticFunctionIr {
         self.address_spaces
             .iter()
             .find(|space| u64::try_from(space.id).ok() == Some(id))
+    }
+
+    fn execute_direct_ram_copy(
+        &self,
+        source: &PcodeOperation,
+        state: &mut PcodeConcreteState,
+        image: Option<&PcodeReadOnlyElfImage>,
+    ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
+        let input = source.inputs.first().ok_or_else(|| {
+            memory_boundary(
+                source,
+                None,
+                None,
+                PcodeMemoryBoundaryKind::UnsupportedLayout,
+                "direct COPY requires one source varnode",
+            )
+        })?;
+        let output = source.output.as_ref().ok_or_else(|| {
+            memory_boundary(
+                source,
+                None,
+                None,
+                PcodeMemoryBoundaryKind::UnsupportedLayout,
+                "direct COPY requires an output varnode",
+            )
+        })?;
+        if source.opcode != 1
+            || source.mnemonic != "COPY"
+            || source.inputs.len() != 1
+            || input.size != output.size
+            || !(1..=16).contains(&input.size)
+            || !matches!(output.space.as_str(), "register" | "unique")
+        {
+            return Err(memory_boundary(
+                source,
+                Some(&input.space),
+                None,
+                PcodeMemoryBoundaryKind::UnsupportedLayout,
+                "direct COPY width, arity or output storage is unsupported",
+            ));
+        }
+        let space = self
+            .address_spaces
+            .iter()
+            .find(|space| space.name == input.space)
+            .ok_or_else(|| {
+                memory_boundary(
+                    source,
+                    Some(&input.space),
+                    None,
+                    PcodeMemoryBoundaryKind::UnknownSpace,
+                    "direct COPY source address space is absent",
+                )
+            })?;
+        if space.space_type != 1 || space.pointer_size != 8 || space.addressable_unit_size == 0 {
+            return Err(memory_boundary(
+                source,
+                Some(&space.name),
+                None,
+                PcodeMemoryBoundaryKind::UnsupportedLayout,
+                "direct COPY requires a 64-bit RAM address space with a known addressable unit",
+            ));
+        }
+        let pointer_offset = hex_u64(&input.offset).map_err(|reason| {
+            memory_boundary(
+                source,
+                Some(&space.name),
+                None,
+                PcodeMemoryBoundaryKind::UnsupportedLayout,
+                reason,
+            )
+        })?;
+        let byte_offset = pointer_offset
+            .checked_mul(u64::from(space.addressable_unit_size))
+            .ok_or_else(|| {
+                memory_boundary(
+                    source,
+                    Some(&space.name),
+                    Some(pointer_offset),
+                    PcodeMemoryBoundaryKind::AddressOverflow,
+                    "direct COPY address scaling overflows u64",
+                )
+            })?;
+        checked_memory_range_wide(byte_offset, input.size).map_err(|reason| {
+            memory_boundary(
+                source,
+                Some(&space.name),
+                Some(pointer_offset),
+                PcodeMemoryBoundaryKind::AddressOverflow,
+                reason,
+            )
+        })?;
+        let value = state
+            .read_memory_with_image_wide(&space.name, byte_offset, input.size, image)
+            .map_err(|reason| {
+                memory_boundary(
+                    source,
+                    Some(&space.name),
+                    Some(pointer_offset),
+                    PcodeMemoryBoundaryKind::AddressOverflow,
+                    reason,
+                )
+            })?
+            .ok_or_else(|| {
+                memory_boundary(
+                    source,
+                    Some(&space.name),
+                    Some(pointer_offset),
+                    PcodeMemoryBoundaryKind::UnknownBytes,
+                    "one or more direct COPY source bytes are unknown",
+                )
+            })?;
+        state.write_varnode_wide(output, value).map_err(|reason| {
+            memory_boundary(
+                source,
+                Some(&space.name),
+                Some(pointer_offset),
+                PcodeMemoryBoundaryKind::StateLimit,
+                reason,
+            )
+        })?;
+        Ok(PcodeExecutedOperation {
+            source: source.clone(),
+            input_values: vec![value],
+            output_value: Some(value),
+            memory_access: None,
+        })
     }
 
     /// Perform one LOAD or STORE only when the space ID, pointer width,
@@ -820,6 +969,9 @@ impl PcodeSemanticFunctionIr {
                 class,
                 PcodeOpaqueClass::MemoryRead | PcodeOpaqueClass::MemoryWrite
             ) {
+                if source.opcode == 1 {
+                    return self.execute_direct_ram_copy(source, state, image);
+                }
                 return self.execute_memory_operation(operation, state, image);
             }
             return Err(Box::new(PcodeExecutionStop::OpaqueBoundary {
@@ -1981,6 +2133,60 @@ mod tests {
             initial.read_varnode(&node("register", "0x0", 8)).unwrap(),
             Some(0x1122_3344_5566_7788)
         );
+    }
+
+    #[test]
+    fn direct_ram_copy_reads_all_sixteen_known_bytes_without_truncation() {
+        let mut f = function(vec![operation(
+            1,
+            "COPY",
+            0,
+            Some(node("register", "0x1240", 16)),
+            vec![node("ram", "0x6000", 16)],
+        )]);
+        f.address_spaces = real_branch_snapshot().address_spaces;
+        let mut seed = PcodeConcreteState::default();
+        seed.write_memory("ram", 0x6000, 8, 0x0123_4567_89ab_cdef)
+            .unwrap();
+        let unknown = f.execute_exact_prefix(&seed, 4).unwrap();
+        assert!(matches!(
+            unknown.stop,
+            PcodeExecutionStop::MemoryBoundary {
+                reason: PcodeMemoryBoundaryKind::UnknownBytes,
+                ..
+            }
+        ));
+        assert!(unknown.executed.is_empty());
+
+        seed.write_memory("ram", 0x6008, 8, 0xfedc_ba98_7654_3210)
+            .unwrap();
+        let trace = f.execute_exact_prefix(&seed, 4).unwrap();
+        let expected = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef_u128;
+        assert_eq!(trace.executed[0].input_values, vec![expected]);
+        assert_eq!(trace.executed[0].output_value, Some(expected));
+        assert_eq!(trace.executed[0].memory_access, None);
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode_wide(&node("register", "0x1240", 16))
+                .unwrap(),
+            Some(expected)
+        );
+        let encoded = serde_json::to_value(&trace.executed[0]).unwrap();
+        assert_eq!(encoded["input_values"][0], format!("0x{expected:x}"));
+        assert_eq!(encoded["output_value"], format!("0x{expected:x}"));
+        assert_eq!(encoded["source"]["inputs"][0]["offset"], "0x6000");
+
+        f.instructions[0].pcode[0].inputs[0].offset = "0xfffffffffffffff8".to_owned();
+        let overflow = f.execute_exact_prefix(&seed, 4).unwrap();
+        assert!(matches!(
+            overflow.stop,
+            PcodeExecutionStop::MemoryBoundary {
+                reason: PcodeMemoryBoundaryKind::AddressOverflow,
+                ..
+            }
+        ));
+        assert!(overflow.executed.is_empty());
     }
 
     #[test]

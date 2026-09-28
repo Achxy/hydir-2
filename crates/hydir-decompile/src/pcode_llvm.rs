@@ -317,6 +317,7 @@ pub fn emit_pcode_exact_operation_llvm(
                 | PcodeExactOp::ShiftLeft
                 | PcodeExactOp::LogicalShiftRight
                 | PcodeExactOp::ArithmeticShiftRight
+                | PcodeExactOp::PackSignedWordsToBytes
         )
     {
         return Err("wide P-code operation lacks checked LLVM lowering".to_owned());
@@ -500,6 +501,26 @@ pub fn emit_pcode_exact_operation_llvm(
                 ));
                 "%result".to_owned()
             }
+        }
+        PcodeExactOp::PackSignedWordsToBytes => {
+            let mut previous = None::<String>;
+            for lane in 0..16 {
+                let source = &operands[if lane < 8 { 1 } else { 2 }];
+                let word_shift = (lane % 8) * 16;
+                let byte_shift = lane * 8;
+                body.push_str(&format!(
+                    "  %word_shifted_{lane} = lshr i128 {source}, {word_shift}\n  %word_{lane} = trunc i128 %word_shifted_{lane} to i16\n  %below_{lane} = icmp slt i16 %word_{lane}, -128\n  %above_{lane} = icmp sgt i16 %word_{lane}, 127\n  %upper_{lane} = select i1 %above_{lane}, i16 127, i16 %word_{lane}\n  %bounded_{lane} = select i1 %below_{lane}, i16 -128, i16 %upper_{lane}\n  %byte_{lane} = trunc i16 %bounded_{lane} to i8\n  %byte_wide_{lane} = zext i8 %byte_{lane} to i128\n  %part_{lane} = shl i128 %byte_wide_{lane}, {byte_shift}\n"
+                ));
+                let part = format!("%part_{lane}");
+                let name = format!("%packed_{lane}");
+                if let Some(previous) = previous {
+                    body.push_str(&format!("  {name} = or i128 {previous}, {part}\n"));
+                } else {
+                    body.push_str(&format!("  {name} = or i128 0, {part}\n"));
+                }
+                previous = Some(name);
+            }
+            previous.expect("16 packed byte lanes")
         }
         PcodeExactOp::ZeroExtend | PcodeExactOp::SignExtend => {
             let input_bits = operation.source.inputs[0].size * 8;
@@ -752,6 +773,7 @@ mod tests {
         };
         let kind = match opcode {
             1 => PcodeExactOp::Copy,
+            9 => PcodeExactOp::PackSignedWordsToBytes,
             11 => PcodeExactOp::Equal,
             12 => PcodeExactOp::NotEqual,
             13 => PcodeExactOp::SignedLess,
@@ -938,6 +960,17 @@ mod tests {
             (15, "INT_LESS", 1, &[16, 16], &[0, 1u128 << 127]),
             (16, "INT_LESSEQUAL", 1, &[16, 16], &[u128::MAX, u128::MAX]),
             (
+                9,
+                "CALLOTHER",
+                16,
+                &[4, 16, 16],
+                &[
+                    0xa2,
+                    0x7fff_0080_007f_0000_ffff_ff80_ff7f_8000,
+                    0x8000_ff7f_ff80_ffff_0000_007f_0080_7fff,
+                ],
+            ),
+            (
                 62,
                 "PIECE",
                 16,
@@ -957,6 +990,10 @@ mod tests {
             if opcode == 63 {
                 op.source.inputs[1].space = "const".to_owned();
                 op.source.inputs[1].offset = "0x8".to_owned();
+            } else if opcode == 9 {
+                op.source.userop_name = Some("packsswb".to_owned());
+                op.source.inputs[0].space = "const".to_owned();
+                op.source.inputs[0].offset = "0xa2".to_owned();
             }
             let expected = op.evaluate_exact_wide(values).unwrap().unwrap();
             let llvm = emit_pcode_exact_operation_llvm(&op).unwrap();

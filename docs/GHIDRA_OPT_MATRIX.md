@@ -11,13 +11,13 @@ For `hydir_triton_add2`, it checks two concrete inputs, including 64-bit
 wraparound, against Rust P-code execution and compiled image-backed LLVM. On
 Linux x86-64 it calls the exact generated ELF under GDB, verifies the selected
 code bytes, and compares return values. Rust and LLVM instruction visits are
-compared with each other. For `hydir_secure_equals`, it checks
-match, mismatch, and wrong-length paths the same way at O0. The O2
-wrong-length path returns exactly. On the current vectorized O2 lift, match
-and mismatch execute a checked 128-bit zero extension in LLVM and then stop
-at a 16-byte direct RAM `COPY`, as Rust does. The matrix checks this boundary
-when that vectorized pattern occurs. The report records each stop and never
-calls these paths equivalent.
+compared with each other. For `hydir_secure_equals`, it checks match,
+mismatch, and wrong-length paths at both O0 and O2. The vectorized O2 lift
+uses two 16-byte direct RAM reads and Ghidra's `packsswb` user operation.
+Hydir executes those reads from fully known guest or file-backed bytes and
+implements the 128-bit signed saturation operation in Rust and LLVM. Unknown
+memory bytes still stop before a result is written. On Linux the matrix also
+checks every selected path against the exact generated ELF under GDB.
 
 Run after building `hydirctl`:
 
@@ -33,8 +33,9 @@ nondefault CLI build. The generated binaries, snapshots, traces, LLVM modules,
 and `report.json` are written to `target/ghidra-opt-matrix/` by default.
 
 The matrix covers one source fixture and two selected functions. It does not
-establish whole-program equivalence or SIMD support. The optimized comparison
-currently exposes a 16-byte direct image operand and `CALLOTHER` as separate
-semantic work for the core. The checked wide LLVM value subset includes
-extension, basic arithmetic and bitwise operations, comparisons, shifts,
-`PIECE`, and `SUBPIECE`; it does not imply complete SIMD instruction support.
+establish whole-program equivalence or general SIMD support. The checked wide
+LLVM subset includes extension, basic arithmetic and bitwise operations,
+comparisons, shifts, `PIECE`, `SUBPIECE`, and the specifically named 128-bit
+`packsswb` user operation. Its lane order and signed saturation follow the
+[Intel instruction definition](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)
+and the [Ghidra x86 SLEIGH call](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/ia.sinc).
