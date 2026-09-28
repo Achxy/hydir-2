@@ -3864,6 +3864,51 @@ struct ActiveGhidraTask {
     timeout: Duration,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderSmokeStage {
+    AwaitAnalysis,
+    PcodeReady,
+    PcodeCapturePending,
+    DisassemblyReady,
+    DisassemblyCapturePending,
+}
+
+struct RenderSmoke {
+    selector: String,
+    output_dir: PathBuf,
+    started: Instant,
+    stage: RenderSmokeStage,
+    selection_requested: bool,
+}
+
+fn render_smoke_fail(output_dir: &Path, reason: &str) -> ! {
+    let _ = fs::write(output_dir.join("failure.txt"), reason);
+    eprintln!("HydIR rendered Ghidra demo failed: {reason}");
+    std::process::exit(1);
+}
+
+fn save_render_smoke_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    let [width, height] = image.size;
+    if width < 100 || height < 100 || image.pixels.len() != width * height {
+        return Err("Rendered GUI screenshot has invalid dimensions".to_owned());
+    }
+    let width = u32::try_from(width).map_err(|error| error.to_string())?;
+    let height = u32::try_from(height).map_err(|error| error.to_string())?;
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+    let rgba = image
+        .pixels
+        .iter()
+        .flat_map(|pixel| pixel.to_array())
+        .collect::<Vec<_>>();
+    writer
+        .write_image_data(&rgba)
+        .map_err(|error| error.to_string())
+}
+
 fn ghidra_progress(ui: &mut egui::Ui, task: &ActiveGhidraTask, label: &str) {
     ui.horizontal(|ui| {
         ui.spinner();
@@ -3960,6 +4005,7 @@ struct AnalystApp {
     ghidra_cli_available: Option<bool>,
     ghidra_runtime_probe: Option<Receiver<(GhidraRuntimeStatus, bool)>>,
     pending_ghidra: Option<(PathBuf, String)>,
+    render_smoke: Option<RenderSmoke>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
     ir: Option<String>,
@@ -4108,6 +4154,7 @@ impl AnalystApp {
             ghidra_cli_available: None,
             ghidra_runtime_probe: Some(probe_ghidra_runtime(ctx)),
             pending_ghidra: None,
+            render_smoke: None,
             symbol: None,
             cfg: None,
             ir: None,
@@ -4207,6 +4254,162 @@ impl AnalystApp {
                 self.failure = Some("Analysis queue is full. Retry Ghidra analysis.".to_owned());
             }
         }
+    }
+
+    fn render_smoke_before_frame(&mut self, ctx: &egui::Context) {
+        let Some(mut smoke) = self.render_smoke.take() else {
+            return;
+        };
+        if smoke.started.elapsed() > Duration::from_secs(20 * 60) {
+            render_smoke_fail(&smoke.output_dir, "Rendered Ghidra demo timed out");
+        }
+        let screenshot = ctx.input(|input| {
+            input.events.iter().find_map(|event| {
+                if let egui::Event::Screenshot { image, .. } = event {
+                    Some(Arc::clone(image))
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(image) = screenshot {
+            let (filename, next_stage) = match smoke.stage {
+                RenderSmokeStage::PcodeCapturePending => {
+                    ("ghidra-pcode.png", RenderSmokeStage::DisassemblyReady)
+                }
+                RenderSmokeStage::DisassemblyCapturePending => (
+                    "disassembly.png",
+                    RenderSmokeStage::DisassemblyCapturePending,
+                ),
+                _ => render_smoke_fail(&smoke.output_dir, "Unexpected GUI screenshot reply"),
+            };
+            if let Err(error) = save_render_smoke_png(&smoke.output_dir.join(filename), &image) {
+                render_smoke_fail(&smoke.output_dir, &error);
+            }
+            if smoke.stage == RenderSmokeStage::DisassemblyCapturePending {
+                let snapshot = self.ghidra_snapshot.as_ref().expect("ready snapshot");
+                let llvm = self
+                    .ghidra_llvm_cfg
+                    .as_ref()
+                    .expect("ready LLVM")
+                    .as_ref()
+                    .expect("valid LLVM");
+                let report = self.disassembly_report.as_ref().expect("ready disassembly");
+                let manifest = serde_json::json!({
+                    "binary_sha256": snapshot.binary_sha256,
+                    "selected_function": snapshot.selected_function.entry.offset,
+                    "function_count": snapshot.functions.len(),
+                    "pcode_rows": self.ghidra_pcode_lines.len(),
+                    "state_rows": self.ghidra_state_lines.len(),
+                    "llvm_source_operations": llvm.source_operations.len(),
+                    "disassembly_instructions": report.instructions.len(),
+                    "linked_address": self.selected_address.map(|address| format!("0x{address:x}")),
+                    "screenshots": ["ghidra-pcode.png", "disassembly.png"]
+                });
+                let path = smoke.output_dir.join("manifest.json");
+                if let Err(error) = fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&manifest).expect("static manifest"),
+                ) {
+                    render_smoke_fail(&smoke.output_dir, &error.to_string());
+                }
+                println!("HydIR rendered Ghidra demo passed: {}", path.display());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            smoke.stage = next_stage;
+        }
+        if smoke.stage == RenderSmokeStage::AwaitAnalysis {
+            if !self.ghidra_busy
+                && self.ghidra_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.selected_function.entry.offset == smoke.selector
+                })
+                && let Some(Err(error)) = &self.ghidra_llvm_cfg
+            {
+                render_smoke_fail(
+                    &smoke.output_dir,
+                    &format!("Desktop CFG LLVM generation failed: {error}"),
+                );
+            }
+            if self.status == "Whole-ELF disassembly failed"
+                || self.status == "Disassembly discarded"
+            {
+                render_smoke_fail(
+                    &smoke.output_dir,
+                    self.failure
+                        .as_deref()
+                        .unwrap_or("Desktop did not produce disassembly"),
+                );
+            }
+            if !self.ghidra_busy
+                && let Some(snapshot) = &self.ghidra_snapshot
+                && snapshot.selected_function.entry.offset != smoke.selector
+                && !smoke.selection_requested
+            {
+                let binary = self.current_local_path.clone().expect("opened local ELF");
+                let digest = snapshot.binary_sha256.clone();
+                self.enqueue_ghidra(binary, digest, Some(smoke.selector.clone()));
+                smoke.selection_requested = true;
+            }
+            if !self.ghidra_busy
+                && self.workbench_loaded
+                && self.pending_ghidra.is_none()
+                && let Some(error) = &self.failure
+            {
+                render_smoke_fail(&smoke.output_dir, error);
+            }
+            if !self.ghidra_busy
+                && let (Some(spec), Some(snapshot), Some(report), Some(Ok(llvm))) = (
+                    self.spec.as_ref(),
+                    self.ghidra_snapshot.as_ref(),
+                    self.disassembly_report.as_ref(),
+                    self.ghidra_llvm_cfg.as_ref(),
+                )
+                && snapshot.selected_function.entry.offset == smoke.selector
+            {
+                let linked = GhidraAddressMap::new(snapshot, spec).and_then(|map| {
+                    map.to_linked(
+                        &snapshot.selected_function.entry.space,
+                        &snapshot.selected_function.entry.offset,
+                    )
+                });
+                if linked.is_none()
+                    || linked != self.selected_address
+                    || report.binary_sha256 != spec.binary_sha256
+                    || snapshot.binary_sha256 != spec.binary_sha256
+                    || self.ghidra_pcode_lines.is_empty()
+                    || self.ghidra_state_lines.is_empty()
+                    || llvm.source_operations.is_empty()
+                    || !llvm.llvm_ir.contains("define ")
+                {
+                    render_smoke_fail(&smoke.output_dir, "Rendered workbench state is incomplete");
+                }
+                self.tab = Tab::GhidraPcode;
+                smoke.stage = RenderSmokeStage::PcodeReady;
+            }
+        }
+        if smoke.stage == RenderSmokeStage::DisassemblyReady {
+            self.tab = Tab::Bytes;
+            self.pending_disassembly_scroll = self.selected_address;
+        }
+        self.render_smoke = Some(smoke);
+    }
+
+    fn render_smoke_after_frame(&mut self, ctx: &egui::Context) {
+        let Some(smoke) = &mut self.render_smoke else {
+            return;
+        };
+        smoke.stage = match smoke.stage {
+            RenderSmokeStage::PcodeReady => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                RenderSmokeStage::PcodeCapturePending
+            }
+            RenderSmokeStage::DisassemblyReady => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                RenderSmokeStage::DisassemblyCapturePending
+            }
+            stage => stage,
+        };
     }
 
     fn poll(&mut self) {
@@ -6829,6 +7032,18 @@ impl AnalystApp {
             .size(11.0)
             .color(MUTED),
         );
+        if let Some(Ok(llvm)) = &self.ghidra_llvm_cfg {
+            ui.label(
+                RichText::new(format!(
+                    "Hydir LLVM CFG: {} linked source operations · {} explicit stop sites · {:?} fidelity",
+                    llvm.source_operations.len(),
+                    llvm.stop_sites.len(),
+                    llvm.semantic_fidelity
+                ))
+                .size(11.0)
+                .color(ACCENT),
+            );
+        }
         ui.separator();
         ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
         let mut requested = None;
@@ -11846,6 +12061,7 @@ fn ir_slice(ir: &str, address: u64) -> Option<String> {
 impl eframe::App for AnalystApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        self.render_smoke_before_frame(ui.ctx());
         let dropped_path = ui.ctx().input(|input| {
             input
                 .raw
@@ -11919,6 +12135,7 @@ impl eframe::App for AnalystApp {
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| self.main_view(ui));
         });
+        self.render_smoke_after_frame(ui.ctx());
     }
 }
 
@@ -12134,6 +12351,22 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let render_smoke = if let [flag, binary, selector, output_dir] = arguments.as_slice()
+        && flag == "--render-ghidra-demo"
+    {
+        let output_dir = PathBuf::from(output_dir);
+        if std::env::var_os("HYDIR_LOCAL_DB").is_none() {
+            eprintln!("Rendered Ghidra demo requires a private HYDIR_LOCAL_DB");
+            std::process::exit(2);
+        }
+        if let Err(error) = fs::create_dir_all(&output_dir) {
+            eprintln!("Could not create rendered Ghidra demo output: {error}");
+            std::process::exit(2);
+        }
+        Some((PathBuf::from(binary), selector.clone(), output_dir))
+    } else {
+        None
+    };
     if let [probe, binary] | [probe, binary, _] = arguments.as_slice()
         && probe == "--probe-ghidra-demo"
     {
@@ -12714,7 +12947,9 @@ fn main() -> eframe::Result<()> {
     } else {
         None
     };
-    let open_local = if let [flag, path] = arguments.as_slice()
+    let open_local = if let Some((binary, _, _)) = &render_smoke {
+        Some((binary.clone(), None))
+    } else if let [flag, path] = arguments.as_slice()
         && flag == "--open-local"
     {
         Some((PathBuf::from(path), None))
@@ -12730,7 +12965,7 @@ fn main() -> eframe::Result<()> {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-ghidra-demo <elf> [0xfunction-entry] (requires HYDIR_LOCAL_DB) | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-ghidra-demo <elf> [0xfunction-entry] (requires HYDIR_LOCAL_DB) | --render-ghidra-demo <elf> <0xfunction-entry> <output-dir> (requires HYDIR_LOCAL_DB) | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -12751,6 +12986,15 @@ fn main() -> eframe::Result<()> {
                 app.initial_symbol = symbol;
                 app.startup_open_local = Some(path);
             }
+            if let Some((_, selector, output_dir)) = render_smoke {
+                app.render_smoke = Some(RenderSmoke {
+                    selector,
+                    output_dir,
+                    started: Instant::now(),
+                    stage: RenderSmokeStage::AwaitAnalysis,
+                    selection_requested: false,
+                });
+            }
             app.startup_recipe_path = open_recipe;
             Ok(Box::new(app))
         }),
@@ -12768,8 +13012,8 @@ mod tests {
         native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
         pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
         persist_local_model_rename, preview_patch_local, resized_console_height,
-        run_ghidra_command, selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token,
-        validate_endpoint, workbench_graph_layout,
+        run_ghidra_command, save_render_smoke_png, selected_ghidra_trace_address,
+        trace_ghidra_path, valid_bearer_token, validate_endpoint, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
@@ -12801,6 +13045,20 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn rendered_smoke_writes_decodable_gui_png() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("gui.png");
+        let image = eframe::egui::ColorImage::filled(
+            [128, 128],
+            eframe::egui::Color32::from_rgb(24, 38, 51),
+        );
+        save_render_smoke_png(&path, &image).unwrap();
+        let decoder = png::Decoder::new(std::io::BufReader::new(fs::File::open(path).unwrap()));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (128, 128));
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+    }
     #[test]
     fn ghidra_subprocess_success_reads_output_tail() {
         #[cfg(windows)]

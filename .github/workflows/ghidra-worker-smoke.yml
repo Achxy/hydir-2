@@ -19,8 +19,10 @@ on:
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-aggregate-walk.py
+      - scripts/check-ghidra-float-compare.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/hydir_aggregate_walk.c
+      - tests/fixtures/ghidra_float_compare.S
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -53,8 +55,10 @@ on:
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-aggregate-walk.py
+      - scripts/check-ghidra-float-compare.py
       - tests/fixtures/hydir_password_demo.c
       - tests/fixtures/hydir_aggregate_walk.c
+      - tests/fixtures/ghidra_float_compare.S
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -159,6 +163,55 @@ jobs:
             --probe-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf 0x2015d0
           cargo run --locked -p hydir-gui --bin hydir -- \
             --probe-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf 0x2016d0
+      - name: Render the automatic Hydir and Ghidra desktop workflow
+        env:
+          HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-render.sqlite
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri tesseract-ocr
+          xvfb-run -a -s "-screen 0 1600x1000x24" \
+            target/debug/hydir \
+              --render-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf \
+              0x2016d0 "$RUNNER_TEMP/hydir-gui-render"
+          python3 - "$RUNNER_TEMP/hydir-gui-render" <<'PY'
+          import json
+          import pathlib
+          import struct
+          import subprocess
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          manifest = json.loads((output / 'manifest.json').read_text())
+          assert manifest['selected_function'] == '0x2016d0'
+          assert manifest['function_count'] >= 7
+          assert manifest['pcode_rows'] > 0
+          assert manifest['state_rows'] > 0
+          assert manifest['llvm_source_operations'] > 0
+          assert manifest['disassembly_instructions'] > 0
+          for name in manifest['screenshots']:
+              image = output / name
+              data = image.read_bytes()
+              assert data[:8] == b'\x89PNG\r\n\x1a\n', name
+              width, height = struct.unpack('>II', data[16:24])
+              assert width >= 1200 and height >= 700, (name, width, height)
+              ocr = subprocess.run(
+                  ['tesseract', str(image), 'stdout', '--psm', '11'],
+                  check=True, capture_output=True, text=True,
+              ).stdout.casefold()
+              (output / f'{name}.txt').write_text(ocr)
+              assert 'hydir' in ocr, (name, ocr)
+              if name == 'ghidra-pcode.png':
+                  assert 'ghidra' in ocr and 'p-code' in ocr, ocr
+              else:
+                  assert 'disassembly' in ocr and 'instructions' in ocr, ocr
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hydir-gui-render-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hydir-gui-render/
+          if-no-files-found: warn
       - name: Reproduce the stripped password lifting demo
         run: bash scripts/demo-ghidra-password-lift.sh
       - name: Differential Ghidra matrix across optimization and DWARF variants
@@ -175,6 +228,10 @@ jobs:
         run: |
           python3 scripts/check-ghidra-aggregate-walk.py \
             --output-dir "$RUNNER_TEMP/ghidra-aggregate-walk"
+      - name: Differential Ghidra floating-point comparisons
+        run: |
+          python3 scripts/check-ghidra-float-compare.py \
+            --output-dir "$RUNNER_TEMP/ghidra-float-compare"
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"
