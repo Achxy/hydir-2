@@ -4,6 +4,8 @@
 ways: O0 and O2, each with DWARF and after stripping. It discovers function
 addresses from the unstripped ELF symbols, imports each binary through the
 automatic Ghidra worker, and compares raw P-code between each matching pair.
+These freestanding ELFs are linked statically so the native debugger enters
+the test program without a dynamic-loader startup step.
 
 For `hydir_triton_add2`, it checks two concrete inputs, including 64-bit
 wraparound, against Rust P-code execution and compiled image-backed LLVM. On

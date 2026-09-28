@@ -63,8 +63,14 @@ def build_variants(directory):
         flags = (["--target=x86_64-unknown-linux-gnu", "-fuse-ld=lld"]
                  if sys.platform == "win32" else [])
         run([clang, *flags, f"-{level.upper()}", "-g", "-fno-stack-protector",
-             "-fno-builtin", "-nostdlib", "-no-pie", "-Wl,--build-id=none",
+             "-fno-builtin", "-nostdlib", "-static", "-no-pie", "-Wl,--build-id=none",
              "-Wl,-e,_start", SOURCE, "-o", dwarf])
+        elf = dwarf.read_bytes()
+        program_offset = struct.unpack_from("<Q", elf, 32)[0]
+        program_size, program_count = struct.unpack_from("<HH", elf, 54)
+        if any(struct.unpack_from("<I", elf, program_offset + index * program_size)[0] == 3
+               for index in range(program_count)):
+            raise AssertionError(f"matrix ELF still has a program interpreter: {dwarf}")
         symbols = {}
         for row in run([nm, dwarf]).splitlines():
             match = re.fullmatch(r"\s*([0-9a-fA-F]+)\s+[Tt]\s+(hydir_triton_add2|hydir_secure_equals)", row)
