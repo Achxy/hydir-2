@@ -54,7 +54,13 @@ for _ in range(max_visits):
     if pc == ret_address and visits and visits[-1] in return_instructions:
         break
     if pc not in instructions:
-        raise RuntimeError("native execution left selected function at 0x%x" % pc)
+        raise RuntimeError(
+            "left function pc=0x%x return=0x%x last=%s ret_sites=%s" % (
+                pc, ret_address,
+                ("0x%x" % visits[-1]) if visits else "none",
+                ",".join("0x%x" % address for address in sorted(return_instructions)),
+            )
+        )
     expected = instructions[pc]
     actual = bytes(gdb.selected_inferior().read_memory(pc, len(expected)))
     if actual != expected:

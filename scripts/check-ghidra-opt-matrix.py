@@ -128,8 +128,11 @@ def native_result(binary, snapshot_path, return_address, kind, case):
         _, candidate, length, _ = case
         env.update(HYDIR_NATIVE_INPUT_HEX=candidate.hex(),
                    HYDIR_NATIVE_RSI=hex(length))
-    output = run(["gdb", "-nx", "-q", "--batch", "-x", GDB_SCRIPT, binary],
-                 env=env, timeout=90)
+    try:
+        output = run(["gdb", "-nx", "-q", "--batch", "-x", GDB_SCRIPT, binary],
+                     env=env, timeout=90)
+    except RuntimeError as error:
+        raise RuntimeError(f"native {binary.stem}/{kind}/{case[0]}: {error}") from error
     results = [json.loads(line.removeprefix("HYDIR_NATIVE_RESULT="))
                for line in output.splitlines()
                if line.startswith("HYDIR_NATIVE_RESULT=")]
