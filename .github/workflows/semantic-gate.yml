@@ -47,10 +47,14 @@ jobs:
             fi
             sleep 0.25
           done
-          test -s "$probe_dir/discovery.json"
+          if ! test -s "$probe_dir/discovery.json"; then
+            cat "$probe_dir/server.log" >&2
+            exit 1
+          fi
           target/debug/hydir --probe-remote-model "$HYDIR_ENDPOINT" \
             "$HYDIR_TOKEN_FILE" "$probe_dir/max2.elf" hydir_max2 \
             > "$probe_dir/probe.txt"
+          cat "$probe_dir/probe.txt"
           grep -q 'typed C available true' "$probe_dir/probe.txt"
       - name: Python SDK tests
         run: |

@@ -42,10 +42,13 @@ model program.elf` reads the saved model, and `hydirctl local decompile-typed
 program.elf <function>` uses it. The private SQLite project checks the ELF
 digest and expected revision, records each model edit as a new revision, and
 rejects stale writes. An ELF change starts a fresh digest-scoped model view.
-The local typed-C cache checks content hashes and keys entries by binary
-digest, model revision, analysis version, options, and function entry. On a
-model edit it carries only entries whose referenced types, own function facts,
-and transitive callees are unchanged.
+The local typed-C cache checks content hashes and keys linear and CFG output
+separately by binary digest, model revision, analysis version, options, source
+MachineIR/FunctionIR, and function entry. On a model edit it carries only
+entries whose referenced types, own function facts, and known transitive
+callees are unchanged. A missing callee summary prevents uncertain caller
+reuse. The CLI uses this cache; remote artifacts are recomputed for the
+requested project revision.
 Local model saves mark changed facts as analyst assertions while retaining
 earlier native and DWARF evidence, even when an editor omits it from the JSON.
 An analyst field type that differs from the previous model type also creates
@@ -82,7 +85,7 @@ single-entry chains, private diamonds, and simple pre-test loops into readable
 statements. Other control flow retains explicit gotos. A flag snapshot is
 inlined into a condition only when that branch is its sole reader. The typed
 command and desktop view try v1 first,
-then v3; the local project caches v1 output and regenerates v3 output. Both
+then v3; the local project caches both outputs. Both
 artifacts retain instruction sites. The CFG subset emits bytewise little-endian
 C11 helpers for its 64-bit memory accesses and carries ExpressionIR alias-region
 versions on each load/store. A validated pointer-to-struct or pointer-to-union
@@ -132,5 +135,7 @@ for the current binary revision, so `HighLevelCIR.model_revision` matches the
 model artifact's `revision`. The desktop native explorer has Typed C and Types
 tabs; selecting a type evidence or C statement address links to the existing
 MachineIR and Evidence views. A saved local project model takes precedence in
-the desktop view. Remote model edits and server-side artifact caching are later
-work.
+the desktop view. The desktop also loads a revision-checked remote model and
+can save function/type renames, prototypes, and field edits through the v3
+service. It refreshes typed C after the saved revision is read back. Server-side
+selective artifact caching remains later work.
