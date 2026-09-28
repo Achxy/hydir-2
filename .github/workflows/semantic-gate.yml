@@ -41,14 +41,19 @@ jobs:
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           export HYDIR_ENDPOINT=http://127.0.0.1:50571
           export HYDIR_TOKEN_FILE="$probe_dir/analyst.token"
-          for attempt in {1..40}; do
-            if target/debug/hydirctl remote discover > "$probe_dir/discovery.json" 2>/dev/null; then
+          for attempt in {1..120}; do
+            if target/debug/hydirctl remote discover \
+              > "$probe_dir/discovery.json" 2> "$probe_dir/discover.err"; then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
               break
             fi
             sleep 0.25
           done
           if ! test -s "$probe_dir/discovery.json"; then
             cat "$probe_dir/server.log" >&2
+            cat "$probe_dir/discover.err" >&2
             exit 1
           fi
           target/debug/hydir --probe-remote-model "$HYDIR_ENDPOINT" \
