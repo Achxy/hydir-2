@@ -98,6 +98,8 @@ The first fresh [optimization and debug-info matrix](GHIDRA_OPT_MATRIX.md) now r
 
 The same four binary variants now have a loop and repeated-call gate for `hydir_password_score` and `hydir_mix64`. Empty, one-byte, and 12-byte inputs check return values, one direct call per byte, and exact Rust/compiled-LLVM source P-code event order across call boundaries. Linux GDB executes the generated ELF and verifies both function bodies against the Ghidra snapshots; the optimized DWARF case also checks the automatic callee collector. This expands path coverage within one source fixture. Independent source programs, compiler families, and broader call/alias cases remain launch work.
 
+An independent linked-list ELF now tests pointer traversal and integer struct fields at O0/O2 × DWARF/stripped. Four seeded paths compare Rust and compiled LLVM results, P-code event order, and instruction visits; Linux GDB checks native results and selected code bytes. This proves bounded concrete execution on a second source program, not recovered aggregate types or general alias reasoning. More compiler families and alias fixtures remain open.
+
 ### Reuse decisions from the 2026-09-26 research pass
 
 | Gap | Adopt or adapt | Boundary and reason |

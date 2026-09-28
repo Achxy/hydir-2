@@ -30,22 +30,33 @@ boundaries. On Linux, GDB checks both function bodies against the snapshots
 and executes the same ELF paths. The O2 DWARF case also exercises Hydir's
 automatic, demand-driven callee collection.
 
+`scripts/check-ghidra-aggregate-walk.py` builds a separate linked-list ELF
+at O0 and O2, with and without DWARF. The selected function follows `next`
+pointers and reads integer fields from guest RAM. Empty, one-node, two-node,
+and zero-scale paths must return the source result in Rust and compiled LLVM;
+their P-code event order and instruction visits must match. Linux GDB checks
+the generated ELF and selected code bytes. This fixture tests concrete
+aggregate access, not recovered source-level struct types.
+
 Run after building `hydirctl`:
 
 ```sh
 cargo build --locked -p hydir-cli --bin hydirctl
 python3 scripts/check-ghidra-opt-matrix.py
 python3 scripts/check-ghidra-call-loop.py
+python3 scripts/check-ghidra-aggregate-walk.py
 ```
 
 On Windows, set `HYDIR_GHIDRA_HOME` to a local Ghidra 12.1.4 installation and
 provide Clang, llvm-nm, and llvm-strip. On Linux, the script uses Docker's
 pinned Hydir Ghidra worker and also requires GDB. Set `HYDIRCTL_BIN` to use a
 nondefault CLI build. The generated binaries, snapshots, traces, LLVM modules,
-`report.json`, and `call-loop-report.json` are written to
-`target/ghidra-opt-matrix/` by default.
+`report.json` and `call-loop-report.json` are written to
+`target/ghidra-opt-matrix/` by default. The separate aggregate gate writes
+to `target/ghidra-aggregate-walk/`.
 
-The matrix covers one source fixture and four selected functions. It does not
+The password matrix covers one source fixture and four selected functions;
+the aggregate gate adds a second source fixture. These gates do not
 establish whole-program equivalence or general SIMD support. The checked wide
 LLVM subset includes extension, basic arithmetic and bitwise operations,
 comparisons, shifts, `PIECE`, `SUBPIECE`, and the specifically named 128-bit

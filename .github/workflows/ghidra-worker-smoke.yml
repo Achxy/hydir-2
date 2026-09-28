@@ -16,9 +16,12 @@ on:
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
+      - scripts/check-ghidra-aggregate-walk.py
       - tests/fixtures/hydir_password_demo.c
+      - tests/fixtures/hydir_aggregate_walk.c
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
+      - tests/fixtures/ghidra_aggregate_native.gdb
       - tests/fixtures/ghidra_prototype.elf
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
@@ -45,9 +48,12 @@ on:
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
+      - scripts/check-ghidra-aggregate-walk.py
       - tests/fixtures/hydir_password_demo.c
+      - tests/fixtures/hydir_aggregate_walk.c
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
+      - tests/fixtures/ghidra_aggregate_native.gdb
       - tests/fixtures/ghidra_prototype.elf
       - tests/fixtures/ghidra_add_zero.S
       - tests/fixtures/ghidra_add_zero.elf
@@ -161,6 +167,10 @@ jobs:
         run: |
           python3 scripts/check-ghidra-call-loop.py \
             --matrix-dir "$RUNNER_TEMP/ghidra-opt-matrix"
+      - name: Differential Ghidra aggregate pointer traversal
+        run: |
+          python3 scripts/check-ghidra-aggregate-walk.py \
+            --output-dir "$RUNNER_TEMP/ghidra-aggregate-walk"
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"
