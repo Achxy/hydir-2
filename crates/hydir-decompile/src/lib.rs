@@ -12,6 +12,12 @@ pub use pcode_assessment::{
     PCODE_FUNCTION_ASSESSMENT_VERSION, PcodeAssessedCall, PcodeFunctionAssessment,
     PcodeLlvmAssessment, PcodeMemoryWitness, assess_pcode_function,
 };
+mod pcode_comparison;
+pub use pcode_comparison::{
+    ComparisonEngine, ComparisonVerdict, DifferenceKind, EngineExecutionEvidence,
+    FirstMachineDifference, MachineStepWitness, PCODE_EXECUTION_COMPARISON_VERSION,
+    PcodeExecutionComparison, WatchedByte, compare_pcode_executions,
+};
 mod pcode_cfg_llvm;
 mod pcode_llvm;
 mod pcode_standalone;
