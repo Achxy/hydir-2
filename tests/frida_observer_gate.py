@@ -93,20 +93,17 @@ def run_one(binary, symbols, value, scratch):
 
 
 def run_jump(scratch):
-    binary = scratch / "ghidra_indirect_jump.elf"
-    # The saved Ghidra fixture has an interpreter despite lacking a dynamic
-    # section; it is suitable for analysis/GDB but not a direct process run.
-    # Link the same assembly as a standalone static ELF for Frida's spawn path.
+    binary = scratch / "frida_indirect_jump.elf"
     subprocess.run([
-        "gcc", "-nostdlib", "-static", "-no-pie", "-Wl,--build-id=none",
-        str(ROOT / "tests/fixtures/ghidra_indirect_jump.S"), "-o", str(binary),
+        "gcc", "-O0", "-fno-pie", "-no-pie", "-Wl,--build-id=none",
+        str(ROOT / "tests/fixtures/frida_indirect_jump.c"), "-o", str(binary),
     ], check=True)
     binary.chmod(0o500)
     elf = binary.read_bytes()
     symbols = symbol_addresses(binary)
     selected = symbols["hydir_indirect_jump"]
-    source = selected + 5  # jmp *%rax in the checked fixture
-    target = selected + 7  # the actual next block, not block adjacency guessed by the host
+    source = symbols["hydir_jump_site"]
+    target = symbols["hydir_jump_target"]
     spec = {
         "schema_version": 1,
         "binary_sha256": hashlib.sha256(elf).hexdigest(),
