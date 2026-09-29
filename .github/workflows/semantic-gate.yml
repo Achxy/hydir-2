@@ -3,7 +3,44 @@ on:
   push:
   pull_request:
 jobs:
-  native-linux:
+  rust-tests:
+    name: Rust tests / ${{ matrix.feature }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature: core-and-backend
+            packages: -p hydir-core -p hydir-backend -p hydir-interchange
+          - feature: analysis-and-c
+            packages: -p hydir-semantics -p hydir-analysis -p hydir-c
+          - feature: patch-and-recompile
+            packages: -p hydir-patch -p hydir-transform -p hydir-recompile
+          - feature: apps-and-projects
+            packages: -p hydir-project -p hydir-cli -p hydir-api -p hydir-server -p hydir-gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc
+      - name: Test feature crates
+        run: cargo test --locked ${{ matrix.packages }}
+
+  fuzz-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Fuzz target build
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
+
+  symbolic-execution:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -11,15 +48,13 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Install native tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc python3-venv
       - name: Install Triton binary-analysis bindings
         run: |
           python3 -m venv .venv
           .venv/bin/python -m pip install triton-library
-      - name: Rust tests
-        run: cargo test --locked --workspace
-      - name: Fuzz target build
-        run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
       - name: Triton bridge protocol tests
         env:
           HYDIR_TRITON_PYTHON: .venv/bin/python
