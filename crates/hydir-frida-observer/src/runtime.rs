@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::unix::{
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -290,12 +293,18 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
         thread::sleep(Duration::from_millis(10));
     };
     if !exit.success() {
+        let stdout = fs::File::open(&stdout_path)
+            .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
+            .unwrap_or_default();
         let stderr = fs::File::open(&stderr_path)
             .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
             .unwrap_or_default();
         return Err(format!(
-            "isolated Frida helper failed: {}",
-            String::from_utf8_lossy(&stderr[..stderr.len().min(4096)])
+            "isolated Frida helper failed (exit={:?}, signal={:?}, stdout={:?}, stderr={:?})",
+            exit.code(),
+            exit.signal(),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
         ));
     }
     let json =
