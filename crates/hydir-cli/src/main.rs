@@ -1654,7 +1654,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_replay_scope": "local Linux x86-64 Bubblewrap replay with private network namespace, bounded argv/stdin/files, exact exit/output goals and explicit setup/timeout/output-limit failures; Ubuntu 24.04 smoke gate passed",
                     "bubblewrap_installed": bwrap_version.is_some(),
                     "frida_observer_helper": frida_helper.display().to_string(),
-                    "frida_observation_ready": cfg!(all(target_os = "linux", target_arch = "x86_64")) && bubblewrap_isolation_ready && frida_helper.is_file(),
+                    "frida_observation_ready": bubblewrap_isolation_ready && frida::helper_ready(&frida_helper),
                     "frida_observation_scope": "InputSpec-bound Linux x86-64 ELF paths with byte-checked block/call witnesses; no process exit-code claim or static CFG-completeness claim",
                     "bubblewrap_isolation_ready": bubblewrap_isolation_ready,
                     "bubblewrap_version": bwrap_version,

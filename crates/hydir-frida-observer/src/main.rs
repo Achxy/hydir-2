@@ -9,6 +9,22 @@ fn main() {
 #[cfg(all(target_os = "linux", feature = "frida-runtime"))]
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--doctor") {
+        if args.next().is_some() {
+            return Err("unexpected doctor arguments".into());
+        }
+        let _frida = unsafe { frida::Frida::obtain() };
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "frida_version": frida::Frida::version(),
+                "observer": "hydir-frida-observer",
+            })
+        );
+        return Ok(());
+    }
+    let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("--inside") {
         return hydir_frida_observer::inside(&args.collect::<Vec<_>>());
     }

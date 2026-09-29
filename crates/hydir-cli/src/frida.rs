@@ -57,6 +57,38 @@ pub(super) fn helper_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(env::current_exe()?.with_file_name("hydir-frida-observer"))
 }
 
+pub(super) fn helper_ready(path: &PathBuf) -> bool {
+    if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" || !path.is_file() {
+        return false;
+    }
+    let Ok(mut child) = Command::new(path)
+        .arg("--doctor")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
 pub(super) fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let options = options(args)?;
     if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {

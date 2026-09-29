@@ -87,6 +87,9 @@ def run_one(binary, symbols, value, scratch):
 
 
 def main():
+    doctor = json.loads(subprocess.check_output([HYDIRCTL, "doctor"], text=True))
+    if doctor.get("frida_observation_ready") is not True:
+        raise AssertionError("hydirctl doctor did not find the bundled Frida runtime")
     with tempfile.TemporaryDirectory(prefix="hydir-frida-gate-") as directory:
         scratch = Path(directory)
         binary = scratch / "frida-branch.elf"
