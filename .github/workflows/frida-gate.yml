@@ -4,21 +4,27 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - LICENSE
+      - crates/hydir-cli/**
       - crates/hydir-execution/**
       - crates/hydir-frida-observer/**
       - vendor/frida-rust-0.17.2/**
       - tests/fixtures/frida_branch.c
       - tests/frida_observer_gate.py
+      - scripts/package-frida-linux.py
       - .github/workflows/frida-gate.yml
   pull_request:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - LICENSE
+      - crates/hydir-cli/**
       - crates/hydir-execution/**
       - crates/hydir-frida-observer/**
       - vendor/frida-rust-0.17.2/**
       - tests/fixtures/frida_branch.c
       - tests/frida_observer_gate.py
+      - scripts/package-frida-linux.py
       - .github/workflows/frida-gate.yml
 jobs:
   linux-x86-64:
@@ -52,13 +58,26 @@ jobs:
           export CPATH="$RUNNER_TEMP/frida-devkit"
           export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
           cargo test --locked -p frida ordinary_send_dispatches_to_registered_handler
-      - name: Build optional Rust observer and run real execution gate
-        env:
-          HYDIR_FRIDA_OBSERVER: target/debug/hydir-frida-observer
+      - name: Build pinned Linux x86-64 release bundle
         run: |
           set -euo pipefail
-          export CPATH="$RUNNER_TEMP/frida-devkit"
-          export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
-          cargo build --locked -p hydir-frida-observer --features frida-runtime --bin hydir-frida-observer
-          cargo build --locked -p hydir-cli --bin hydirctl
+          python3 scripts/package-frida-linux.py build \
+            --devkit-archive "$RUNNER_TEMP/frida-devkit.tar.xz" \
+            --output "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz"
+      - name: Verify offline installation and real observation from bundle
+        run: |
+          set -euo pipefail
+          unset CPATH RUSTFLAGS
+          python3 scripts/package-frida-linux.py verify \
+            "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz" \
+            --require-observation-ready
+          mkdir -p "$RUNNER_TEMP/frida-installed"
+          tar -xzf "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/frida-installed"
+          export HYDIRCTL="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydirctl"
+          export HYDIR_FRIDA_OBSERVER="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydir-frida-observer"
           python3 tests/frida_observer_gate.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydir-linux-x86_64-frida
+          path: ${{ runner.temp }}/hydir-linux-x86_64.tar.gz
+          if-no-files-found: error

@@ -11,7 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OBSERVER = Path(os.environ["HYDIR_FRIDA_OBSERVER"])
-HYDIRCTL = ROOT / "target" / "debug" / "hydirctl"
+HYDIRCTL = Path(os.environ.get("HYDIRCTL", ROOT / "target" / "debug" / "hydirctl"))
 
 
 def symbol_addresses(binary):
