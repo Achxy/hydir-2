@@ -506,16 +506,33 @@ fn project_root(key: &str) -> Result<PathBuf, String> {
     let base =
         env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Caches").into_os_string());
     #[cfg(target_os = "linux")]
-    let base = env::var_os("XDG_CACHE_HOME").or_else(|| {
-        env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").into_os_string())
-    });
+    let base = if env::var_os("HYDIR_GHIDRA_HOME").is_some() {
+        // Ghidra rejects a local project when any path element starts with
+        // '.', including the usual ~/.cache directory. Keep the local
+        // headless project in a visible directory under HOME instead.
+        env::var_os("HYDIR_GHIDRA_PROJECT_HOME").or_else(|| env::var_os("HOME"))
+    } else {
+        env::var_os("XDG_CACHE_HOME").or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").into_os_string())
+        })
+    };
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let base: Option<std::ffi::OsString> = None;
     let base = base.ok_or("cannot determine user cache directory for Ghidra projects")?;
-    Ok(PathBuf::from(base)
+    let root = PathBuf::from(base)
         .join("HydIR")
         .join("ghidra-projects")
-        .join(key))
+        .join(key);
+    #[cfg(target_os = "linux")]
+    if env::var_os("HYDIR_GHIDRA_HOME").is_some()
+        && root.components().any(|component| match component {
+            std::path::Component::Normal(part) => part.to_string_lossy().starts_with('.'),
+            _ => false,
+        })
+    {
+        return Err("local Ghidra project path has a hidden component; set HYDIR_GHIDRA_PROJECT_HOME to a visible directory".into());
+    }
+    Ok(root)
 }
 
 fn existing_project(root: &Path, key: &str) -> Option<PathBuf> {
