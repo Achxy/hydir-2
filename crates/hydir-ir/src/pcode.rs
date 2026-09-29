@@ -237,6 +237,16 @@ pub struct GhidraSymbol {
     pub external: bool,
 }
 
+/// A byte-aligned base register exported by the selected Ghidra language.
+/// Capture values may use this only after the name, width, and storage match.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhidraRegisterLayout {
+    pub name: String,
+    pub storage: PcodeAddress,
+    pub size_bytes: u32,
+}
+
 /// Ghidra's analyzed instruction flow, including overrides and references.
 /// A missing target is an unresolved flow, not a proven absent edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -342,6 +352,10 @@ pub struct GhidraSnapshot {
     pub binary_sha256: String,
     pub program: GhidraProgram,
     pub address_spaces: Vec<GhidraAddressSpace>,
+    /// Optional in v2. Older snapshots stay readable but cannot bind a
+    /// runtime register capture to P-code storage by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub register_layout: Vec<GhidraRegisterLayout>,
     /// Optional in v2 for compatibility with snapshots exported before this slice.
     #[serde(default)]
     pub memory_blocks: Vec<GhidraMemoryBlock>,
@@ -648,6 +662,30 @@ pub fn validate_ghidra_snapshot(
     }
     if !space_names.contains(snapshot.program.image_base.space.as_str()) {
         return Err("image base references an unknown address space".to_owned());
+    }
+    if snapshot.register_layout.len() > 256 {
+        return Err("Ghidra register layout exceeds 256 base registers".to_owned());
+    }
+    let mut previous_register = None;
+    for register in &snapshot.register_layout {
+        bounded_text(&register.name, "Ghidra register name", 128)?;
+        let address = offset(&register.storage)?;
+        if register.storage.space != "register"
+            || !space_names.contains("register")
+            || !(1..=8).contains(&register.size_bytes)
+            || address
+                .checked_add(u64::from(register.size_bytes))
+                .is_none()
+        {
+            return Err("Ghidra register layout has invalid storage or width".to_owned());
+        }
+        if previous_register
+            .as_deref()
+            .is_some_and(|prior| prior >= register.name.as_str())
+        {
+            return Err("Ghidra register layout must be strictly name sorted".to_owned());
+        }
+        previous_register = Some(register.name.clone());
     }
     if snapshot.memory_blocks.len() > MAX_MEMORY_BLOCKS {
         return Err(format!(
@@ -1342,6 +1380,43 @@ mod tests {
         assert_eq!(decision.address.offset, "0x20137c");
         assert_eq!(decision.source_type, "IMPORTED");
         assert_eq!(decision.symbol_type, "Function");
+    }
+
+    #[test]
+    fn base_register_layout_is_bounded_and_keeps_legacy_v2_readers() {
+        let mut value = fixture();
+        let digest = "a".repeat(64);
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &digest)
+                .unwrap()
+                .register_layout
+                .is_empty()
+        );
+        value["address_spaces"].as_array_mut().unwrap().push(json!({
+            "name":"register", "id":2, "type":4,
+            "addressable_unit_size":1, "pointer_size":8
+        }));
+        value["register_layout"] = json!([
+            {"name":"RAX","storage":{"space":"register","offset":"0x0"},"size_bytes":8},
+            {"name":"RIP","storage":{"space":"register","offset":"0x288"},"size_bytes":8}
+        ]);
+        let snapshot =
+            parse_ghidra_snapshot(&serde_json::to_vec(&value).unwrap(), &digest).unwrap();
+        assert_eq!(snapshot.register_layout.len(), 2);
+        let mut invalid = value.clone();
+        invalid["register_layout"][1]["name"] = json!("RAX");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&invalid).unwrap(), &digest)
+                .unwrap_err()
+                .contains("strictly name sorted")
+        );
+        invalid = value;
+        invalid["register_layout"][0]["storage"]["space"] = json!("ram");
+        assert!(
+            parse_ghidra_snapshot(&serde_json::to_vec(&invalid).unwrap(), &digest)
+                .unwrap_err()
+                .contains("invalid storage")
+        );
     }
 
     #[test]

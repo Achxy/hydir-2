@@ -24,6 +24,7 @@ import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.PcodeOpAST;
@@ -53,6 +54,7 @@ public class HydIRSnapshot extends GhidraScript {
     // export; it never produces a plausible-looking partial analysis.
     private static final int MAX_FUNCTIONS = 65_536;
     private static final int MAX_ADDRESS_SPACES = 256;
+    private static final int MAX_REGISTER_LAYOUT = 256;
     private static final int MAX_MEMORY_BLOCKS = 4_096;
     private static final int MAX_SYMBOLS = 65_536;
     private static final int MAX_PROTOTYPE_PARAMETERS = 256;
@@ -616,6 +618,31 @@ public class HydIRSnapshot extends GhidraScript {
             json.raw(",\"type\":" + space.getType());
             json.raw(",\"addressable_unit_size\":" + space.getAddressableUnitSize());
             json.raw(",\"pointer_size\":" + space.getPointerSize() + "}");
+        }
+        json.raw("],\"register_layout\":[");
+        List<Register> registers = new ArrayList<>();
+        for (Register register : currentProgram.getLanguage().getRegisters()) {
+            if (!register.isBaseRegister() || register.isHidden()
+                || register.isProcessorContext() || register.isBigEndian()
+                || register.getNumBytes() < 1 || register.getNumBytes() > 8
+                || register.getBitLength() != register.getNumBytes() * 8
+                || register.getLeastSignificantBit() != 0
+                || !register.getAddressSpace().getName().equals("register")) {
+                continue;
+            }
+            if (registers.size() >= MAX_REGISTER_LAYOUT) {
+                throw new IllegalStateException("HydIR snapshot exceeds base-register layout limit "
+                    + MAX_REGISTER_LAYOUT);
+            }
+            registers.add(register);
+        }
+        registers.sort(Comparator.comparing(Register::getName));
+        for (int i = 0; i < registers.size(); i++) {
+            Register register = registers.get(i);
+            if (i != 0) json.raw(",");
+            json.raw("{\"name\":").quoted(register.getName());
+            json.raw(",\"storage\":").address(register.getAddress());
+            json.raw(",\"size_bytes\":" + register.getNumBytes() + "}");
         }
         json.raw("],\"memory_blocks\":[");
         MemoryBlock[] blocks = currentProgram.getMemory().getBlocks();

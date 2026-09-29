@@ -195,6 +195,10 @@ jobs:
           binary = pathlib.Path('tests/fixtures/hydir-password-gate-stripped.elf').read_bytes()
           assert snapshot['binary_sha256'] == hashlib.sha256(binary).hexdigest()
           assert len(snapshot['functions']) == 7
+          layout = {register['name']: register for register in snapshot['register_layout']}
+          assert {'RAX', 'RSP', 'RIP'} <= layout.keys()
+          assert all(layout[name]['storage']['space'] == 'register' and
+                     layout[name]['size_bytes'] == 8 for name in ('RAX', 'RSP', 'RIP'))
           selected = snapshot['selected_function']
           assert selected['entry']['offset'] == '0x2015d0'
           operations = [op for row in selected['instructions'] for op in row['pcode']]
