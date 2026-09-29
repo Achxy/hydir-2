@@ -705,6 +705,62 @@ class ClientBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual(len(requests), 2)
 
+    def test_v3_allocated_calls_check_version_and_bound_contract(self):
+        digest = "a" * 64
+        entry = {"space": "ram", "offset": "0x2013a9"}
+        seed = json.dumps({
+            "schema_version": 1, "binary_sha256": digest, "entry": entry,
+            "registers": [], "memory": [],
+        }).encode()
+        declaration = b'{"schema_version":1,"regions":[]}'
+        bound = {"schema_version": 1, "binary_sha256": digest,
+                 "snapshot_layout_sha256": "b" * 64, "regions": []}
+        trace = {"schema_version": 3, "binary_sha256": digest,
+                 "root_entry": entry,
+                 "process_binding": {"process_memory_sha256": "c" * 64,
+                                     "allocations": bound}}
+        llvm = {"schema_version": 2, "binary_sha256": digest,
+                "function_entries": [entry],
+                "llvm": {"schema_version": 5, "binary_sha256": digest,
+                         "start": entry, "allocations": bound,
+                         "llvm_ir": "define void @f() { ret void }"}}
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request, **kwargs):
+                requests.append(request)
+                value = llvm if method is client._stub_v3.BuildGhidraCallCfgLlvm else trace
+                content = json.dumps(value).encode()
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type=(
+                        "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2"
+                        if value is llvm else
+                        "application/vnd.hydir.pcode-call-trace+json;version=3"
+                    ), content=content, project_revision=4,
+                )
+            client._call = call
+            self.assertEqual(client.trace_ghidra_calls(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration,
+            )["schema_version"], 3)
+            self.assertEqual(client.build_ghidra_call_cfg_llvm(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration,
+            )["llvm"]["schema_version"], 5)
+            self.assertEqual([request.allocation_json for request in requests],
+                             [declaration, declaration])
+            with self.assertRaises(ValueError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    allocations=b"x" * 4097,
+                )
+            trace["process_binding"]["allocations"]["binary_sha256"] = "0" * 64
+            with self.assertRaises(RuntimeError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    allocations=declaration,
+                )
+
     def test_v3_function_assessment_is_seed_bound_and_unverified(self):
         digest = "a" * 64
         entry = {"space": "ram", "offset": "0x2013a9"}

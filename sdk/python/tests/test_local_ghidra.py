@@ -236,6 +236,12 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("ghidra", "trace-calls"))
         self.assertIn("--function", run.call_args.args)
         self.assertIn("0x401000", run.call_args.args)
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated = {**artifact, "schema_version": 3}
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
+            self.client.trace_calls(self.binary, seed, function=0x401000, allocations=allocations)
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
         with self.assertRaises(ValueError):
             self.client.trace_calls(self.binary, seed, function=0x401000, max_depth=17)
         with patch.object(self.client, "_run", return_value=b'{"binary_sha256":"wrong"}'):
@@ -257,6 +263,14 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-calls"))
         self.assertIn("--callee", run.call_args.args)
         self.assertEqual(run.call_args.args[-2:], ("--max-depth", "2"))
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated = {**artifact, "llvm": {**artifact["llvm"], "schema_version": 5, "allocations": {}}}
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
+            self.client.llvm_cfg_calls(
+                self.binary, self.snapshot, (callee,), allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
         with self.assertRaises(ValueError):
             self.client.llvm_cfg_calls(self.binary, self.snapshot, (callee,), max_depth=17)
         callee.write_text(json.dumps({"binary_sha256": "0" * 64}), encoding="utf-8")
@@ -275,6 +289,14 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("ghidra", "llvm-cfg-calls"))
         self.assertIn("0x401000", run.call_args.args)
         self.assertIn("--max-functions", run.call_args.args)
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated = {**artifact, "llvm": {**artifact["llvm"], "schema_version": 5, "allocations": {}}}
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
+            self.client.llvm_cfg_calls_auto(
+                self.binary, seed, function=0x401000, allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
         with self.assertRaises(ValueError):
             self.client.llvm_cfg_calls_auto(self.binary, seed, function=0x401000, max_depth=17)
 

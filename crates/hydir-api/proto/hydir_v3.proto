@@ -174,6 +174,9 @@ message GhidraCallTraceRequest {
   optional uint32 max_operations = 6;
   optional uint32 max_visits = 7;
   optional uint32 max_depth = 8;
+  // Optional v1 stack/heap declaration. Trace and LLVM use strict ELF process
+  // memory when supplied; assessment requires this field to be empty.
+  bytes allocation_json = 9;
 }
 
 // Runs the separately bundled Linux x86-64 observer on the project's ELF.

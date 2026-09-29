@@ -667,6 +667,7 @@ mod tests {
                 make_event(1, TraceEventKind::Block, entry_witness.clone()),
                 make_event(2, TraceEventKind::Exit, entry_witness),
             ],
+            jump_evidence: vec![],
         };
         let instructions = &snapshot.selected_function.instructions;
         let path = PcodePathTrace {

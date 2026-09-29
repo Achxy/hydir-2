@@ -314,6 +314,7 @@ class LocalGhidra:
         callees: tuple[str | os.PathLike[str], ...] = (),
         *,
         max_depth: int = 4,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Emit bounded LLVM across loaded, validated Ghidra call snapshots."""
         if not isinstance(max_depth, int) or not 0 <= max_depth <= 16:
@@ -330,6 +331,8 @@ class LocalGhidra:
         for path in paths[1:]:
             args.extend(["--callee", str(path)])
         args.extend(["--max-depth", str(max_depth)])
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
         data = json.loads(self._run(*args))
         if (not isinstance(data, dict) or data.get("schema_version") != 1
                 or data.get("binary_sha256") != digest
@@ -340,6 +343,11 @@ class LocalGhidra:
                 or not isinstance(data.get("function_entries"), list)
                 or len(data["function_entries"]) != len(paths)):
             raise RuntimeError("Hydir call CFG LLVM artifact is invalid or belongs to another binary")
+        if allocations is not None and (
+            data["llvm"].get("schema_version") != 5
+            or not isinstance(data["llvm"].get("allocations"), dict)
+        ):
+            raise RuntimeError("Hydir allocated call CFG LLVM artifact has the wrong version")
         return data
 
     def llvm_cfg_calls_auto(
@@ -352,6 +360,7 @@ class LocalGhidra:
         max_operations: int = 4096,
         max_visits: int = 1024,
         max_depth: int = 8,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Analyze a binary and lift the callees reached by one concrete seed."""
         if not isinstance(function, int) or not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
@@ -363,17 +372,25 @@ class LocalGhidra:
         binary_path = Path(binary).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
         digest = self._digest(binary_path)
-        data = json.loads(self._run(
+        args = [
             "ghidra", "llvm-cfg-calls", str(binary_path), str(seed_path),
             "--function", hex(function), "--max-functions", str(max_functions),
             "--max-ops", str(max_operations), "--max-visits", str(max_visits),
             "--max-depth", str(max_depth),
-        ))
+        ]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
+        data = json.loads(self._run(*args))
         if (not isinstance(data, dict) or data.get("schema_version") != 1
                 or data.get("binary_sha256") != digest
                 or not isinstance(data.get("llvm"), dict)
                 or data["llvm"].get("binary_sha256") != digest):
             raise RuntimeError("Hydir automatic call CFG LLVM artifact belongs to another binary")
+        if allocations is not None and (
+            data["llvm"].get("schema_version") != 5
+            or not isinstance(data["llvm"].get("allocations"), dict)
+        ):
+            raise RuntimeError("Hydir automatic allocated call CFG LLVM artifact has the wrong version")
         return data
 
     def slice(
@@ -496,6 +513,7 @@ class LocalGhidra:
         max_operations: int = 4096,
         max_visits: int = 1024,
         max_depth: int = 8,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Ask Hydir's managed Ghidra worker for direct callees and trace one path."""
         if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
@@ -507,14 +525,19 @@ class LocalGhidra:
         binary_path = Path(binary).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
         digest = self._digest(binary_path)
-        data = json.loads(self._run(
+        args = [
             "ghidra", "trace-calls", str(binary_path), str(seed_path),
             "--function", hex(function), "--max-functions", str(max_functions),
             "--max-ops", str(max_operations), "--max-visits", str(max_visits),
             "--max-depth", str(max_depth),
-        ))
+        ]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
+        data = json.loads(self._run(*args))
         if not isinstance(data, dict) or data.get("binary_sha256") != digest:
             raise RuntimeError("Hydir call trace belongs to another binary")
+        if allocations is not None and data.get("schema_version") != 3:
+            raise RuntimeError("Hydir allocated call trace has the wrong version")
         return data
 
     def assess(

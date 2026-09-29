@@ -63,6 +63,13 @@ and compares it with one Frida trace; `inconclusive` does
 not mean the paths match.
 `LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
 managed worker and collects only callees reached by the seed before lifting.
+Add `allocations="allocations.json"` to `trace_calls`, `llvm_cfg_calls`, or
+`llvm_cfg_calls_auto` to share validated ELF process bytes and declared stack
+or heap ranges across those calls. The strict trace is v3 and the call CFG
+contains LLVM v5. The remote `trace_ghidra_calls` and
+`build_ghidra_call_cfg_llvm` methods accept the same declaration as bytes or
+a file path, bound to the uploaded ELF and project revision. Unknown imports,
+relocations, and undeclared memory still stop at their source instruction.
 `HydirClient.build_ghidra_call_cfg_llvm(project_id, revision, seed,
 function_entry=...)` runs that bounded lift for an uploaded ELF through the
 v3 service and returns a revision-bound LLVM artifact. The returned module

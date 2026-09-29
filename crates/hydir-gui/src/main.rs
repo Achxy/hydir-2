@@ -200,6 +200,7 @@ enum Task {
         binary_sha256: String,
         function: String,
         seed_json: String,
+        allocation_json: Option<String>,
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
@@ -235,6 +236,7 @@ enum Task {
         binary_sha256: String,
         function: String,
         seed_json: String,
+        allocation_json: Option<String>,
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
@@ -2276,6 +2278,7 @@ fn run_ghidra_call_trace(
     binary_sha256: &str,
     function: &str,
     seed_json: &str,
+    allocation_json: Option<&str>,
     cancel: &AtomicBool,
     timeout: Duration,
 ) -> Result<PcodeInterproceduralTrace, String> {
@@ -2286,6 +2289,16 @@ fn run_ghidra_call_trace(
     let seed_path = scratch.path().join("seed.json");
     let trace_path = scratch.path().join("calls.json");
     fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let allocation_path = if let Some(json) = allocation_json {
+        if json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+            return Err("Ghidra allocation declaration exceeds the JSON input limit".to_owned());
+        }
+        let path = scratch.path().join("allocations.json");
+        fs::write(&path, json).map_err(|error| error.to_string())?;
+        Some(path)
+    } else {
+        None
+    };
     let mut command = Command::new(hydirctl_path());
     command
         .args(["ghidra", "trace-calls"])
@@ -2297,6 +2310,9 @@ fn run_ghidra_call_trace(
         .arg("8")
         .arg("--output")
         .arg(&trace_path);
+    if let Some(path) = &allocation_path {
+        command.arg("--allocations").arg(path);
+    }
     let output = run_ghidra_command(&mut command, cancel, timeout)
         .map_err(|error| format!("Could not start Ghidra call tracing: {error}"))?;
     if !output.status.success() {
@@ -2324,7 +2340,13 @@ fn run_ghidra_call_trace(
     let trace: PcodeInterproceduralTrace =
         serde_json::from_slice(&fs::read(&trace_path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("Invalid Ghidra call trace: {error}"))?;
-    if trace.schema_version != hydir_ir::pcode::PCODE_CALL_PATH_VERSION
+    let expected_version = if allocation_json.is_some() {
+        hydir_ir::pcode::PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION
+    } else {
+        hydir_ir::pcode::PCODE_CALL_PATH_VERSION
+    };
+    if trace.schema_version != expected_version
+        || trace.process_binding.is_some() != allocation_json.is_some()
         || trace.binary_sha256 != binary_sha256
         || trace.root_entry.offset != function
     {
@@ -2518,6 +2540,7 @@ fn run_ghidra_call_llvm(
     binary_sha256: &str,
     function: &str,
     seed_json: &str,
+    allocation_json: Option<&str>,
     cancel: &AtomicBool,
     timeout: Duration,
 ) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
@@ -2528,6 +2551,16 @@ fn run_ghidra_call_llvm(
     let seed_path = scratch.path().join("seed.json");
     let artifact_path = scratch.path().join("call-cfg-llvm.json");
     fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let allocation_path = if let Some(json) = allocation_json {
+        if json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+            return Err("Ghidra allocation declaration exceeds the JSON input limit".to_owned());
+        }
+        let path = scratch.path().join("allocations.json");
+        fs::write(&path, json).map_err(|error| error.to_string())?;
+        Some(path)
+    } else {
+        None
+    };
     let mut command = Command::new(hydirctl_path());
     command
         .args(["ghidra", "llvm-cfg-calls"])
@@ -2539,6 +2572,9 @@ fn run_ghidra_call_llvm(
         .arg("8")
         .arg("--output")
         .arg(&artifact_path);
+    if let Some(path) = &allocation_path {
+        command.arg("--allocations").arg(path);
+    }
     let output = run_ghidra_command(&mut command, cancel, timeout)
         .map_err(|error| format!("Could not start Ghidra call LLVM generation: {error}"))?;
     if !output.status.success() {
@@ -2566,7 +2602,11 @@ fn run_ghidra_call_llvm(
     let artifact: PcodeInterproceduralCfgLlvmArtifact =
         serde_json::from_slice(&fs::read(&artifact_path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("Invalid Ghidra call LLVM artifact: {error}"))?;
-    if artifact.schema_version != 1
+    let expected_version = if allocation_json.is_some() { 2 } else { 1 };
+    let expected_llvm_version = if allocation_json.is_some() { 5 } else { 2 };
+    if artifact.schema_version != expected_version
+        || artifact.llvm.schema_version != expected_llvm_version
+        || artifact.llvm.allocations.is_some() != allocation_json.is_some()
         || artifact.binary_sha256 != binary_sha256
         || artifact.llvm.binary_sha256 != binary_sha256
         || artifact
@@ -3336,6 +3376,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 binary_sha256,
                 function,
                 seed_json,
+                allocation_json,
                 cancel,
                 timeout,
             } => {
@@ -3347,6 +3388,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         &binary_sha256,
                         &function,
                         &seed_json,
+                        allocation_json.as_deref(),
                         &cancel,
                         timeout,
                     );
@@ -3448,6 +3490,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 binary_sha256,
                 function,
                 seed_json,
+                allocation_json,
                 cancel,
                 timeout,
             } => {
@@ -3459,6 +3502,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         &binary_sha256,
                         &function,
                         &seed_json,
+                        allocation_json.as_deref(),
                         &cancel,
                         timeout,
                     );
@@ -8776,6 +8820,8 @@ impl AnalystApp {
                                 binary_sha256: snapshot.binary_sha256.clone(),
                                 function: snapshot.selected_function.entry.offset.clone(),
                                 seed_json: self.ghidra_trace_seed_json.clone(),
+                                allocation_json: (self.ghidra_trace_memory_mode == "allocated")
+                                    .then(|| self.ghidra_allocation_json.clone()),
                                 cancel: Arc::clone(&cancel),
                                 timeout,
                             };
@@ -8822,9 +8868,16 @@ impl AnalystApp {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("unknown");
                         ui.label(RichText::new(format!(
-                            "{} calls · {} function segments · {} visits · stop: {kind}",
-                            trace.calls.len(), trace.segments.len(), trace.instruction_visits
+                            "Trace v{} · {} calls · {} function segments · {} visits · stop: {kind}",
+                            trace.schema_version, trace.calls.len(), trace.segments.len(), trace.instruction_visits
                         )).size(11.0).color(ACCENT));
+                        if let Some(binding) = &trace.process_binding {
+                            ui.label(RichText::new(format!(
+                                "Shared ELF process {} · {} declared allocations",
+                                binding.process_memory_sha256,
+                                binding.allocations.regions().len(),
+                            )).monospace().size(11.0).color(MUTED));
+                        }
                         if ui.button("Copy call trace JSON").clicked()
                             && let Ok(json) = serde_json::to_string_pretty(trace) {
                                 ui.ctx().copy_text(json);
@@ -9305,6 +9358,8 @@ impl AnalystApp {
                                 binary_sha256: snapshot.binary_sha256.clone(),
                                 function: snapshot.selected_function.entry.offset.clone(),
                                 seed_json: self.ghidra_trace_seed_json.clone(),
+                                allocation_json: (self.ghidra_trace_memory_mode == "allocated")
+                                    .then(|| self.ghidra_allocation_json.clone()),
                                 cancel: Arc::clone(&cancel),
                                 timeout,
                             };
@@ -9340,7 +9395,9 @@ impl AnalystApp {
                 match &self.ghidra_call_llvm {
                     Some(Ok(artifact)) => {
                         ui.label(RichText::new(format!(
-                            "{} loaded functions · {} source operations · {} static stop sites · max call depth {} · fidelity: {:?} · verification: {:?}",
+                            "Call CFG v{} / LLVM v{} · {} loaded functions · {} source operations · {} static stop sites · max call depth {} · fidelity: {:?} · verification: {:?}",
+                            artifact.schema_version,
+                            artifact.llvm.schema_version,
                             artifact.function_entries.len(),
                             artifact.llvm.source_operations.len(),
                             artifact.llvm.stop_sites.len(),
@@ -9348,6 +9405,12 @@ impl AnalystApp {
                             artifact.semantic_fidelity,
                             artifact.verification,
                         )).size(11.0).color(ACCENT));
+                        if let Some(allocations) = &artifact.llvm.allocations {
+                            ui.label(RichText::new(format!(
+                                "Shared ELF process and {} declared allocations",
+                                allocations.regions().len(),
+                            )).size(11.0).color(MUTED));
+                        }
                         ui.label(RichText::new("Runnable path module; execution can stop at the listed boundaries. The generated code has not been verified against the binary.")
                             .size(11.0).color(MUTED));
                         for diagnostic in &artifact.snapshot_diagnostics {
@@ -15277,6 +15340,41 @@ mod tests {
             trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "process", "").unwrap();
         assert!(matches!(traced.stop, PcodePathStop::Return { .. }));
         assert_eq!(process.final_state, traced.final_state);
+        let mut allocated_seed = seed.clone();
+        allocated_seed["registers"] = serde_json::json!([
+            {"offset": "0x38", "size": 8, "value": "0x700100"},
+            {"offset": "0x30", "size": 8, "value": "0xc"},
+            {"offset": "0x20", "size": 8, "value": "0x700000"},
+            {"offset": "0x0", "size": 8, "value": "0x0"},
+            {"offset": "0x8", "size": 8, "value": "0x0"}
+        ]);
+        allocated_seed["memory"] = serde_json::json!([
+            {"space": "ram", "byte_offset": "0x700000", "size": 8, "value": "0xdeadbeef"},
+            {"space": "ram", "byte_offset": "0x700100", "size": 8, "value": "0x43412d5249445948"},
+            {"space": "ram", "byte_offset": "0x700108", "size": 4, "value": "0x53534543"}
+        ]);
+        let declaration = r#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":512}]}"#;
+        let allocated = trace_ghidra_path(
+            &snapshot,
+            &allocated_seed.to_string(),
+            "0x2016d0",
+            Some(binary),
+            "allocated",
+            declaration,
+        )
+        .unwrap();
+        assert!(matches!(allocated.stop, PcodePathStop::Return { .. }));
+        assert_eq!(
+            allocated
+                .final_state
+                .read_varnode(&hydir_ir::pcode::PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x0".to_owned(),
+                    size: 8,
+                })
+                .unwrap(),
+            Some(1)
+        );
         assert_eq!(
             traced
                 .final_state

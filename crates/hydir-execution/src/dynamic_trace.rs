@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 pub const DYNAMIC_TRACE_VERSION: u32 = 1;
 pub const DYNAMIC_TRACE_V2_VERSION: u32 = 2;
+pub const DYNAMIC_TRACE_V3_VERSION: u32 = 3;
 pub const MAX_DYNAMIC_TRACE_JSON_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TRACE_EVENTS: usize = 100_000;
 
@@ -60,6 +61,18 @@ pub struct TraceEvent {
     pub registers: Option<BTreeMap<String, u64>>,
 }
 
+/// Independently ordered, synchronous source-to-next-block observations.
+/// These are not interleaved with the buffered Stalker call/block stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputedJumpEvidence {
+    pub sequence: u64,
+    pub thread_id: u32,
+    pub invocation_id: u64,
+    pub source: TraceWitness,
+    pub target: TraceWitness,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicTrace {
@@ -81,6 +94,8 @@ pub struct DynamicTrace {
     pub stderr_hex: String,
     pub diagnostics: Vec<String>,
     pub events: Vec<TraceEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jump_evidence: Vec<ComputedJumpEvidence>,
 }
 
 pub fn parse_dynamic_trace(json: &[u8]) -> Result<DynamicTrace, String> {
@@ -98,7 +113,7 @@ pub fn validate_dynamic_trace(
     validate_input_spec(elf, input)?;
     if !matches!(
         trace.schema_version,
-        DYNAMIC_TRACE_VERSION | DYNAMIC_TRACE_V2_VERSION
+        DYNAMIC_TRACE_VERSION | DYNAMIC_TRACE_V2_VERSION | DYNAMIC_TRACE_V3_VERSION
     ) || trace.binary_sha256 != input.binary_sha256
         || trace.input_sha256 != input_sha256(input)?
     {
@@ -112,7 +127,7 @@ pub fn validate_dynamic_trace(
         || trace.budget.max_events > MAX_TRACE_EVENTS
         || trace.budget.timeout_ms == 0
         || trace.budget.timeout_ms > input.budget.timeout_ms
-        || trace.events.len() > trace.budget.max_events
+        || trace.events.len().saturating_add(trace.jump_evidence.len()) > trace.budget.max_events
         || trace.observer.is_empty()
         || trace.observer.len() > 128
         || trace.frida_version.is_empty()
@@ -126,6 +141,14 @@ pub fn validate_dynamic_trace(
         || trace.diagnostics.iter().any(|value| value.len() > 512)
     {
         return Err("DynamicTrace metadata or budget is invalid".into());
+    }
+    if trace.schema_version < DYNAMIC_TRACE_V3_VERSION && !trace.jump_evidence.is_empty() {
+        return Err("computed jump evidence requires DynamicTrace v3".into());
+    }
+    if !trace.jump_evidence.is_empty()
+        && (!matches!(trace.status, TraceStatus::Completed) || trace.lost_events != 0)
+    {
+        return Err("computed jump evidence requires a complete loss-free trace".into());
     }
     if trace.runtime_module_base.is_some() != trace.elf_load_bias.is_some() {
         return Err("runtime module base and ELF load bias must be paired".into());
@@ -170,14 +193,18 @@ pub fn validate_dynamic_trace(
             }
         }
         match (&event.kind, &event.registers, trace.schema_version) {
-            (TraceEventKind::Entry, Some(registers), DYNAMIC_TRACE_V2_VERSION) => {
+            (
+                TraceEventKind::Entry,
+                Some(registers),
+                DYNAMIC_TRACE_V2_VERSION | DYNAMIC_TRACE_V3_VERSION,
+            ) => {
                 validate_entry_registers(registers, event.source.runtime_address)?;
             }
-            (TraceEventKind::Entry, None, DYNAMIC_TRACE_V2_VERSION) => {
-                return Err("v2 entry lacks captured register context".into());
+            (TraceEventKind::Entry, None, DYNAMIC_TRACE_V2_VERSION | DYNAMIC_TRACE_V3_VERSION) => {
+                return Err("v2/v3 entry lacks captured register context".into());
             }
             (_, Some(_), _) => {
-                return Err("register context is only allowed on v2 entry events".into());
+                return Err("register context is only allowed on v2/v3 entry events".into());
             }
             _ => {}
         }
@@ -188,13 +215,33 @@ pub fn validate_dynamic_trace(
             return Err("call target presence is invalid".into());
         }
     }
+    let entry_threads: Vec<u32> = trace
+        .events
+        .iter()
+        .filter(|event| event.kind == TraceEventKind::Entry)
+        .map(|event| event.thread_id)
+        .collect();
+    for (index, jump) in trace.jump_evidence.iter().enumerate() {
+        if jump.sequence != index as u64
+            || jump.thread_id == 0
+            || jump.invocation_id == 0
+            || !entry_threads.contains(&jump.thread_id)
+        {
+            return Err("computed jump sequence, thread, or invocation is invalid".into());
+        }
+        validate_witness(&file, elf, trace.elf_load_bias, &jump.source)?;
+        validate_witness(&file, elf, trace.elf_load_bias, &jump.target)?;
+        if jump.source.elf_vaddr.is_none() || jump.target.elf_vaddr.is_none() {
+            return Err("computed jump requires byte-verified ELF source and target".into());
+        }
+    }
     if matches!(trace.status, TraceStatus::Completed)
         && (entries == 0 || exits == 0 || trace.lost_events != 0)
     {
         return Err("completed trace lacks entry/exit or has lost events".into());
     }
     if matches!(trace.status, TraceStatus::Truncated)
-        && trace.events.len() < trace.budget.max_events
+        && trace.events.len().saturating_add(trace.jump_evidence.len()) < trace.budget.max_events
         && trace.lost_events == 0
     {
         return Err("truncated trace has not reached its event cap".into());
@@ -359,6 +406,7 @@ mod tests {
                     registers: None,
                 },
             ],
+            jump_evidence: vec![],
         };
         validate_dynamic_trace(elf, &input, &trace).unwrap();
         trace.events[0].source.original_bytes_hex = Some("90909090".into());
@@ -372,6 +420,7 @@ mod tests {
         trace.lost_events = 1;
         validate_dynamic_trace(elf, &input, &trace).unwrap();
         let legacy = serde_json::to_vec(&trace).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy).contains("jump_evidence"));
         assert!(
             parse_dynamic_trace(&legacy).unwrap().events[0]
                 .registers
@@ -390,6 +439,38 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert("RIP".into(), address + 1);
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.events[0]
+            .registers
+            .as_mut()
+            .unwrap()
+            .insert("RIP".into(), address);
+        trace.schema_version = DYNAMIC_TRACE_V3_VERSION;
+        trace.status = TraceStatus::Completed;
+        trace.lost_events = 0;
+        trace.jump_evidence = vec![ComputedJumpEvidence {
+            sequence: 0,
+            thread_id: 1,
+            invocation_id: 1,
+            source: trace.events[0].source.clone(),
+            target: trace.events[0].source.clone(),
+        }];
+        validate_dynamic_trace(elf, &input, &trace).unwrap();
+        assert_eq!(
+            parse_dynamic_trace(&serde_json::to_vec(&trace).unwrap()).unwrap(),
+            trace
+        );
+        trace.jump_evidence[0].target.original_bytes_hex = Some("90909090".into());
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.jump_evidence[0].target = trace.events[0].source.clone();
+        trace.jump_evidence[0].sequence = 1;
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.jump_evidence[0].sequence = 0;
+        trace.schema_version = DYNAMIC_TRACE_V2_VERSION;
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.schema_version = DYNAMIC_TRACE_V3_VERSION;
+        trace.status = TraceStatus::Truncated;
+        trace.lost_events = 1;
         assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
     }
 }

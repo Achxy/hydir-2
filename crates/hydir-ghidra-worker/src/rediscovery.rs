@@ -325,6 +325,7 @@ mod tests {
             stdout_hex: String::new(),
             stderr_hex: String::new(),
             diagnostics: vec![],
+            jump_evidence: vec![],
             events: vec![
                 TraceEvent {
                     sequence: 0,

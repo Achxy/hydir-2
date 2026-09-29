@@ -23,6 +23,7 @@ pub const PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION: u32 = 5;
 pub const PCODE_CFG_ELF_IMAGE_MAX_BYTES: usize = 65_536;
 pub const PCODE_SIMPLIFIED_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION: u32 = 1;
+pub const PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION: u32 = 2;
 pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
 const MAX_CFG_INSTRUCTIONS: usize = 4096;
 const MAX_CFG_OPERATIONS: usize = 4096;
@@ -170,6 +171,26 @@ struct CallLlvmContext<'a> {
     snapshots: &'a [GhidraSnapshot],
     owners: Vec<usize>,
     max_call_depth: usize,
+    process: Option<&'a PcodeElfProcessMemory>,
+}
+
+fn internal_process_call_target(
+    snapshot: &GhidraSnapshot,
+    process: &PcodeElfProcessMemory,
+    space: &str,
+    address: u64,
+) -> bool {
+    process.is_mapped(space, address)
+        && process.initial_byte(space, address).is_some()
+        && snapshot.memory_blocks.iter().any(|block| {
+            block.start.space == space
+                && block.loaded
+                && block.execute
+                && !block.overlay
+                && (block.name == ".text" || block.name.starts_with(".text."))
+                && offset(&block.start.offset).is_ok_and(|start| start <= address)
+                && offset(&block.end.offset).is_ok_and(|end| address <= end)
+        })
 }
 
 fn offset(value: &str) -> Result<u64, String> {
@@ -471,6 +492,19 @@ fn emit_interprocedural_call(
         body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
         return Ok(());
     }
+    if let (Some(process), Some((space, address))) = (context.process, target_key.as_ref())
+        && !internal_process_call_target(snapshot, process, space, *address)
+    {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL target is not a loaded internal executable ELF function",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    }
     let routes = context
         .snapshots
         .iter()
@@ -482,6 +516,9 @@ fn emit_interprocedural_call(
                 || evidence_target
                     .as_ref()
                     .is_some_and(|target| target != &key)
+                || context.process.is_some_and(|process| {
+                    !internal_process_call_target(snapshot, process, &key.0, key.1)
+                })
             {
                 return None;
             }
@@ -554,7 +591,11 @@ fn emit_interprocedural_call(
             &source.source_address,
             Some(operation_index),
             PcodeCfgLlvmStatus::Call,
-            "CALLIND target is not a loaded, evidenced callee",
+            if context.process.is_some() {
+                "CALLIND target is not a loaded, evidenced internal ELF callee"
+            } else {
+                "CALLIND target is not a loaded, evidenced callee"
+            },
         );
     } else if let Some((_, callee)) = routes.first() {
         body.push_str(&format!("  br label %call_route_{id}_{callee}\n"));
@@ -564,7 +605,11 @@ fn emit_interprocedural_call(
             &source.source_address,
             Some(operation_index),
             PcodeCfgLlvmStatus::Call,
-            "CALL callee snapshot is unavailable",
+            if context.process.is_some() {
+                "CALL target is not a loaded internal executable ELF function"
+            } else {
+                "CALL callee snapshot is unavailable"
+            },
         );
         body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
     }
@@ -1462,6 +1507,30 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
     snapshots: &[GhidraSnapshot],
     max_call_depth: usize,
 ) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    emit_pcode_interprocedural_cfg_llvm_inner(snapshots, max_call_depth, None)
+}
+
+/// Emit an opt-in v5 interprocedural module with one shared ELF process and
+/// declared stack/heap contract. Only loaded internal RAM callees are entered;
+/// PLT and unresolved external calls stop at their source operation.
+pub fn emit_pcode_interprocedural_cfg_llvm_with_allocations(
+    snapshots: &[GhidraSnapshot],
+    max_call_depth: usize,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    emit_pcode_interprocedural_cfg_llvm_inner(
+        snapshots,
+        max_call_depth,
+        Some((process, allocations)),
+    )
+}
+
+fn emit_pcode_interprocedural_cfg_llvm_inner(
+    snapshots: &[GhidraSnapshot],
+    max_call_depth: usize,
+    allocated: Option<(&PcodeElfProcessMemory, &PcodeProcessAllocations)>,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
     let root = snapshots
         .first()
         .ok_or("interprocedural LLVM needs a root snapshot")?;
@@ -1475,6 +1544,9 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
     let mut digests = Vec::new();
     for (owner, snapshot) in snapshots.iter().enumerate() {
         validate_ghidra_snapshot(snapshot, &root.binary_sha256)?;
+        if let Some((process, allocations)) = allocated {
+            allocations.validate_for(snapshot, process)?;
+        }
         snapshot.pcode_cfg_ir()?;
         if snapshot.program != root.program
             || snapshot.address_spaces != root.address_spaces
@@ -1499,12 +1571,28 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
         snapshots,
         owners,
         max_call_depth,
+        process: allocated.map(|(process, _)| process),
     };
-    let mut llvm =
-        emit_pcode_cfg_llvm_semantic(root, None, semantic, Some(&context), None, None, None)?;
-    llvm.state_abi.push_str("; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly");
+    let mut llvm = emit_pcode_cfg_llvm_semantic(
+        root,
+        None,
+        semantic,
+        Some(&context),
+        None,
+        allocated.map(|(process, _)| process),
+        allocated.map(|(_, allocations)| allocations),
+    )?;
+    llvm.state_abi.push_str(if allocated.is_some() {
+        "; loaded internal calls share state, process bytes, stack, and heap; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly"
+    } else {
+        "; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly"
+    });
     Ok(PcodeInterproceduralCfgLlvmArtifact {
-        schema_version: PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
+        schema_version: if allocated.is_some() {
+            PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION
+        } else {
+            PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION
+        },
         binary_sha256: root.binary_sha256.clone(),
         function_entries: snapshots
             .iter()
@@ -2717,6 +2805,30 @@ mod tests {
         .collect()
     }
 
+    fn choose_call_snapshots() -> Vec<GhidraSnapshot> {
+        let digest = "dc459793ce9edcc543c9ffcadbecc27c6a2e1976782f1da4d3adc2119dd27723";
+        [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_root_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_right_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_left_v2.json"
+            ))
+            .as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, digest).unwrap())
+        .collect()
+    }
+
     fn call_event_ids(
         artifact: &PcodeCfgLlvmArtifact,
         trace: &hydir_ir::pcode::PcodeInterproceduralTrace,
@@ -3684,6 +3796,222 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn allocated_interprocedural_calls_match_rust_and_stop_on_stack_boundary() {
+        let snapshots = choose_call_snapshots();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        for (argument, expected_rax, call_site, return_low) in [
+            (1u64, 2u8, "0x201179", 0x7e_u8),
+            (0u64, 1u8, "0x20117f", 0x84_u8),
+        ] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), argument).unwrap();
+            seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+            seed.write_memory("ram", 0x700000, 8, 0x201195).unwrap();
+            for (stack_base, stack_len, expected_status, expected_first, expected_known) in [
+                (
+                    0x6ffff8_u64,
+                    16_u64,
+                    PcodeCfgLlvmStatus::Return,
+                    return_low,
+                    255_u8,
+                ),
+                (
+                    0x6ffffc_u64,
+                    12_u64,
+                    PcodeCfgLlvmStatus::MemoryUnmappedWrite,
+                    0,
+                    0,
+                ),
+            ] {
+                let allocations = PcodeProcessAllocations::new(
+                    &snapshots[0],
+                    &process,
+                    vec![PcodeProcessAllocation {
+                        kind: PcodeProcessAllocationKind::Stack,
+                        space: "ram".into(),
+                        base: stack_base,
+                        byte_len: stack_len,
+                    }],
+                )
+                .unwrap();
+                let rust = hydir_ir::pcode::execute_concrete_call_path_with_allocations(
+                    &snapshots,
+                    &seed,
+                    &process,
+                    &allocations,
+                    128,
+                    16,
+                    4,
+                )
+                .unwrap();
+                let artifact = emit_pcode_interprocedural_cfg_llvm_with_allocations(
+                    &snapshots,
+                    4,
+                    &process,
+                    &allocations,
+                )
+                .unwrap();
+                assert_eq!(
+                    artifact.schema_version,
+                    PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION
+                );
+                assert_eq!(
+                    artifact.llvm.schema_version,
+                    PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION
+                );
+                assert_eq!(artifact.llvm.allocations.as_ref(), Some(&allocations));
+                assert_eq!(
+                    rust.process_binding.as_ref().unwrap().allocations,
+                    allocations
+                );
+                verify(&artifact.llvm.llvm_ir);
+                let expected_events = if expected_status == PcodeCfgLlvmStatus::Return {
+                    assert_eq!(rust.calls.len(), 1);
+                    assert_eq!(
+                        rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                        Some(expected_rax as u64)
+                    );
+                    call_event_ids(&artifact.llvm, &rust)
+                } else {
+                    assert_eq!(rust.calls.len(), 0);
+                    assert!(matches!(
+                        rust.stop,
+                        hydir_ir::pcode::PcodeCallPathStop::PathBoundary {
+                            stop: PcodePathStop::EffectBoundary {
+                                boundary: PcodeExecutionStop::MemoryBoundary {
+                                    reason: PcodeMemoryBoundaryKind::UnmappedWrite,
+                                    ..
+                                }
+                            }
+                        }
+                    ));
+                    assert!(artifact.llvm.stop_sites.iter().any(|site| {
+                        site.status == PcodeCfgLlvmStatus::MemoryUnmappedWrite
+                            && site.address.offset == call_site
+                            && site.operation_index == Some(1)
+                    }));
+                    source_event_ids(&artifact.llvm, &rust.segments[0].path)
+                };
+                if Command::new("lli").arg("--version").output().is_err() {
+                    continue;
+                }
+                let state_len = artifact.llvm.state_bytes.max(1);
+                let mut main = format!(
+                    "define i32 @main() {{\nentry:\n  %state = alloca [{state_len} x i8]\n  %known = alloca [{state_len} x i8]\n  %stack = alloca [{stack_len} x i8]\n  %stack_known = alloca [{stack_len} x i8]\n  %heap = alloca [1 x i8]\n  %heap_known = alloca [1 x i8]\n  %events = alloca [128 x i32]\n  %count = alloca i32\n"
+                );
+                for byte in &artifact.llvm.byte_map {
+                    let value = seed
+                        .read_varnode(&PcodeVarnode {
+                            space: byte.space.clone(),
+                            offset: byte.offset.clone(),
+                            size: 1,
+                        })
+                        .unwrap();
+                    main.push_str(&format!(
+                        "  %s{} = getelementptr i8, ptr %state, i64 {}\n  store i8 {}, ptr %s{}\n  %k{} = getelementptr i8, ptr %known, i64 {}\n  store i8 {}, ptr %k{}\n",
+                        byte.index, byte.index, value.unwrap_or(0), byte.index,
+                        byte.index, byte.index, if value.is_some() { 255 } else { 0 }, byte.index
+                    ));
+                }
+                for index in 0..stack_len {
+                    let value = seed.read_memory("ram", stack_base + index, 1).unwrap();
+                    main.push_str(&format!(
+                        "  %ss{index} = getelementptr i8, ptr %stack, i64 {index}\n  store i8 {}, ptr %ss{index}\n  %sk{index} = getelementptr i8, ptr %stack_known, i64 {index}\n  store i8 {}, ptr %sk{index}\n",
+                        value.unwrap_or(0), if value.is_some() { 255 } else { 0 }
+                    ));
+                }
+                main.push_str(&format!(
+                    "  %status = call i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 433, ptr %stack, ptr %stack_known, i64 {stack_base}, i64 {stack_len}, ptr %heap, ptr %heap_known, i64 0, i64 0, ptr %events, ptr %count, i32 128, i32 128)\n  %count_value = load i32, ptr %count\n  %status_ok = icmp eq i32 %status, {}\n  %count_ok = icmp eq i32 %count_value, {}\n  %ok0 = and i1 %status_ok, %count_ok\n",
+                    expected_status.code(), expected_events.len()
+                ));
+                let mut last = "%ok0".to_owned();
+                for (index, event) in expected_events.iter().enumerate() {
+                    main.push_str(&format!(
+                        "  %event_ptr{index} = getelementptr i32, ptr %events, i64 {index}\n  %event_value{index} = load i32, ptr %event_ptr{index}\n  %event_ok{index} = icmp eq i32 %event_value{index}, {event}\n  %ok_event{index} = and i1 {last}, %event_ok{index}\n"
+                    ));
+                    last = format!("%ok_event{index}");
+                }
+                main.push_str(&format!(
+                    "  %first = load i8, ptr %stack\n  %first_known = load i8, ptr %stack_known\n  %first_ok = icmp eq i8 %first, {expected_first}\n  %known_ok = icmp eq i8 %first_known, {expected_known}\n  %stack_ok = and i1 %first_ok, %known_ok\n  %ok_stack = and i1 {last}, %stack_ok\n"
+                ));
+                let mut last = "%ok_stack".to_owned();
+                if expected_status == PcodeCfgLlvmStatus::Return {
+                    let rax = artifact
+                        .llvm
+                        .byte_map
+                        .iter()
+                        .find(|byte| byte.space == "register" && byte.offset == "0x0")
+                        .unwrap();
+                    main.push_str(&format!(
+                        "  %rax_ptr = getelementptr i8, ptr %state, i64 {}\n  %rax_low = load i8, ptr %rax_ptr\n  %rax_ok = icmp eq i8 %rax_low, {expected_rax}\n  %ok_rax = and i1 {last}, %rax_ok\n",
+                        rax.index
+                    ));
+                    last = "%ok_rax".to_owned();
+                }
+                main.push_str(&format!(
+                    "  %failed = xor i1 {last}, true\n  %exit = zext i1 %failed to i32\n  ret i32 %exit\n}}\n"
+                ));
+                let module = format!("{}\n{main}", artifact.llvm.llvm_ir);
+                let file = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(file.path(), module).unwrap();
+                let output = Command::new("lli").arg(file.path()).output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allocated_interprocedural_llvm_marks_plt_call_source() {
+        let mut snapshots = choose_call_snapshots();
+        for snapshot in &mut snapshots {
+            snapshot
+                .memory_blocks
+                .iter_mut()
+                .find(|block| block.name == ".text")
+                .unwrap()
+                .name = ".plt".into();
+        }
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshots[0],
+            &process,
+            vec![PcodeProcessAllocation {
+                kind: PcodeProcessAllocationKind::Stack,
+                space: "ram".into(),
+                base: 0x6ffff8,
+                byte_len: 16,
+            }],
+        )
+        .unwrap();
+        let artifact = emit_pcode_interprocedural_cfg_llvm_with_allocations(
+            &snapshots,
+            4,
+            &process,
+            &allocations,
+        )
+        .unwrap();
+        assert!(artifact.llvm.stop_sites.iter().any(|site| {
+            site.status == PcodeCfgLlvmStatus::Call
+                && site.address.offset == "0x201179"
+                && site.reason.contains("internal executable")
+        }));
+        verify(&artifact.llvm.llvm_ir);
     }
 
     #[test]

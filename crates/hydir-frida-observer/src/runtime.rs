@@ -3,9 +3,9 @@ use frida::{
     SpawnStdio,
 };
 use hydir_execution::{
-    DYNAMIC_TRACE_V2_VERSION, DynamicTrace, InputSpec, TraceBudget, TraceEvent, TraceEventKind,
-    TraceStatus, TraceWitness, decode_hex, input_sha256, validate_dynamic_trace,
-    validate_input_spec,
+    ComputedJumpEvidence, DYNAMIC_TRACE_V3_VERSION, DynamicTrace, InputSpec, TraceBudget,
+    TraceEvent, TraceEventKind, TraceStatus, TraceWitness, decode_hex, input_sha256,
+    validate_dynamic_trace, validate_input_spec,
 };
 use object::{Object, ObjectSegment, SegmentFlags};
 use serde::Deserialize;
@@ -90,6 +90,7 @@ impl Drop for TargetStdioRedirect {
 struct Collector {
     base: Option<u64>,
     events: Vec<RawEvent>,
+    jumps: Vec<RawJump>,
     done: bool,
     lost: u64,
     errors: Vec<String>,
@@ -136,7 +137,20 @@ struct RawEvent {
     registers: Option<BTreeMap<String, String>>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJump {
+    sequence: u64,
+    thread_id: u32,
+    invocation_id: u64,
+    source: RawWitness,
+    target: RawWitness,
+}
+
 fn apply_agent_record(state: &mut Collector, value: Value) -> Result<(), String> {
+    if state.done {
+        return Err("Frida agent reported evidence after completion".into());
+    }
     let size = serde_json::to_vec(&value)
         .map_err(|error| error.to_string())?
         .len();
@@ -172,10 +186,29 @@ fn apply_agent_record(state: &mut Collector, value: Value) -> Result<(), String>
                 return Err("Frida event batch exceeds cap".into());
             }
             for event in batch {
-                if state.events.len() < MAX_EVENTS {
+                if state.events.len().saturating_add(state.jumps.len()) < MAX_EVENTS {
                     state.events.push(event);
                 } else {
-                    state.lost += 1;
+                    state.lost = state.lost.saturating_add(1);
+                }
+            }
+        }
+        Some("jump_batch") => {
+            let batch: Vec<RawJump> = serde_json::from_value(
+                value
+                    .get("jumps")
+                    .cloned()
+                    .ok_or("missing Frida jump batch")?,
+            )
+            .map_err(|error| error.to_string())?;
+            if batch.is_empty() || batch.len() > 128 {
+                return Err("Frida jump batch size is invalid".into());
+            }
+            for jump in batch {
+                if state.events.len().saturating_add(state.jumps.len()) < MAX_EVENTS {
+                    state.jumps.push(jump);
+                } else {
+                    state.lost = state.lost.saturating_add(1);
                 }
             }
         }
@@ -184,10 +217,12 @@ fn apply_agent_record(state: &mut Collector, value: Value) -> Result<(), String>
                 return Err("Frida agent reported completion twice".into());
             }
             state.done = true;
-            state.lost += value
-                .get("lost")
-                .and_then(|value| value.as_u64())
-                .ok_or("invalid Frida loss count")?;
+            state.lost = state.lost.saturating_add(
+                value
+                    .get("lost")
+                    .and_then(|value| value.as_u64())
+                    .ok_or("invalid Frida loss count")?,
+            );
         }
         Some("error") => {
             if state.errors.len() < 16 {
@@ -548,6 +583,21 @@ pub fn inside(args: &[String]) -> Result<(), String> {
                     .transpose()?,
             });
         }
+        let mut jump_evidence = Vec::with_capacity(state.jumps.len());
+        for raw in &state.jumps {
+            let source = normalize(&file, &elf, bias, &raw.source)?;
+            let target = normalize(&file, &elf, bias, &raw.target)?;
+            if source.elf_vaddr.is_none() || target.elf_vaddr.is_none() {
+                return Err("Frida computed jump lacks byte-verified ELF source or target".into());
+            }
+            jump_evidence.push(ComputedJumpEvidence {
+                sequence: raw.sequence,
+                thread_id: raw.thread_id,
+                invocation_id: raw.invocation_id,
+                source,
+                target,
+            });
+        }
         let mut diagnostics = state.errors.clone();
         if timed_out {
             diagnostics.push("isolated target exceeded Frida observation timeout".into());
@@ -556,20 +606,28 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             TraceStatus::TimedOut
         } else if !state.errors.is_empty() {
             TraceStatus::InjectionError
-        } else if state.lost > 0 || events.len() >= MAX_EVENTS {
+        } else if state.lost > 0 || events.len().saturating_add(jump_evidence.len()) >= MAX_EVENTS {
             TraceStatus::Truncated
         } else if state.done {
             TraceStatus::Completed
         } else {
             TraceStatus::Detached
         };
+        if !matches!(status, TraceStatus::Completed) && !jump_evidence.is_empty() {
+            state.lost = state.lost.saturating_add(jump_evidence.len() as u64);
+            jump_evidence.clear();
+            if diagnostics.len() < 16 {
+                diagnostics
+                    .push("computed jump evidence discarded because trace is incomplete".into());
+            }
+        }
         let trace = DynamicTrace {
-            schema_version: DYNAMIC_TRACE_V2_VERSION,
+            schema_version: DYNAMIC_TRACE_V3_VERSION,
             binary_sha256: format!("{:x}", Sha256::digest(&elf)),
             input_sha256: input_digest.clone(),
             selected_elf_vaddr: selected,
             ghidra_snapshot_sha256: None,
-            observer: "bubblewrap-frida-rust-message-v4".into(),
+            observer: "bubblewrap-frida-rust-message-v5".into(),
             frida_version: Frida::version().into(),
             agent_sha256: format!("{:x}", Sha256::digest(AGENT.as_bytes())),
             runtime_module_base: Some(base),
@@ -584,6 +642,7 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             stderr_hex: String::new(),
             diagnostics,
             events,
+            jump_evidence,
         };
         let json = serde_json::to_vec(&trace).map_err(|error| error.to_string())?;
         std::io::stdout()

@@ -220,6 +220,77 @@ fn real_prism_call_snapshots_emit_one_binary_bound_llvm_module() {
 }
 
 #[test]
+fn allocated_call_cli_shares_bounded_stack_across_validated_callees() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/ghidra_choose_calls.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_choose_root_v2.json");
+    let right = root.join("tests/fixtures/ghidra_choose_right_v2.json");
+    let left = root.join("tests/fixtures/ghidra_choose_left_v2.json");
+    let allocations = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        allocations.path(),
+        br#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340024,"byte_len":16}]}"#,
+    )
+    .unwrap();
+    for (seed, expected, callee) in [
+        ("ghidra_choose_right_seed_v1.json", 2, "0x201185"),
+        ("ghidra_choose_left_seed_v1.json", 1, "0x20118d"),
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+            .args(["ghidra-snapshot", "trace-calls"])
+            .arg(&binary)
+            .arg(&snapshot)
+            .arg(root.join("tests/fixtures").join(seed))
+            .arg("--callee")
+            .arg(&right)
+            .arg("--callee")
+            .arg(&left)
+            .arg("--allocations")
+            .arg(allocations.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let trace: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(trace["schema_version"], 3);
+        assert_eq!(trace["stop"]["kind"], "return");
+        assert_eq!(trace["calls"][0]["callee_entry"]["offset"], callee);
+        assert_eq!(trace["final_state"]["register_bytes"]["0"], expected);
+        assert_eq!(
+            trace["process_binding"]["allocations"]["regions"][0]["base"],
+            7340024
+        );
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-calls"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .arg("--callee")
+        .arg(&right)
+        .arg("--callee")
+        .arg(&left)
+        .arg("--allocations")
+        .arg(allocations.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(artifact["llvm"]["schema_version"], 5);
+    assert_eq!(
+        artifact["llvm"]["allocations"]["regions"][0]["kind"],
+        "stack"
+    );
+}
+
+#[test]
 fn ghidra_function_index_imports_into_analysis_model() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-"""Real Linux Frida/Bubblewrap gate for two PIE paths and an indirect call."""
+"""Real Linux Frida/Bubblewrap gate for indirect call and jump paths."""
 
 import hashlib
 import json
@@ -47,7 +47,7 @@ def run_one(binary, symbols, value, scratch):
     if observed.returncode != 0:
         raise AssertionError(f"isolated Frida observation failed: {observed.stderr}")
     trace = json.loads(observed.stdout)
-    if trace["schema_version"] != 2 or trace["observer"] != "bubblewrap-frida-rust-message-v4":
+    if trace["schema_version"] != 3 or trace["observer"] != "bubblewrap-frida-rust-message-v5":
         raise AssertionError("observer did not use the isolated Frida result pipe")
     if trace["status"] != "completed":
         raise AssertionError(f"trace incomplete: {trace['status']} {trace['diagnostics']}")
@@ -92,6 +92,52 @@ def run_one(binary, symbols, value, scratch):
     return len(events)
 
 
+def run_jump(scratch):
+    binary = scratch / "ghidra_indirect_jump.elf"
+    binary.write_bytes((ROOT / "tests/fixtures/ghidra_indirect_jump.elf").read_bytes())
+    binary.chmod(0o500)
+    elf = binary.read_bytes()
+    symbols = symbol_addresses(binary)
+    selected = symbols["hydir_indirect_jump"]
+    source = selected + 5  # jmp *%rax in the checked fixture
+    target = selected + 7  # the actual next block, not block adjacency guessed by the host
+    spec = {
+        "schema_version": 1,
+        "binary_sha256": hashlib.sha256(elf).hexdigest(),
+        "argv_hex": [], "stdin_hex": "", "files": [], "origins": [],
+        "goal": {"exit_code": 0, "stdout_contains_hex": None, "stderr_contains_hex": None},
+        "budget": {"timeout_ms": 10000, "memory_bytes": 1073741824, "output_bytes": 4096},
+    }
+    input_file = scratch / "input-jump.json"
+    input_file.write_text(json.dumps(spec), encoding="utf-8")
+    native = subprocess.run([binary], capture_output=True, timeout=10, check=False)
+    if native.returncode != 0:
+        raise AssertionError(f"native jump fixture failed: {native.returncode} {native.stderr!r}")
+    observed = subprocess.run(
+        [OBSERVER, binary, input_file, f"{selected:x}"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    if observed.returncode != 0:
+        raise AssertionError(f"isolated jump observation failed: {observed.stderr}")
+    trace = json.loads(observed.stdout)
+    if trace["schema_version"] != 3 or trace["status"] != "completed" or trace["lost_events"]:
+        raise AssertionError(f"jump trace incomplete: {trace['status']} {trace['diagnostics']}")
+    if bytes.fromhex(trace["stdout_hex"]) != native.stdout:
+        raise AssertionError("jump fixture output changed under observation")
+    matches = [jump for jump in trace["jump_evidence"]
+               if jump["source"]["elf_vaddr"] == source
+               and jump["target"]["elf_vaddr"] == target]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one synchronous {source:x}->{target:x} jump pair: {trace['jump_evidence']}")
+    match = matches[0]
+    if not match["source"]["original_bytes_hex"].startswith("ffe0") or \
+            not match["target"]["original_bytes_hex"].startswith("48c7c0"):
+        raise AssertionError("jump source or target lacks original ELF byte witness")
+    if not any(event["kind"] == "block" for event in trace["events"]):
+        raise AssertionError("ordered block stream was lost while recording jump evidence")
+    return len(trace["jump_evidence"])
+
+
 def main():
     doctor = json.loads(subprocess.check_output([HYDIRCTL, "doctor"], text=True))
     if doctor.get("frida_observation_ready") is not True:
@@ -105,7 +151,8 @@ def main():
         ], check=True)
         symbols = symbol_addresses(binary)
         counts = {value: run_one(binary, symbols, value, scratch) for value in ("0", "1")}
-        print(f"Frida inside Bubblewrap: two completed PIE paths, events={counts}")
+        jumps = run_jump(scratch)
+        print(f"Frida inside Bubblewrap: two completed PIE paths, events={counts}; computed jumps={jumps}")
 
 
 if __name__ == "__main__":

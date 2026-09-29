@@ -3,9 +3,11 @@
 use super::{read_binary, read_bounded_json, write_new_or_identical};
 use hydir_ghidra_worker as ghidra_worker;
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, execute_concrete_call_path,
-    execute_concrete_call_path_with_image, parse_ghidra_snapshot, parse_pcode_seed,
-    unloaded_call_target,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+    MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfProcessMemory,
+    PcodeProcessAllocations, execute_concrete_call_path,
+    execute_concrete_call_path_with_allocations, execute_concrete_call_path_with_image,
+    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, error::Error, path::Path};
@@ -22,6 +24,7 @@ struct Options<'a> {
     max_visits: usize,
     max_depth: usize,
     output: Option<&'a str>,
+    allocations: Option<&'a str>,
 }
 
 fn parse_options<'a>(args: &'a [String], automatic: bool) -> Result<Options<'a>, Box<dyn Error>> {
@@ -33,6 +36,7 @@ fn parse_options<'a>(args: &'a [String], automatic: bool) -> Result<Options<'a>,
         max_visits: 1024,
         max_depth: 8,
         output: None,
+        allocations: None,
     };
     let mut pairs = args.chunks_exact(2);
     for pair in &mut pairs {
@@ -46,6 +50,9 @@ fn parse_options<'a>(args: &'a [String], automatic: bool) -> Result<Options<'a>,
             "--max-visits" => options.max_visits = pair[1].parse()?,
             "--max-depth" => options.max_depth = pair[1].parse()?,
             "--output" if options.output.is_none() => options.output = Some(&pair[1]),
+            "--allocations" if options.allocations.is_none() => {
+                options.allocations = Some(&pair[1]);
+            }
             _ => return Err("invalid Ghidra call-path option".into()),
         }
     }
@@ -63,6 +70,22 @@ fn parse_options<'a>(args: &'a [String], automatic: bool) -> Result<Options<'a>,
     Ok(options)
 }
 
+fn strict_allocations(
+    snapshots: &[GhidraSnapshot],
+    binary: &[u8],
+    path: &str,
+) -> Result<(PcodeElfProcessMemory, PcodeProcessAllocations), Box<dyn Error>> {
+    let snapshot = snapshots.first().ok_or("missing root Ghidra snapshot")?;
+    let process =
+        PcodeElfProcessMemory::from_elf(binary, snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let allocations = PcodeProcessAllocations::parse_declared(
+        &read_bounded_json(path, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES)?,
+        snapshot,
+        &process,
+    )?;
+    Ok((process, allocations))
+}
+
 fn emit(
     snapshots: &[GhidraSnapshot],
     binary: &[u8],
@@ -74,8 +97,23 @@ fn emit(
         &read_bounded_json(seed_path, MAX_PCODE_SEED_BYTES)?,
         &snapshots[0],
     )?;
-    let image = super::pcode_image_or_legacy(binary, &snapshots[0])?;
-    let mut trace = if let Some(image) = &image {
+    let image = if options.allocations.is_none() {
+        super::pcode_image_or_legacy(binary, &snapshots[0])?
+    } else {
+        None
+    };
+    let mut trace = if let Some(path) = options.allocations {
+        let (process, allocations) = strict_allocations(snapshots, binary, path)?;
+        execute_concrete_call_path_with_allocations(
+            snapshots,
+            &seed,
+            &process,
+            &allocations,
+            options.max_operations,
+            options.max_visits,
+            options.max_depth,
+        )?
+    } else if let Some(image) = &image {
         execute_concrete_call_path_with_image(
             snapshots,
             &seed,
@@ -110,6 +148,9 @@ fn emit_assessment(
     options: &Options<'_>,
     diagnostics: Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
+    if options.allocations.is_some() {
+        return Err("seeded assessment does not yet support declared process allocations".into());
+    }
     let seed_json = read_bounded_json(seed_path, MAX_PCODE_SEED_BYTES)?;
     let image = super::pcode_image_or_legacy(binary, &snapshots[0])?;
     let mut assessment = hydir_decompile::assess_pcode_function(
@@ -190,8 +231,18 @@ pub fn run_automatic_llvm(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let options = parse_options(options, true)?;
     let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
-    let mut artifact =
-        hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, options.max_depth)?;
+    let mut artifact = if let Some(path) = options.allocations {
+        let binary_bytes = read_binary(binary)?;
+        let (process, allocations) = strict_allocations(&snapshots, &binary_bytes, path)?;
+        hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
+            &snapshots,
+            options.max_depth,
+            &process,
+            &allocations,
+        )?
+    } else {
+        hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, options.max_depth)?
+    };
     artifact.snapshot_diagnostics = diagnostics;
     let bytes = serde_json::to_vec_pretty(&artifact)?;
     if let Some(path) = options.output {
@@ -222,9 +273,24 @@ fn collect_automatic(
     let mut seen = BTreeSet::from([root_entry]);
     let mut diagnostics = Vec::new();
     let parsed_seed = parse_pcode_seed(&read_bounded_json(seed, MAX_PCODE_SEED_BYTES)?, &root)?;
-    let image = super::pcode_image_or_legacy(&binary_bytes, &root)?;
+    let image = if options.allocations.is_none() {
+        super::pcode_image_or_legacy(&binary_bytes, &root)?
+    } else {
+        None
+    };
     loop {
-        let trace = if let Some(image) = &image {
+        let trace = if let Some(path) = options.allocations {
+            let (process, allocations) = strict_allocations(&snapshots, &binary_bytes, path)?;
+            execute_concrete_call_path_with_allocations(
+                &snapshots,
+                &parsed_seed,
+                &process,
+                &allocations,
+                options.max_operations,
+                options.max_visits,
+                options.max_depth,
+            )?
+        } else if let Some(image) = &image {
             execute_concrete_call_path_with_image(
                 &snapshots,
                 &parsed_seed,

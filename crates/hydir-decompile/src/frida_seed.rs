@@ -2,7 +2,8 @@
 //! Runtime memory and rebased PIE pointers are deliberately not guessed.
 
 use hydir_execution::{
-    DYNAMIC_TRACE_V2_VERSION, DynamicTrace, InputSpec, TraceEventKind, validate_dynamic_trace,
+    DYNAMIC_TRACE_V2_VERSION, DYNAMIC_TRACE_V3_VERSION, DynamicTrace, InputSpec, TraceEventKind,
+    validate_dynamic_trace,
 };
 use hydir_ir::pcode::{GhidraSnapshot, parse_pcode_seed, validate_ghidra_snapshot};
 use hydir_loader::import_elf;
@@ -27,8 +28,11 @@ pub fn frida_entry_pcode_seed(
 ) -> Result<Vec<u8>, String> {
     validate_dynamic_trace(elf, input, trace)?;
     validate_ghidra_snapshot(snapshot, &input.binary_sha256)?;
-    if trace.schema_version != DYNAMIC_TRACE_V2_VERSION {
-        return Err("Frida entry seed needs DynamicTrace v2 register capture".into());
+    if !matches!(
+        trace.schema_version,
+        DYNAMIC_TRACE_V2_VERSION | DYNAMIC_TRACE_V3_VERSION
+    ) {
+        return Err("Frida entry seed needs DynamicTrace v2/v3 register capture".into());
     }
     let snapshot_digest = format!(
         "{:x}",
@@ -203,6 +207,7 @@ mod tests {
                     registers: None,
                 },
             ],
+            jump_evidence: vec![],
         };
         let seed = frida_entry_pcode_seed(elf, &input, &snapshot, &trace).unwrap();
         let json: Value = serde_json::from_slice(&seed).unwrap();

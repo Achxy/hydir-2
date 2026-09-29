@@ -559,13 +559,15 @@ class HydirClient:
         max_operations: int | None = None,
         max_visits: int | None = None,
         max_depth: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
         timeout: float | None = None,
     ) -> dict:
         """Trace a seeded direct-call path through the uploaded ELF."""
         return self._ghidra_call_artifact(
             project_id, revision, seed, function_entry=function_entry, llvm=False,
             max_functions=max_functions, max_operations=max_operations,
-            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+            max_visits=max_visits, max_depth=max_depth, allocations=allocations,
+            timeout=timeout,
         )
 
     def build_ghidra_call_cfg_llvm(
@@ -579,13 +581,15 @@ class HydirClient:
         max_operations: int | None = None,
         max_visits: int | None = None,
         max_depth: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
         timeout: float | None = None,
     ) -> dict:
         """Emit bounded interprocedural CFG LLVM from an uploaded ELF and seed."""
         return self._ghidra_call_artifact(
             project_id, revision, seed, function_entry=function_entry, llvm=True,
             max_functions=max_functions, max_operations=max_operations,
-            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+            max_visits=max_visits, max_depth=max_depth, allocations=allocations,
+            timeout=timeout,
         )
 
     def assess_ghidra_function(
@@ -622,6 +626,7 @@ class HydirClient:
         max_operations: int | None = None,
         max_visits: int | None = None,
         max_depth: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
         timeout: float | None = None,
     ) -> dict:
         """Validate and request a seeded Ghidra call artifact."""
@@ -678,11 +683,25 @@ class HydirClient:
                 raise ValueError(f"{name} must be {minimum}..={maximum}")
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
+        if assessment and allocations is not None:
+            raise ValueError("Ghidra assessment does not support process allocations")
+        allocation_json = b""
+        if allocations is not None:
+            if isinstance(allocations, bytes):
+                allocation_json = allocations
+            else:
+                path = Path(allocations)
+                if path.stat().st_size > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                    raise ValueError("Process allocation declaration exceeds 4 KiB")
+                allocation_json = path.read_bytes()
+            if not 1 <= len(allocation_json) <= MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                raise ValueError("Process allocation declaration must be 1..=4096 bytes")
         request = proto_v3.GhidraCallTraceRequest(
             project_id=project_id,
             expected_revision=revision,
             function_entry=function_hex,
             seed_json=content,
+            allocation_json=allocation_json,
         )
         for name, value, _, _ in limits:
             if value is not None:
@@ -697,11 +716,15 @@ class HydirClient:
         artifact = self._checked_json_artifact(
             reply, revision=revision,
             media_type=(
+                "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2"
+                if llvm and allocations is not None else
                 "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
                 if llvm else "application/vnd.hydir.pcode-function-assessment+json;version=1"
-                if assessment else "application/vnd.hydir.pcode-call-trace+json;version=2"
+                if assessment else "application/vnd.hydir.pcode-call-trace+json;version=3"
+                if allocations is not None else "application/vnd.hydir.pcode-call-trace+json;version=2"
             ),
-            schema_version=1 if llvm or assessment else 2,
+            schema_version=2 if llvm and allocations is not None else 1 if llvm or assessment
+            else 3 if allocations is not None else 2,
         )
         if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
             raise RuntimeError("Ghidra call artifact belongs to another binary")
@@ -714,9 +737,10 @@ class HydirClient:
                 or entries[0] != seed_json["entry"]
                 or not isinstance(module, dict)
                 or module.get("binary_sha256") != seed_json["binary_sha256"]
-                or module.get("schema_version") != 2
+                or module.get("schema_version") != (5 if allocations is not None else 2)
                 or module.get("start") != seed_json["entry"]
                 or not isinstance(module.get("llvm_ir"), str)
+                or (allocations is not None) != isinstance(module.get("allocations"), dict)
             ):
                 raise RuntimeError("Ghidra call LLVM artifact differs from the requested binary or function")
         elif assessment:
@@ -731,6 +755,11 @@ class HydirClient:
                 raise RuntimeError("Ghidra assessment differs from the requested seed or function")
         elif artifact.get("root_entry", {}).get("offset") != function_hex:
             raise RuntimeError("Ghidra call trace differs from the requested function")
+        if allocations is not None:
+            binding = (artifact.get("llvm", {}).get("allocations") if llvm else
+                       artifact.get("process_binding", {}).get("allocations"))
+            if not isinstance(binding, dict) or binding.get("binary_sha256") != seed_json["binary_sha256"]:
+                raise RuntimeError("Ghidra allocated call artifact lacks the binary-bound allocation contract")
         return artifact
 
     def start_program_analysis(

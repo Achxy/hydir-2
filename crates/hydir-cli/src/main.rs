@@ -81,9 +81,9 @@ Usage:
   hydirctl ghidra llvm-cfg-process <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-process.json>]
   hydirctl ghidra llvm-cfg-allocated <binary> --allocations <allocations.json> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-allocated.json>]
   hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
-  hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--allocations <allocations.json>] [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra assess <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
-  hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--allocations <allocations.json>] [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
@@ -105,11 +105,11 @@ Usage:
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
   hydirctl ghidra-snapshot llvm-cfg-image <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
-  hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--allocations <allocations.json>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
-  hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--allocations <allocations.json>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot assess <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
@@ -598,6 +598,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut max_depth = 4usize;
             let mut depth_seen = false;
             let mut output_path = None;
+            let mut allocations_path = None;
             let mut options = args[4..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -607,13 +608,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                         depth_seen = true;
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
             }
-            let digest = format!("{:x}", sha2::Sha256::digest(read_binary(&args[2])?));
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
             let mut snapshots = vec![parse_ghidra_snapshot(
                 &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
                 &digest,
@@ -624,9 +629,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &digest,
                 )?);
             }
-            let bytes = serde_json::to_vec_pretty(
-                &hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?,
-            )?;
+            let artifact = if let Some(path) = allocations_path {
+                let process = PcodeElfProcessMemory::from_elf(
+                    &binary,
+                    &snapshots[0],
+                    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                )?;
+                let allocations = PcodeProcessAllocations::parse_declared(
+                    &read_bounded_json(path, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES)?,
+                    &snapshots[0],
+                    &process,
+                )?;
+                hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
+                    &snapshots,
+                    max_depth,
+                    &process,
+                    &allocations,
+                )?
+            } else {
+                hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?
+            };
+            let bytes = serde_json::to_vec_pretty(&artifact)?;
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
             } else {
