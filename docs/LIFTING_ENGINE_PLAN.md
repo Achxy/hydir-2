@@ -1,6 +1,6 @@
 # Lifting engine: autonomous execution plan
 
-Status: ready for implementation. Created 2026-09-29 on `lifting-engine` from
+Status: implementation underway. Created 2026-09-29 on `lifting-engine` from
 `bde1901` (`hydir-launch`). This is the execution plan for the Ghidra-backed
 lifting core. [HYDIR_LAUNCH_PLAN.md](HYDIR_LAUNCH_PLAN.md) remains the product
 direction; this document defines the next implementation sequence and gates.
@@ -86,6 +86,15 @@ verifying commit or CI run beside it.
 - [ ] L4 discovery
 - [ ] L5 analyses and rewriting
 - [ ] L6 release gate
+
+L0 checkpoint (2026-09-29): `ghidra-snapshot capability` now emits a separate,
+binary-bound v1 report with selected-function CFG evidence, static execution
+categories, memory and call boundaries, and bounded source-linked stop sites.
+The same artifact is exposed through the v3 API, Python SDK, and existing GUI
+P-code view. The Ghidra smoke workflow now runs the real EmulatorHelper oracle
+with its pinned worker image and fails if the oracle cannot run. The full L0
+gate remains open: the report still needs supplied-memory and loaded-callee
+assessments plus validation witnesses tied to a specific seed and tool run.
 
 1. Work in phase order. Within a phase, make the smallest reviewable code
    change that passes its gate, commit it, and update this document's status.

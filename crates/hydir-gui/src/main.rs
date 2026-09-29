@@ -47,10 +47,10 @@ use hydir_hlc::{
 use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeBackwardSlice,
-    PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace, PcodePathDestination,
-    PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage, PcodeSemanticFunctionIr,
-    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
-    parse_ghidra_snapshot, parse_pcode_seed,
+    PcodeCapabilityReport, PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace,
+    PcodePathDestination, PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage,
+    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr,
+    PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -4535,6 +4535,7 @@ struct AnalystApp {
     ghidra_graph: Option<GhidraGraph>,
     ghidra_snapshot: Option<GhidraSnapshot>,
     ghidra_semantics: Option<PcodeSemanticFunctionIr>,
+    ghidra_capability: Option<PcodeCapabilityReport>,
     ghidra_coverage: Option<PcodeCoverageReport>,
     ghidra_slice: Option<Result<PcodeBackwardSlice, String>>,
     ghidra_pcode_lines: Vec<(Option<u64>, String)>,
@@ -4685,6 +4686,7 @@ impl AnalystApp {
             ghidra_graph: None,
             ghidra_snapshot: None,
             ghidra_semantics: None,
+            ghidra_capability: None,
             ghidra_coverage: None,
             ghidra_slice: None,
             ghidra_pcode_lines: Vec::new(),
@@ -5081,6 +5083,7 @@ impl AnalystApp {
                     self.disassembly_report = None;
                     self.ghidra_snapshot = None;
                     self.ghidra_semantics = None;
+                    self.ghidra_capability = None;
                     self.ghidra_coverage = None;
                     self.ghidra_pcode_lines.clear();
                     self.ghidra_slice = None;
@@ -5241,6 +5244,7 @@ impl AnalystApp {
                                 snapshot.functions.len()
                             );
                             self.history.push(self.status.clone());
+                            self.ghidra_capability = snapshot.pcode_capability_report().ok();
                             self.ghidra_coverage = snapshot.pcode_coverage_report().ok();
                             self.ghidra_semantics = snapshot
                                 .pcode_function_ir()
@@ -7808,6 +7812,58 @@ impl AnalystApp {
                             }
                         });
                 });
+        }
+        if let Some(report) = &self.ghidra_capability {
+            egui::CollapsingHeader::new(format!(
+                "Function capability: {} operations · {} conditions/stops",
+                report.operations,
+                report.stop_sites.len() + report.omitted_stop_sites
+            ))
+            .id_salt("ghidra_pcode_capability")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new("Static capability estimate; execution needs a concrete state. Function equivalence is unverified.")
+                    .size(11.0).color(MUTED));
+                ui.label(RichText::new(format!(
+                    "Discovery: {} instruction nodes, {} known edges, {} unresolved nodes · complete: {}",
+                    report.discovery.instruction_nodes, report.discovery.known_edges,
+                    report.discovery.unresolved_nodes, report.discovery.complete
+                )).monospace().size(11.0));
+                ui.label(RichText::new(format!(
+                    "Execution: {} exact values, {} conditional memory, {} conditional control, {} stopping operations",
+                    report.execution.exact_value_operations,
+                    report.execution.conditional_memory_operations,
+                    report.execution.conditional_control_operations,
+                    report.execution.stopping_operations
+                )).monospace().size(11.0));
+                ui.label(RichText::new(format!(
+                    "Memory: {} reads, {} writes ({} / {} conditional) · calls: {} direct targets, {} unresolved",
+                    report.memory.reads, report.memory.writes,
+                    report.memory.conditional_reads, report.memory.conditional_writes,
+                    report.calls.direct_targets, report.calls.unresolved_targets
+                )).monospace().size(11.0));
+                egui::ScrollArea::vertical().id_salt("ghidra_capability_stop_sites")
+                    .max_height(160.0)
+                    .show_rows(ui, 18.0, report.stop_sites.len(), |ui, range| {
+                        for row in range {
+                            let site = &report.stop_sites[row];
+                            let address = address_map.as_ref().and_then(|map| {
+                                map.to_linked(&site.address.space, &site.address.offset)
+                            });
+                            let sequence = site.sequence_index.map_or(String::new(), |index| format!(" #{index}"));
+                            let label = format!("{}{} {}: {}", site.address.offset,
+                                sequence, site.mnemonic, site.reason);
+                            if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                RichText::new(label).monospace().size(11.0)).clicked() {
+                                    if address.is_some() { self.selected_address = address; }
+                            }
+                        }
+                    });
+                if report.omitted_stop_sites > 0 {
+                    ui.label(RichText::new(format!("{} more sites omitted", report.omitted_stop_sites))
+                        .size(11.0).color(MUTED));
+                }
+            });
         }
         if let Some(report) = &self.ghidra_coverage {
             egui::CollapsingHeader::new(format!(

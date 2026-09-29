@@ -103,6 +103,12 @@ class LocalGhidraTests(unittest.TestCase):
             self.assertEqual(self.client.artifact("coverage", self.binary, self.snapshot)["opaque_effects"], 2)
         with patch.object(self.client, "_run", return_value=json.dumps({
             "binary_sha256": self.digest, "schema_version": 1,
+            "stop_sites": [{"reason": "unsupported user operation"}],
+        }).encode()) as run:
+            self.assertEqual(len(self.client.artifact("capability", self.binary, self.snapshot)["stop_sites"]), 1)
+            self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "capability"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "schema_version": 1,
             "rewrites": [],
         }).encode()) as run:
             self.assertEqual(self.client.artifact("simplify", self.binary, self.snapshot)["rewrites"], [])

@@ -253,6 +253,21 @@ class ClientBoundaryTests(unittest.TestCase):
                 [],
             )
 
+            capability = json.dumps({"schema_version": 1, "stop_sites": []}).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(capability).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-capability+json;version=1",
+                    content=capability,
+                    project_revision=4,
+                )
+            )
+            self.assertEqual(
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "capability")["stop_sites"],
+                [],
+            )
+            self.assertEqual(requests[-1].stage, "capability")
+
             transformed = json.dumps({"schema_version": 1, "simplification": {"rewrites": []}}).encode()
             client._call = lambda *_: proto_v3.ArtifactReply(
                 sha256=hashlib.sha256(transformed).hexdigest(),

@@ -2474,6 +2474,7 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "state" => Some("application/vnd.hydir.pcode-state-ir+json;version=1"),
         "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
         "coverage" => Some("application/vnd.hydir.pcode-coverage+json;version=1"),
+        "capability" => Some("application/vnd.hydir.pcode-capability+json;version=1"),
         "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
         "llvm-cfg-image" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=3"),
         "llvm-cfg-simplified" => {
@@ -2712,6 +2713,7 @@ fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>
         "state" => serde_json::to_vec(&raw.lower_state()),
         "cfg" => serde_json::to_vec(&snapshot.pcode_cfg_ir()?),
         "coverage" => serde_json::to_vec(&snapshot.pcode_coverage_report()?),
+        "capability" => serde_json::to_vec(&snapshot.pcode_capability_report()?),
         "slice" => serde_json::to_vec(
             &snapshot
                 .backward_pcode_slice(slice_target.expect("slice selector validated above"))?,
@@ -7191,6 +7193,7 @@ mod tests {
             "state",
             "cfg",
             "coverage",
+            "capability",
             "llvm-cfg",
             "llvm-cfg-simplified",
             "slice",

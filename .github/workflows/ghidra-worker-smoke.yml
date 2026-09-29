@@ -2,7 +2,7 @@ name: Ghidra worker smoke
 
 on:
   push:
-    branches: [hydir-launch]
+    branches: [hydir-launch, lifting-engine]
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
       - crates/hydir-ghidra-worker/**
@@ -15,6 +15,7 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - integrations/ghidra/HydIROracle.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
@@ -41,6 +42,10 @@ on:
       - 'tests/fixtures/ghidra_choose_*'
       - tests/fixtures/hydir-password-gate-stripped.elf
       - tests/fixtures/ghidra_password_mix_o1_v2.json
+      - tests/fixtures/ghidra_prism_patch_portal_v2.json
+      - tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json
+      - tests/ghidra_oracle_test.py
+      - demo/hydir-prism.elf
   pull_request:
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
@@ -54,6 +59,7 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - integrations/ghidra/HydIROracle.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
@@ -80,12 +86,16 @@ on:
       - 'tests/fixtures/ghidra_choose_*'
       - tests/fixtures/hydir-password-gate-stripped.elf
       - tests/fixtures/ghidra_password_mix_o1_v2.json
+      - tests/fixtures/ghidra_prism_patch_portal_v2.json
+      - tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json
+      - tests/ghidra_oracle_test.py
+      - demo/hydir-prism.elf
   workflow_dispatch:
 
 jobs:
   container-frontend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -117,6 +127,58 @@ jobs:
           assert high and high['source'] == 'ghidra_decompiler'
           assert high['status'] == 'complete' and high['operations']
           PY
+      - name: Report selected function lifting capability
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra-snapshot capability \
+            tests/fixtures/ghidra_prototype.elf \
+            "$RUNNER_TEMP/ghidra-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-capability.json"
+          python3 - "$RUNNER_TEMP/ghidra-capability.json" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_text())
+          binary = Path('tests/fixtures/ghidra_prototype.elf').read_bytes()
+          assert report['schema_version'] == 1
+          assert report['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          assert len(report['snapshot_sha256']) == 64
+          assert report['entry']['offset'] == '0x101320'
+          assert report['operations'] > 0
+          assert report['discovery']['complete'] is False
+          assert report['semantic_fidelity'] == 'unknown'
+          assert report['verification'] == 'not_run'
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Compare Rust path execution with Ghidra EmulatorHelper
+        run: |
+          set -euo pipefail
+          # The preceding analysis built the SHA-verified Ghidra image. Reuse
+          # that exact image so the independent oracle tests the same release.
+          image="$(python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          digest = hashlib.sha256()
+          for source in ('integrations/ghidra/Dockerfile.worker',
+                         'integrations/ghidra/HydIRSnapshot.java'):
+              digest.update(Path(source).read_bytes())
+          print(f'hydir-ghidra:12.1.4-{digest.hexdigest()[:16]}')
+          PY
+          )"
+          docker image inspect "$image" > /dev/null
+          container="$(docker create --entrypoint /bin/true "$image")"
+          trap 'docker rm "$container" > /dev/null' EXIT
+          docker cp "$container:/opt/ghidra" "$RUNNER_TEMP/ghidra"
+          export HYDIR_GHIDRA_HOME="$RUNNER_TEMP/ghidra"
+          export HYDIRCTL_BIN="$PWD/target/debug/hydirctl"
+          test -x "$HYDIR_GHIDRA_HOME/support/analyzeHeadless"
+          test -x "$HYDIRCTL_BIN"
+          python3 -m unittest -v tests/ghidra_oracle_test.py
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -507,6 +569,7 @@ jobs:
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}/ghidra-snapshot.json
+            ${{ runner.temp }}/ghidra-capability.json
             ${{ runner.temp }}/ghidra-analyst-snapshot.json
             ${{ runner.temp }}/ghidra-divide-unsigned.json
             ${{ runner.temp }}/ghidra-divide-signed.json

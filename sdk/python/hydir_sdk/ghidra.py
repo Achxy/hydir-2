@@ -138,8 +138,8 @@ class LocalGhidra:
         binary: str | os.PathLike[str],
         snapshot: str | os.PathLike[str],
     ) -> dict[str, Any]:
-        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
-            raise ValueError("artifact kind must be pcode, simplify, semantics, state, cfg, coverage, llvm-prefix, llvm-standalone, llvm-cfg, or llvm-cfg-simplified")
+        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "capability", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
+            raise ValueError("artifact kind must be pcode, simplify, semantics, state, cfg, coverage, capability, llvm-prefix, llvm-standalone, llvm-cfg, or llvm-cfg-simplified")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         self._snapshot(snapshot_path, self._digest(binary_path))

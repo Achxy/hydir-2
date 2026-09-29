@@ -282,6 +282,7 @@ class HydirClient:
             "state": ("application/vnd.hydir.pcode-state-ir+json;version=1", 1),
             "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
             "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
+            "capability": ("application/vnd.hydir.pcode-capability+json;version=1", 1),
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
             "llvm-cfg-image": ("application/vnd.hydir.pcode-cfg-llvm+json;version=3", 3),
             "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),

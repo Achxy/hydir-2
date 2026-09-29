@@ -21,7 +21,10 @@ pub use cfg::{
     PcodeCfgNode,
 };
 pub use coverage::{
-    PCODE_COVERAGE_VERSION, PcodeCoverageReport, PcodeOpaqueSite, PcodeOpcodeCoverage,
+    PCODE_CAPABILITY_VERSION, PCODE_COVERAGE_VERSION, PcodeCallCapability, PcodeCapabilityKind,
+    PcodeCapabilityReport, PcodeCapabilitySite, PcodeCapabilityStatus, PcodeCoverageReport,
+    PcodeDiscoveryCapability, PcodeExecutionCapability, PcodeMemoryCapability, PcodeOpaqueSite,
+    PcodeOpcodeCoverage,
 };
 pub use execution::{
     PCODE_EXECUTION_TRACE_VERSION, PCODE_PATH_TRACE_VERSION, PcodeConcreteMemoryAccess,
