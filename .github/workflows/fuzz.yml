@@ -31,11 +31,14 @@ jobs:
           rustup toolchain install nightly
           cargo install cargo-fuzz --version 0.12.0 --locked
       - name: Build and run feature corpus
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          LSAN_OPTIONS: detect_leaks=0
         run: |
           set -o pipefail
           cargo +nightly fuzz build ${{ matrix.target }}
-          # LeakSanitizer reports a runtime startup leak on empty input even when
-          # cfg_lift skips the callback; retain sanitizer crash checks.
+          # The Rust/libFuzzer runtime leaks at process exit on empty input even
+          # when cfg_lift skips the callback; keep the other sanitizer checks.
           cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -detect_leaks=0 2>&1 | tee fuzz/fuzz-${{ matrix.target }}.log
       - name: Report bounded fuzz crash evidence
         if: failure()
