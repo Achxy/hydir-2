@@ -176,6 +176,7 @@ pub fn validate_dynamic_trace(
     }
     if matches!(trace.status, TraceStatus::Truncated)
         && trace.events.len() < trace.budget.max_events
+        && trace.lost_events == 0
     {
         return Err("truncated trace has not reached its event cap".into());
     }
@@ -326,5 +327,10 @@ mod tests {
         trace.events[0].source.original_bytes_hex = Some(crate::encode_hex(bytes));
         trace.input_sha256 = "0".repeat(64);
         assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.input_sha256 = input_sha256(&input).unwrap();
+        trace.status = TraceStatus::Truncated;
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.lost_events = 1;
+        validate_dynamic_trace(elf, &input, &trace).unwrap();
     }
 }

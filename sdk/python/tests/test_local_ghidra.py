@@ -247,3 +247,29 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(path["events"], [])
         self.assertEqual(run.call_args.args[1], "trace-path")
         self.assertEqual(run.call_args.args[-2:], ("--start", "0x401000"))
+
+    def test_observe_checks_input_and_selected_function(self):
+        input_path = Path(self.directory.name) / "input.json"
+        input_path.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        trace = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "input_sha256": "a" * 64, "selected_elf_vaddr": 0x401000,
+            "status": "completed", "events": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(trace).encode()) as run:
+            self.assertEqual(
+                self.client.observe(self.binary, input_path, function=0x401000)["status"],
+                "completed",
+            )
+        self.assertEqual(run.call_args.args[:2], ("observe", "frida"))
+        self.assertEqual(run.call_args.args[-2:], ("--function", "0x401000"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            **trace, "selected_elf_vaddr": 0x401001,
+        }).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.observe(self.binary, input_path, function=0x401000)
+        input_path.write_text(json.dumps({"binary_sha256": "0" * 64}), encoding="utf-8")
+        with patch.object(self.client, "_run") as run:
+            with self.assertRaises(ValueError):
+                self.client.observe(self.binary, input_path, function=0x401000)
+            run.assert_not_called()

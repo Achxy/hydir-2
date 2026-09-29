@@ -451,3 +451,45 @@ class LocalGhidra:
         ):
             raise RuntimeError("Hydir assessment belongs to another binary, seed, or function")
         return data
+
+    def observe(
+        self,
+        binary: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        *,
+        function: int,
+        snapshot: str | os.PathLike[str] | None = None,
+    ) -> dict[str, Any]:
+        """Collect a bounded Frida path through Hydir's Linux observer.
+
+        A completed path is execution evidence; it is not an exit-code or CFG
+        completeness claim.
+        """
+        if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("observed function entry must be a 64-bit address")
+        binary_path = Path(binary).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        digest = self._digest(binary_path)
+        if not 0 < input_path.stat().st_size <= 2 * 1024 * 1024:
+            raise ValueError("InputSpec is empty or exceeds Hydir's size limit")
+        requested_input = json.loads(input_path.read_bytes())
+        if not isinstance(requested_input, dict) or requested_input.get("binary_sha256") != digest:
+            raise ValueError("InputSpec belongs to another binary")
+        args = ["observe", "frida", str(binary_path), str(input_path),
+                "--function", hex(function)]
+        if snapshot is not None:
+            snapshot_path = Path(snapshot).resolve(strict=True)
+            selected = self._snapshot(snapshot_path, digest).get("selected_function", {}).get("entry", {})
+            if selected.get("space") != "ram" or selected.get("offset") != hex(function):
+                raise ValueError("Ghidra snapshot selects another function")
+            args.extend(["--snapshot", str(snapshot_path)])
+        data = json.loads(self._run(*args))
+        if (
+            not isinstance(data, dict) or data.get("schema_version") != 1
+            or data.get("binary_sha256") != digest
+            or data.get("selected_elf_vaddr") != function
+            or not isinstance(data.get("input_sha256"), str)
+            or len(data["input_sha256"]) != 64
+        ):
+            raise RuntimeError("Hydir observation belongs to another binary, input, or function")
+        return data

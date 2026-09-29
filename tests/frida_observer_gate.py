@@ -11,6 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OBSERVER = Path(os.environ["HYDIR_FRIDA_OBSERVER"])
+HYDIRCTL = ROOT / "target" / "debug" / "hydirctl"
 
 
 def symbol_addresses(binary):
@@ -67,6 +68,21 @@ def run_one(binary, symbols, value, scratch):
     if not any(event["kind"] == "call" and event["target"]["elf_vaddr"] == expected
                for event in events):
         raise AssertionError(f"indirect call target {expected:x} was not observed")
+    cli = subprocess.run(
+        [HYDIRCTL, "observe", "frida", binary, input_file,
+         "--function", hex(symbols["hydir_select"])],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    if cli.returncode != 0:
+        raise AssertionError(f"hydirctl observation failed: {cli.stderr}")
+    cli_trace = json.loads(cli.stdout)
+    if (cli_trace["binary_sha256"] != spec["binary_sha256"] or
+            cli_trace["status"] != "completed" or
+            cli_trace["input_sha256"] != trace["input_sha256"] or
+            not any(event["kind"] == "call" and
+                    event["target"]["elf_vaddr"] == expected
+                    for event in cli_trace["events"])):
+        raise AssertionError("hydirctl returned a different or incomplete path")
     return len(events)
 
 

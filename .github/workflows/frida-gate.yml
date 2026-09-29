@@ -60,4 +60,5 @@ jobs:
           export CPATH="$RUNNER_TEMP/frida-devkit"
           export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
           cargo build --locked -p hydir-frida-observer --features frida-runtime --bin hydir-frida-observer
+          cargo build --locked -p hydir-cli --bin hydirctl
           python3 tests/frida_observer_gate.py
