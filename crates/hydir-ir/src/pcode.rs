@@ -11,6 +11,7 @@ pub mod coverage;
 pub mod execution;
 pub mod image;
 pub mod interprocedural;
+pub mod process_memory;
 pub mod seed;
 pub mod semantics;
 pub mod simplify;
@@ -37,6 +38,9 @@ pub use interprocedural::{
     PCODE_CALL_PATH_VERSION, PcodeCallPathSegment, PcodeCallPathStop, PcodeCallTransition,
     PcodeInterproceduralTrace, execute_concrete_call_path, execute_concrete_call_path_with_image,
     unloaded_call_target,
+};
+pub use process_memory::{
+    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PCODE_ELF_PROCESS_MEMORY_VERSION, PcodeElfProcessMemory,
 };
 pub use seed::{MAX_PCODE_SEED_BYTES, PCODE_SEED_VERSION, parse_pcode_seed};
 pub use semantics::{

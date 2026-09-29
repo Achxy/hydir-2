@@ -48,11 +48,12 @@ use hydir_hlc::{
 };
 use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
-    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeBackwardSlice,
-    PcodeCapabilityReport, PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace,
-    PcodePathDestination, PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage,
-    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr,
-    PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+    PcodeAddress, PcodeBackwardSlice, PcodeCapabilityReport, PcodeCoverageReport, PcodeEffect,
+    PcodeElfProcessMemory, PcodeInterproceduralTrace, PcodePathDestination, PcodePathEvent,
+    PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage, PcodeSemanticFunctionIr,
+    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -187,6 +188,7 @@ enum Task {
         snapshot: Box<GhidraSnapshot>,
         seed_json: String,
         start_text: String,
+        memory_mode: String,
     },
     TraceGhidraCalls {
         binary: PathBuf,
@@ -2637,16 +2639,44 @@ fn trace_ghidra_path(
     seed_json: &str,
     start_text: &str,
     binary: Option<&[u8]>,
+    memory_mode: &str,
 ) -> Result<PcodePathTrace, String> {
     let initial = parse_pcode_seed(seed_json.as_bytes(), snapshot)?;
     let start = ghidra_trace_start(snapshot, start_text)?;
-    if let Some(binary) = binary
-        && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
-    {
-        let image = PcodeReadOnlyElfImage::from_elf(binary, snapshot)?;
-        snapshot.execute_concrete_path_with_image(&initial, &image, Some(&start), 4096, 1024)
-    } else {
-        snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024)
+    match memory_mode {
+        "process" => {
+            let binary = binary.ok_or("process memory needs the local ELF bytes")?;
+            let memory = PcodeElfProcessMemory::from_elf(
+                binary,
+                snapshot,
+                PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+            )?;
+            snapshot.execute_concrete_path_with_process_memory(
+                &initial,
+                &memory,
+                Some(&start),
+                4096,
+                1024,
+            )
+        }
+        "readonly" => {
+            if let Some(binary) = binary
+                && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
+            {
+                let image = PcodeReadOnlyElfImage::from_elf(binary, snapshot)?;
+                snapshot.execute_concrete_path_with_image(
+                    &initial,
+                    &image,
+                    Some(&start),
+                    4096,
+                    1024,
+                )
+            } else {
+                snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024)
+            }
+        }
+        "seed" => snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024),
+        _ => Err("unknown P-code memory mode".to_owned()),
     }
 }
 
@@ -3161,12 +3191,13 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 snapshot,
                 seed_json,
                 start_text,
+                memory_mode,
             } => {
                 let binary = match &source {
                     Source::Local(bytes) => Some(bytes.as_slice()),
                     _ => None,
                 };
-                let result = trace_ghidra_path(&snapshot, &seed_json, &start_text, binary);
+                let result = trace_ghidra_path(&snapshot, &seed_json, &start_text, binary, &memory_mode);
                 Event::GhidraPathTraced {
                     binary_sha256: snapshot.binary_sha256.clone(),
                     function: snapshot.selected_function.entry.clone(),
@@ -4762,6 +4793,7 @@ struct AnalystApp {
     ghidra_simplification: Option<Result<PcodeSimplificationArtifact, String>>,
     ghidra_trace_seed_json: String,
     ghidra_trace_start: String,
+    ghidra_trace_memory_mode: String,
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
     ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
@@ -4918,6 +4950,7 @@ impl AnalystApp {
             ghidra_simplification: None,
             ghidra_trace_seed_json: String::new(),
             ghidra_trace_start: String::new(),
+            ghidra_trace_memory_mode: "readonly".to_owned(),
             ghidra_path_trace: None,
             ghidra_path_lines: Vec::new(),
             ghidra_call_trace: None,
@@ -8350,7 +8383,8 @@ impl AnalystApp {
             .show(ui, |ui| {
                 ui.label(RichText::new("Seed known register or RAM bytes, then follow one bounded path. Unknown values and unsupported effects stop explicitly; the trace is not a whole-function proof.")
                     .size(11.0).color(MUTED));
-                if self.current_local_path.is_some()
+                if self.ghidra_trace_memory_mode == "readonly"
+                    && self.current_local_path.is_some()
                     && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
                 {
                     ui.label(RichText::new("File-backed read-only ELF bytes are loaded automatically; seed input and mutable RAM bytes.")
@@ -8392,6 +8426,16 @@ impl AnalystApp {
                             task.cancel.store(true, Ordering::Release);
                         }
                     }
+                egui::ComboBox::from_label("Memory")
+                    .selected_text(self.ghidra_trace_memory_mode.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.ghidra_trace_memory_mode,
+                            "readonly".to_owned(), "Read-only ELF + seed");
+                        ui.selectable_value(&mut self.ghidra_trace_memory_mode,
+                            "process".to_owned(), "ELF writable data + .bss + seed");
+                        ui.selectable_value(&mut self.ghidra_trace_memory_mode,
+                            "seed".to_owned(), "Seed only");
+                    });
                 if ui.add_enabled(!self.busy && !self.ghidra_busy, egui::Button::new("Trace path")).clicked() {
                     self.ghidra_path_trace = None;
                     self.ghidra_path_lines.clear();
@@ -8399,6 +8443,7 @@ impl AnalystApp {
                         snapshot: Box::new(snapshot.clone()),
                         seed_json: self.ghidra_trace_seed_json.clone(),
                         start_text: self.ghidra_trace_start.clone(),
+                        memory_mode: self.ghidra_trace_memory_mode.clone(),
                     });
                 }
                 match &self.ghidra_path_trace {
@@ -13597,6 +13642,7 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
             snapshot: Box::new(snapshot.clone()),
             seed_json: seed_json.clone(),
             start_text: start_text.clone(),
+            memory_mode: "readonly".to_owned(),
         };
         app.ghidra_trace_seed_json = seed_json;
         app.ghidra_trace_start = start_text;
@@ -14716,10 +14762,14 @@ mod tests {
             {"space": "ram", "byte_offset": "0x210108", "size": 4, "value": "0x53534543"}
         ]);
         let json = seed.to_string();
-        let plain = trace_ghidra_path(&snapshot, &json, "0x2016d0", None).unwrap();
+        let plain = trace_ghidra_path(&snapshot, &json, "0x2016d0", None, "readonly").unwrap();
         assert!(!matches!(plain.stop, PcodePathStop::Return { .. }));
-        let traced = trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary)).unwrap();
+        let traced =
+            trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "readonly").unwrap();
+        let process =
+            trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "process").unwrap();
         assert!(matches!(traced.stop, PcodePathStop::Return { .. }));
+        assert_eq!(process.final_state, traced.final_state);
         assert_eq!(
             traced
                 .final_state

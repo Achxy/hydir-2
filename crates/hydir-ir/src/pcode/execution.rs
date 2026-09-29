@@ -17,8 +17,8 @@
 use super::semantics::lower_operation;
 use super::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PCODE_SEMANTIC_IR_VERSION, PcodeAddress,
-    PcodeEffect, PcodeFunctionIr, PcodeOpaqueClass, PcodeOperation, PcodeReadOnlyElfImage,
-    PcodeSemanticFunctionIr, PcodeSemanticOperation, PcodeVarnode, hex_u64,
+    PcodeEffect, PcodeElfProcessMemory, PcodeFunctionIr, PcodeOpaqueClass, PcodeOperation,
+    PcodeReadOnlyElfImage, PcodeSemanticFunctionIr, PcodeSemanticOperation, PcodeVarnode, hex_u64,
     validate_ghidra_snapshot,
 };
 use crate::{SemanticFidelity, VerificationStatus};
@@ -27,6 +27,75 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const PCODE_EXECUTION_TRACE_VERSION: u32 = 3;
 const MAX_KNOWN_STATE_BYTES: usize = 1_048_576;
+
+trait PcodeInitialMemory {
+    fn byte(&self, space: &str, address: u64) -> Option<u8>;
+    fn mapped(&self, space: &str, address: u64) -> bool;
+    fn writable(&self, space: &str, address: u64) -> bool;
+    fn validate_for(
+        &self,
+        snapshot: &GhidraSnapshot,
+        state: &PcodeConcreteState,
+    ) -> Result<(), String>;
+}
+
+impl PcodeInitialMemory for PcodeReadOnlyElfImage {
+    fn byte(&self, space: &str, address: u64) -> Option<u8> {
+        self.byte(space, address)
+    }
+
+    fn mapped(&self, space: &str, address: u64) -> bool {
+        self.byte(space, address).is_some()
+    }
+
+    fn writable(&self, _space: &str, _address: u64) -> bool {
+        false
+    }
+
+    fn validate_for(
+        &self,
+        snapshot: &GhidraSnapshot,
+        state: &PcodeConcreteState,
+    ) -> Result<(), String> {
+        self.validate_for(snapshot, state)
+    }
+}
+
+impl PcodeInitialMemory for PcodeElfProcessMemory {
+    fn byte(&self, space: &str, address: u64) -> Option<u8> {
+        self.initial_byte(space, address)
+    }
+
+    fn mapped(&self, space: &str, address: u64) -> bool {
+        self.is_mapped(space, address)
+    }
+
+    fn writable(&self, space: &str, address: u64) -> bool {
+        self.is_writable(space, address)
+    }
+
+    fn validate_for(
+        &self,
+        snapshot: &GhidraSnapshot,
+        state: &PcodeConcreteState,
+    ) -> Result<(), String> {
+        self.validate_for_snapshot(snapshot)?;
+        if let Some(bytes) = state.memory_bytes.get(self.space()) {
+            for (&address, &value) in bytes {
+                if !self.is_writable(self.space(), address)
+                    && let Some(expected) = self.initial_byte(self.space(), address)
+                    && value != expected
+                {
+                    return Err(format!(
+                        "seed byte at {}:0x{address:x} conflicts with binary read-only memory",
+                        self.space()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +131,7 @@ impl PcodeConcreteState {
         space: &str,
         byte_offset: u64,
         size: u32,
-        image: Option<&PcodeReadOnlyElfImage>,
+        image: Option<&dyn PcodeInitialMemory>,
     ) -> Result<Option<u64>, String> {
         checked_memory_range(byte_offset, size)?;
         self.read_memory_with_image_wide(space, byte_offset, size, image)
@@ -74,7 +143,7 @@ impl PcodeConcreteState {
         space: &str,
         byte_offset: u64,
         size: u32,
-        image: Option<&PcodeReadOnlyElfImage>,
+        image: Option<&dyn PcodeInitialMemory>,
     ) -> Result<Option<u128>, String> {
         checked_memory_range_wide(byte_offset, size)?;
         let mut value = 0u128;
@@ -547,7 +616,7 @@ impl PcodeSemanticFunctionIr {
         &self,
         source: &PcodeOperation,
         state: &mut PcodeConcreteState,
-        image: Option<&PcodeReadOnlyElfImage>,
+        image: Option<&dyn PcodeInitialMemory>,
     ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
         let input = source.inputs.first().ok_or_else(|| {
             memory_boundary(
@@ -678,7 +747,7 @@ impl PcodeSemanticFunctionIr {
         &self,
         operation: &PcodeSemanticOperation,
         state: &mut PcodeConcreteState,
-        image: Option<&PcodeReadOnlyElfImage>,
+        image: Option<&dyn PcodeInitialMemory>,
     ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
         let source = &operation.source;
         let kind = match (source.opcode, source.mnemonic.as_str()) {
@@ -870,9 +939,8 @@ impl PcodeSemanticFunctionIr {
             PcodeMemoryAccessKind::Store => {
                 if image.is_some_and(|image| {
                     (0..width).any(|index| {
-                        image
-                            .byte(&space.name, byte_offset + u64::from(index))
-                            .is_some()
+                        let address = byte_offset + u64::from(index);
+                        image.mapped(&space.name, address) && !image.writable(&space.name, address)
                     })
                 }) {
                     return Err(memory_boundary(
@@ -880,7 +948,7 @@ impl PcodeSemanticFunctionIr {
                         Some(&space.name),
                         Some(pointer_offset),
                         PcodeMemoryBoundaryKind::ReadOnlyImageWrite,
-                        "STORE targets a byte in the binary read-only image",
+                        "STORE targets a byte in a binary read-only mapping",
                     ));
                 }
                 let data = &source.inputs[2];
@@ -955,7 +1023,7 @@ impl PcodeSemanticFunctionIr {
         &self,
         operation: &PcodeSemanticOperation,
         state: &mut PcodeConcreteState,
-        image: Option<&PcodeReadOnlyElfImage>,
+        image: Option<&dyn PcodeInitialMemory>,
     ) -> Result<PcodeExecutedOperation, Box<PcodeExecutionStop>> {
         let source = &operation.source;
         if source.inputs.len() > 256 || lower_operation(source) != operation.effect {
@@ -1124,10 +1192,31 @@ impl GhidraSnapshot {
         )
     }
 
+    /// Execute with checked PT_LOAD bytes, zero-filled tails, and writable
+    /// ELF mappings. Dynamic relocation destination bytes remain unknown
+    /// unless supplied by the seed. Unmapped stack and heap bytes still need
+    /// an explicit seed; this does not model allocation or external calls.
+    pub fn execute_concrete_path_with_process_memory(
+        &self,
+        initial_state: &PcodeConcreteState,
+        memory: &PcodeElfProcessMemory,
+        start: Option<&PcodeAddress>,
+        max_operations: usize,
+        max_instruction_visits: usize,
+    ) -> Result<PcodePathTrace, String> {
+        self.execute_concrete_path_inner(
+            initial_state,
+            Some(memory),
+            start,
+            max_operations,
+            max_instruction_visits,
+        )
+    }
+
     fn execute_concrete_path_inner(
         &self,
         initial_state: &PcodeConcreteState,
-        image: Option<&PcodeReadOnlyElfImage>,
+        image: Option<&dyn PcodeInitialMemory>,
         start: Option<&PcodeAddress>,
         max_operations: usize,
         max_instruction_visits: usize,

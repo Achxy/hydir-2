@@ -31,7 +31,8 @@ use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeReadOnlyElfImage,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES,
+    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfProcessMemory, PcodeReadOnlyElfImage,
     PcodeSliceTarget, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_model::{
@@ -90,6 +91,7 @@ Usage:
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
   hydirctl ghidra-snapshot coverage <binary> <snapshot.json> [--output <coverage.json>]
   hydirctl ghidra-snapshot capability <binary> <snapshot.json> [--output <capability.json>]
+  hydirctl ghidra-snapshot process-memory <binary> <snapshot.json> [--output <memory.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
@@ -98,7 +100,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
-  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--memory readonly|process|seed] [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot assess <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
@@ -305,6 +307,28 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Some("ghidra-snapshot")
+            if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
+                && args[1] == "process-memory" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let memory = PcodeElfProcessMemory::from_elf(
+                &binary,
+                &snapshot,
+                PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&memory)?;
+            if args.len() == 6 {
+                write_new_or_identical(&args[5], &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
             if args.len() >= 4
                 && matches!(
                     args[1].as_str(),
@@ -460,6 +484,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut max_visits = 1024usize;
             let mut start_address = None;
             let mut output_path = None;
+            let mut memory_mode = "readonly";
+            let mut memory_option_seen = false;
             let mut options = args[5..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -481,6 +507,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--memory"
+                        if !memory_option_seen
+                            && matches!(pair[1].as_str(), "readonly" | "process" | "seed") =>
+                    {
+                        memory_mode = pair[1].as_str();
+                        memory_option_seen = true;
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
@@ -497,26 +530,50 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
                 &snapshot,
             )?;
-            let image = pcode_image_or_legacy(&binary, &snapshot)?;
             let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let trace = if let Some(image) = &image {
-                snapshot.execute_concrete_path_with_image(
+            let trace = match memory_mode {
+                "process" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    snapshot.execute_concrete_path_with_process_memory(
+                        &initial,
+                        &memory,
+                        start.as_ref(),
+                        max_operations,
+                        max_visits,
+                    )?
+                }
+                "readonly" => {
+                    if let Some(image) = pcode_image_or_legacy(&binary, &snapshot)? {
+                        snapshot.execute_concrete_path_with_image(
+                            &initial,
+                            &image,
+                            start.as_ref(),
+                            max_operations,
+                            max_visits,
+                        )?
+                    } else {
+                        snapshot.execute_concrete_path(
+                            &initial,
+                            start.as_ref(),
+                            max_operations,
+                            max_visits,
+                        )?
+                    }
+                }
+                "seed" => snapshot.execute_concrete_path(
                     &initial,
-                    image,
                     start.as_ref(),
                     max_operations,
                     max_visits,
-                )?
-            } else {
-                snapshot.execute_concrete_path(
-                    &initial,
-                    start.as_ref(),
-                    max_operations,
-                    max_visits,
-                )?
+                )?,
+                _ => unreachable!("validated memory mode"),
             };
             let bytes = serde_json::to_vec_pretty(&trace)?;
             if let Some(path) = output_path {
