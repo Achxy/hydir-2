@@ -1,4 +1,4 @@
-// Apply a byte-verified, bounded observed-call worklist in a disposable project.
+// Apply a byte-verified, bounded observed call or jump worklist in a disposable project.
 // Run before HydIRSnapshot.java with: -postScript HydIRRediscover.java <worklist> <binary>
 
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
@@ -47,7 +47,7 @@ public class HydIRRediscover extends GhidraScript {
 
     private static Address address(AddressSpace ram, String text) {
         if (!text.matches("0x[0-9a-f]{1,16}")) {
-            throw new IllegalArgumentException("Invalid observed-call address: " + text);
+            throw new IllegalArgumentException("Invalid observed control address: " + text);
         }
         return ram.getAddress(Long.parseUnsignedLong(text.substring(2), 16));
     }
@@ -62,29 +62,31 @@ public class HydIRRediscover extends GhidraScript {
         Path binary = Path.of(args[1]);
         if (!Files.isRegularFile(worklist) || Files.size(worklist) > MAX_WORKLIST_BYTES
                 || !Files.isRegularFile(binary)) {
-            throw new IllegalArgumentException("Observed-call worklist or binary is unavailable or oversized");
+            throw new IllegalArgumentException("Observed worklist or binary is unavailable or oversized");
         }
         String digest = sha256(binary);
         if (!digest.equalsIgnoreCase(currentProgram.getExecutableSHA256())) {
-            throw new IllegalStateException("Observed-call binary does not match Ghidra project");
+            throw new IllegalStateException("Observed binary does not match Ghidra project");
         }
         List<String> lines = Files.readAllLines(worklist, StandardCharsets.US_ASCII);
-        if (lines.isEmpty()) throw new IllegalArgumentException("Observed-call worklist is empty");
+        if (lines.isEmpty()) throw new IllegalArgumentException("Observed worklist is empty");
         String[] header = lines.get(0).split("\\t", -1);
-        if (header.length != 4 || !header[0].equals("hydir-observed-calls-v1")
+        boolean calls = header.length == 4 && header[0].equals("hydir-observed-calls-v1");
+        boolean jumps = header.length == 4 && header[0].equals("hydir-observed-jumps-v1");
+        if ((!calls && !jumps)
                 || !header[1].equals(digest)
                 || !header[3].matches("[1-9][0-9]{0,2}")) {
-            throw new IllegalArgumentException("Observed-call worklist header is invalid");
+            throw new IllegalArgumentException("Observed worklist header is invalid");
         }
         int count = Integer.parseInt(header[3]);
         if (count > MAX_TARGETS || lines.size() != count + 1) {
-            throw new IllegalArgumentException("Observed-call worklist exceeds target limit");
+            throw new IllegalArgumentException("Observed worklist exceeds target limit");
         }
         AddressSpace ram = currentProgram.getAddressFactory().getAddressSpace("ram");
         if (ram == null) throw new IllegalStateException("Ghidra project lacks ram space");
         Address selected = address(ram, header[2]);
         if (currentProgram.getFunctionManager().getFunctionAt(selected) == null) {
-            throw new IllegalStateException("Selected observed-call function is absent");
+            throw new IllegalStateException("Selected observed function is absent");
         }
         AddressSet changed = new AddressSet();
         for (int index = 1; index < lines.size(); index++) {
@@ -92,23 +94,27 @@ public class HydIRRediscover extends GhidraScript {
             String[] fields = lines.get(index).split("\\t", -1);
             if (fields.length != 4 || !fields[2].matches("(?:[0-9a-f]{2}){1,16}")
                     || !fields[3].matches("(?:[0-9a-f]{2}){1,16}")) {
-                throw new IllegalArgumentException("Malformed observed-call entry " + index);
+                throw new IllegalArgumentException("Malformed observed entry " + index);
             }
             Address source = address(ram, fields[0]);
             Address target = address(ram, fields[1]);
             Instruction instruction = currentProgram.getListing().getInstructionAt(source);
-            if (instruction == null || !instruction.getFlowType().isCall()
+            if (instruction == null || !(calls ? instruction.getFlowType().isCall()
+                                             : instruction.getFlowType().isJump())
                     || !instruction.getFlowType().isComputed()
                     || !currentProgram.getFunctionManager().getFunctionAt(selected).getBody().contains(source)) {
-                throw new IllegalStateException("Observed call site is no longer an unresolved computed call: " + source);
+                throw new IllegalStateException("Observed source is no longer a computed flow in selected function: " + source);
             }
             String parsed = hex(instruction.getParsedBytes());
             if (instruction.getLength() * 2 != fields[2].length() || !parsed.equals(fields[2])) {
-                throw new IllegalStateException("Observed call bytes disagree with Ghidra: " + source);
+                throw new IllegalStateException("Observed source bytes disagree with Ghidra: " + source);
             }
             MemoryBlock block = currentProgram.getMemory().getBlock(target);
             if (block == null || !block.isExecute() || !block.isInitialized()) {
                 throw new IllegalStateException("Observed target is not executable Ghidra memory: " + target);
+            }
+            if (jumps && !currentProgram.getFunctionManager().getFunctionAt(selected).getBody().contains(target)) {
+                throw new IllegalStateException("Observed jump target leaves selected function: " + target);
             }
             byte[] targetWitness = new byte[fields[3].length() / 2];
             if (currentProgram.getMemory().getBytes(target, targetWitness) != targetWitness.length
@@ -117,7 +123,7 @@ public class HydIRRediscover extends GhidraScript {
             }
             Address[] existing = instruction.getFlows();
             if (existing != null && Arrays.asList(existing).contains(target)) {
-                throw new IllegalStateException("Observed target is already a static call flow: " + source);
+                throw new IllegalStateException("Observed target is already a static flow: " + source);
             }
             for (Reference reference : instruction.getMnemonicReferences()) {
                 if (!reference.isMemoryReference()) {
@@ -125,7 +131,8 @@ public class HydIRRediscover extends GhidraScript {
                 }
             }
             currentProgram.getReferenceManager().addMemoryReference(
-                source, target, RefType.COMPUTED_CALL, SourceType.USER_DEFINED, CodeUnit.MNEMONIC);
+                source, target, calls ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP,
+                SourceType.USER_DEFINED, CodeUnit.MNEMONIC);
             changed.add(source);
             changed.add(target);
         }
@@ -133,6 +140,6 @@ public class HydIRRediscover extends GhidraScript {
         manager.setIgnoreChanges(false);
         manager.reAnalyzeAll(changed);
         analyzeChanges(currentProgram);
-        println("HydIR reanalyzed " + count + " observed computed-call targets");
+        println("HydIR reanalyzed " + count + (calls ? " observed computed-call targets" : " observed computed-jump targets"));
     }
 }

@@ -96,7 +96,9 @@ Usage:
   hydirctl ghidra-snapshot capability <binary> <snapshot.json> [--output <capability.json>]
   hydirctl ghidra-snapshot process-memory <binary> <snapshot.json> [--output <memory.json>]
   hydirctl ghidra-snapshot rediscover-calls <binary> <snapshot.json> <input.json> <trace.json> [--output <plan.json>]
+  hydirctl ghidra-snapshot rediscover-jumps <binary> <snapshot.json> <input.json> <trace-v3.json> [--output <plan.json>]
   hydirctl ghidra-snapshot rediscover-apply <binary> <snapshot.json> <input.json> <trace.json> [--output <snapshot.json>]
+  hydirctl ghidra-snapshot rediscover-jumps-apply <binary> <snapshot.json> <input.json> <trace-v3.json> [--output <snapshot.json>]
   hydirctl ghidra-snapshot compare-observed-path <binary> <snapshot.json> <input.json> <trace.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--output <comparison.json>]
   hydirctl ghidra-snapshot llvm-cfg-process <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-process.json>]
   hydirctl ghidra-snapshot llvm-cfg-allocated <binary> <snapshot.json> --allocations <allocations.json> [--start <0xaddress>] [--output <cfg-llvm-allocated.json>]
@@ -338,7 +340,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra-snapshot")
             if (args.len() == 6 || args.len() == 8 && args[6] == "--output")
-                && args[1] == "rediscover-calls" =>
+                && matches!(args[1].as_str(), "rediscover-calls" | "rediscover-jumps") =>
         {
             let binary = read_binary(&args[2])?;
             let snapshot = read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?;
@@ -350,8 +352,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &args[5],
                 hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES,
             )?)?;
-            let plan = ghidra_worker::plan_observed_calls(&binary, &input, &trace, &snapshot)?;
-            let bytes = serde_json::to_vec_pretty(&plan)?;
+            let bytes = if args[1] == "rediscover-jumps" {
+                serde_json::to_vec_pretty(&ghidra_worker::plan_observed_jumps(
+                    &binary, &input, &trace, &snapshot,
+                )?)?
+            } else {
+                serde_json::to_vec_pretty(&ghidra_worker::plan_observed_calls(
+                    &binary, &input, &trace, &snapshot,
+                )?)?
+            };
             if args.len() == 8 {
                 write_new_or_identical(&args[7], &bytes)?;
             } else {
@@ -464,7 +473,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra-snapshot")
             if (args.len() == 6 || args.len() == 8 && args[6] == "--output")
-                && args[1] == "rediscover-apply" =>
+                && matches!(
+                    args[1].as_str(),
+                    "rediscover-apply" | "rediscover-jumps-apply"
+                ) =>
         {
             let snapshot = read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?;
             let input = parse_input_spec(&read_bounded_json(
@@ -475,12 +487,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &args[5],
                 hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES,
             )?)?;
-            let result = ghidra_worker::reanalyze_observed_calls(
-                Path::new(&args[2]),
-                &input,
-                &trace,
-                &snapshot,
-            )?;
+            let result = if args[1] == "rediscover-jumps-apply" {
+                ghidra_worker::reanalyze_observed_jumps(
+                    Path::new(&args[2]),
+                    &input,
+                    &trace,
+                    &snapshot,
+                )?
+            } else {
+                ghidra_worker::reanalyze_observed_calls(
+                    Path::new(&args[2]),
+                    &input,
+                    &trace,
+                    &snapshot,
+                )?
+            };
             let bytes = serde_json::to_vec_pretty(&result)?;
             if args.len() == 8 {
                 write_new_or_identical(&args[7], &bytes)?;

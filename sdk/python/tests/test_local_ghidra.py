@@ -192,6 +192,25 @@ class LocalGhidraTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.client.rediscover_calls(self.binary, self.snapshot, input_path, trace_path)
 
+        jump_plan = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "changed_targets": [], "unresolved_jump_sites": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(jump_plan).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_jumps(self.binary, self.snapshot, input_path, trace_path),
+                jump_plan,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-jumps"))
+        with patch.object(self.client, "_run", return_value=json.dumps(applied).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_jumps(
+                    self.binary, self.snapshot, input_path, trace_path, apply=True,
+                ),
+                applied,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-jumps-apply"))
+
     def test_observed_path_comparison_uses_bounded_cli_contract(self):
         self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
         paths = [Path(self.directory.name) / name for name in

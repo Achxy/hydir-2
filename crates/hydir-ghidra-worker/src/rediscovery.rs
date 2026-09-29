@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const OBSERVED_CALL_REDISCOVERY_VERSION: u32 = 1;
+pub const OBSERVED_JUMP_REDISCOVERY_VERSION: u32 = 1;
 const MAX_CHANGED_CALL_SITES: usize = 64;
 const MAX_CHANGED_TARGETS: usize = 256;
 const MAX_EVENT_SEQUENCES_PER_TARGET: usize = 8;
@@ -45,6 +46,34 @@ pub struct ObservedCallRediscoveryPlan {
     pub unresolved_call_sites: Vec<PcodeAddress>,
     /// Static artifacts for these entries need regeneration if a candidate is
     /// applied. Callers outside the selected snapshot must be discovered then.
+    pub invalidate_function_entries: Vec<PcodeAddress>,
+}
+
+/// A jump candidate from a synchronous Frida source-to-next-block witness.
+/// It is input-specific evidence, even after Ghidra adds a reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObservedJumpTarget {
+    pub jump_site: PcodeAddress,
+    pub target: PcodeAddress,
+    pub source_original_bytes_hex: String,
+    pub target_original_bytes_hex: String,
+    pub evidence_sequences: Vec<u64>,
+    pub target_was_analyzed_instruction: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObservedJumpRediscoveryPlan {
+    pub schema_version: u32,
+    pub binary_sha256: String,
+    pub input_sha256: String,
+    pub ghidra_version: String,
+    pub snapshot_sha256: String,
+    pub trace_sha256: String,
+    pub cache_key: String,
+    pub selected_function: PcodeAddress,
+    pub changed_targets: Vec<ObservedJumpTarget>,
+    pub omitted_targets: usize,
+    pub unresolved_jump_sites: Vec<PcodeAddress>,
     pub invalidate_function_entries: Vec<PcodeAddress>,
 }
 
@@ -254,12 +283,182 @@ pub fn plan_observed_calls(
     })
 }
 
+/// Accept only a byte-verified BRANCHIND in the selected function and a
+/// witnessed target already analyzed in that function's bounded extent. The
+/// plan retains the unresolved edge because one input cannot prove its target set.
+pub fn plan_observed_jumps(
+    elf: &[u8],
+    input: &InputSpec,
+    trace: &DynamicTrace,
+    snapshot_json: &[u8],
+) -> Result<ObservedJumpRediscoveryPlan, String> {
+    validate_dynamic_trace(elf, input, trace)?;
+    if trace.schema_version < hydir_execution::DYNAMIC_TRACE_V3_VERSION {
+        return Err("computed jump rediscovery requires DynamicTrace v3".into());
+    }
+    let snapshot = validate_cached_snapshot(
+        snapshot_json,
+        &trace.binary_sha256,
+        Some(trace.selected_elf_vaddr),
+    )?;
+    let snapshot_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?)
+    );
+    if trace.ghidra_snapshot_sha256.as_deref() != Some(snapshot_sha256.as_str()) {
+        return Err("DynamicTrace does not bind the selected Ghidra snapshot".into());
+    }
+    let entry = &snapshot.selected_function.entry;
+    if entry.space != "ram" || address_offset(entry)? != trace.selected_elf_vaddr {
+        return Err("selected function is not the traced ELF entry".into());
+    }
+    let selected_size = snapshot
+        .functions
+        .iter()
+        .find(|function| function.entry == *entry)
+        .ok_or("selected function is absent from the Ghidra index")?
+        .size;
+    let function_end = trace
+        .selected_elf_vaddr
+        .checked_add(selected_size)
+        .ok_or("selected function extent overflows")?;
+    let instructions = snapshot
+        .selected_function
+        .instructions
+        .iter()
+        .filter(|instruction| instruction.address.space == "ram")
+        .map(|instruction| {
+            address_offset(&instruction.address).map(|address| (address, instruction))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let unresolved: BTreeSet<u64> = snapshot
+        .selected_function
+        .flow_edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == GhidraFlowKind::Branch
+                && edge.computed
+                && edge.target.is_none()
+                && edge.source.space == "ram"
+        })
+        .map(|edge| address_offset(&edge.source))
+        .collect::<Result<_, _>>()?;
+    let existing: BTreeSet<(u64, u64)> = snapshot
+        .selected_function
+        .flow_edges
+        .iter()
+        .filter(|edge| edge.kind == GhidraFlowKind::Branch && edge.source.space == "ram")
+        .filter_map(|edge| {
+            edge.target
+                .as_ref()
+                .filter(|target| target.space == "ram")
+                .map(|target| (address_offset(&edge.source), address_offset(target)))
+        })
+        .map(|(source, target)| Ok((source?, target?)))
+        .collect::<Result<_, String>>()?;
+    let mut candidates = BTreeMap::<(u64, u64), ObservedJumpTarget>::new();
+    for evidence in &trace.jump_evidence {
+        let (Some(source), Some(target)) = (evidence.source.elf_vaddr, evidence.target.elf_vaddr)
+        else {
+            continue;
+        };
+        if !unresolved.contains(&source)
+            || target < trace.selected_elf_vaddr
+            || target >= function_end
+            || !instructions.contains_key(&target)
+            || existing.contains(&(source, target))
+        {
+            continue;
+        }
+        let Some(instruction) = instructions.get(&source) else {
+            continue;
+        };
+        if !instruction
+            .pcode
+            .iter()
+            .any(|operation| operation.opcode == 6)
+        {
+            continue;
+        }
+        let parsed = instruction.parsed_bytes.as_str();
+        let witnessed = evidence.source.original_bytes_hex.as_deref().unwrap();
+        let common = parsed.len().min(witnessed.len());
+        if parsed.len() != instruction.bytes.len()
+            || parsed.len() > 32
+            || !parsed[..common].eq_ignore_ascii_case(&witnessed[..common])
+            || !extract_executable_window(elf, source, parsed.len() / 2).is_ok_and(|bytes| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+                    .eq_ignore_ascii_case(parsed)
+            })
+        {
+            continue;
+        }
+        let candidate = candidates
+            .entry((source, target))
+            .or_insert_with(|| ObservedJumpTarget {
+                jump_site: ram_address(source),
+                target: ram_address(target),
+                source_original_bytes_hex: parsed.to_owned(),
+                target_original_bytes_hex: evidence.target.original_bytes_hex.clone().unwrap(),
+                evidence_sequences: Vec::new(),
+                target_was_analyzed_instruction: true,
+            });
+        if candidate.evidence_sequences.len() < MAX_EVENT_SEQUENCES_PER_TARGET {
+            candidate.evidence_sequences.push(evidence.sequence);
+        }
+    }
+    let mut sites = BTreeSet::new();
+    let mut changed_targets = Vec::new();
+    let mut omitted_targets = 0;
+    for ((source, _), candidate) in candidates {
+        if changed_targets.len() == MAX_CHANGED_TARGETS
+            || (!sites.contains(&source) && sites.len() == MAX_CHANGED_CALL_SITES)
+        {
+            omitted_targets += 1;
+            continue;
+        }
+        sites.insert(source);
+        changed_targets.push(candidate);
+    }
+    let trace_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(trace).map_err(|error| error.to_string())?)
+    );
+    let mut hash = Sha256::new();
+    hash.update(b"hydir-observed-jump-rediscovery-v1\0");
+    hash.update(analysis_cache_key(
+        &trace.binary_sha256,
+        Some(trace.selected_elf_vaddr),
+    ));
+    hash.update(&snapshot_sha256);
+    hash.update(&trace_sha256);
+    Ok(ObservedJumpRediscoveryPlan {
+        schema_version: OBSERVED_JUMP_REDISCOVERY_VERSION,
+        binary_sha256: trace.binary_sha256.clone(),
+        input_sha256: trace.input_sha256.clone(),
+        ghidra_version: GHIDRA_VERSION.into(),
+        snapshot_sha256,
+        trace_sha256,
+        cache_key: format!("{:x}", hash.finalize()),
+        selected_function: entry.clone(),
+        changed_targets,
+        omitted_targets,
+        unresolved_jump_sites: unresolved.into_iter().map(ram_address).collect(),
+        invalidate_function_entries: (!sites.is_empty())
+            .then(|| vec![entry.clone()])
+            .unwrap_or_default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hydir_execution::{
-        DYNAMIC_TRACE_VERSION, INPUT_SPEC_VERSION, ReplayBudget, ReplayGoal, TraceBudget,
-        TraceEvent, TraceStatus, TraceWitness, input_sha256,
+        ComputedJumpEvidence, DYNAMIC_TRACE_V3_VERSION, DYNAMIC_TRACE_VERSION, INPUT_SPEC_VERSION,
+        ReplayBudget, ReplayGoal, TraceBudget, TraceEvent, TraceStatus, TraceWitness, input_sha256,
     };
     use serde_json::json;
 
@@ -267,6 +466,98 @@ mod tests {
     const SNAPSHOT: &[u8] = include_bytes!("../../../tests/fixtures/ghidra_indirect_root_v2.json");
     const CALL_SITE: u64 = 0x20117c;
     const LEAF: u64 = 0x201174;
+    const JUMP_ELF: &[u8] = include_bytes!("../../../tests/fixtures/ghidra_indirect_jump.elf");
+    const JUMP_SNAPSHOT: &[u8] =
+        include_bytes!("../../../tests/fixtures/ghidra_indirect_jump_v2.json");
+
+    fn jump_fixture() -> (InputSpec, DynamicTrace) {
+        let digest = format!("{:x}", Sha256::digest(JUMP_ELF));
+        let input = InputSpec {
+            schema_version: INPUT_SPEC_VERSION,
+            binary_sha256: digest.clone(),
+            argv_hex: vec![],
+            stdin_hex: String::new(),
+            files: vec![],
+            origins: vec![],
+            goal: ReplayGoal {
+                exit_code: Some(0),
+                stdout_contains_hex: None,
+                stderr_contains_hex: None,
+            },
+            budget: ReplayBudget {
+                timeout_ms: 2000,
+                memory_bytes: 1024 * 1024 * 1024,
+                output_bytes: 1024,
+            },
+        };
+        let entry = witness(0x201174, "4885ff");
+        let trace = DynamicTrace {
+            schema_version: DYNAMIC_TRACE_V3_VERSION,
+            binary_sha256: digest,
+            input_sha256: input_sha256(&input).unwrap(),
+            selected_elf_vaddr: 0x201174,
+            ghidra_snapshot_sha256: Some(snapshot_digest(JUMP_SNAPSHOT)),
+            observer: "test".into(),
+            frida_version: "17.9.5".into(),
+            agent_sha256: format!("{:x}", Sha256::digest(b"test")),
+            runtime_module_base: Some(0x200000),
+            elf_load_bias: Some(0),
+            budget: TraceBudget {
+                max_events: 8,
+                timeout_ms: 1000,
+            },
+            status: TraceStatus::Completed,
+            lost_events: 0,
+            stdout_hex: String::new(),
+            stderr_hex: String::new(),
+            diagnostics: vec![],
+            events: vec![
+                TraceEvent {
+                    sequence: 0,
+                    thread_id: 1,
+                    kind: TraceEventKind::Entry,
+                    source: entry.clone(),
+                    target: None,
+                    registers: Some(BTreeMap::from([
+                        ("RIP".into(), 0x201174),
+                        ("RSP".into(), 0x700000),
+                    ])),
+                },
+                TraceEvent {
+                    sequence: 1,
+                    thread_id: 1,
+                    kind: TraceEventKind::Exit,
+                    source: entry,
+                    target: None,
+                    registers: None,
+                },
+            ],
+            jump_evidence: vec![ComputedJumpEvidence {
+                sequence: 0,
+                thread_id: 1,
+                invocation_id: 1,
+                source: witness(0x201179, "ffe0"),
+                target: witness(0x20117b, "48c7c007000000"),
+            }],
+        };
+        (input, trace)
+    }
+
+    #[test]
+    fn computed_jump_plan_keeps_unresolved_edge_and_checks_full_source_bytes() {
+        let (input, mut trace) = jump_fixture();
+        let plan = plan_observed_jumps(JUMP_ELF, &input, &trace, JUMP_SNAPSHOT).unwrap();
+        assert_eq!(plan.changed_targets.len(), 1);
+        assert_eq!(plan.changed_targets[0].jump_site.offset, "0x201179");
+        assert_eq!(plan.changed_targets[0].target.offset, "0x20117b");
+        assert_eq!(plan.unresolved_jump_sites, vec![ram_address(0x201179)]);
+        assert_eq!(
+            plan.invalidate_function_entries,
+            vec![ram_address(0x201174)]
+        );
+        trace.jump_evidence[0].source.original_bytes_hex = Some("90e0".into());
+        assert!(plan_observed_jumps(JUMP_ELF, &input, &trace, JUMP_SNAPSHOT).is_err());
+    }
 
     fn snapshot_digest(bytes: &[u8]) -> String {
         let snapshot: hydir_ir::pcode::GhidraSnapshot = serde_json::from_slice(bytes).unwrap();
@@ -554,6 +845,36 @@ mod tests {
                 && edge.computed
                 && edge.target.is_none()
         }));
+        assert_eq!(std::fs::read(&output).unwrap(), static_json);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires HYDIR_GHIDRA_HOME pointing to the pinned Ghidra 12.1.4 installation"]
+    fn headless_rediscovery_preserves_unresolved_jump() {
+        assert!(std::env::var_os("HYDIR_GHIDRA_HOME").is_some());
+        let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/ghidra_indirect_jump.elf");
+        let scratch = tempfile::tempdir().unwrap();
+        let output = scratch.path().join("static-jump-snapshot.json");
+        super::super::analyze(&binary, Some(0x201174), &output).unwrap();
+        let static_json = std::fs::read(&output).unwrap();
+        let (input, mut trace) = jump_fixture();
+        bind_snapshot(&mut trace, &static_json);
+        let plan = plan_observed_jumps(JUMP_ELF, &input, &trace, &static_json).unwrap();
+        assert_eq!(plan.changed_targets.len(), 1);
+
+        let updated =
+            super::super::reanalyze_observed_jumps(&binary, &input, &trace, &static_json).unwrap();
+        let edges = &updated.selected_function.flow_edges;
+        assert!(edges.iter().any(|edge| edge.source == ram_address(0x201179)
+            && edge.kind == GhidraFlowKind::Branch
+            && edge.computed
+            && edge.target.is_none()));
+        assert!(edges.iter().any(|edge| edge.source == ram_address(0x201179)
+            && edge.kind == GhidraFlowKind::Branch
+            && edge.computed
+            && edge.target == Some(ram_address(0x20117b))));
         assert_eq!(std::fs::read(&output).unwrap(), static_json);
     }
 }

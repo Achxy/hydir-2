@@ -44,7 +44,8 @@ use hydir_execution::{
     validate_dynamic_trace,
 };
 use hydir_ghidra_worker::{
-    GhidraRuntimeStatus, ObservedCallRediscoveryPlan, plan_observed_calls, runtime_status,
+    GhidraRuntimeStatus, ObservedCallRediscoveryPlan, ObservedJumpRediscoveryPlan,
+    plan_observed_calls, plan_observed_jumps, runtime_status,
 };
 use hydir_hlc::{
     HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
@@ -221,13 +222,14 @@ enum Task {
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
-    RediscoverFridaCalls {
+    RediscoverFridaFlow {
         binary: PathBuf,
         binary_sha256: String,
         function: u64,
         snapshot: Box<GhidraSnapshot>,
         input_path: PathBuf,
         trace: Box<DynamicTrace>,
+        jumps: bool,
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
@@ -388,7 +390,7 @@ enum Event {
         input_path: PathBuf,
         result: Result<DynamicTrace, String>,
     },
-    FridaCallsRediscovered {
+    FridaFlowRediscovered {
         binary_sha256: String,
         function: u64,
         trace_sha256: String,
@@ -2483,12 +2485,13 @@ fn run_frida_observation(
     Ok(trace)
 }
 
-fn run_frida_call_rediscovery(
+fn run_frida_rediscovery(
     binary: &Path,
     binary_sha256: &str,
     snapshot: &GhidraSnapshot,
     input_path: &Path,
     trace: &DynamicTrace,
+    jumps: bool,
     cancel: &AtomicBool,
     timeout: Duration,
 ) -> Result<GhidraSnapshot, String> {
@@ -2508,7 +2511,14 @@ fn run_frida_call_rediscovery(
     .map_err(|error| error.to_string())?;
     let mut command = Command::new(hydirctl_path());
     command
-        .args(["ghidra-snapshot", "rediscover-apply"])
+        .args([
+            "ghidra-snapshot",
+            if jumps {
+                "rediscover-jumps-apply"
+            } else {
+                "rediscover-apply"
+            },
+        ])
         .arg(binary)
         .arg(&snapshot_path)
         .arg(input_path)
@@ -3455,13 +3465,14 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 });
                 continue;
             },
-            Task::RediscoverFridaCalls {
+            Task::RediscoverFridaFlow {
                 binary,
                 binary_sha256,
                 function,
                 snapshot,
                 input_path,
                 trace,
+                jumps,
                 cancel,
                 timeout,
             } => {
@@ -3471,11 +3482,11 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     let trace_sha256 = format!("{:x}", Sha256::digest(
                         serde_json::to_vec(&trace).unwrap_or_default()
                     ));
-                    let result = run_frida_call_rediscovery(
+                    let result = run_frida_rediscovery(
                         &binary, &binary_sha256, &snapshot, &input_path,
-                        &trace, &cancel, timeout,
+                        &trace, jumps, &cancel, timeout,
                     );
-                    let _ = completion.send(Event::FridaCallsRediscovered {
+                    let _ = completion.send(Event::FridaFlowRediscovered {
                         binary_sha256,
                         function,
                         trace_sha256,
@@ -5001,6 +5012,8 @@ struct AnalystApp {
     frida_input_path: String,
     frida_observation: Option<Result<DynamicTrace, String>>,
     frida_rediscovery_plan: Option<Result<ObservedCallRediscoveryPlan, String>>,
+    frida_jump_plan: Option<Result<ObservedJumpRediscoveryPlan, String>>,
+    frida_rediscovery_mode: String,
     frida_path_comparison: Option<Result<PcodeObservedPathComparison, String>>,
     frida_rediscovered_snapshot: Option<Result<GhidraSnapshot, String>>,
     frida_rediscovery_busy: bool,
@@ -5164,6 +5177,8 @@ impl AnalystApp {
             frida_input_path: String::new(),
             frida_observation: None,
             frida_rediscovery_plan: None,
+            frida_jump_plan: None,
+            frida_rediscovery_mode: "calls".to_owned(),
             frida_path_comparison: None,
             frida_rediscovered_snapshot: None,
             frida_rediscovery_busy: false,
@@ -5574,6 +5589,7 @@ impl AnalystApp {
                     self.ghidra_assessment = None;
                     self.frida_observation = None;
                     self.frida_rediscovery_plan = None;
+                    self.frida_jump_plan = None;
                     self.frida_rediscovered_snapshot = None;
                     if let Some(task) = &self.frida_rediscovery_task {
                         task.cancel.store(true, Ordering::Release);
@@ -5788,6 +5804,7 @@ impl AnalystApp {
                             self.ghidra_assessment = None;
                             self.frida_observation = None;
                             self.frida_rediscovery_plan = None;
+                            self.frida_jump_plan = None;
                             self.frida_rediscovered_snapshot = None;
                             if let Some(task) = &self.frida_rediscovery_task {
                                 task.cancel.store(true, Ordering::Release);
@@ -5970,6 +5987,7 @@ impl AnalystApp {
                         self.status = "Frida observation cancelled".to_owned();
                         self.frida_observation = None;
                         self.frida_rediscovery_plan = None;
+                        self.frida_jump_plan = None;
                         self.frida_rediscovered_snapshot = None;
                         self.frida_path_comparison = None;
                         continue;
@@ -5984,10 +6002,11 @@ impl AnalystApp {
                     };
                     self.frida_observation = Some(result);
                     self.frida_rediscovery_plan = None;
+                    self.frida_jump_plan = None;
                     self.frida_rediscovered_snapshot = None;
                     self.frida_path_comparison = None;
                 }
-                Event::FridaCallsRediscovered {
+                Event::FridaFlowRediscovered {
                     binary_sha256,
                     function,
                     trace_sha256,
@@ -6018,11 +6037,25 @@ impl AnalystApp {
                         continue;
                     }
                     if cancelled {
-                        self.status = "Observed-call reanalysis cancelled".to_owned();
+                        self.status = format!(
+                            "Observed-{} reanalysis cancelled",
+                            self.frida_rediscovery_mode
+                        );
                         self.frida_rediscovered_snapshot = None;
                         continue;
                     }
                     self.status = match &result {
+                        Ok(snapshot) if self.frida_rediscovery_mode == "jumps" => format!(
+                            "Ghidra rediscovered {} observed jump targets in an isolated project",
+                            snapshot
+                                .selected_function
+                                .flow_edges
+                                .iter()
+                                .filter(|edge| edge.kind == hydir_ir::pcode::GhidraFlowKind::Branch
+                                    && edge.computed
+                                    && edge.target.is_some())
+                                .count(),
+                        ),
                         Ok(snapshot) => format!(
                             "Ghidra rediscovered {} observed call targets in an isolated project",
                             snapshot
@@ -6032,7 +6065,9 @@ impl AnalystApp {
                                 .filter(|call| call.computed && call.target.is_some())
                                 .count(),
                         ),
-                        Err(_) => "Observed-call reanalysis failed".to_owned(),
+                        Err(_) => {
+                            format!("Observed-{} reanalysis failed", self.frida_rediscovery_mode)
+                        }
                     };
                     self.frida_rediscovered_snapshot = Some(result);
                 }
@@ -9020,6 +9055,7 @@ impl AnalystApp {
                     if ui.text_edit_singleline(&mut self.frida_input_path).changed() {
                         self.frida_observation = None;
                         self.frida_rediscovery_plan = None;
+                        self.frida_jump_plan = None;
                         self.frida_rediscovered_snapshot = None;
                         if let Some(task) = &self.frida_rediscovery_task {
                             task.cancel.store(true, Ordering::Release);
@@ -9055,6 +9091,7 @@ impl AnalystApp {
                             });
                             self.frida_observation = None;
                             self.frida_rediscovery_plan = None;
+                            self.frida_jump_plan = None;
                             self.frida_rediscovered_snapshot = None;
                             self.frida_path_comparison = None;
                             self.status = "Observing selected ELF function…".to_owned();
@@ -9074,8 +9111,8 @@ impl AnalystApp {
                 match &self.frida_observation {
                     Some(Ok(trace)) => {
                         ui.label(RichText::new(format!(
-                            "{:?} · {} events · {} lost · {} · process exit code unknown",
-                            trace.status, trace.events.len(), trace.lost_events,
+                            "{:?} · {} events · {} verified jump pairs · {} lost · {} · process exit code unknown",
+                            trace.status, trace.events.len(), trace.jump_evidence.len(), trace.lost_events,
                             trace.observer,
                         )).size(11.0).color(ACCENT));
                         if ui.button("Copy observation JSON").clicked()
@@ -9131,6 +9168,26 @@ impl AnalystApp {
                                 plan_observed_calls(&binary, &input, trace, &snapshot_json)
                             })());
                         }
+                        if ui.button("Plan observed indirect jumps").clicked() {
+                            self.frida_jump_plan = Some((|| -> Result<_, String> {
+                                let binary_path = self.current_local_path.as_ref()
+                                    .ok_or("No local ELF is open")?;
+                                let binary = bounded_read(binary_path)?;
+                                let mut input_bytes = Vec::new();
+                                fs::File::open(self.frida_input_path.trim())
+                                    .map_err(|error| error.to_string())?
+                                    .take((MAX_INPUT_SPEC_BYTES + 1) as u64)
+                                    .read_to_end(&mut input_bytes)
+                                    .map_err(|error| error.to_string())?;
+                                if input_bytes.len() > MAX_INPUT_SPEC_BYTES {
+                                    return Err("InputSpec exceeds size limit".into());
+                                }
+                                let input = parse_input_spec(&input_bytes)?;
+                                let snapshot_json = serde_json::to_vec(snapshot)
+                                    .map_err(|error| error.to_string())?;
+                                plan_observed_jumps(&binary, &input, trace, &snapshot_json)
+                            })());
+                        }
                         match &self.frida_rediscovery_plan {
                             Some(Ok(plan)) => {
                                 ui.label(RichText::new(format!(
@@ -9176,18 +9233,20 @@ impl AnalystApp {
                                 )).clicked() {
                                     let cancel = Arc::new(AtomicBool::new(false));
                                     let timeout = Duration::from_secs(15 * 60);
-                                    let task = Task::RediscoverFridaCalls {
+                                    let task = Task::RediscoverFridaFlow {
                                         binary: self.current_local_path.clone().expect("checked above"),
                                         binary_sha256: snapshot.binary_sha256.clone(),
                                         function: trace.selected_elf_vaddr,
                                         snapshot: Box::new(snapshot.clone()),
                                         input_path: PathBuf::from(self.frida_input_path.trim()),
                                         trace: Box::new(trace.clone()),
+                                        jumps: false,
                                         cancel: Arc::clone(&cancel),
                                         timeout,
                                     };
                                     match self.tasks.try_send(task) {
                                         Ok(()) => {
+                                            self.frida_rediscovery_mode = "calls".to_owned();
                                             self.frida_rediscovery_busy = true;
                                             self.frida_rediscovery_task = Some(ActiveGhidraTask {
                                                 cancel, started: Instant::now(), timeout,
@@ -9206,19 +9265,92 @@ impl AnalystApp {
                             }
                             None => {}
                         }
+                        match &self.frida_jump_plan {
+                            Some(Ok(plan)) => {
+                                ui.label(RichText::new(format!(
+                                    "{} byte-verified jump targets · {} unresolved static jump sites · {} omitted by budget",
+                                    plan.changed_targets.len(), plan.unresolved_jump_sites.len(),
+                                    plan.omitted_targets,
+                                )).size(11.0).color(ACCENT));
+                                ui.label(RichText::new("Each jump target belongs to one observed input; the unknown CFG edge stays open.")
+                                    .size(11.0).color(MUTED));
+                                for candidate in plan.changed_targets.iter().take(64) {
+                                    let source = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&candidate.jump_site.space,
+                                                      &candidate.jump_site.offset));
+                                    let target = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&candidate.target.space,
+                                                      &candidate.target.offset));
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(source.is_some() && self.selected_address == source,
+                                            RichText::new(format!("{} → {} · {} witnesses",
+                                                candidate.jump_site.offset, candidate.target.offset,
+                                                candidate.evidence_sequences.len()))
+                                                .monospace().size(11.0)).clicked() && source.is_some() {
+                                            self.selected_address = source;
+                                        }
+                                        if let Some(target) = target && ui.small_button("Target").clicked() {
+                                            self.selected_address = Some(target);
+                                        }
+                                    });
+                                }
+                                if ui.button("Copy jump rediscovery plan JSON").clicked()
+                                    && let Ok(json) = serde_json::to_string_pretty(plan) {
+                                    ui.ctx().copy_text(json);
+                                }
+                                let can_apply = !plan.changed_targets.is_empty()
+                                    && self.current_local_path.is_some()
+                                    && !self.frida_rediscovery_busy;
+                                if ui.add_enabled(can_apply, egui::Button::new(
+                                    "Reanalyze observed jumps in isolated Ghidra project",
+                                )).clicked() {
+                                    let cancel = Arc::new(AtomicBool::new(false));
+                                    let timeout = Duration::from_secs(15 * 60);
+                                    let task = Task::RediscoverFridaFlow {
+                                        binary: self.current_local_path.clone().expect("checked above"),
+                                        binary_sha256: snapshot.binary_sha256.clone(),
+                                        function: trace.selected_elf_vaddr,
+                                        snapshot: Box::new(snapshot.clone()),
+                                        input_path: PathBuf::from(self.frida_input_path.trim()),
+                                        trace: Box::new(trace.clone()),
+                                        jumps: true,
+                                        cancel: Arc::clone(&cancel),
+                                        timeout,
+                                    };
+                                    match self.tasks.try_send(task) {
+                                        Ok(()) => {
+                                            self.frida_rediscovery_mode = "jumps".to_owned();
+                                            self.frida_rediscovery_busy = true;
+                                            self.frida_rediscovery_task = Some(ActiveGhidraTask {
+                                                cancel, started: Instant::now(), timeout,
+                                            });
+                                            self.frida_rediscovered_snapshot = None;
+                                            self.status = "Reanalyzing observed jumps in isolated Ghidra project…".to_owned();
+                                        }
+                                        Err(_) => self.frida_rediscovered_snapshot = Some(Err(
+                                            "Analysis queue is full. Retry observed-jump reanalysis.".to_owned(),
+                                        )),
+                                    }
+                                }
+                            }
+                            Some(Err(error)) => { ui.label(RichText::new(error).size(11.0).color(BAD)); }
+                            None => {}
+                        }
                         if self.frida_rediscovery_busy && let Some(task) = &self.frida_rediscovery_task {
-                            ghidra_progress(ui, task, "Reanalyzing observed calls");
+                            ghidra_progress(ui, task, "Reanalyzing observed control flow");
                             if ui.add_enabled(!task.cancel.load(Ordering::Acquire),
-                                egui::Button::new("Cancel call reanalysis")).clicked() {
+                                egui::Button::new("Cancel reanalysis")).clicked() {
                                 task.cancel.store(true, Ordering::Release);
                             }
                         }
                         match &self.frida_rediscovered_snapshot {
                             Some(Ok(rediscovered)) => {
                                 ui.label(RichText::new(format!(
-                                    "Isolated Ghidra snapshot: {} instructions · {} call targets",
+                                    "Isolated Ghidra snapshot ({}): {} instructions · {} call targets · {} flow edges",
+                                    self.frida_rediscovery_mode,
                                     rediscovered.selected_function.instructions.len(),
                                     rediscovered.selected_function.call_targets.len(),
+                                    rediscovered.selected_function.flow_edges.len(),
                                 )).size(11.0).color(ACCENT));
                                 for call in rediscovered.selected_function.call_targets.iter()
                                     .filter(|call| call.computed && call.target.is_some()).take(64) {
@@ -9239,6 +9371,28 @@ impl AnalystApp {
                                             self.selected_address = Some(target);
                                         }
                                     });
+                                }
+                                if self.frida_rediscovery_mode == "jumps" {
+                                    for edge in rediscovered.selected_function.flow_edges.iter()
+                                        .filter(|edge| edge.kind == hydir_ir::pcode::GhidraFlowKind::Branch
+                                            && edge.computed && edge.target.is_some()).take(64) {
+                                        let source = address_map.as_ref().and_then(|map|
+                                            map.to_linked(&edge.source.space, &edge.source.offset));
+                                        let target = edge.target.as_ref().and_then(|target| address_map.as_ref()
+                                            .and_then(|map| map.to_linked(&target.space, &target.offset)));
+                                        ui.horizontal(|ui| {
+                                            if ui.selectable_label(source.is_some() && self.selected_address == source,
+                                                RichText::new(format!("{} → {} · observed jump reference",
+                                                    edge.source.offset,
+                                                    edge.target.as_ref().map_or("unknown", |target| target.offset.as_str()),
+                                                )).monospace().size(11.0)).clicked() && source.is_some() {
+                                                self.selected_address = source;
+                                            }
+                                            if let Some(target) = target && ui.small_button("Target").clicked() {
+                                                self.selected_address = Some(target);
+                                            }
+                                        });
+                                    }
                                 }
                                 if ui.button("Copy rediscovered snapshot JSON").clicked()
                                     && let Ok(json) = serde_json::to_string_pretty(rediscovered) {

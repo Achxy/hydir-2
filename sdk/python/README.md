@@ -61,6 +61,10 @@ remains available. `compare_observed_path(binary, snapshot, input_spec, trace,
 seed, memory="process")` executes a bounded P-code path from the supplied seed
 and compares it with one Frida trace; `inconclusive` does
 not mean the paths match.
+`LocalGhidra.rediscover_jumps(...)` uses the independent DynamicTrace v3
+computed-jump witnesses for already analyzed instructions inside the selected
+function. Its plan and isolated `apply=True` route keep the unresolved branch
+visible alongside observed targets.
 `LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
 managed worker and collects only callees reached by the seed before lifting.
 Add `allocations="allocations.json"` to `trace_calls`, `llvm_cfg_calls`, or

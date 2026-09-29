@@ -85,6 +85,10 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-pri
 For the declared-stack example, create `allocations.json` containing
 `{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340024,"byte_len":16}]}`.
 The declaration bounds memory; the seed supplies any known initial bytes.
+For a completed DynamicTrace v3, `ghidra-snapshot rediscover-jumps` produces a
+byte-verified, input-specific candidate plan. `rediscover-jumps-apply` runs
+targeted Ghidra reanalysis in an isolated project copy and keeps the unknown
+computed branch edge in the resulting snapshot.
 
 For a stripped ELF with no function names, open
 `tests/fixtures/hydir-password-gate-stripped.elf` in the GUI and select the

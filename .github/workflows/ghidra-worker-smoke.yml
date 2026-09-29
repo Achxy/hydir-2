@@ -192,6 +192,8 @@ jobs:
           python3 tests/ghidra_four_engine_gate.py
           cargo test --locked -p hydir-ghidra-worker --lib \
             headless_rediscovery_preserves_unresolved_call -- --ignored --nocapture
+          cargo test --locked -p hydir-ghidra-worker --lib \
+            headless_rediscovery_preserves_unresolved_jump -- --ignored --nocapture
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \

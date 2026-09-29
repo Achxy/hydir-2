@@ -180,6 +180,38 @@ class LocalGhidra:
             raise RuntimeError("Hydir rediscovery plan is malformed")
         return data
 
+    def rediscover_jumps(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+        *,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Plan byte-witnessed computed jumps, or reanalyze an isolated project copy."""
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        stage = "rediscover-jumps-apply" if apply else "rediscover-jumps"
+        data = json.loads(self._run(
+            "ghidra-snapshot", stage, str(binary_path),
+            str(snapshot_path), str(input_path), str(trace_path),
+        ))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir jump rediscovery result belongs to another binary")
+        if apply:
+            if data.get("schema_version") != 2 or not isinstance(data.get("selected_function"), dict):
+                raise RuntimeError("Hydir jump rediscovery snapshot is malformed")
+        elif (data.get("schema_version") != 1
+              or not isinstance(data.get("changed_targets"), list)
+              or not isinstance(data.get("unresolved_jump_sites"), list)):
+            raise RuntimeError("Hydir jump rediscovery plan is malformed")
+        return data
+
     def compare_observed_path(
         self,
         binary: str | os.PathLike[str],

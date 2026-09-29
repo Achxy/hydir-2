@@ -21,8 +21,9 @@ use std::{
 
 mod rediscovery;
 pub use rediscovery::{
-    OBSERVED_CALL_REDISCOVERY_VERSION, ObservedCallRediscoveryPlan, ObservedCallTarget,
-    plan_observed_calls,
+    OBSERVED_CALL_REDISCOVERY_VERSION, OBSERVED_JUMP_REDISCOVERY_VERSION,
+    ObservedCallRediscoveryPlan, ObservedCallTarget, ObservedJumpRediscoveryPlan,
+    ObservedJumpTarget, plan_observed_calls, plan_observed_jumps,
 };
 
 const GHIDRA_VERSION: &str = "12.1.4";
@@ -1320,6 +1321,71 @@ pub fn analyze(
     Ok(snapshot)
 }
 
+fn run_observed_worklist(
+    binary: &Path,
+    binary_sha256: &str,
+    selected: u64,
+    lines: &str,
+) -> Result<GhidraSnapshot, String> {
+    if lines.len() > 64 * 1024 {
+        return Err("observed worklist exceeds 64 KiB".into());
+    }
+    let mode = if env::var_os("HYDIR_GHIDRA_HOME").is_some() {
+        "local-12.1.4"
+    } else {
+        "docker-12.1.4"
+    };
+    let key = project_key(binary_sha256, mode);
+    let root = project_root(&key)?;
+    if !root.is_dir() {
+        return Err("managed Ghidra project is unavailable; analyze this binary first".into());
+    }
+    let _project_lock = lock_output(&root.join("project"))?;
+    let managed = existing_project(&root, &key)
+        .ok_or("managed Ghidra project is unavailable; analyze this binary first")?;
+    let scratch = tempfile::Builder::new()
+        .prefix("hydir-ghidra-rediscovery-")
+        .tempdir()
+        .map_err(|e| format!("cannot create rediscovery scratch directory: {e}"))?;
+    let staged = scratch.path().join("project");
+    stage_closed_project(&managed.join("HydirAuto.gpr"), &staged)?;
+    let worklist = scratch.path().join("observed-calls.tsv");
+    fs::write(&worklist, lines).map_err(|e| format!("cannot write observed worklist: {e}"))?;
+    if let Some(home) = env::var_os("HYDIR_GHIDRA_HOME") {
+        local_analyze(
+            Path::new(&home),
+            binary,
+            scratch.path(),
+            &staged,
+            true,
+            Some(selected),
+            None,
+            Some(&worklist),
+        )?;
+    } else {
+        docker_analyze(
+            binary,
+            scratch.path(),
+            &staged,
+            true,
+            Some(selected),
+            None,
+            Some(&worklist),
+        )?;
+    }
+    let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
+        format!(
+            "{e}; headless log: {}",
+            log_tail(&scratch.path().join("analysis.log"))
+        )
+    })?;
+    let snapshot = validate_output(&bytes, binary_sha256, Some(selected))?;
+    if digest_file(binary)? != binary_sha256 {
+        return Err("original binary changed during Ghidra rediscovery".into());
+    }
+    Ok(snapshot)
+}
+
 /// Apply byte-verified observed calls to a disposable copy of the managed
 /// Ghidra project, then reanalyze only their source and target addresses.
 /// The original managed project and its cached static snapshot are untouched.
@@ -1345,26 +1411,6 @@ pub fn reanalyze_observed_calls(
         return Err("observed-call worklist has no changed targets".into());
     }
     let selected = trace.selected_elf_vaddr;
-    let mode = if env::var_os("HYDIR_GHIDRA_HOME").is_some() {
-        "local-12.1.4"
-    } else {
-        "docker-12.1.4"
-    };
-    let key = project_key(&plan.binary_sha256, mode);
-    let root = project_root(&key)?;
-    if !root.is_dir() {
-        return Err("managed Ghidra project is unavailable; analyze this binary first".into());
-    }
-    let _project_lock = lock_output(&root.join("project"))?;
-    let managed = existing_project(&root, &key)
-        .ok_or("managed Ghidra project is unavailable; analyze this binary first")?;
-    let scratch = tempfile::Builder::new()
-        .prefix("hydir-ghidra-rediscovery-")
-        .tempdir()
-        .map_err(|e| format!("cannot create rediscovery scratch directory: {e}"))?;
-    let staged = scratch.path().join("project");
-    stage_closed_project(&managed.join("HydirAuto.gpr"), &staged)?;
-    let worklist = scratch.path().join("observed-calls.tsv");
     let mut lines = format!(
         "hydir-observed-calls-v1\t{}\t0x{selected:x}\t{}\n",
         plan.binary_sha256,
@@ -1379,43 +1425,8 @@ pub fn reanalyze_observed_calls(
             change.target_original_bytes_hex.to_ascii_lowercase()
         ));
     }
-    if lines.len() > 64 * 1024 {
-        return Err("observed-call worklist exceeds 64 KiB".into());
-    }
-    fs::write(&worklist, lines).map_err(|e| format!("cannot write observed-call worklist: {e}"))?;
-    if let Some(home) = env::var_os("HYDIR_GHIDRA_HOME") {
-        local_analyze(
-            Path::new(&home),
-            &binary,
-            scratch.path(),
-            &staged,
-            true,
-            Some(selected),
-            None,
-            Some(&worklist),
-        )?;
-    } else {
-        docker_analyze(
-            &binary,
-            scratch.path(),
-            &staged,
-            true,
-            Some(selected),
-            None,
-            Some(&worklist),
-        )?;
-    }
-    let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
-        format!(
-            "{e}; headless log: {}",
-            log_tail(&scratch.path().join("analysis.log"))
-        )
-    })?;
-    let snapshot = validate_output(&bytes, &plan.binary_sha256, Some(selected))?;
+    let snapshot = run_observed_worklist(&binary, &plan.binary_sha256, selected, &lines)?;
     let original = validate_cached_snapshot(snapshot_json, &plan.binary_sha256, Some(selected))?;
-    if digest_file(&binary)? != plan.binary_sha256 {
-        return Err("original binary changed during Ghidra rediscovery".into());
-    }
     for change in &plan.changed_targets {
         let source = &change.call_site;
         let target = &change.target;
@@ -1455,6 +1466,90 @@ pub fn reanalyze_observed_calls(
             return Err(format!(
                 "Ghidra did not preserve unresolved computed call and observed target at {}",
                 source.offset
+            ));
+        }
+    }
+    Ok(snapshot)
+}
+
+/// Add witnessed computed-jump references in an isolated Ghidra project copy.
+/// The returned snapshot retains the unresolved branch beside each observed
+/// target; the original static cache and managed project remain untouched.
+pub fn reanalyze_observed_jumps(
+    binary: &Path,
+    input: &hydir_execution::InputSpec,
+    trace: &hydir_execution::DynamicTrace,
+    snapshot_json: &[u8],
+) -> Result<GhidraSnapshot, String> {
+    let binary = fs::canonicalize(binary)
+        .map_err(|e| format!("cannot resolve binary {}: {e}", binary.display()))?;
+    let size = fs::metadata(&binary)
+        .map_err(|e| format!("cannot stat binary: {e}"))?
+        .len();
+    if size == 0 || size > MAX_BINARY_BYTES as u64 {
+        return Err(format!(
+            "binary size {size} exceeds Hydir's 64 MiB input limit"
+        ));
+    }
+    let elf = fs::read(&binary).map_err(|e| format!("cannot read binary: {e}"))?;
+    let plan = plan_observed_jumps(&elf, input, trace, snapshot_json)?;
+    if plan.changed_targets.is_empty() {
+        return Err("observed-jump worklist has no changed targets".into());
+    }
+    let selected = trace.selected_elf_vaddr;
+    let mut lines = format!(
+        "hydir-observed-jumps-v1\t{}\t0x{selected:x}\t{}\n",
+        plan.binary_sha256,
+        plan.changed_targets.len(),
+    );
+    for change in &plan.changed_targets {
+        lines.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            change.jump_site.offset,
+            change.target.offset,
+            change.source_original_bytes_hex.to_ascii_lowercase(),
+            change.target_original_bytes_hex.to_ascii_lowercase(),
+        ));
+    }
+    let snapshot = run_observed_worklist(&binary, &plan.binary_sha256, selected, &lines)?;
+    let original = validate_cached_snapshot(snapshot_json, &plan.binary_sha256, Some(selected))?;
+    for change in &plan.changed_targets {
+        let source = &change.jump_site;
+        let target = &change.target;
+        let before = original
+            .selected_function
+            .instructions
+            .iter()
+            .find(|instruction| instruction.address == *source);
+        let after = snapshot
+            .selected_function
+            .instructions
+            .iter()
+            .find(|instruction| instruction.address == *source);
+        if before.zip(after).is_none_or(|(before, after)| {
+            before.parsed_bytes != after.parsed_bytes || before.pcode != after.pcode
+        }) {
+            return Err(format!(
+                "Ghidra changed raw P-code at observed computed jump {}",
+                source.offset
+            ));
+        }
+        let unresolved = snapshot.selected_function.flow_edges.iter().any(|edge| {
+            edge.source == *source
+                && edge.kind == hydir_ir::pcode::GhidraFlowKind::Branch
+                && edge.computed
+                && edge.target.is_none()
+        });
+        let observed = snapshot.selected_function.flow_edges.iter().any(|edge| {
+            edge.source == *source
+                && edge.kind == hydir_ir::pcode::GhidraFlowKind::Branch
+                && edge.computed
+                && edge.target.as_ref() == Some(target)
+        });
+        if !(unresolved && observed) {
+            return Err(format!(
+                "Ghidra did not retain unresolved computed jump and observed target at {}",
+                source.offset,
             ));
         }
     }
