@@ -4,6 +4,10 @@ Status: implementation underway. Created 2026-09-29 on `lifting-engine` from
 `bde1901` (`hydir-launch`). This is the execution plan for the Ghidra-backed
 lifting core. [HYDIR_LAUNCH_PLAN.md](HYDIR_LAUNCH_PLAN.md) remains the product
 direction; this document defines the next implementation sequence and gates.
+The optional runtime-observation extension is specified in
+[FRIDA_INTEGRATION_PLAN.md](FRIDA_INTEGRATION_PLAN.md); its F0 feasibility
+gate can run alongside L1, while its trace comparison and discovery work
+depend on the corresponding L1-L4 gates.
 
 ## Outcome and scope
 
