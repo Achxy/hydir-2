@@ -5916,14 +5916,22 @@ async fn serve_rpc(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "worker")
+    {
+        return worker_main(&arguments[1..]);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main(arguments))
+}
+
+async fn async_main(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     match arguments.as_slice() {
-        [worker, action] if worker == "worker" => worker_main(std::slice::from_ref(action))?,
-        [worker, action, symbol] if worker == "worker" => {
-            worker_main(&[action.clone(), symbol.clone()])?
-        }
         [identity, create, database, principal] if identity == "identity" && create == "create" => {
             let store = Store::open(Path::new(database))?;
             let token = store.create_identity(principal)?;
