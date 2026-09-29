@@ -1,0 +1,26 @@
+[package]
+name = "hydir-frida-observer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+frida-runtime = ["dep:frida"]
+
+[[bin]]
+name = "hydir-frida-observer"
+path = "src/main.rs"
+required-features = ["frida-runtime"]
+
+[dependencies]
+hydir-execution = { path = "../hydir-execution" }
+object.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+frida = { version = "=0.17.2", optional = true, default-features = false }
+libc.workspace = true
+tempfile = "3.23"
