@@ -3,8 +3,23 @@ on:
   push:
   pull_request:
 jobs:
-  native-linux:
+  rust-tests:
+    name: Rust tests / ${{ matrix.feature }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature: binary-and-ir
+            packages: -p hydir-core -p hydir-ir -p hydir-loader -p hydir-interchange
+          - feature: types-and-decompilation
+            packages: -p hydir-model -p hydir-hlc -p hydir-analysis -p hydir-c -p hydir-decompile
+          - feature: semantics-and-vm
+            packages: -p hydir-semantics -p hydir-vm -p hydir-execution
+          - feature: patching-and-recompilation
+            packages: -p hydir-patch -p hydir-transform -p hydir-recompile
+          - feature: ghidra-and-apps
+            packages: -p hydir-ghidra-worker -p hydir-cli -p hydir-api -p hydir-server -p hydir-project -p hydir-backend -p hydir-gui
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -13,16 +28,21 @@ jobs:
       - name: Install native tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc python3-venv bubblewrap gdb apparmor-profiles apparmor-utils
-          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
-          bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true
-      - name: Install Triton binary-analysis bindings
+          sudo apt-get install -y clang llvm gcc gdb bubblewrap
+      - name: Test feature crates
+        run: cargo test --locked ${{ matrix.packages }}
+
+  remote-gui-model:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native compiler
         run: |
-          python3 -m venv .venv
-          .venv/bin/python -m pip install triton-library==1.0.0rc4
-      - name: Rust tests
-        run: cargo test --locked --workspace
+          sudo apt-get update
+          sudo apt-get install -y clang
       - name: Remote GUI model edit over live RPC
         run: |
           set -euo pipefail
@@ -62,10 +82,33 @@ jobs:
             > "$probe_dir/probe.txt"
           cat "$probe_dir/probe.txt"
           grep -q 'typed C available true' "$probe_dir/probe.txt"
-      - name: Python SDK tests
+
+  python-sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python venv
         run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv
+      - name: Install Python SDK
+        run: |
+          python3 -m venv .venv
           .venv/bin/python -m pip install -e sdk/python
-          PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests -q
+      - name: Python SDK tests
+        run: PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests -q
+
+  native-differential:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc gdb
       - name: Exact PRISM bit-gate native differential
         run: |
           cargo build --locked -p hydir-cli --bin hydirctl
@@ -85,6 +128,18 @@ jobs:
       - name: Concrete indirect-jump native differential
         run: |
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/ghidra_indirect_jump_native_test.py -q
+
+  patch-and-replay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc gdb
       - name: Native execution of checked P-code rewrite fixture
         run: |
           clang -O0 -no-pie -DHYDIR_NO_START \
@@ -95,16 +150,46 @@ jobs:
           done
       - name: Transformed Ghidra LLVM versus native ELF
         run: |
+          cargo build --locked -p hydir-cli --bin hydirctl
           HYDIRCTL_BIN="$PWD/target/debug/hydirctl" \
             python3 tests/ghidra_add_zero_transformed_native_test.py -q
       - name: Checked scalar patch and native replay
         run: bash scripts/demo-patch.sh
       - name: Native replay smoke
         run: python3 scripts/replay-smoke.py
-      - name: Fuzz target build
-        run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
+
+  native-decompiler:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang gcc
       - name: Native ELF decompiler artifacts and C11
         run: bash scripts/demo-native-decompiler.sh
+
+  symbolic-execution:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native tools and sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc python3-venv bubblewrap gdb apparmor-profiles apparmor-utils
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true
+      - name: Install Triton binary-analysis bindings
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install triton-library==1.0.0rc4
       - name: Triton bridge protocol tests
         env:
           HYDIR_TRITON_PYTHON: .venv/bin/python

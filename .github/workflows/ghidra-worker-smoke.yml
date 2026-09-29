@@ -2,7 +2,7 @@ name: Ghidra worker smoke
 
 on:
   push:
-    branches: [hydir-launch, lifting-engine]
+    branches: [main, hydir-launch, lifting-engine, fuzz-ci-split]
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
       - crates/hydir-ghidra-worker/**
@@ -280,6 +280,26 @@ jobs:
           name: hydir-gui-render-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hydir-gui-render/
           if-no-files-found: warn
+      - name: Retain automatic import and lift artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-frontend-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/ghidra-snapshot.json
+            ${{ runner.temp }}/ghidra-capability.json
+            ${{ runner.temp }}/hydir-password-snapshot.json
+            ${{ runner.temp }}/hydir-password-llvm.json
+
+  differential-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
       - name: Reproduce the stripped password lifting demo
         run: bash scripts/demo-ghidra-password-lift.sh
       - name: Differential Ghidra matrix across optimization and DWARF variants
@@ -306,6 +326,27 @@ jobs:
         run: |
           python3 scripts/check-ghidra-frame-holdout.py \
             --output-dir "$RUNNER_TEMP/ghidra-frame-holdout"
+      - name: Retain differential reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-differential-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            target/demo-ghidra-password-lift/run.*/
+            ${{ runner.temp }}/ghidra-opt-matrix/report.json
+            ${{ runner.temp }}/ghidra-aggregate-walk/report.json
+            ${{ runner.temp }}/ghidra-float-compare/report.json
+            ${{ runner.temp }}/ghidra-frame-holdout/report.json
+
+  project-and-pcode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
       - name: Import a closed analyst-edited Ghidra project
         run: |
           project="$RUNNER_TEMP/ghidra-analyst-project"
@@ -448,6 +489,30 @@ jobs:
           PY
           clang -x ir -c "$RUNNER_TEMP/ghidra-userop.ll" \
             -o "$RUNNER_TEMP/ghidra-userop.o"
+      - name: Retain project and P-code diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-project-pcode-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/ghidra-analyst-snapshot.json
+            ${{ runner.temp }}/ghidra-divide-unsigned.json
+            ${{ runner.temp }}/ghidra-divide-signed.json
+            ${{ runner.temp }}/ghidra-add-zero-snapshot.json
+            ${{ runner.temp }}/ghidra-add-zero-rewrite.json
+            ${{ runner.temp }}/ghidra-add-zero-llvm.json
+            ${{ runner.temp }}/ghidra-userop-snapshot.json
+            ${{ runner.temp }}/ghidra-userop-llvm.json
+
+  calls-and-control-flow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
       - name: Follow a direct call with automatic callee export
         run: |
           cargo run --locked -p hydir-cli -- ghidra trace-calls \
@@ -565,23 +630,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ghidra-worker-smoke
+          name: ghidra-control-flow-${{ github.run_attempt }}
           if-no-files-found: ignore
           path: |
-            ${{ runner.temp }}/ghidra-snapshot.json
-            ${{ runner.temp }}/ghidra-capability.json
-            ${{ runner.temp }}/ghidra-analyst-snapshot.json
-            ${{ runner.temp }}/ghidra-divide-unsigned.json
-            ${{ runner.temp }}/ghidra-divide-signed.json
-            ${{ runner.temp }}/ghidra-add-zero-snapshot.json
-            ${{ runner.temp }}/ghidra-add-zero-rewrite.json
-            ${{ runner.temp }}/ghidra-add-zero-llvm.json
             ${{ runner.temp }}/ghidra-call-trace.json
             ${{ runner.temp }}/ghidra-indirect-call-trace.json
+            ${{ runner.temp }}/ghidra-call-module.json
             ${{ runner.temp }}/ghidra-chosen-call-trace.json
             ${{ runner.temp }}/ghidra-indirect-jump-snapshot.json
             ${{ runner.temp }}/ghidra-indirect-jump-llvm.json
-            target/demo-ghidra-password-lift/run.*/
-            ${{ runner.temp }}/ghidra-opt-matrix/report.json
-            ${{ runner.temp }}/ghidra-float-compare/report.json
-            ${{ runner.temp }}/ghidra-frame-holdout/report.json
