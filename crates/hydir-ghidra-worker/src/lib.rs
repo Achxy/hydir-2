@@ -32,6 +32,10 @@ const MAX_PROJECT_PROPERTY_BYTES: u64 = 64 * 1024;
 const EXPERT_PROJECT_USER: &str = "hydir";
 const EXPERT_JAVA_OPTIONS: &str = "-Duser.name=hydir";
 
+fn offline_requested() -> bool {
+    env::var_os("HYDIR_OFFLINE").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
 #[derive(Debug)]
 struct ProjectSelector {
     headless_name: String,
@@ -431,12 +435,20 @@ pub fn runtime_status() -> GhidraRuntimeStatus {
         )
         .unwrap_or(false)
     });
+    let offline = offline_requested();
     GhidraRuntimeStatus {
         mode: "docker",
         pinned_version: GHIDRA_VERSION,
-        runtime_ready: ready,
+        runtime_ready: ready && (!offline || image_cached == Some(true)),
         worker_image_cached: image_cached,
         detail: match check {
+            Ok(true) if offline && image_cached != Some(true) => {
+                "HYDIR_OFFLINE=1 requires the pinned Ghidra worker image in Docker's local image store"
+                    .to_owned()
+            }
+            Ok(true) if offline => {
+                "Docker engine and pinned Ghidra worker image are available offline".to_owned()
+            }
             Ok(true) => {
                 "Docker engine reachable; Hydir provisions the pinned image on first analysis"
                     .to_owned()
@@ -832,6 +844,11 @@ fn provision_image(work: &Path) -> Result<String, String> {
         .is_ok_and(|status| status.success())
     {
         return Ok(tag);
+    }
+    if offline_requested() {
+        return Err(format!(
+            "HYDIR_OFFLINE=1: pinned Ghidra worker image {tag} is not cached; provision it before going offline or set HYDIR_GHIDRA_HOME"
+        ));
     }
     let context = work.join("build-context");
     fs::create_dir(&context).map_err(|e| format!("cannot create Ghidra build context: {e}"))?;

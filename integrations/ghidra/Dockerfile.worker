@@ -1,6 +1,6 @@
 # Hydir's Ghidra frontend. This image contains no Hydir lifting backend.
 # Build context contains this Dockerfile and HydIRSnapshot.java only.
-FROM eclipse-temurin:21.0.12_8-jdk-noble
+FROM eclipse-temurin:21.0.12_8-jdk-noble@sha256:4d271cd5e0624598cf563342f47281b09cb364bc13acbbd7251f49f83470018d
 
 ARG GHIDRA_VERSION=12.1.4
 ARG GHIDRA_ARCHIVE=ghidra_12.1.4_PUBLIC_20260921.zip
