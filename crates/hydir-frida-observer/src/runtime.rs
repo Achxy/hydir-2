@@ -116,9 +116,45 @@ impl ScriptHandler for AgentMessages {
                 "detail": format!("unexpected Frida message: {other:?}"),
             }),
         };
+        let event_count = dropped_record_events(&value);
         if self.sender.try_send(value).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.dropped.fetch_add(event_count, Ordering::Relaxed);
         }
+    }
+}
+
+fn dropped_record_events(value: &Value) -> u64 {
+    let field = match value.get("type").and_then(Value::as_str) {
+        Some("batch") => "events",
+        Some("jump_batch") => "jumps",
+        _ => return 1,
+    };
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|rows| rows.len().max(1) as u64)
+        .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod loss_tests {
+    use super::dropped_record_events;
+    use serde_json::json;
+
+    #[test]
+    fn dropped_batches_count_observations_not_messages() {
+        assert_eq!(
+            dropped_record_events(&json!({"type": "batch", "events": [{}, {}, {}]})),
+            3
+        );
+        assert_eq!(
+            dropped_record_events(&json!({"type": "jump_batch", "jumps": [{}, {}]})),
+            2
+        );
+        assert_eq!(
+            dropped_record_events(&json!({"type": "done", "lost": 0})),
+            1
+        );
     }
 }
 
