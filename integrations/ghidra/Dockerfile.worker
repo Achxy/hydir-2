@@ -1,5 +1,5 @@
 # Hydir's Ghidra frontend. This image contains no Hydir lifting backend.
-# Build context contains this Dockerfile and HydIRSnapshot.java only.
+# Build context contains this Dockerfile and the two HydIR Java scripts only.
 FROM eclipse-temurin:21.0.12_8-jdk-noble@sha256:4d271cd5e0624598cf563342f47281b09cb364bc13acbbd7251f49f83470018d
 
 ARG GHIDRA_VERSION=12.1.4
@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin hydir
 
 COPY HydIRSnapshot.java /opt/hydir/scripts/HydIRSnapshot.java
+COPY HydIRRediscover.java /opt/hydir/scripts/HydIRRediscover.java
 
 USER 10001:10001
 WORKDIR /work

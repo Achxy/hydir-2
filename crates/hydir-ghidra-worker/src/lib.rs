@@ -19,9 +19,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod rediscovery;
+pub use rediscovery::{
+    OBSERVED_CALL_REDISCOVERY_VERSION, ObservedCallRediscoveryPlan, ObservedCallTarget,
+    plan_observed_calls,
+};
+
 const GHIDRA_VERSION: &str = "12.1.4";
 const DOCKERFILE: &str = include_str!("../../../integrations/ghidra/Dockerfile.worker");
 const EXPORTER: &str = include_str!("../../../integrations/ghidra/HydIRSnapshot.java");
+const REDISCOVER: &str = include_str!("../../../integrations/ghidra/HydIRRediscover.java");
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DOCKER_LOG_BYTES: u64 = 16 * 1024;
@@ -486,6 +493,7 @@ fn project_key(binary_digest: &str, mode: &str) -> String {
     hash.update(GHIDRA_VERSION.as_bytes());
     hash.update(binary_digest.as_bytes());
     hash.update(EXPORTER.as_bytes());
+    hash.update(REDISCOVER.as_bytes());
     hash.update(DOCKERFILE.as_bytes());
     hash.update(mode.as_bytes());
     format!("{:x}", hash.finalize())
@@ -609,6 +617,7 @@ fn cache_key(binary_digest: &str, selected_entry: Option<u64>, mode: &str) -> St
     hash.update(binary_digest.as_bytes());
     hash.update(b"\0");
     hash.update(EXPORTER.as_bytes());
+    hash.update(REDISCOVER.as_bytes());
     hash.update(b"\0");
     hash.update(DOCKERFILE.as_bytes());
     hash.update(b"\0");
@@ -821,6 +830,7 @@ fn image_tag() -> String {
     let mut hash = Sha256::new();
     hash.update(DOCKERFILE.as_bytes());
     hash.update(EXPORTER.as_bytes());
+    hash.update(REDISCOVER.as_bytes());
     let hex = format!("{:x}", hash.finalize());
     format!("hydir-ghidra:12.1.4-{}", &hex[..16])
 }
@@ -856,6 +866,8 @@ fn provision_image(work: &Path) -> Result<String, String> {
         .map_err(|e| format!("cannot stage Ghidra Dockerfile: {e}"))?;
     fs::write(context.join("HydIRSnapshot.java"), EXPORTER)
         .map_err(|e| format!("cannot stage Ghidra exporter: {e}"))?;
+    fs::write(context.join("HydIRRediscover.java"), REDISCOVER)
+        .map_err(|e| format!("cannot stage Ghidra rediscovery script: {e}"))?;
     let mut build = Command::new("docker");
     build.arg("build").arg("--tag").arg(&tag).arg(&context);
     run_bounded(
@@ -868,13 +880,27 @@ fn provision_image(work: &Path) -> Result<String, String> {
     Ok(tag)
 }
 
-fn script_args(selected_entry: Option<u64>, snapshot: &str, binary: &str) -> Vec<String> {
-    let mut args = vec![
+fn script_args(
+    selected_entry: Option<u64>,
+    snapshot: &str,
+    binary: &str,
+    worklist: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(worklist) = worklist {
+        args.extend([
+            "-postScript".to_owned(),
+            "HydIRRediscover.java".to_owned(),
+            worklist.to_owned(),
+            binary.to_owned(),
+        ]);
+    }
+    args.extend([
         "-postScript".to_owned(),
         "HydIRSnapshot.java".to_owned(),
         snapshot.to_owned(),
         binary.to_owned(),
-    ];
+    ]);
     if let Some(entry) = selected_entry {
         args.push(format!("0x{entry:x}"));
     }
@@ -890,6 +916,7 @@ fn docker_run_args(
     reuse_project: bool,
     selected_entry: Option<u64>,
     run_as: Option<&str>,
+    worklist: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "run".into(),
@@ -928,6 +955,12 @@ fn docker_run_args(
     if let Some(user) = run_as {
         args.extend(["--user".into(), user.into()]);
     }
+    if worklist.is_some() {
+        args.extend([
+            "--env".into(),
+            format!("JAVA_TOOL_OPTIONS={EXPERT_JAVA_OPTIONS}"),
+        ]);
+    }
     args.extend([tag.into(), "/project".into(), "HydirAuto".into()]);
     if reuse_project {
         args.extend(["-process".into(), "-noanalysis".into()]);
@@ -939,6 +972,7 @@ fn docker_run_args(
         selected_entry,
         "/work/snapshot.json",
         "/input/binary",
+        worklist,
     ));
     args
 }
@@ -974,12 +1008,17 @@ fn local_analyze(
     reuse_project: bool,
     selected_entry: Option<u64>,
     project_import: Option<&ProjectSelector>,
+    worklist: Option<&Path>,
 ) -> Result<(), String> {
     let script_dir = work.join("scripts");
     fs::create_dir(&script_dir)
         .map_err(|e| format!("cannot create Ghidra script directory: {e}"))?;
     fs::write(script_dir.join("HydIRSnapshot.java"), EXPORTER)
         .map_err(|e| format!("cannot stage Ghidra exporter: {e}"))?;
+    if worklist.is_some() {
+        fs::write(script_dir.join("HydIRRediscover.java"), REDISCOVER)
+            .map_err(|e| format!("cannot stage Ghidra rediscovery script: {e}"))?;
+    }
     let executable = home.join("support").join(if cfg!(windows) {
         "analyzeHeadless.bat"
     } else {
@@ -990,7 +1029,7 @@ fn local_analyze(
     }
     let snapshot = work.join("snapshot.json");
     let mut command = Command::new(&executable);
-    if project_import.is_some() {
+    if project_import.is_some() || worklist.is_some() {
         command.env("JAVA_TOOL_OPTIONS", EXPERT_JAVA_OPTIONS);
     }
     command
@@ -1011,6 +1050,9 @@ fn local_analyze(
         selected_entry,
         &snapshot.display().to_string(),
         &binary.display().to_string(),
+        worklist
+            .map(|path| path.to_str().ok_or("worklist path is not UTF-8"))
+            .transpose()?,
     ));
     if let Some(selector) = project_import {
         command.arg(format!("domainPath={}", selector.domain_path));
@@ -1031,10 +1073,15 @@ fn docker_analyze(
     reuse_project: bool,
     selected_entry: Option<u64>,
     project_import: Option<&ProjectSelector>,
+    worklist: Option<&Path>,
 ) -> Result<(), String> {
     let tag = provision_image(work)?;
     let staging = work.join("container-work");
     fs::create_dir(&staging).map_err(|e| format!("cannot stage Ghidra project: {e}"))?;
+    if let Some(worklist) = worklist {
+        fs::copy(worklist, staging.join("observed-calls.tsv"))
+            .map_err(|e| format!("cannot stage observed-call worklist: {e}"))?;
+    }
     // On Unix, use the host user's uid/gid for bind-mounted output and project
     // files. A fixed image uid can write them but may leave mode-0600 snapshots
     // unreadable to the Rust process on the host.
@@ -1076,6 +1123,7 @@ fn docker_analyze(
         reuse_project,
         selected_entry,
         run_as.as_deref(),
+        worklist.map(|_| "/work/observed-calls.tsv"),
     );
     if let Some(selector) = project_import {
         args = docker_project_args(args, &tag, selector);
@@ -1191,6 +1239,7 @@ pub fn analyze(
             reuse_project,
             selected_entry,
             None,
+            None,
         )?;
     } else {
         docker_analyze(
@@ -1199,6 +1248,7 @@ pub fn analyze(
             project,
             reuse_project,
             selected_entry,
+            None,
             None,
         )?;
     }
@@ -1247,6 +1297,147 @@ pub fn analyze(
         &serde_json::to_vec(&record)
             .map_err(|e| format!("cannot encode Ghidra cache record: {e}"))?,
     )?;
+    Ok(snapshot)
+}
+
+/// Apply byte-verified observed calls to a disposable copy of the managed
+/// Ghidra project, then reanalyze only their source and target addresses.
+/// The original managed project and its cached static snapshot are untouched.
+pub fn reanalyze_observed_calls(
+    binary: &Path,
+    input: &hydir_execution::InputSpec,
+    trace: &hydir_execution::DynamicTrace,
+    snapshot_json: &[u8],
+) -> Result<GhidraSnapshot, String> {
+    let binary = fs::canonicalize(binary)
+        .map_err(|e| format!("cannot resolve binary {}: {e}", binary.display()))?;
+    let size = fs::metadata(&binary)
+        .map_err(|e| format!("cannot stat binary: {e}"))?
+        .len();
+    if size == 0 || size > MAX_BINARY_BYTES as u64 {
+        return Err(format!(
+            "binary size {size} exceeds Hydir's 64 MiB input limit"
+        ));
+    }
+    let elf = fs::read(&binary).map_err(|e| format!("cannot read binary: {e}"))?;
+    let plan = plan_observed_calls(&elf, input, trace, snapshot_json)?;
+    if plan.changed_targets.is_empty() {
+        return Err("observed-call worklist has no changed targets".into());
+    }
+    let selected = trace.selected_elf_vaddr;
+    let mode = if env::var_os("HYDIR_GHIDRA_HOME").is_some() {
+        "local-12.1.4"
+    } else {
+        "docker-12.1.4"
+    };
+    let key = project_key(&plan.binary_sha256, mode);
+    let root = project_root(&key)?;
+    if !root.is_dir() {
+        return Err("managed Ghidra project is unavailable; analyze this binary first".into());
+    }
+    let _project_lock = lock_output(&root.join("project"))?;
+    let managed = existing_project(&root, &key)
+        .ok_or("managed Ghidra project is unavailable; analyze this binary first")?;
+    let scratch = tempfile::Builder::new()
+        .prefix("hydir-ghidra-rediscovery-")
+        .tempdir()
+        .map_err(|e| format!("cannot create rediscovery scratch directory: {e}"))?;
+    let staged = scratch.path().join("project");
+    stage_closed_project(&managed.join("HydirAuto.gpr"), &staged)?;
+    let worklist = scratch.path().join("observed-calls.tsv");
+    let mut lines = format!(
+        "hydir-observed-calls-v1\t{}\t0x{selected:x}\t{}\n",
+        plan.binary_sha256,
+        plan.changed_targets.len()
+    );
+    for change in &plan.changed_targets {
+        lines.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            change.call_site.offset,
+            change.target.offset,
+            change.source_original_bytes_hex.to_ascii_lowercase(),
+            change.target_original_bytes_hex.to_ascii_lowercase()
+        ));
+    }
+    if lines.len() > 64 * 1024 {
+        return Err("observed-call worklist exceeds 64 KiB".into());
+    }
+    fs::write(&worklist, lines).map_err(|e| format!("cannot write observed-call worklist: {e}"))?;
+    if let Some(home) = env::var_os("HYDIR_GHIDRA_HOME") {
+        local_analyze(
+            Path::new(&home),
+            &binary,
+            scratch.path(),
+            &staged,
+            true,
+            Some(selected),
+            None,
+            Some(&worklist),
+        )?;
+    } else {
+        docker_analyze(
+            &binary,
+            scratch.path(),
+            &staged,
+            true,
+            Some(selected),
+            None,
+            Some(&worklist),
+        )?;
+    }
+    let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
+        format!(
+            "{e}; headless log: {}",
+            log_tail(&scratch.path().join("analysis.log"))
+        )
+    })?;
+    let snapshot = validate_output(&bytes, &plan.binary_sha256, Some(selected))?;
+    let original = validate_cached_snapshot(snapshot_json, &plan.binary_sha256, Some(selected))?;
+    if digest_file(&binary)? != plan.binary_sha256 {
+        return Err("original binary changed during Ghidra rediscovery".into());
+    }
+    for change in &plan.changed_targets {
+        let source = &change.call_site;
+        let target = &change.target;
+        let before = original
+            .selected_function
+            .instructions
+            .iter()
+            .find(|instruction| instruction.address == *source);
+        let after = snapshot
+            .selected_function
+            .instructions
+            .iter()
+            .find(|instruction| instruction.address == *source);
+        if before.zip(after).is_none_or(|(before, after)| {
+            before.parsed_bytes != after.parsed_bytes || before.pcode != after.pcode
+        }) {
+            return Err(format!(
+                "Ghidra changed raw P-code at observed computed call {}",
+                source.offset
+            ));
+        }
+        let unresolved_call = snapshot
+            .selected_function
+            .call_targets
+            .iter()
+            .any(|call| call.call_site == *source && call.computed && call.target.is_none());
+        let observed_call = snapshot.selected_function.call_targets.iter().any(|call| {
+            call.call_site == *source && call.computed && call.target.as_ref() == Some(target)
+        });
+        let unresolved_flow = snapshot.selected_function.flow_edges.iter().any(|edge| {
+            edge.source == *source
+                && edge.kind == hydir_ir::pcode::GhidraFlowKind::Call
+                && edge.computed
+                && edge.target.is_none()
+        });
+        if !(unresolved_call && observed_call && unresolved_flow) {
+            return Err(format!(
+                "Ghidra did not preserve unresolved computed call and observed target at {}",
+                source.offset
+            ));
+        }
+    }
     Ok(snapshot)
 }
 
@@ -1329,6 +1520,7 @@ pub fn import_project(
             true,
             selected_entry,
             Some(&selector),
+            None,
         )?;
     } else {
         docker_analyze(
@@ -1338,6 +1530,7 @@ pub fn import_project(
             true,
             selected_entry,
             Some(&selector),
+            None,
         )?;
     }
     let bytes = snapshot_bytes(&scratch.path().join("snapshot.json")).map_err(|e| {
@@ -1537,6 +1730,7 @@ mod tests {
             true,
             Some(0x401000),
             None,
+            None,
         );
         let args = docker_project_args(args, "image:tag", &selector);
         assert!(args.windows(5).any(|w| w
@@ -1610,6 +1804,7 @@ mod tests {
             false,
             Some(0x401080),
             Some("1001:1001"),
+            None,
         );
         assert!(args.windows(2).any(|w| w == ["--network", "none"]));
         assert!(args.iter().any(|a| a == "--read-only"));
@@ -1630,11 +1825,40 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         assert!(!reused.iter().any(|arg| arg == "--user"));
         assert!(reused.iter().any(|arg| arg == "-process"));
         assert!(reused.iter().any(|arg| arg == "-noanalysis"));
         assert!(!reused.iter().any(|arg| arg == "-import"));
+    }
+
+    #[test]
+    fn rediscovery_script_precedes_snapshot_export_in_writable_project_copy() {
+        let args = docker_run_args(
+            "hydir-ghidra:test",
+            "hydir-test",
+            Path::new("/tmp/input"),
+            Path::new("/tmp/scratch"),
+            Path::new("/tmp/project"),
+            true,
+            Some(0x20117c),
+            None,
+            Some("/work/observed-calls.tsv"),
+        );
+        let scripts: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-postScript")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(scripts, ["HydIRRediscover.java", "HydIRSnapshot.java"]);
+        assert!(args.iter().any(|arg| arg == "/work/observed-calls.tsv"));
+        assert!(args.iter().any(|arg| arg == "-process"));
+        assert!(!args.iter().any(|arg| arg == "-readOnly"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env", "JAVA_TOOL_OPTIONS=-Duser.name=hydir"])
+        );
     }
 
     #[test]

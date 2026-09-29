@@ -2365,6 +2365,7 @@ name = "hydir-ghidra-worker"
 version = "0.1.0"
 dependencies = [
  "hydir-backend",
+ "hydir-execution",
  "hydir-ir",
  "libc",
  "quick-xml",

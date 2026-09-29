@@ -134,10 +134,74 @@ class LocalGhidraTests(unittest.TestCase):
         with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()):
             with self.assertRaises(RuntimeError):
                 self.client.llvm_cfg(self.binary, self.snapshot, image=True)
+        process_artifact = {**artifact, "schema_version": 4, "process_memory": {"space": "ram"}}
+        with patch.object(self.client, "_run", return_value=json.dumps(process_artifact).encode()) as run:
+            self.client.llvm_cfg(self.binary, self.snapshot, process=True)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-process"))
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.llvm_cfg(self.binary, self.snapshot, process=True)
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, image=True, simplified=True)
         with self.assertRaises(ValueError):
+            self.client.llvm_cfg(self.binary, self.snapshot, process=True, image=True)
+        with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
+
+    def test_observed_call_rediscovery_uses_bounded_cli_contract(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        input_path = Path(self.directory.name) / "input.json"
+        trace_path = Path(self.directory.name) / "trace.json"
+        input_path.write_text("{}", encoding="utf-8")
+        trace_path.write_text("{}", encoding="utf-8")
+        plan = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "changed_targets": [], "unresolved_call_sites": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(plan).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_calls(self.binary, self.snapshot, input_path, trace_path),
+                plan,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-calls"))
+        applied = {
+            "schema_version": 2, "binary_sha256": self.digest,
+            "selected_function": {"entry": {"space": "ram", "offset": "0x401000"}},
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(applied).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_calls(
+                    self.binary, self.snapshot, input_path, trace_path, apply=True
+                ),
+                applied,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-apply"))
+        with patch.object(self.client, "_run", return_value=b"{}"):
+            with self.assertRaises(RuntimeError):
+                self.client.rediscover_calls(self.binary, self.snapshot, input_path, trace_path)
+
+    def test_observed_path_comparison_uses_bounded_cli_contract(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        paths = [Path(self.directory.name) / name for name in
+                 ("input.json", "trace.json", "seed.json")]
+        for path in paths:
+            path.write_text("{}", encoding="utf-8")
+        comparison = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "verdict": "inconclusive", "inconclusive_reasons": ["unknown memory"],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(comparison).encode()) as run:
+            self.assertEqual(
+                self.client.compare_observed_path(self.binary, self.snapshot, *paths),
+                comparison,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "compare-observed-path"))
+        self.assertEqual(run.call_args.args[-2:], ("--memory", "readonly"))
+        with self.assertRaises(ValueError):
+            self.client.compare_observed_path(self.binary, self.snapshot, *paths, memory="unknown")
+        with patch.object(self.client, "_run", return_value=b"{}"):
+            with self.assertRaises(RuntimeError):
+                self.client.compare_observed_path(self.binary, self.snapshot, *paths)
 
     def test_call_trace_uses_managed_worker_and_checks_binary(self):
         seed = Path(self.directory.name) / "seed.json"

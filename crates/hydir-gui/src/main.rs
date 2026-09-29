@@ -30,18 +30,21 @@ use hydir_core::{
 };
 use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, PCODE_CFG_ELF_IMAGE_MAX_BYTES, PcodeCfgLlvmArtifact,
-    PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
-    PcodeStandalonePrefixArtifact, decompile_function_at, decompile_symbol, discover_functions,
-    emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_image, emit_pcode_exact_operation_llvm,
-    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, frida_entry_pcode_seed,
-    measure_native_coverage,
+    PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, PcodeObservedPathComparison,
+    PcodeSimplifiedCfgLlvmArtifact, PcodeStandalonePrefixArtifact, compare_pcode_observed_path,
+    decompile_function_at, decompile_symbol, discover_functions, emit_pcode_cfg_llvm,
+    emit_pcode_cfg_llvm_with_image, emit_pcode_cfg_llvm_with_process_memory,
+    emit_pcode_exact_operation_llvm, emit_pcode_simplified_cfg_llvm,
+    emit_pcode_standalone_prefix_llvm, frida_entry_pcode_seed, measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, DynamicTrace, MAX_ANALYSIS_RECIPE_JSON_BYTES, MAX_INPUT_SPEC_BYTES, StopPoint,
     parse_analysis_recipe, parse_dynamic_trace, parse_input_spec, validate_analysis_recipe,
     validate_dynamic_trace,
 };
-use hydir_ghidra_worker::{GhidraRuntimeStatus, runtime_status};
+use hydir_ghidra_worker::{
+    GhidraRuntimeStatus, ObservedCallRediscoveryPlan, plan_observed_calls, runtime_status,
+};
 use hydir_hlc::{
     HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
     emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
@@ -215,6 +218,16 @@ enum Task {
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
+    RediscoverFridaCalls {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: u64,
+        snapshot: Box<GhidraSnapshot>,
+        input_path: PathBuf,
+        trace: Box<DynamicTrace>,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
     EmitGhidraCallLlvm {
         binary: PathBuf,
         binary_sha256: String,
@@ -370,6 +383,12 @@ enum Event {
         function: u64,
         input_path: PathBuf,
         result: Result<DynamicTrace, String>,
+    },
+    FridaCallsRediscovered {
+        binary_sha256: String,
+        function: u64,
+        trace_sha256: String,
+        result: Result<GhidraSnapshot, String>,
     },
     GhidraCallLlvmEmitted {
         binary_sha256: String,
@@ -2440,6 +2459,58 @@ fn run_frida_observation(
     Ok(trace)
 }
 
+fn run_frida_call_rediscovery(
+    binary: &Path,
+    binary_sha256: &str,
+    snapshot: &GhidraSnapshot,
+    input_path: &Path,
+    trace: &DynamicTrace,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<GhidraSnapshot, String> {
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let snapshot_path = scratch.path().join("snapshot.json");
+    let trace_path = scratch.path().join("trace.json");
+    let output_path = scratch.path().join("rediscovered.json");
+    fs::write(
+        &snapshot_path,
+        serde_json::to_vec(snapshot).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        &trace_path,
+        serde_json::to_vec(trace).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut command = Command::new(hydirctl_path());
+    command
+        .args(["ghidra-snapshot", "rediscover-apply"])
+        .arg(binary)
+        .arg(&snapshot_path)
+        .arg(input_path)
+        .arg(&trace_path)
+        .arg("--output")
+        .arg(&output_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Ghidra rediscovery failed: {}",
+            String::from_utf8_lossy(detail).trim()
+        ));
+    }
+    let metadata = fs::metadata(&output_path).map_err(|error| error.to_string())?;
+    if metadata.len() == 0 || metadata.len() > MAX_GHIDRA_SNAPSHOT_BYTES as u64 {
+        return Err("rediscovered Ghidra snapshot exceeds size limit".into());
+    }
+    let bytes = fs::read(&output_path).map_err(|error| error.to_string())?;
+    parse_ghidra_snapshot(&bytes, binary_sha256)
+}
+
 fn run_ghidra_call_llvm(
     binary: &Path,
     binary_sha256: &str,
@@ -2690,6 +2761,18 @@ fn emit_ghidra_image_cfg_llvm(
     let image = PcodeReadOnlyElfImage::from_elf(&binary, snapshot)?;
     let window = image.materialize_window(PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
     emit_pcode_cfg_llvm_with_image(snapshot, Some(&start), &window)
+}
+
+fn emit_ghidra_process_cfg_llvm(
+    snapshot: &GhidraSnapshot,
+    start_text: &str,
+    binary_path: &Path,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    let start = ghidra_trace_start(snapshot, start_text)?;
+    let binary = bounded_read(binary_path)?;
+    let memory =
+        PcodeElfProcessMemory::from_elf(&binary, snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    emit_pcode_cfg_llvm_with_process_memory(snapshot, Some(&start), &memory)
 }
 
 /// Translate Ghidra's imported RAM image back to linked ELF virtual addresses.
@@ -3282,6 +3365,36 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         binary_sha256,
                         function,
                         input_path,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::RediscoverFridaCalls {
+                binary,
+                binary_sha256,
+                function,
+                snapshot,
+                input_path,
+                trace,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let trace_sha256 = format!("{:x}", Sha256::digest(
+                        serde_json::to_vec(&trace).unwrap_or_default()
+                    ));
+                    let result = run_frida_call_rediscovery(
+                        &binary, &binary_sha256, &snapshot, &input_path,
+                        &trace, &cancel, timeout,
+                    );
+                    let _ = completion.send(Event::FridaCallsRediscovered {
+                        binary_sha256,
+                        function,
+                        trace_sha256,
                         result,
                     });
                     repaint.request_repaint();
@@ -4800,6 +4913,11 @@ struct AnalystApp {
     ghidra_assessment: Option<Result<PcodeFunctionAssessment, String>>,
     frida_input_path: String,
     frida_observation: Option<Result<DynamicTrace, String>>,
+    frida_rediscovery_plan: Option<Result<ObservedCallRediscoveryPlan, String>>,
+    frida_path_comparison: Option<Result<PcodeObservedPathComparison, String>>,
+    frida_rediscovered_snapshot: Option<Result<GhidraSnapshot, String>>,
+    frida_rediscovery_busy: bool,
+    frida_rediscovery_task: Option<ActiveGhidraTask>,
     frida_busy: bool,
     frida_task: Option<ActiveGhidraTask>,
     ghidra_call_lines: Vec<(Option<u64>, String)>,
@@ -4957,6 +5075,11 @@ impl AnalystApp {
             ghidra_assessment: None,
             frida_input_path: String::new(),
             frida_observation: None,
+            frida_rediscovery_plan: None,
+            frida_path_comparison: None,
+            frida_rediscovered_snapshot: None,
+            frida_rediscovery_busy: false,
+            frida_rediscovery_task: None,
             frida_busy: false,
             frida_task: None,
             ghidra_call_lines: Vec::new(),
@@ -5362,6 +5485,12 @@ impl AnalystApp {
                     self.ghidra_call_lines.clear();
                     self.ghidra_assessment = None;
                     self.frida_observation = None;
+                    self.frida_rediscovery_plan = None;
+                    self.frida_rediscovered_snapshot = None;
+                    if let Some(task) = &self.frida_rediscovery_task {
+                        task.cancel.store(true, Ordering::Release);
+                    }
+                    self.frida_path_comparison = None;
                     self.ghidra_call_llvm = None;
                     if let Some(task) = &self.ghidra_call_llvm_task {
                         task.cancel.store(true, Ordering::Release);
@@ -5570,6 +5699,12 @@ impl AnalystApp {
                             self.ghidra_call_lines.clear();
                             self.ghidra_assessment = None;
                             self.frida_observation = None;
+                            self.frida_rediscovery_plan = None;
+                            self.frida_rediscovered_snapshot = None;
+                            if let Some(task) = &self.frida_rediscovery_task {
+                                task.cancel.store(true, Ordering::Release);
+                            }
+                            self.frida_path_comparison = None;
                             self.ghidra_call_llvm = None;
                             if let Some(task) = &self.ghidra_call_llvm_task {
                                 task.cancel.store(true, Ordering::Release);
@@ -5621,6 +5756,7 @@ impl AnalystApp {
                         Err(_) => "Ghidra path trace failed".to_owned(),
                     };
                     self.ghidra_path_trace = Some(result);
+                    self.frida_path_comparison = None;
                 }
                 Event::GhidraCallsTraced {
                     binary_sha256,
@@ -5745,6 +5881,9 @@ impl AnalystApp {
                     if cancelled {
                         self.status = "Frida observation cancelled".to_owned();
                         self.frida_observation = None;
+                        self.frida_rediscovery_plan = None;
+                        self.frida_rediscovered_snapshot = None;
+                        self.frida_path_comparison = None;
                         continue;
                     }
                     self.status = match &result {
@@ -5756,6 +5895,58 @@ impl AnalystApp {
                         Err(_) => "Frida observation failed".to_owned(),
                     };
                     self.frida_observation = Some(result);
+                    self.frida_rediscovery_plan = None;
+                    self.frida_rediscovered_snapshot = None;
+                    self.frida_path_comparison = None;
+                }
+                Event::FridaCallsRediscovered {
+                    binary_sha256,
+                    function,
+                    trace_sha256,
+                    result,
+                } => {
+                    self.frida_rediscovery_busy = false;
+                    let cancelled = self
+                        .frida_rediscovery_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    let current_trace_sha256 = self
+                        .frida_observation
+                        .as_ref()
+                        .and_then(|trace| trace.as_ref().ok())
+                        .and_then(|trace| serde_json::to_vec(trace).ok())
+                        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || self
+                            .frida_observation
+                            .as_ref()
+                            .and_then(|trace| trace.as_ref().ok())
+                            .is_none_or(|trace| trace.selected_elf_vaddr != function)
+                        || current_trace_sha256.as_deref() != Some(trace_sha256.as_str())
+                    {
+                        continue;
+                    }
+                    if cancelled {
+                        self.status = "Observed-call reanalysis cancelled".to_owned();
+                        self.frida_rediscovered_snapshot = None;
+                        continue;
+                    }
+                    self.status = match &result {
+                        Ok(snapshot) => format!(
+                            "Ghidra rediscovered {} observed call targets in an isolated project",
+                            snapshot
+                                .selected_function
+                                .call_targets
+                                .iter()
+                                .filter(|call| call.computed && call.target.is_some())
+                                .count(),
+                        ),
+                        Err(_) => "Observed-call reanalysis failed".to_owned(),
+                    };
+                    self.frida_rediscovered_snapshot = Some(result);
                 }
                 Event::GhidraCallLlvmEmitted {
                     binary_sha256,
@@ -8394,6 +8585,7 @@ impl AnalystApp {
                     ui.label("Start instruction");
                     if ui.text_edit_singleline(&mut self.ghidra_trace_start).changed() {
                         self.ghidra_path_trace = None;
+                        self.frida_path_comparison = None;
                         self.ghidra_path_lines.clear();
                         self.ghidra_llvm_cfg = None;
                         self.ghidra_llvm_image_cfg = None;
@@ -8406,6 +8598,7 @@ impl AnalystApp {
                     ) && ui.button("Use selected").clicked() {
                             self.ghidra_trace_start = format!("0x{address:x}");
                             self.ghidra_path_trace = None;
+                            self.frida_path_comparison = None;
                             self.ghidra_path_lines.clear();
                             self.ghidra_llvm_cfg = None;
                             self.ghidra_llvm_image_cfg = None;
@@ -8417,6 +8610,7 @@ impl AnalystApp {
                     if ui.add(egui::TextEdit::multiline(&mut self.ghidra_trace_seed_json)
                     .code_editor().desired_rows(8).desired_width(f32::INFINITY)).changed() {
                         self.ghidra_path_trace = None;
+                        self.frida_path_comparison = None;
                         self.ghidra_path_lines.clear();
                         self.ghidra_call_trace = None;
                         self.ghidra_call_lines.clear();
@@ -8426,6 +8620,7 @@ impl AnalystApp {
                             task.cancel.store(true, Ordering::Release);
                         }
                     }
+                let prior_memory_mode = self.ghidra_trace_memory_mode.clone();
                 egui::ComboBox::from_label("Memory")
                     .selected_text(self.ghidra_trace_memory_mode.as_str())
                     .show_ui(ui, |ui| {
@@ -8436,8 +8631,14 @@ impl AnalystApp {
                         ui.selectable_value(&mut self.ghidra_trace_memory_mode,
                             "seed".to_owned(), "Seed only");
                     });
+                if self.ghidra_trace_memory_mode != prior_memory_mode {
+                    self.ghidra_path_trace = None;
+                    self.ghidra_path_lines.clear();
+                    self.frida_path_comparison = None;
+                }
                 if ui.add_enabled(!self.busy && !self.ghidra_busy, egui::Button::new("Trace path")).clicked() {
                     self.ghidra_path_trace = None;
+                    self.frida_path_comparison = None;
                     self.ghidra_path_lines.clear();
                     path_trace_task = Some(Task::TraceGhidraPath {
                         snapshot: Box::new(snapshot.clone()),
@@ -8702,6 +8903,12 @@ impl AnalystApp {
                     ui.label("InputSpec JSON path");
                     if ui.text_edit_singleline(&mut self.frida_input_path).changed() {
                         self.frida_observation = None;
+                        self.frida_rediscovery_plan = None;
+                        self.frida_rediscovered_snapshot = None;
+                        if let Some(task) = &self.frida_rediscovery_task {
+                            task.cancel.store(true, Ordering::Release);
+                        }
+                        self.frida_path_comparison = None;
                     }
                 });
                 let linked_entry = address_map.as_ref().and_then(|map|
@@ -8731,6 +8938,9 @@ impl AnalystApp {
                                 cancel, started: Instant::now(), timeout,
                             });
                             self.frida_observation = None;
+                            self.frida_rediscovery_plan = None;
+                            self.frida_rediscovered_snapshot = None;
+                            self.frida_path_comparison = None;
                             self.status = "Observing selected ELF function…".to_owned();
                         }
                         Err(_) => self.frida_observation = Some(Err(
@@ -8777,10 +8987,204 @@ impl AnalystApp {
                             match seed {
                                 Ok(seed) => {
                                     self.ghidra_trace_seed_json = seed;
+                                    self.ghidra_path_trace = None;
+                                    self.ghidra_path_lines.clear();
+                                    self.frida_path_comparison = None;
                                     self.status = "Captured entry registers loaded as a P-code seed; memory remains unknown".to_owned();
                                 }
                                 Err(error) => self.status = format!("Cannot use Frida entry registers: {error}"),
                             }
+                        }
+                        if ui.button("Plan observed indirect calls").clicked() {
+                            self.frida_rediscovery_plan = Some((|| -> Result<_, String> {
+                                let binary_path = self.current_local_path.as_ref()
+                                    .ok_or("No local ELF is open")?;
+                                let binary = bounded_read(binary_path)?;
+                                let mut input_bytes = Vec::new();
+                                fs::File::open(self.frida_input_path.trim())
+                                    .map_err(|error| error.to_string())?
+                                    .take((MAX_INPUT_SPEC_BYTES + 1) as u64)
+                                    .read_to_end(&mut input_bytes)
+                                    .map_err(|error| error.to_string())?;
+                                if input_bytes.len() > MAX_INPUT_SPEC_BYTES {
+                                    return Err("InputSpec exceeds size limit".into());
+                                }
+                                let input = parse_input_spec(&input_bytes)?;
+                                let snapshot_json = serde_json::to_vec(snapshot)
+                                    .map_err(|error| error.to_string())?;
+                                plan_observed_calls(&binary, &input, trace, &snapshot_json)
+                            })());
+                        }
+                        match &self.frida_rediscovery_plan {
+                            Some(Ok(plan)) => {
+                                ui.label(RichText::new(format!(
+                                    "{} byte-verified candidate targets · {} unresolved static call sites · {} omitted by budget",
+                                    plan.changed_targets.len(), plan.unresolved_call_sites.len(),
+                                    plan.omitted_targets,
+                                )).size(11.0).color(ACCENT));
+                                ui.label(RichText::new("Observed targets are input-specific; unresolved CFG edges remain open.")
+                                    .size(11.0).color(MUTED));
+                                for candidate in plan.changed_targets.iter().take(64) {
+                                    let source = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&candidate.call_site.space,
+                                                      &candidate.call_site.offset));
+                                    let target = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&candidate.target.space,
+                                                      &candidate.target.offset));
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(
+                                            source.is_some() && self.selected_address == source,
+                                            RichText::new(format!("{} → {} · {} witnesses",
+                                                candidate.call_site.offset,
+                                                candidate.target.offset,
+                                                candidate.event_sequences.len()))
+                                                .monospace().size(11.0),
+                                        ).clicked() && source.is_some() {
+                                            self.selected_address = source;
+                                        }
+                                        if let Some(target) = target
+                                            && ui.small_button("Target").clicked() {
+                                                self.selected_address = Some(target);
+                                            }
+                                    });
+                                }
+                                if ui.button("Copy rediscovery plan JSON").clicked()
+                                    && let Ok(json) = serde_json::to_string_pretty(plan) {
+                                    ui.ctx().copy_text(json);
+                                }
+                                let can_apply = !plan.changed_targets.is_empty()
+                                    && self.current_local_path.is_some()
+                                    && !self.frida_rediscovery_busy;
+                                if ui.add_enabled(can_apply, egui::Button::new(
+                                    "Reanalyze observed calls in isolated Ghidra project",
+                                )).clicked() {
+                                    let cancel = Arc::new(AtomicBool::new(false));
+                                    let timeout = Duration::from_secs(15 * 60);
+                                    let task = Task::RediscoverFridaCalls {
+                                        binary: self.current_local_path.clone().expect("checked above"),
+                                        binary_sha256: snapshot.binary_sha256.clone(),
+                                        function: trace.selected_elf_vaddr,
+                                        snapshot: Box::new(snapshot.clone()),
+                                        input_path: PathBuf::from(self.frida_input_path.trim()),
+                                        trace: Box::new(trace.clone()),
+                                        cancel: Arc::clone(&cancel),
+                                        timeout,
+                                    };
+                                    match self.tasks.try_send(task) {
+                                        Ok(()) => {
+                                            self.frida_rediscovery_busy = true;
+                                            self.frida_rediscovery_task = Some(ActiveGhidraTask {
+                                                cancel, started: Instant::now(), timeout,
+                                            });
+                                            self.frida_rediscovered_snapshot = None;
+                                            self.status = "Reanalyzing observed calls in isolated Ghidra project…".to_owned();
+                                        }
+                                        Err(_) => self.frida_rediscovered_snapshot = Some(Err(
+                                            "Analysis queue is full. Retry observed-call reanalysis.".to_owned(),
+                                        )),
+                                    }
+                                }
+                            }
+                            Some(Err(error)) => {
+                                ui.label(RichText::new(error).size(11.0).color(BAD));
+                            }
+                            None => {}
+                        }
+                        if self.frida_rediscovery_busy && let Some(task) = &self.frida_rediscovery_task {
+                            ghidra_progress(ui, task, "Reanalyzing observed calls");
+                            if ui.add_enabled(!task.cancel.load(Ordering::Acquire),
+                                egui::Button::new("Cancel call reanalysis")).clicked() {
+                                task.cancel.store(true, Ordering::Release);
+                            }
+                        }
+                        match &self.frida_rediscovered_snapshot {
+                            Some(Ok(rediscovered)) => {
+                                ui.label(RichText::new(format!(
+                                    "Isolated Ghidra snapshot: {} instructions · {} call targets",
+                                    rediscovered.selected_function.instructions.len(),
+                                    rediscovered.selected_function.call_targets.len(),
+                                )).size(11.0).color(ACCENT));
+                                for call in rediscovered.selected_function.call_targets.iter()
+                                    .filter(|call| call.computed && call.target.is_some()).take(64) {
+                                    let source = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&call.call_site.space, &call.call_site.offset));
+                                    let target = call.target.as_ref().and_then(|target| address_map.as_ref()
+                                        .and_then(|map| map.to_linked(&target.space, &target.offset)));
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(source.is_some() && self.selected_address == source,
+                                            RichText::new(format!("{} → {} · observed reference",
+                                                call.call_site.offset,
+                                                call.target.as_ref().map_or("unknown", |target| target.offset.as_str()),
+                                            )).monospace().size(11.0),
+                                        ).clicked() && source.is_some() {
+                                            self.selected_address = source;
+                                        }
+                                        if let Some(target) = target && ui.small_button("Target").clicked() {
+                                            self.selected_address = Some(target);
+                                        }
+                                    });
+                                }
+                                if ui.button("Copy rediscovered snapshot JSON").clicked()
+                                    && let Ok(json) = serde_json::to_string_pretty(rediscovered) {
+                                    ui.ctx().copy_text(json);
+                                }
+                            }
+                            Some(Err(error)) => { ui.label(RichText::new(error).size(11.0).color(BAD)); }
+                            None => {}
+                        }
+                        if let Some(Ok(path)) = &self.ghidra_path_trace
+                            && ui.button("Compare observed path with P-code path").clicked() {
+                            self.frida_path_comparison = Some((|| -> Result<_, String> {
+                                let binary_path = self.current_local_path.as_ref()
+                                    .ok_or("No local ELF is open")?;
+                                let binary = bounded_read(binary_path)?;
+                                let mut input_bytes = Vec::new();
+                                fs::File::open(self.frida_input_path.trim())
+                                    .map_err(|error| error.to_string())?
+                                    .take((MAX_INPUT_SPEC_BYTES + 1) as u64)
+                                    .read_to_end(&mut input_bytes)
+                                    .map_err(|error| error.to_string())?;
+                                if input_bytes.len() > MAX_INPUT_SPEC_BYTES {
+                                    return Err("InputSpec exceeds size limit".into());
+                                }
+                                let input = parse_input_spec(&input_bytes)?;
+                                compare_pcode_observed_path(&binary, &input, snapshot, trace, path)
+                            })());
+                        }
+                        match &self.frida_path_comparison {
+                            Some(Ok(comparison)) => {
+                                ui.label(RichText::new(format!(
+                                    "Observed path: {:?} · {} blocks · {} calls",
+                                    comparison.verdict, comparison.compared_blocks,
+                                    comparison.compared_calls,
+                                )).size(11.0).color(ACCENT));
+                                if let Some(difference) = &comparison.first_difference {
+                                    let linked = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&difference.source.space,
+                                                      &difference.source.offset));
+                                    if ui.selectable_label(
+                                        linked.is_some() && self.selected_address == linked,
+                                        RichText::new(format!(
+                                            "First difference at {}: {:?} · expected {:?} · observed {:?}",
+                                            difference.source.offset, difference.kind,
+                                            difference.expected, difference.observed,
+                                        )).monospace().size(11.0),
+                                    ).clicked() && linked.is_some() {
+                                        self.selected_address = linked;
+                                    }
+                                }
+                                for reason in &comparison.inconclusive_reasons {
+                                    ui.label(RichText::new(reason).size(11.0).color(MUTED));
+                                }
+                                if ui.button("Copy observed path comparison JSON").clicked()
+                                    && let Ok(json) = serde_json::to_string_pretty(comparison) {
+                                    ui.ctx().copy_text(json);
+                                }
+                            }
+                            Some(Err(error)) => {
+                                ui.label(RichText::new(error).size(11.0).color(BAD));
+                            }
+                            None => {}
                         }
                         egui::ScrollArea::vertical().id_salt("frida_observed_events")
                             .max_height(240.0)
@@ -9075,10 +9479,17 @@ impl AnalystApp {
                 }
                 if let Some(path) = self.current_local_path.as_ref() {
                     ui.separator();
-                    ui.label(RichText::new("Embed the matching ELF's validated read-only bytes in a v3 LLVM module. Mutable guest RAM remains a separate window; unresolved reads and effects stop explicitly.")
+                    ui.label(RichText::new("Embed validated ELF bytes in LLVM. The v4 process view includes writable globals and zero-filled tails; unknown relocations and unsupported effects stop explicitly.")
                         .size(11.0).color(MUTED));
                     if ui.button("Generate image-backed CFG LLVM").clicked() {
                         self.ghidra_llvm_image_cfg = Some(emit_ghidra_image_cfg_llvm(
+                            snapshot,
+                            &self.ghidra_trace_start,
+                            path,
+                        ));
+                    }
+                    if ui.button("Generate process-backed CFG LLVM").clicked() {
+                        self.ghidra_llvm_image_cfg = Some(emit_ghidra_process_cfg_llvm(
                             snapshot,
                             &self.ghidra_trace_start,
                             path,
@@ -9100,6 +9511,16 @@ impl AnalystApp {
                                     "Read-only ELF image: {} 0x{:x} · {} byte window · {} known bytes · contents SHA-256 {}",
                                     image.space, image.base, image.byte_len,
                                     image.known_byte_count, image.contents_sha256,
+                                )).monospace().size(11.0).color(MUTED));
+                            }
+                            if let Some(memory) = &artifact.process_memory {
+                                ui.label(RichText::new(format!(
+                                    "ELF process memory: {} 0x{:x} · {} byte window · {} known · {} mapped · {} writable · {} unresolved relocation bytes · contents SHA-256 {}",
+                                    memory.space, memory.base, memory.byte_len,
+                                    memory.known_byte_count, memory.mapped_byte_count,
+                                    memory.writable_byte_count,
+                                    memory.unresolved_relocation_bytes,
+                                    memory.contents_sha256,
                                 )).monospace().size(11.0).color(MUTED));
                             }
                             egui::ScrollArea::vertical().id_salt("ghidra_llvm_image_cfg_stops")
@@ -14434,15 +14855,15 @@ mod tests {
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
         ModelEdit, ModelEditDraft, ModelEditTarget, ModelRenameTarget, NativeViewMode, Tab,
         WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
-        emit_ghidra_image_cfg_llvm, ghidra_composite_evidence, ghidra_readiness_copy,
-        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
-        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
-        native_instruction_count, native_opaque_instruction_count, parse_model_edit_draft,
-        pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
-        persist_local_model_edit, persist_local_model_rename, prepare_model_rename,
-        preview_patch_local, resized_console_height, run_ghidra_command, save_render_smoke_png,
-        selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
-        validate_remote_model_save, workbench_graph_layout,
+        emit_ghidra_image_cfg_llvm, emit_ghidra_process_cfg_llvm, ghidra_composite_evidence,
+        ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start,
+        high_pcode_varnode, indexed_function_action, ir_slice, local_region_artifacts,
+        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
+        parse_model_edit_draft, pcode_display_lines, pcode_line_target, pcode_state_lines,
+        persist_ghidra_snapshot, persist_local_model_edit, persist_local_model_rename,
+        prepare_model_rename, preview_patch_local, resized_console_height, run_ghidra_command,
+        save_render_smoke_png, selected_ghidra_trace_address, trace_ghidra_path,
+        valid_bearer_token, validate_endpoint, validate_remote_model_save, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
@@ -14455,6 +14876,7 @@ mod tests {
     };
     use hydir_execution::StopPoint;
     use hydir_ghidra_worker::GhidraRuntimeStatus;
+    use hydir_ir::pcode::PCODE_ELF_PROCESS_MEMORY_MAX_BYTES;
     use hydir_ir::pcode::{
         GhidraSnapshot, PcodeEffect, PcodePathStop, parse_ghidra_snapshot, parse_pcode_seed,
     };
@@ -14805,10 +15227,21 @@ mod tests {
         assert!(image.byte_len <= PCODE_CFG_ELF_IMAGE_MAX_BYTES);
         assert!(artifact.llvm_ir.contains("define "));
 
+        let process = emit_ghidra_process_cfg_llvm(&snapshot, "0x2016d0", &path).unwrap();
+        assert_eq!(process.schema_version, 4);
+        assert_eq!(process.binary_sha256, digest);
+        assert_eq!(process.start, snapshot.selected_function.entry);
+        let memory = process.process_memory.as_ref().unwrap();
+        assert!(memory.known_byte_count > 0);
+        assert!(memory.writable_byte_count > 0);
+        assert!(memory.byte_len <= PCODE_ELF_PROCESS_MEMORY_MAX_BYTES);
+        assert!(process.llvm_ir.contains("define "));
+
         let mut changed = binary.to_vec();
         *changed.last_mut().unwrap() ^= 1;
         fs::write(&path, changed).unwrap();
         assert!(emit_ghidra_image_cfg_llvm(&snapshot, "0x2016d0", &path).is_err());
+        assert!(emit_ghidra_process_cfg_llvm(&snapshot, "0x2016d0", &path).is_err());
     }
 
     #[test]

@@ -148,6 +148,72 @@ class LocalGhidra:
             raise RuntimeError("Hydir artifact belongs to another binary")
         return data
 
+    def rediscover_calls(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+        *,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Plan observed computed calls, or reanalyze a disposable Ghidra project."""
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        stage = "rediscover-apply" if apply else "rediscover-calls"
+        data = json.loads(self._run(
+            "ghidra-snapshot", stage, str(binary_path),
+            str(snapshot_path), str(input_path), str(trace_path),
+        ))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir rediscovery result belongs to another binary")
+        if apply:
+            if data.get("schema_version") != 2 or not isinstance(data.get("selected_function"), dict):
+                raise RuntimeError("Hydir rediscovery snapshot is malformed")
+        elif (data.get("schema_version") != 1
+              or not isinstance(data.get("changed_targets"), list)
+              or not isinstance(data.get("unresolved_call_sites"), list)):
+            raise RuntimeError("Hydir rediscovery plan is malformed")
+        return data
+
+    def compare_observed_path(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        memory: str = "readonly",
+    ) -> dict[str, Any]:
+        """Execute a bounded P-code path from a seed and compare observations."""
+        if memory not in {"readonly", "process", "seed"}:
+            raise ValueError("memory must be readonly, process, or seed")
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        data = json.loads(self._run(
+            "ghidra-snapshot", "compare-observed-path", str(binary_path),
+            str(snapshot_path), str(input_path), str(trace_path), str(seed_path),
+            "--memory", memory,
+        ))
+        if (
+            not isinstance(data, dict)
+            or data.get("schema_version") != 1
+            or data.get("binary_sha256") != digest
+            or data.get("verdict") not in {"diverged", "matched_observed_path", "inconclusive"}
+        ):
+            raise RuntimeError("Hydir observed path comparison is malformed or belongs to another binary")
+        return data
+
     def save_snapshot(
         self,
         binary: str | os.PathLike[str],
@@ -190,21 +256,26 @@ class LocalGhidra:
         start: int | None = None,
         simplified: bool = False,
         image: bool = False,
+        process: bool = False,
     ) -> dict[str, Any]:
         """Emit bounded CFG-aware LLVM with explicit stop status and provenance.
 
-        ``image=True`` binds file-backed read-only ELF bytes into a version 3
-        module. The original version 2 ABI remains the default.
+        ``image=True`` binds read-only ELF bytes into v3. ``process=True``
+        adds checked writable globals and zero-filled ELF tails in v4.
+        Version 2 remains the default.
         """
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("start must be a 64-bit address")
-        if image and simplified:
-            raise ValueError("image and simplified LLVM modes cannot be combined")
+        if sum((image, process, simplified)) > 1:
+            raise ValueError("LLVM modes cannot be combined")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         digest = self._digest(binary_path)
         self._snapshot(snapshot_path, digest)
-        stage = "llvm-cfg-image" if image else "llvm-cfg-simplified" if simplified else "llvm-cfg"
+        stage = (
+            "llvm-cfg-process" if process else "llvm-cfg-image" if image
+            else "llvm-cfg-simplified" if simplified else "llvm-cfg"
+        )
         args = ["ghidra-snapshot", stage, str(binary_path), str(snapshot_path)]
         if start is not None:
             args.extend(["--start", hex(start)])
@@ -213,6 +284,11 @@ class LocalGhidra:
             raise RuntimeError("Hydir CFG LLVM artifact belongs to another binary")
         if image and data.get("schema_version") != 3:
             raise RuntimeError("Hydir image-backed CFG LLVM artifact has the wrong version")
+        if process and (
+            data.get("schema_version") != 4
+            or not isinstance(data.get("process_memory"), dict)
+        ):
+            raise RuntimeError("Hydir process-backed CFG LLVM artifact has the wrong version")
         return data
 
     def llvm_cfg_calls(

@@ -15,6 +15,7 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - integrations/ghidra/HydIRRediscover.java
       - integrations/ghidra/HydIROracle.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
@@ -60,6 +61,7 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - integrations/ghidra/HydIRRediscover.java
       - integrations/ghidra/HydIROracle.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
@@ -171,7 +173,8 @@ jobs:
 
           digest = hashlib.sha256()
           for source in ('integrations/ghidra/Dockerfile.worker',
-                         'integrations/ghidra/HydIRSnapshot.java'):
+                         'integrations/ghidra/HydIRSnapshot.java',
+                         'integrations/ghidra/HydIRRediscover.java'):
               digest.update(Path(source).read_bytes())
           print(f'hydir-ghidra:12.1.4-{digest.hexdigest()[:16]}')
           PY
@@ -187,6 +190,8 @@ jobs:
           python3 -m unittest -v tests/ghidra_oracle_test.py
           chmod +x tests/fixtures/ghidra_add_zero.elf
           python3 tests/ghidra_four_engine_gate.py
+          cargo test --locked -p hydir-ghidra-worker --lib \
+            headless_rediscovery_preserves_unresolved_call -- --ignored --nocapture
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -235,6 +240,30 @@ jobs:
           PY
           clang -x ir -c "$RUNNER_TEMP/hydir-password.ll" \
             -o "$RUNNER_TEMP/hydir-password.o"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-process \
+            tests/fixtures/hydir-password-gate-stripped.elf \
+            "$RUNNER_TEMP/hydir-password-snapshot.json" \
+            --output "$RUNNER_TEMP/hydir-password-process-llvm.json"
+          python3 - "$RUNNER_TEMP/hydir-password-process-llvm.json" \
+            "$RUNNER_TEMP/hydir-password-process.ll" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          memory = artifact['process_memory']
+          binary = pathlib.Path('tests/fixtures/hydir-password-gate-stripped.elf').read_bytes()
+          assert artifact['schema_version'] == 4
+          assert artifact['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          assert memory['known_byte_count'] > 0
+          assert memory['writable_byte_count'] > 0
+          assert memory['mapped_byte_count'] >= memory['known_byte_count']
+          assert '@hydir_process_initial_bytes' in artifact['llvm_ir']
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/hydir-password-process.ll" \
+            -o "$RUNNER_TEMP/hydir-password-process.o"
       - name: Probe the Hydir desktop import path with the container worker
         env:
           HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-demo.sqlite
@@ -303,6 +332,7 @@ jobs:
             ${{ runner.temp }}/ghidra-capability.json
             ${{ runner.temp }}/hydir-password-snapshot.json
             ${{ runner.temp }}/hydir-password-llvm.json
+            ${{ runner.temp }}/hydir-password-process-llvm.json
 
   differential-fixtures:
     runs-on: ubuntu-24.04

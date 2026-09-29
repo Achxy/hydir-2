@@ -287,12 +287,14 @@ class HydirClient:
             "capability": ("application/vnd.hydir.pcode-capability+json;version=1", 1),
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
             "llvm-cfg-image": ("application/vnd.hydir.pcode-cfg-llvm+json;version=3", 3),
+            "llvm-cfg-process": ("application/vnd.hydir.pcode-cfg-llvm+json;version=4", 4),
+            "process-memory": ("application/vnd.hydir.pcode-process-memory+json;version=1", 1),
             "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
             "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
         if stage not in media_types:
             raise ValueError("Unsupported Ghidra snapshot artifact stage")
-        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-simplified"}:
+        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-process", "llvm-cfg-simplified"}:
             raise ValueError("Start address is supported only for CFG LLVM stages")
         if stage == "slice":
             if instruction_index is None or operation_index is None:
@@ -379,6 +381,108 @@ class HydirClient:
                        for character in image["contents_sha256"])
             ):
                 raise RuntimeError("Image-backed CFG LLVM lacks a valid ELF image binding")
+        if stage == "llvm-cfg-process":
+            process = artifact.get("process_memory")
+            if (
+                not isinstance(process, dict)
+                or not isinstance(process.get("space"), str)
+                or type(process.get("base")) is not int
+                or type(process.get("byte_len")) is not int
+                or type(process.get("known_byte_count")) is not int
+                or type(process.get("mapped_byte_count")) is not int
+                or type(process.get("writable_byte_count")) is not int
+                or not 0 <= process["base"] <= 0xFFFFFFFFFFFFFFFF
+                or not 0 <= process["known_byte_count"] <= process["mapped_byte_count"] <= process["byte_len"] <= 1_048_576
+                or not 0 <= process["writable_byte_count"] <= process["mapped_byte_count"]
+                or not isinstance(process.get("contents_sha256"), str)
+                or len(process["contents_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in process["contents_sha256"])
+            ):
+                raise RuntimeError("Process-backed CFG LLVM lacks a valid ELF memory binding")
+        if stage == "process-memory":
+            byte_values = artifact.get("bytes")
+            masks = [artifact.get(key) for key in ("known", "mapped", "writable")]
+            if (
+                not isinstance(artifact.get("binary_sha256"), str)
+                or len(artifact["binary_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in artifact["binary_sha256"])
+                or not isinstance(artifact.get("snapshot_layout_sha256"), str)
+                or len(artifact["snapshot_layout_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in artifact["snapshot_layout_sha256"])
+                or not isinstance(artifact.get("space"), str)
+                or type(artifact.get("base")) is not int
+                or not 0 <= artifact["base"] <= 0xFFFFFFFFFFFFFFFF
+                or not isinstance(byte_values, list)
+                or not 0 < len(byte_values) <= 1_048_576
+                or any(type(value) is not int or not 0 <= value <= 255
+                       for value in byte_values)
+                or any(not isinstance(mask, list) or len(mask) != len(byte_values)
+                       or any(type(value) is not int or value not in (0, 255)
+                              for value in mask) for mask in masks)
+            ):
+                raise RuntimeError("Process memory lacks a valid ELF image binding")
+            known, mapped, writable = masks
+            if any((known[i] and not mapped[i]) or (writable[i] and not mapped[i])
+                   for i in range(len(byte_values))):
+                raise RuntimeError("Process memory has contradictory mapping masks")
+        return artifact
+
+    def analyze_ghidra_observation(
+        self,
+        project_id: str,
+        revision: int,
+        snapshot: bytes | str | os.PathLike[str],
+        input_spec: bytes | str | os.PathLike[str],
+        trace: bytes | str | os.PathLike[str],
+        stage: str,
+        *,
+        seed: bytes | str | os.PathLike[str] | None = None,
+    ) -> dict:
+        """Plan observed calls or compare a seed-driven ELF memory P-code path.
+
+        A comparison does not prove that the seed matches Frida's initial state.
+        """
+        media_types = {
+            "observed-call-rediscovery":
+                "application/vnd.hydir.observed-call-rediscovery+json;version=1",
+            "observed-path-comparison":
+                "application/vnd.hydir.pcode-observed-path-comparison+json;version=1",
+        }
+        if stage not in media_types:
+            raise ValueError("Unsupported Ghidra observation stage")
+        if (stage == "observed-path-comparison") != (seed is not None):
+            raise ValueError("Comparison requires a seed; plan must omit it")
+
+        def bounded(value, limit: int, label: str) -> bytes:
+            if isinstance(value, bytes):
+                data = value
+            else:
+                path = Path(value)
+                if path.stat().st_size > limit:
+                    raise ValueError(f"{label} exceeds size limit")
+                data = path.read_bytes()
+            if not 1 <= len(data) <= limit:
+                raise ValueError(f"{label} must be 1..={limit} bytes")
+            return data
+
+        request = proto_v3.GhidraObservationArtifactRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            stage=stage,
+            snapshot_json=bounded(snapshot, MAX_GHIDRA_SNAPSHOT_BYTES, "Snapshot"),
+            input_spec_json=bounded(input_spec, MAX_INPUT_SPEC_BYTES, "InputSpec"),
+            trace_json=bounded(trace, 16 * 1024 * 1024, "DynamicTrace"),
+            seed_json=bounded(seed, MAX_PCODE_SEED_BYTES, "P-code seed")
+                if seed is not None else b"",
+        )
+        reply = self._call(self._stub_v3.AnalyzeGhidraObservation, request)
+        artifact = self._checked_json_artifact(
+            reply, revision=revision, media_type=media_types[stage], schema_version=1,
+        )
+        if stage == "observed-path-comparison" and (
+            artifact.get("same_initial_state_proven") is not False
+        ):
+            raise RuntimeError("Observed path artifact has an unsupported initial-state claim")
         return artifact
 
     def analyze_ghidra_binary(
