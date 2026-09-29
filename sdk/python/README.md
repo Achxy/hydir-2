@@ -65,6 +65,8 @@ not mean the paths match.
 computed-jump witnesses for already analyzed instructions inside the selected
 function. Its plan and isolated `apply=True` route keep the unresolved branch
 visible alongside observed targets.
+The revision-checked service exposes the same read-only jump plan through
+`HydirClient.analyze_ghidra_observation(..., "observed-jump-rediscovery")`.
 `LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
 managed worker and collects only callees reached by the seed before lifting.
 Add `allocations="allocations.json"` to `trace_calls`, `llvm_cfg_calls`, or

@@ -148,8 +148,9 @@ message GhidraSnapshotArtifactRequest {
 
 // Read-only artifacts from a caller-supplied DynamicTrace bound to a selected
 // Ghidra snapshot and InputSpec for the current project revision. The server
-// supplies the uploaded ELF. stage is observed-call-rediscovery or
-// observed-path-comparison. Only comparison accepts seed_json (PcodeSeed v1).
+// supplies the uploaded ELF. stage is observed-call-rediscovery,
+// observed-jump-rediscovery, or observed-path-comparison. Only comparison
+// accepts seed_json (PcodeSeed v1).
 message GhidraObservationArtifactRequest {
   string project_id = 1;
   uint64 expected_revision = 2;

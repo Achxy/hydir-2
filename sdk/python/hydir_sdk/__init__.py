@@ -476,13 +476,15 @@ class HydirClient:
         *,
         seed: bytes | str | os.PathLike[str] | None = None,
     ) -> dict:
-        """Plan observed calls or compare a seed-driven ELF memory P-code path.
+        """Plan observed calls or jumps, or compare a seeded ELF memory P-code path.
 
         A comparison does not prove that the seed matches Frida's initial state.
         """
         media_types = {
             "observed-call-rediscovery":
                 "application/vnd.hydir.observed-call-rediscovery+json;version=1",
+            "observed-jump-rediscovery":
+                "application/vnd.hydir.observed-jump-rediscovery+json;version=1",
             "observed-path-comparison":
                 "application/vnd.hydir.pcode-observed-path-comparison+json;version=1",
         }
@@ -517,6 +519,13 @@ class HydirClient:
         artifact = self._checked_json_artifact(
             reply, revision=revision, media_type=media_types[stage], schema_version=1,
         )
+        if stage in {"observed-call-rediscovery", "observed-jump-rediscovery"}:
+            unresolved = ("unresolved_call_sites" if stage == "observed-call-rediscovery"
+                          else "unresolved_jump_sites")
+            if (not isinstance(artifact.get("changed_targets"), list)
+                    or not isinstance(artifact.get(unresolved), list)
+                    or not isinstance(artifact.get("input_sha256"), str)):
+                raise RuntimeError("Observed rediscovery plan is malformed")
         if stage == "observed-path-comparison" and (
             artifact.get("same_initial_state_proven") is not False
         ):

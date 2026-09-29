@@ -492,8 +492,11 @@ class ClientBoundaryTests(unittest.TestCase):
                 self.assertIs(method, client._stub_v3.AnalyzeGhidraObservation)
                 requests.append(request)
                 if request.stage == "observed-call-rediscovery":
-                    content = b'{"schema_version":1,"changed_targets":[]}'
+                    content = b'{"schema_version":1,"input_sha256":"abc","changed_targets":[],"unresolved_call_sites":[]}'
                     media_type = "application/vnd.hydir.observed-call-rediscovery+json;version=1"
+                elif request.stage == "observed-jump-rediscovery":
+                    content = b'{"schema_version":1,"input_sha256":"abc","changed_targets":[],"unresolved_jump_sites":[]}'
+                    media_type = "application/vnd.hydir.observed-jump-rediscovery+json;version=1"
                 else:
                     content = b'{"schema_version":1,"same_initial_state_proven":false}'
                     media_type = "application/vnd.hydir.pcode-observed-path-comparison+json;version=1"
@@ -510,6 +513,11 @@ class ClientBoundaryTests(unittest.TestCase):
             self.assertEqual(requests[-1].snapshot_json, snapshot)
             self.assertEqual(requests[-1].input_spec_json, input_spec)
             self.assertEqual(requests[-1].trace_json, trace)
+            self.assertEqual(requests[-1].seed_json, b"")
+            jump_plan = client.analyze_ghidra_observation(
+                "project", 4, snapshot, input_spec, trace, "observed-jump-rediscovery"
+            )
+            self.assertEqual(jump_plan["unresolved_jump_sites"], [])
             self.assertEqual(requests[-1].seed_json, b"")
             comparison = client.analyze_ghidra_observation(
                 "project", 4, snapshot, input_spec, trace,

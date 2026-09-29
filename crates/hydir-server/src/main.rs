@@ -2198,6 +2198,9 @@ fn ghidra_observation_media_type(stage: &str) -> Option<&'static str> {
         "observed-call-rediscovery" => {
             Some("application/vnd.hydir.observed-call-rediscovery+json;version=1")
         }
+        "observed-jump-rediscovery" => {
+            Some("application/vnd.hydir.observed-jump-rediscovery+json;version=1")
+        }
         "observed-path-comparison" => {
             Some("application/vnd.hydir.pcode-observed-path-comparison+json;version=1")
         }
@@ -2708,6 +2711,14 @@ fn ghidra_observation_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<
         }
         let plan =
             hydir_ghidra_worker::plan_observed_calls(binary, &input, &trace, snapshot_bytes)?;
+        return serde_json::to_vec(&plan).map_err(|error| error.to_string());
+    }
+    if selector.stage == "observed-jump-rediscovery" {
+        if !seed_bytes.is_empty() {
+            return Err("rediscovery plan does not accept a P-code seed".to_owned());
+        }
+        let plan =
+            hydir_ghidra_worker::plan_observed_jumps(binary, &input, &trace, snapshot_bytes)?;
         return serde_json::to_vec(&plan).map_err(|error| error.to_string());
     }
     let snapshot = hydir_ghidra_worker::validate_cached_snapshot(
@@ -9693,6 +9704,119 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_observed_jump_plan_is_revision_bound_and_retrievable() {
+        use api_v3::hydir_v3_server::HydirV3;
+        use hydir_execution::input_sha256;
+
+        let binary = include_bytes!("../../../tests/fixtures/ghidra_indirect_jump.elf");
+        let snapshot = include_bytes!("../../../tests/fixtures/ghidra_indirect_jump_v2.json");
+        let snapshot_value = parse_ghidra_snapshot(snapshot, &sha256(binary)).unwrap();
+        let snapshot_digest = sha256(&serde_json::to_vec(&snapshot_value).unwrap());
+        let input: InputSpec = serde_json::from_value(json!({
+            "schema_version":1,"binary_sha256":sha256(binary),
+            "argv_hex":[],"stdin_hex":"","files":[],"origins":[],
+            "goal":{"exit_code":0},
+            "budget":{"timeout_ms":2000,"memory_bytes":1073741824,"output_bytes":1024}
+        }))
+        .unwrap();
+        let entry = json!({"runtime_address":0x201174,"elf_vaddr":0x201174,
+            "original_bytes_hex":"4885ff"});
+        let trace = json!({
+            "schema_version":3,"binary_sha256":sha256(binary),
+            "input_sha256":input_sha256(&input).unwrap(),
+            "selected_elf_vaddr":0x201174,
+            "ghidra_snapshot_sha256":snapshot_digest,
+            "observer":"test","frida_version":"17.9.5","agent_sha256":sha256(b"test"),
+            "runtime_module_base":0x200000,"elf_load_bias":0,
+            "budget":{"max_events":8,"timeout_ms":1000},
+            "status":"completed","lost_events":0,
+            "stdout_hex":"","stderr_hex":"","diagnostics":[],
+            "events":[
+                {"sequence":0,"thread_id":1,"kind":"entry","source":entry,"target":null,
+                 "registers":{"RIP":0x201174,"RSP":0x700000}},
+                {"sequence":1,"thread_id":1,"kind":"exit","source":entry,"target":null}
+            ],
+            "jump_evidence":[{"sequence":0,"thread_id":1,"invocation_id":1,
+                "source":{"runtime_address":0x201179,"elf_vaddr":0x201179,
+                    "original_bytes_hex":"ffe0"},
+                "target":{"runtime_address":0x20117b,"elf_vaddr":0x20117b,
+                    "original_bytes_hex":"48c7c007000000"}}]
+        });
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("jump-observation-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "observed jump".into(),
+                    idempotency_key: "observed-jump-project".into(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(binary),
+                    content: binary.to_vec(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = api_v3::GhidraObservationArtifactRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            snapshot_json: snapshot.to_vec(),
+            input_spec_json: serde_json::to_vec(&input).unwrap(),
+            trace_json: serde_json::to_vec(&trace).unwrap(),
+            seed_json: Vec::new(),
+            stage: "observed-jump-rediscovery".into(),
+        };
+        let reply =
+            HydirV3::analyze_ghidra_observation(&store, authorized(request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            reply.media_type,
+            "application/vnd.hydir.observed-jump-rediscovery+json;version=1"
+        );
+        let plan: serde_json::Value = serde_json::from_slice(&reply.content).unwrap();
+        assert_eq!(
+            plan["changed_targets"][0]["jump_site"]["offset"],
+            "0x201179"
+        );
+        assert_eq!(plan["changed_targets"][0]["target"]["offset"], "0x20117b");
+        assert_eq!(plan["unresolved_jump_sites"][0]["offset"], "0x201179");
+        let stored = store
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: reply.sha256,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stored.content, reply.content);
+        let mut stale = request;
+        stale.expected_revision = 0;
+        assert_eq!(
+            HydirV3::analyze_ghidra_observation(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
         );
     }
 
