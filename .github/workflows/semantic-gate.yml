@@ -139,7 +139,10 @@ jobs:
       - name: Install native tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc gdb
+          sudo apt-get install -y clang llvm gcc gdb bubblewrap apparmor-profiles apparmor-utils
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true
       - name: Native execution of checked P-code rewrite fixture
         run: |
           clang -O0 -no-pie -DHYDIR_NO_START \
