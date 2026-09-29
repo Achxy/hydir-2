@@ -480,8 +480,8 @@ class LocalGhidra:
         if snapshot is not None:
             snapshot_path = Path(snapshot).resolve(strict=True)
             selected = self._snapshot(snapshot_path, digest).get("selected_function", {}).get("entry", {})
-            if selected.get("space") != "ram" or selected.get("offset") != hex(function):
-                raise ValueError("Ghidra snapshot selects another function")
+            if selected.get("space") != "ram":
+                raise ValueError("Ghidra snapshot must select RAM code")
             args.extend(["--snapshot", str(snapshot_path)])
         data = json.loads(self._run(*args))
         if (

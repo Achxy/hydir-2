@@ -71,7 +71,24 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             &input.binary_sha256,
         )?;
         let entry = &snapshot.selected_function.entry;
-        if entry.space != "ram" || entry.offset != format!("0x{:x}", options.function) {
+        let elf_base = super::import_elf(&elf)?
+            .mapped_segments
+            .iter()
+            .filter(|segment| segment.address_space == 0 && segment.memory_size > 0)
+            .map(|segment| segment.virtual_address.0)
+            .min()
+            .ok_or("ELF has no mapped RAM segment")?;
+        let snapshot_base =
+            parse_u64_auto(&snapshot.program.image_base.offset, "Ghidra image base")?;
+        let snapshot_entry = parse_u64_auto(&entry.offset, "Ghidra function entry")?;
+        let linked_entry = snapshot_entry
+            .checked_sub(snapshot_base)
+            .and_then(|offset| elf_base.checked_add(offset))
+            .ok_or("Ghidra function entry cannot be normalized to ELF")?;
+        if entry.space != "ram"
+            || snapshot.program.image_base.space != "ram"
+            || linked_entry != options.function
+        {
             return Err("Ghidra snapshot entry differs from observed ELF address".into());
         }
         Some(format!(

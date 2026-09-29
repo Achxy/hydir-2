@@ -207,6 +207,7 @@ enum Task {
         binary: PathBuf,
         binary_sha256: String,
         function: u64,
+        snapshot: Box<GhidraSnapshot>,
         input_path: PathBuf,
         cancel: Arc<AtomicBool>,
         timeout: Duration,
@@ -2374,6 +2375,7 @@ fn run_frida_observation(
     binary: &Path,
     binary_sha256: &str,
     function: u64,
+    snapshot: &GhidraSnapshot,
     input_path: &Path,
     cancel: &AtomicBool,
     timeout: Duration,
@@ -2395,6 +2397,10 @@ fn run_frida_observation(
     }
     let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
     let artifact_path = scratch.path().join("observation.json");
+    let snapshot_path = scratch.path().join("snapshot.json");
+    let snapshot_bytes = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+    fs::write(&snapshot_path, &snapshot_bytes).map_err(|error| error.to_string())?;
+    let snapshot_sha256 = format!("{:x}", Sha256::digest(&snapshot_bytes));
     let mut command = Command::new(hydirctl_path());
     command
         .args(["observe", "frida"])
@@ -2402,6 +2408,8 @@ fn run_frida_observation(
         .arg(input_path)
         .arg("--function")
         .arg(format!("0x{function:x}"))
+        .arg("--snapshot")
+        .arg(&snapshot_path)
         .arg("--output")
         .arg(&artifact_path);
     let output = run_ghidra_command(&mut command, cancel, timeout)?;
@@ -2418,7 +2426,10 @@ fn run_frida_observation(
     }
     let trace_bytes = fs::read(&artifact_path).map_err(|error| error.to_string())?;
     let trace = parse_dynamic_trace(&trace_bytes)?;
-    if trace.selected_elf_vaddr != function || trace.binary_sha256 != binary_sha256 {
+    if trace.selected_elf_vaddr != function
+        || trace.binary_sha256 != binary_sha256
+        || trace.ghidra_snapshot_sha256.as_deref() != Some(snapshot_sha256.as_str())
+    {
         return Err("Frida trace belongs to another function or ELF".to_owned());
     }
     let elf = fs::read(binary).map_err(|error| error.to_string())?;
@@ -3224,6 +3235,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 binary,
                 binary_sha256,
                 function,
+                snapshot,
                 input_path,
                 cancel,
                 timeout,
@@ -3232,7 +3244,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 let repaint = ctx.clone();
                 thread::spawn(move || {
                     let result = run_frida_observation(
-                        &binary, &binary_sha256, function, &input_path, &cancel, timeout,
+                        &binary, &binary_sha256, function, &snapshot, &input_path, &cancel, timeout,
                     );
                     let _ = completion.send(Event::FridaObserved {
                         binary_sha256,
@@ -5685,6 +5697,16 @@ impl AnalystApp {
                         || self.frida_input_path.trim() != input_path.to_string_lossy().as_ref()
                     {
                         continue;
+                    }
+                    if let Ok(trace) = &result {
+                        let current_snapshot = self
+                            .ghidra_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| serde_json::to_vec(snapshot).ok())
+                            .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+                        if trace.ghidra_snapshot_sha256 != current_snapshot {
+                            continue;
+                        }
                     }
                     if cancelled {
                         self.status = "Frida observation cancelled".to_owned();
@@ -8651,6 +8673,7 @@ impl AnalystApp {
                         binary: self.current_local_path.clone().expect("checked above"),
                         binary_sha256: snapshot.binary_sha256.clone(),
                         function: linked_entry.expect("checked above"),
+                        snapshot: Box::new(snapshot.clone()),
                         input_path: PathBuf::from(self.frida_input_path.trim()),
                         cancel: Arc::clone(&cancel),
                         timeout,
