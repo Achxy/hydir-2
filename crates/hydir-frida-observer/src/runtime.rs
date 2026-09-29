@@ -16,6 +16,7 @@ use std::{
     io::{Read, Write},
     os::unix::{
         fs::PermissionsExt,
+        io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
     process::{Command, Stdio},
@@ -31,6 +32,58 @@ use std::{
 const AGENT: &str = include_str!("agent.js");
 const MAX_EVENTS: usize = 4096;
 const CAPTURE_TIMEOUT_MS: u64 = 10_000;
+
+/// Keep the helper's result pipe out of the target's descriptor table. Frida's
+/// Inherit mode observes the temporary stdout/stderr redirection at spawn.
+struct TargetStdioRedirect {
+    saved_stdout: libc::c_int,
+    saved_stderr: libc::c_int,
+}
+
+impl TargetStdioRedirect {
+    fn install(stdout: &fs::File, stderr: &fs::File) -> Result<Self, String> {
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        std::io::stderr()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let saved_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if saved_stdout < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if saved_stderr < 0 {
+            unsafe { libc::close(saved_stdout) };
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let guard = Self {
+            saved_stdout,
+            saved_stderr,
+        };
+        let redirected = unsafe {
+            libc::fcntl(saved_stdout, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+                && libc::fcntl(saved_stderr, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+                && libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) >= 0
+                && libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) >= 0
+        };
+        if !redirected {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for TargetStdioRedirect {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
+            libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
+            libc::close(self.saved_stdout);
+            libc::close(self.saved_stderr);
+        }
+    }
+}
 
 #[derive(Default)]
 struct Collector {
@@ -222,7 +275,6 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
     .map_err(|error| error.to_string())?;
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o500))
         .map_err(|error| error.to_string())?;
-    let result_path = scratch.path().join(".hydir-trace.json");
     let stdout_path = scratch.path().join(".hydir-stdout");
     let stderr_path = scratch.path().join(".hydir-stderr");
     let mut command = Command::new("bwrap");
@@ -279,15 +331,14 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
     command.arg(format!("{image_base:x}"));
     command.arg(timeout_ms.to_string());
     command.arg(input_sha256(input)?);
-    command.args(["/work/.hydir-trace.json", "/work/.hydir-program"]);
+    command.args([
+        "/work/.hydir-stdout",
+        "/work/.hydir-stderr",
+        "/work/.hydir-program",
+    ]);
     command.args(argv.iter());
     command.stdin(Stdio::null());
-    command.stdout(Stdio::from(
-        fs::File::create(&stdout_path).map_err(|error| error.to_string())?,
-    ));
-    command.stderr(Stdio::from(
-        fs::File::create(&stderr_path).map_err(|error| error.to_string())?,
-    ));
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let memory = input.budget.memory_bytes;
     let cpu_seconds = timeout_ms.div_ceil(1000).saturating_add(3);
     unsafe {
@@ -317,6 +368,15 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
     let mut child = command
         .spawn()
         .map_err(|error| format!("Bubblewrap launch failed: {error}"))?;
+    let result_pipe = child.stdout.take().ok_or("Frida result pipe unavailable")?;
+    let diagnostic_pipe = child
+        .stderr
+        .take()
+        .ok_or("Frida diagnostic pipe unavailable")?;
+    let result_reader = thread::spawn(move || {
+        read_limited(result_pipe, hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES)
+    });
+    let diagnostic_reader = thread::spawn(move || read_limited(diagnostic_pipe, 8192));
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms.saturating_add(3000));
     let exit = loop {
@@ -328,13 +388,21 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.wait();
+            let _ = result_reader.join();
+            let _ = diagnostic_reader.join();
             return Err("Frida helper exceeded isolated wall-clock budget".into());
         }
         thread::sleep(Duration::from_millis(10));
     };
+    let json = result_reader
+        .join()
+        .map_err(|_| "Frida result reader panicked")?
+        .map_err(|error| error.to_string())?;
+    let helper_stderr = diagnostic_reader
+        .join()
+        .map_err(|_| "Frida diagnostic reader panicked")?
+        .map_err(|error| error.to_string())?;
     if !exit.success() {
-        let stages =
-            fs::read_to_string(scratch.path().join(".hydir-trace.json.stages")).unwrap_or_default();
         let stdout = fs::File::open(&stdout_path)
             .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
             .unwrap_or_default();
@@ -342,16 +410,14 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
             .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
             .unwrap_or_default();
         return Err(format!(
-            "isolated Frida helper failed (exit={:?}, signal={:?}, stages={:?}, stdout={:?}, stderr={:?})",
+            "isolated Frida helper failed (exit={:?}, signal={:?}, helper={:?}, stdout={:?}, stderr={:?})",
             exit.code(),
             exit.signal(),
-            stages,
+            String::from_utf8_lossy(&helper_stderr),
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         ));
     }
-    let json =
-        fs::read(result_path).map_err(|error| format!("Frida trace file missing: {error}"))?;
     let mut trace = hydir_execution::parse_dynamic_trace(&json)?;
     for path in [&stdout_path, &stderr_path] {
         if fs::metadata(path).map_err(|error| error.to_string())?.len() > input.budget.output_bytes
@@ -371,7 +437,7 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
 }
 
 pub fn inside(args: &[String]) -> Result<(), String> {
-    if args.len() < 6 {
+    if args.len() < 7 {
         return Err("invalid isolated helper arguments".into());
     }
     let offset = parse_address(&args[0])?;
@@ -381,10 +447,10 @@ pub fn inside(args: &[String]) -> Result<(), String> {
     if input_digest.len() != 64 || !input_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("invalid InputSpec digest".into());
     }
-    let result_path = &args[4];
-    let stage_path = format!("{result_path}.stages");
-    stage(&stage_path, "start");
-    let program = &args[5];
+    stage("start");
+    let target_stdout = fs::File::create(&args[4]).map_err(|error| error.to_string())?;
+    let target_stderr = fs::File::create(&args[5]).map_err(|error| error.to_string())?;
+    let program = &args[6];
     let elf = fs::read(program).map_err(|error| error.to_string())?;
     let file = object::File::parse(elf.as_slice()).map_err(|error| error.to_string())?;
     let selected = image_base.checked_add(offset).ok_or("address overflow")?;
@@ -395,27 +461,28 @@ pub fn inside(args: &[String]) -> Result<(), String> {
         .replace("__OFFSET__", &format!("0x{offset:x}"))
         .replace("__CAP__", &MAX_EVENTS.to_string());
     let frida = unsafe { Frida::obtain() };
-    stage(&stage_path, "frida initialized");
+    stage("frida initialized");
     let manager = DeviceManager::obtain(&frida);
-    stage(&stage_path, "device manager acquired");
+    stage("device manager acquired");
     let mut device = manager
         .get_local_device()
         .map_err(|error| error.to_string())?;
-    stage(&stage_path, "local device acquired");
-    let argv = std::iter::once(program.as_str()).chain(args[6..].iter().map(String::as_str));
+    stage("local device acquired");
+    let argv = std::iter::once(program.as_str()).chain(args[7..].iter().map(String::as_str));
     let options = SpawnOptions::new().argv(argv).stdio(SpawnStdio::Inherit);
-    let pid = device
-        .spawn(program, &options)
-        .map_err(|error| error.to_string())?;
-    stage(&stage_path, "target spawned paused");
+    let redirect = TargetStdioRedirect::install(&target_stdout, &target_stderr)?;
+    let spawned = device.spawn(program, &options);
+    drop(redirect);
+    let pid = spawned.map_err(|error| error.to_string())?;
+    stage("target spawned paused");
     let result = (|| {
         let session = device.attach(pid).map_err(|error| error.to_string())?;
-        stage(&stage_path, "target attached");
+        stage("target attached");
         let mut script_options = ScriptOption::new().set_runtime(ScriptRuntime::QJS);
         let mut script = session
             .create_script(&source, &mut script_options)
             .map_err(|error| error.to_string())?;
-        stage(&stage_path, "script created");
+        stage("script created");
         let (sender, receiver) = sync_channel(32);
         let dropped = Arc::new(AtomicU64::new(0));
         script
@@ -424,11 +491,11 @@ pub fn inside(args: &[String]) -> Result<(), String> {
                 dropped: Arc::clone(&dropped),
             })
             .map_err(|error| error.to_string())?;
-        stage(&stage_path, "message callback installed");
+        stage("message callback installed");
         script.load().map_err(|error| error.to_string())?;
-        stage(&stage_path, "script loaded");
+        stage("script loaded");
         device.resume(pid).map_err(|error| error.to_string())?;
-        stage(&stage_path, "target resumed");
+        stage("target resumed");
         let start = Instant::now();
         let mut state = Collector::default();
         while !session.is_detached() && start.elapsed() < Duration::from_millis(timeout_ms) {
@@ -438,7 +505,7 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             thread::sleep(Duration::from_millis(10));
         }
         let timed_out = !session.is_detached();
-        stage(&stage_path, "target detached or timed out");
+        stage("target detached or timed out");
         thread::sleep(Duration::from_millis(50));
         while let Ok(record) = receiver.try_recv() {
             apply_agent_record(&mut state, record)?;
@@ -490,7 +557,7 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             input_sha256: input_digest.clone(),
             selected_elf_vaddr: selected,
             ghidra_snapshot_sha256: None,
-            observer: "bubblewrap-frida-rust-message-v2".into(),
+            observer: "bubblewrap-frida-rust-message-v3".into(),
             frida_version: Frida::version().into(),
             agent_sha256: format!("{:x}", Sha256::digest(AGENT.as_bytes())),
             runtime_module_base: Some(base),
@@ -507,8 +574,8 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             events,
         };
         let json = serde_json::to_vec(&trace).map_err(|error| error.to_string())?;
-        fs::File::create(result_path)
-            .and_then(|mut output| output.write_all(&json))
+        std::io::stdout()
+            .write_all(&json)
             .map_err(|error| error.to_string())?;
         Ok(())
     })();
@@ -521,9 +588,22 @@ fn parse_address(value: &str) -> Result<u64, String> {
         .map_err(|_| "invalid hex address".into())
 }
 
-fn stage(path: &str, label: &str) {
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{label}");
+fn stage(label: &str) {
+    eprintln!("hydir-frida stage: {label}");
+}
+
+fn read_limited<R: Read>(mut reader: R, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len() <= limit {
+            let remaining = limit + 1 - output.len();
+            output.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
     }
 }
 

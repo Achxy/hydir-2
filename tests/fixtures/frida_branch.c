@@ -11,6 +11,8 @@ __attribute__((noinline)) int hydir_select(int value) {
 
 int main(int argc, char **argv) {
   if (argc != 2) return 64;
+  if (atoi(argv[1]) == 1)
+    puts("{\"schema_version\":999,\"observer\":\"target-forged\"}");
   printf("%d\n", hydir_select(atoi(argv[1])));
   return 0;
 }

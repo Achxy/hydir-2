@@ -47,8 +47,8 @@ def run_one(binary, symbols, value, scratch):
     if observed.returncode != 0:
         raise AssertionError(f"isolated Frida observation failed: {observed.stderr}")
     trace = json.loads(observed.stdout)
-    if trace["observer"] != "bubblewrap-frida-rust-message-v2":
-        raise AssertionError("observer did not use the Frida message transport")
+    if trace["observer"] != "bubblewrap-frida-rust-message-v3":
+        raise AssertionError("observer did not use the isolated Frida result pipe")
     if trace["status"] != "completed":
         raise AssertionError(f"trace incomplete: {trace['status']} {trace['diagnostics']}")
     if trace["lost_events"]:
