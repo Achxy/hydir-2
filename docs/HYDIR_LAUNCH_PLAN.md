@@ -2,6 +2,8 @@
 
 Status: active direction, updated 2026-09-28. This is the current product and implementation plan. The earlier [CTF workflow proposal](HYDIR_CTF_WORKFLOW_PLAN.md) is retained as historical research; its release priorities are superseded here.
 
+The [lifting-engine execution plan](LIFTING_ENGINE_PLAN.md) defines the next ordered core work, dependency choices, and acceptance gates.
+
 ## What Hydir is
 
 **Hydir is a binary lifting and reverse-engineering framework with its own GUI and Rust analysis core.** A user opens a binary in Hydir. Hydir starts a version-pinned, containerized Ghidra headless worker, imports and analyzes the binary there, extracts P-code and other facts, then populates Hydir's GUI and artifacts. Hydir converts P-code into its own explicit semantic IR in Rust, runs inspectable analyses and checked transformations, and exports useful LLVM IR and other results with links to the source instructions.
