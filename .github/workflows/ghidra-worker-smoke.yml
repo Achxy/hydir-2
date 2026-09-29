@@ -213,6 +213,7 @@ jobs:
             --output-dir "$RUNNER_TEMP/ghidra-recursion"
       - name: Resolve a disjoint PIE RELATIVE relocation for Rust execution
         env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
           HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
         run: |
           python3 scripts/check-ghidra-relative-reloc.py \

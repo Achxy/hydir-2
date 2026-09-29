@@ -52,9 +52,21 @@ def main():
         target = symbol_address(symbols, "hydir_target")
         start = symbol_address(symbols, "_start")
         digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        catalog_path = directory / "catalog.json"
+        run(CLIENT, "ghidra", "analyze", binary, "--output", catalog_path,
+            timeout=240)
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        matches = [item for item in catalog["functions"]
+                   if item["name"] == "hydir_read_target"]
+        if len(matches) != 1:
+            raise AssertionError("Ghidra did not discover the PIE fixture function")
+        selected_entry = int(matches[0]["entry"]["offset"], 16)
         snapshot_path = directory / "snapshot.json"
-        run(CLIENT, "ghidra", "analyze", binary, "--function", hex(entry),
-            "--output", snapshot_path, timeout=240)
+        if catalog["selected_function"]["entry"] == matches[0]["entry"]:
+            snapshot_path = catalog_path
+        else:
+            run(CLIENT, "ghidra", "analyze", binary, "--function",
+                hex(selected_entry), "--output", snapshot_path, timeout=240)
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
         if snapshot["binary_sha256"] != digest:
             raise AssertionError("PIE snapshot digest differs from ELF")
@@ -97,6 +109,16 @@ def main():
                                      for i in range(8)), "little")
         if trace["stop"]["kind"] != "return" or value != 42:
             raise AssertionError(f"PIE relocation Rust execution failed: {trace['stop']}")
+        llvm_path = directory / "llvm.json"
+        run(CLIENT, "ghidra-snapshot", "llvm-cfg-allocated", binary, snapshot_path,
+            "--allocations", allocations, "--output", llvm_path)
+        llvm = json.loads(llvm_path.read_text(encoding="utf-8"))
+        if (llvm["schema_version"] != 5 or
+                llvm["process_memory"]["unresolved_relocation_bytes"] != 0):
+            raise AssertionError("LLVM artifact did not consume resolved PIE process memory")
+        module = directory / "relative.ll"
+        module.write_text(llvm["llvm_ir"], encoding="utf-8")
+        run("clang", "-x", "ir", "-c", module, "-o", directory / "relative.o")
         result = {"binary_sha256": digest, "schema_version": 2,
                   "relocation_address": hex(pointer + bias),
                   "resolved_pointer": hex(actual_pointer), "result": value}

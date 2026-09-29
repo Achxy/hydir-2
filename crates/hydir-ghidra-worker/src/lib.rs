@@ -1159,8 +1159,12 @@ fn docker_analyze(
         Some(&name),
     );
     if result.is_ok() {
-        fs::copy(staging.join("snapshot.json"), work.join("snapshot.json"))
-            .map_err(|e| format!("Ghidra did not export a snapshot: {e}"))?;
+        fs::copy(staging.join("snapshot.json"), work.join("snapshot.json")).map_err(|e| {
+            format!(
+                "Ghidra did not export a snapshot: {e}; headless log: {}",
+                log_tail(&work.join("analysis.log"))
+            )
+        })?;
     }
     result
 }
