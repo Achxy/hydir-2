@@ -29,6 +29,7 @@ on:
       - tests/fixtures/ghidra_float_compare.S
       - tests/fixtures/hydir_frame_holdout.c
       - tests/fixtures/ghidra_frame_holdout_native.gdb
+      - tests/fixtures/ghidra_recursive_native.gdb
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -77,6 +78,7 @@ on:
       - tests/fixtures/ghidra_float_compare.S
       - tests/fixtures/hydir_frame_holdout.c
       - tests/fixtures/ghidra_frame_holdout_native.gdb
+      - tests/fixtures/ghidra_recursive_native.gdb
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -198,6 +200,13 @@ jobs:
             headless_rediscovery_preserves_unresolved_call -- --ignored --nocapture
           cargo test --locked -p hydir-ghidra-worker --lib \
             headless_rediscovery_preserves_unresolved_jump -- --ignored --nocapture
+      - name: Compare recursive ELF paths in Ghidra Rust LLVM and native code
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/check-ghidra-recursion.py \
+            --output-dir "$RUNNER_TEMP/ghidra-recursion"
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -370,6 +379,7 @@ jobs:
             ${{ runner.temp }}/hydir-password-snapshot.json
             ${{ runner.temp }}/hydir-password-llvm.json
             ${{ runner.temp }}/hydir-password-process-llvm.json
+            ${{ runner.temp }}/ghidra-recursion/report.json
 
   differential-fixtures:
     runs-on: ubuntu-24.04
@@ -613,10 +623,6 @@ jobs:
           assert trace['final_state']['register_bytes']['0'] == 12
           assert trace['snapshot_diagnostics'] == []
           PY
-      - name: Execute bounded real ELF recursion in Rust LLVM and native code
-        run: |
-          python3 scripts/check-ghidra-recursion.py \
-            --output-dir "$RUNNER_TEMP/ghidra-recursion"
       - name: Resolve a concrete indirect call with automatic callee export
         run: |
           cargo run --locked -p hydir-cli -- ghidra trace-calls \
@@ -722,6 +728,5 @@ jobs:
             ${{ runner.temp }}/ghidra-indirect-call-trace.json
             ${{ runner.temp }}/ghidra-call-module.json
             ${{ runner.temp }}/ghidra-chosen-call-trace.json
-            ${{ runner.temp }}/ghidra-recursion/report.json
             ${{ runner.temp }}/ghidra-indirect-jump-snapshot.json
             ${{ runner.temp }}/ghidra-indirect-jump-llvm.json

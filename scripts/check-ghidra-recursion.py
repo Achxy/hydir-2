@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -15,6 +16,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/ghidra_recursive_calls.S"
+NATIVE_SCRIPT = ROOT / "tests/fixtures/ghidra_recursive_native.gdb"
+GHIDRA_ORACLE = ROOT / "integrations/ghidra/HydIROracle.java"
 CLIENT = Path(os.environ.get("HYDIRCTL_BIN", ROOT / "target/debug/hydirctl"))
 STACK_BASE = 0x700100
 STACK_SIZE = 0x108
@@ -22,9 +25,9 @@ ENTRY_RSP = STACK_BASE + 0x100
 MAX_OPS = 512
 
 
-def run(*args, timeout=180):
+def run(*args, timeout=180, env=None):
     result = subprocess.run([str(arg) for arg in args], cwd=ROOT,
-                            capture_output=True, text=True, timeout=timeout)
+                            capture_output=True, text=True, timeout=timeout, env=env)
     if result.returncode:
         raise AssertionError(f"{args[0]} failed ({result.returncode}):\n"
                              f"{result.stdout[-3000:]}\n{result.stderr[-3000:]}")
@@ -33,6 +36,53 @@ def run(*args, timeout=180):
 
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def encoded(value):
+    return "h" + value.encode().hex()
+
+
+def independent_paths(directory, binary, snapshot_path, entry, return_address, value):
+    ghidra_home = Path(os.environ["HYDIR_GHIDRA_HOME"])
+    scripts = directory / "oracle-scripts"
+    scripts.mkdir(exist_ok=True)
+    shutil.copy2(GHIDRA_ORACLE, scripts / GHIDRA_ORACLE.name)
+    projects = directory / "oracle-projects"
+    projects.mkdir(exist_ok=True)
+    oracle_path = directory / f"oracle-{value}.json"
+    run(ghidra_home / "support/analyzeHeadless", projects, "HydirRecursion",
+        "-import", binary, "-scriptPath", scripts, "-postScript",
+        GHIDRA_ORACLE.name, oracle_path, binary, hex(entry), "128",
+        encoded(f"RDI={value:#x};RSP={ENTRY_RSP:#x};RAX=0x0"),
+        encoded(f"{ENTRY_RSP:#x}:8:{return_address:#x}"),
+        encoded("RAX,RSP"), encoded(f"{ENTRY_RSP:#x}:8"), hex(entry),
+        encoded(hex(entry)), "-deleteProject", timeout=240)
+    oracle = read_json(oracle_path)
+    if oracle["stop"]["kind"] != "return":
+        raise AssertionError(f"Ghidra recursion stopped: {oracle['stop']}")
+    env = {**os.environ,
+           "HYDIR_RECURSIVE_SNAPSHOT": str(snapshot_path),
+           "HYDIR_RECURSIVE_RETURN": hex(return_address),
+           "HYDIR_RECURSIVE_ARG": str(value)}
+    output = run("gdb", "-nx", "-q", "--batch", "-x", NATIVE_SCRIPT, binary,
+                 timeout=90, env=env)
+    rows = [json.loads(line.removeprefix("HYDIR_NATIVE_RESULT="))
+            for line in output.splitlines() if line.startswith("HYDIR_NATIVE_RESULT=")]
+    if len(rows) != 1:
+        raise AssertionError("GDB did not produce exactly one recursive path")
+    native = rows[0]
+    if len(oracle["steps"]) != len(native["steps"]):
+        raise AssertionError("Ghidra/native recursive instruction counts differ")
+    for oracle_step, native_step in zip(oracle["steps"], native["steps"]):
+        registers = oracle_step["register_values"]
+        if (oracle_step["address"]["offset"] != native_step["address"] or
+                registers[0] is None or registers[1] is None or
+                int(registers[0], 16) != native_step["rax"] or
+                int(registers[1], 16) - ENTRY_RSP != native_step["rsp_delta"] or
+                int(oracle_step["memory_values"][0], 16) != native_step["return_slot"]):
+            raise AssertionError(f"Ghidra/native first differing instruction: "
+                                 f"{oracle_step['address']['offset']}")
+    return [step["address"] for step in native["steps"]]
 
 
 def register_value(state, offset, width=8):
@@ -116,7 +166,8 @@ def llvm_run(artifact, module, seed, expected_events, space_id):
         return int.from_bytes(bytes(state[index] for index in indexes), "little")
     memory = {STACK_BASE + index: stack[index]
               for index in range(STACK_SIZE) if stack_known[index] == 255}
-    return result_register(0), result_register(0x20), event_count.value, memory
+    return (result_register(0), result_register(0x20),
+            actual_events, memory)
 
 
 def main():
@@ -162,6 +213,7 @@ def main():
             seed = {"schema_version": 1, "binary_sha256": digest,
                     "entry": snapshot["selected_function"]["entry"],
                     "registers": [
+                        {"offset": "0x0", "size": 8, "value": "0x0"},
                         {"offset": "0x38", "size": 8, "value": hex(value)},
                         {"offset": "0x20", "size": 8, "value": hex(ENTRY_RSP)}],
                     "memory": [{"space": "ram", "byte_offset": hex(ENTRY_RSP),
@@ -181,7 +233,7 @@ def main():
                 raise AssertionError(f"Rust recursion failed for {value}: {trace['stop']}")
             space_id = next(row["id"] for row in snapshot["address_spaces"]
                             if row["name"] == "ram")
-            actual, rsp, event_count, memory = llvm_run(
+            actual, rsp, llvm_events, memory = llvm_run(
                 artifact, module, seed, source_event_ids(trace, artifact["llvm"]), space_id)
             if actual != expected or rsp != ENTRY_RSP + 8:
                 raise AssertionError(f"LLVM recursion returned {actual}, RSP={rsp:#x}")
@@ -190,8 +242,25 @@ def main():
                 address = int(address)
                 if STACK_BASE <= address < STACK_BASE + STACK_SIZE and memory.get(address) != byte:
                     raise AssertionError(f"LLVM stack differs from Rust at {address:#x}")
+            if "HYDIR_GHIDRA_HOME" in os.environ:
+                native_path = independent_paths(directory, binary, snapshot_path,
+                                                entry, return_address, value)
+                rust_path = [visit["offset"] for segment in trace["segments"]
+                             for visit in segment["path"]["instruction_visits"]]
+                llvm_path = []
+                for event_id in llvm_events:
+                    address = artifact["llvm"]["source_operations"][event_id][
+                        "instruction_address"]["offset"]
+                    if not llvm_path or llvm_path[-1] != address:
+                        llvm_path.append(address)
+                if rust_path and (not llvm_path or llvm_path[-1] != rust_path[-1]):
+                    llvm_path.append(rust_path[-1])
+                if native_path != rust_path or llvm_path != rust_path:
+                    raise AssertionError(f"recursive instruction paths differ for {value}: "
+                                         f"native={native_path}, Rust={rust_path}, "
+                                         f"LLVM={llvm_path}")
             results[str(value)] = {"result": actual, "calls": len(trace["calls"]),
-                                   "llvm_events": event_count}
+                                   "llvm_events": len(llvm_events)}
         native = subprocess.run([str(binary)], cwd=ROOT, capture_output=True, timeout=10)
         if native.returncode != 6:
             raise AssertionError(f"native recursion returned exit code {native.returncode}")
