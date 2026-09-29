@@ -1,7 +1,6 @@
 // Runs only in the staged target. Rust owns identity checks and artifact validation.
 const moduleBase = Process.mainModule.base;
 const selected = moduleBase.add(__OFFSET__);
-const traceFile = new File('/work/.hydir-agent-events', 'wb');
 const cap = __CAP__;
 let count = 0;
 let lost = 0;
@@ -9,8 +8,7 @@ let depth = 0;
 let activeThread = 0;
 
 function record(value) {
-  traceFile.write(JSON.stringify(value) + '\n');
-  traceFile.flush();
+  send({ type: 'hydir', id: 0, result: 'event', returns: value });
 }
 
 function emit(payload) {

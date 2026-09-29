@@ -31,3 +31,7 @@ url = "=2.5.7"
 eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui_graph = "=0.16.3"
 egui_graph_egui = { package = "egui", version = "=0.34.3", default-features = false }
+
+# Pinned Frida 0.17.2 with the script-message callback pointer fix below.
+[patch.crates-io]
+frida = { path = "vendor/frida-rust-0.17.2" }

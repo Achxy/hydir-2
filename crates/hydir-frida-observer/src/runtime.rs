@@ -1,4 +1,7 @@
-use frida::{DeviceManager, Frida, ScriptOption, ScriptRuntime, SpawnOptions, SpawnStdio};
+use frida::{
+    DeviceManager, Frida, Message, ScriptHandler, ScriptOption, ScriptRuntime, SpawnOptions,
+    SpawnStdio,
+};
 use hydir_execution::{
     DYNAMIC_TRACE_VERSION, DynamicTrace, InputSpec, TraceBudget, TraceEvent, TraceEventKind,
     TraceStatus, TraceWitness, decode_hex, input_sha256, validate_dynamic_trace,
@@ -6,6 +9,7 @@ use hydir_execution::{
 };
 use object::{Object, ObjectSegment, SegmentFlags};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -15,6 +19,11 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{SyncSender, sync_channel},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -30,6 +39,32 @@ struct Collector {
     done: bool,
     lost: u64,
     errors: Vec<String>,
+    received_bytes: usize,
+}
+
+struct AgentMessages {
+    sender: SyncSender<Value>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl ScriptHandler for AgentMessages {
+    fn on_message(&mut self, message: Message, _data: Option<Vec<u8>>) {
+        let value = match message {
+            Message::Send(sent) if sent.payload.r#type == "hydir" => sent.payload.returns,
+            Message::Error(error) => serde_json::json!({
+                "type": "error",
+                "detail": error.description,
+            }),
+            Message::Log(_) => return,
+            other => serde_json::json!({
+                "type": "error",
+                "detail": format!("unexpected Frida message: {other:?}"),
+            }),
+        };
+        if self.sender.try_send(value).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -46,58 +81,75 @@ struct RawEvent {
     target: Option<RawWitness>,
 }
 
-fn read_agent_events(path: &str) -> Result<Collector, String> {
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("Frida agent evidence missing: {error}"))?;
-    if metadata.len() > hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES as u64 {
+fn apply_agent_record(state: &mut Collector, value: Value) -> Result<(), String> {
+    let size = serde_json::to_vec(&value)
+        .map_err(|error| error.to_string())?
+        .len();
+    if size > 1024 * 1024 {
+        return Err("Frida agent event batch exceeds 1 MiB".into());
+    }
+    state.received_bytes = state
+        .received_bytes
+        .checked_add(size)
+        .ok_or("Frida agent evidence size overflow")?;
+    if state.received_bytes > hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES {
         return Err("Frida agent evidence exceeds 16 MiB".into());
     }
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let content = std::str::from_utf8(&bytes).map_err(|_| "Frida agent evidence is not UTF-8")?;
-    let mut state = Collector::default();
-    for line in content.lines() {
-        if line.len() > 1024 * 1024 {
-            return Err("Frida agent event line exceeds 1 MiB".into());
-        }
-        let value: serde_json::Value =
-            serde_json::from_str(line).map_err(|error| error.to_string())?;
-        match value.get("type").and_then(|value| value.as_str()) {
-            Some("meta") => {
-                state.base = value
-                    .get("base")
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| parse_address(value).ok());
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("meta") => {
+            if state.base.is_some() {
+                return Err("Frida agent reported multiple module bases".into());
             }
-            Some("batch") => {
-                let batch: Vec<RawEvent> = serde_json::from_value(
+            state.base = value
+                .get("base")
+                .and_then(|value| value.as_str())
+                .and_then(|value| parse_address(value).ok());
+        }
+        Some("batch") => {
+            let batch: Vec<RawEvent> = serde_json::from_value(
+                value
+                    .get("events")
+                    .cloned()
+                    .ok_or("missing Frida event batch")?,
+            )
+            .map_err(|error| error.to_string())?;
+            if batch.len() > MAX_EVENTS {
+                return Err("Frida event batch exceeds cap".into());
+            }
+            for event in batch {
+                if state.events.len() < MAX_EVENTS {
+                    state.events.push(event);
+                } else {
+                    state.lost += 1;
+                }
+            }
+        }
+        Some("done") => {
+            if state.done {
+                return Err("Frida agent reported completion twice".into());
+            }
+            state.done = true;
+            state.lost += value
+                .get("lost")
+                .and_then(|value| value.as_u64())
+                .ok_or("invalid Frida loss count")?;
+        }
+        Some("error") => {
+            if state.errors.len() < 16 {
+                state.errors.push(
                     value
-                        .get("events")
-                        .cloned()
-                        .ok_or("missing Frida event batch")?,
-                )
-                .map_err(|error| error.to_string())?;
-                if batch.len() > MAX_EVENTS {
-                    return Err("Frida event batch exceeds cap".into());
-                }
-                for event in batch {
-                    if state.events.len() < MAX_EVENTS {
-                        state.events.push(event);
-                    } else {
-                        state.lost += 1;
-                    }
-                }
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Frida agent error")
+                        .chars()
+                        .take(512)
+                        .collect(),
+                );
             }
-            Some("done") => {
-                state.done = true;
-                state.lost += value
-                    .get("lost")
-                    .and_then(|value| value.as_u64())
-                    .ok_or("invalid Frida loss count")?;
-            }
-            _ => return Err("unknown Frida agent record".into()),
         }
+        _ => return Err("unknown Frida agent record".into()),
     }
-    Ok(state)
+    Ok(())
 }
 
 /// Observe a selected ELF address using a helper and target in the same
@@ -360,22 +412,38 @@ pub fn inside(args: &[String]) -> Result<(), String> {
         let session = device.attach(pid).map_err(|error| error.to_string())?;
         stage(&stage_path, "target attached");
         let mut script_options = ScriptOption::new().set_runtime(ScriptRuntime::QJS);
-        let script = session
+        let mut script = session
             .create_script(&source, &mut script_options)
             .map_err(|error| error.to_string())?;
         stage(&stage_path, "script created");
+        let (sender, receiver) = sync_channel(32);
+        let dropped = Arc::new(AtomicU64::new(0));
+        script
+            .handle_message(AgentMessages {
+                sender,
+                dropped: Arc::clone(&dropped),
+            })
+            .map_err(|error| error.to_string())?;
+        stage(&stage_path, "message callback installed");
         script.load().map_err(|error| error.to_string())?;
         stage(&stage_path, "script loaded");
         device.resume(pid).map_err(|error| error.to_string())?;
         stage(&stage_path, "target resumed");
         let start = Instant::now();
+        let mut state = Collector::default();
         while !session.is_detached() && start.elapsed() < Duration::from_millis(timeout_ms) {
+            while let Ok(record) = receiver.try_recv() {
+                apply_agent_record(&mut state, record)?;
+            }
             thread::sleep(Duration::from_millis(10));
         }
         let timed_out = !session.is_detached();
         stage(&stage_path, "target detached or timed out");
         thread::sleep(Duration::from_millis(50));
-        let state = read_agent_events("/work/.hydir-agent-events")?;
+        while let Ok(record) = receiver.try_recv() {
+            apply_agent_record(&mut state, record)?;
+        }
+        state.lost = state.lost.saturating_add(dropped.load(Ordering::Relaxed));
         let base = state.base.ok_or("Frida agent did not report module base")?;
         let bias = base
             .checked_sub(image_base)
@@ -422,7 +490,7 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             input_sha256: input_digest.clone(),
             selected_elf_vaddr: selected,
             ghidra_snapshot_sha256: None,
-            observer: "bubblewrap-frida-rust-linux-v1".into(),
+            observer: "bubblewrap-frida-rust-message-v2".into(),
             frida_version: Frida::version().into(),
             agent_sha256: format!("{:x}", Sha256::digest(AGENT.as_bytes())),
             runtime_module_base: Some(base),

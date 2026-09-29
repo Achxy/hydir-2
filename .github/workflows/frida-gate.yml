@@ -6,6 +6,7 @@ on:
       - Cargo.lock
       - crates/hydir-execution/**
       - crates/hydir-frida-observer/**
+      - vendor/frida-rust-0.17.2/**
       - tests/fixtures/frida_branch.c
       - tests/frida_observer_gate.py
       - .github/workflows/frida-gate.yml
@@ -15,6 +16,7 @@ on:
       - Cargo.lock
       - crates/hydir-execution/**
       - crates/hydir-frida-observer/**
+      - vendor/frida-rust-0.17.2/**
       - tests/fixtures/frida_branch.c
       - tests/frida_observer_gate.py
       - .github/workflows/frida-gate.yml
@@ -49,5 +51,6 @@ jobs:
           set -euo pipefail
           export CPATH="$RUNNER_TEMP/frida-devkit"
           export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
+          cargo test --locked -p frida ordinary_send_dispatches_to_registered_handler
           cargo build --locked -p hydir-frida-observer --features frida-runtime --bin hydir-frida-observer
           python3 tests/frida_observer_gate.py

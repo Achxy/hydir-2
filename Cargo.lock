@@ -1718,8 +1718,6 @@ dependencies = [
 [[package]]
 name = "frida"
 version = "0.17.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6047db66e218d00e7681e17320c90e24ee6b618809a6fc95f3c3954b3ad87d6"
 dependencies = [
  "frida-sys",
  "serde",
