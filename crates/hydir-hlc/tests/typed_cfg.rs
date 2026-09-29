@@ -225,6 +225,54 @@ fn scalar_cfg_branches_and_loops_compile_and_match_oracles() {
 }
 
 #[test]
+fn early_return_guard_before_loop_compiles_and_matches_oracle() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");
+    let temp = tempfile::tempdir().unwrap();
+    let object = temp.path().join("typed_cfg.o");
+    let compile = Command::new("clang")
+        .args(["--target=x86_64-unknown-linux-gnu", "-c"])
+        .arg(fixture)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = fs::read(&object).unwrap();
+    let model = init_model(&bytes).unwrap();
+    let native = decompile_symbol(&bytes, "hydir_cfg_guarded_loop").unwrap();
+    let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model).unwrap();
+    let c = emit_typed_cfg_c(&ir, &model).unwrap();
+    assert!(
+        c.contains("if (") && c.contains("} else {") && c.contains("goto hydir_bb_"),
+        "{c}"
+    );
+    let source = format!(
+        "{c}\nint main(void) {{ uint64_t steps[] = {{ 0, 1, 2, 7, UINT64_MAX }}; for (unsigned i=0;i<5;++i) for (uint64_t n=1;n<20;++n) {{ uint64_t x=steps[i]; uint64_t expected=x==0 ? 1 : x*n; if (hydir_cfg_guarded_loop(x,n)!=expected) return 1; }} return 0; }}\n"
+    );
+    let path = temp.path().join("guarded_loop.c");
+    fs::write(&path, source).unwrap();
+    let exe = temp.path().join("guarded_loop.exe");
+    let compile = Command::new("clang")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(path)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert!(Command::new(exe).status().unwrap().success());
+}
+
+#[test]
 fn scalar_cfg_rejects_unmodeled_widths_and_callee_saved_writes() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/typed_cfg.S");

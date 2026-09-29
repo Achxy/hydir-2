@@ -26,6 +26,23 @@ hydir_cfg_sum:
     retq
 .size hydir_cfg_sum, .-hydir_cfg_sum
 
+.globl hydir_cfg_guarded_loop
+.type hydir_cfg_guarded_loop,@function
+hydir_cfg_guarded_loop:
+    testq %rdi, %rdi
+    jz .Lguarded_early
+    movq $0, %rax
+    jmp .Lguarded_loop
+.Lguarded_early:
+    movq $1, %rax
+    retq
+.Lguarded_loop:
+    addq %rdi, %rax
+    subq $1, %rsi
+    jnz .Lguarded_loop
+    retq
+.size hydir_cfg_guarded_loop, .-hydir_cfg_guarded_loop
+
 .globl hydir_cfg_add_flags
 .type hydir_cfg_add_flags,@function
 hydir_cfg_add_flags:
