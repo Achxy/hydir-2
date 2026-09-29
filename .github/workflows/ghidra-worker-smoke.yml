@@ -45,6 +45,7 @@ on:
       - tests/fixtures/ghidra_prism_patch_portal_v2.json
       - tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json
       - tests/ghidra_oracle_test.py
+      - tests/ghidra_four_engine_gate.py
       - demo/hydir-prism.elf
   pull_request:
     paths:
@@ -89,6 +90,7 @@ on:
       - tests/fixtures/ghidra_prism_patch_portal_v2.json
       - tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json
       - tests/ghidra_oracle_test.py
+      - tests/ghidra_four_engine_gate.py
       - demo/hydir-prism.elf
   workflow_dispatch:
 
@@ -154,6 +156,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - name: Install native four-engine gate tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang gdb
       - name: Compare Rust path execution with Ghidra EmulatorHelper
         run: |
           set -euo pipefail
@@ -179,6 +185,7 @@ jobs:
           test -x "$HYDIR_GHIDRA_HOME/support/analyzeHeadless"
           test -x "$HYDIRCTL_BIN"
           python3 -m unittest -v tests/ghidra_oracle_test.py
+          python3 tests/ghidra_four_engine_gate.py
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \

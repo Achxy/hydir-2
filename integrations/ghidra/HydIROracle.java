@@ -26,7 +26,7 @@ public class HydIROracle extends GhidraScript {
     private static final int MAX_STEPS = 256;
     private static final int MAX_ITEMS = 64;
     private static final int MAX_MEMORY_WIDTH = 8;
-    private static final int MAX_OUTPUT_BYTES = 64 * 1024;
+    private static final int MAX_OUTPUT_BYTES = 1024 * 1024;
 
     private record MemoryItem(Address address, int size) {}
 
@@ -276,6 +276,21 @@ public class HydIROracle extends GhidraScript {
                 quoted(json, instruction.getMnemonicString());
                 json.append(",\"next_address\":");
                 addressJson(json, emulator.getExecutionAddress());
+                json.append(",\"register_values\":[");
+                for (int i = 0; i < watchedRegisters.size(); i++) {
+                    if (i != 0) json.append(',');
+                    BigInteger value = emulator.readRegister(watchedRegisters.get(i));
+                    if (value == null) json.append("null"); else quoted(json, hex(value));
+                }
+                json.append("],\"memory_values\":[");
+                for (int i = 0; i < watchedMemory.size(); i++) {
+                    if (i != 0) json.append(',');
+                    MemoryItem item = watchedMemory.get(i);
+                    byte[] bytes = emulator.readMemory(item.address, item.size);
+                    if (bytes == null || bytes.length != item.size) json.append("null");
+                    else quoted(json, hex(littleEndian(bytes)));
+                }
+                json.append(']');
                 json.append('}');
                 if (returns) {
                     stop = "return";

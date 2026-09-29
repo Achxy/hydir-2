@@ -52,6 +52,7 @@ if "HYDIR_NATIVE_RAX" in os.environ:
     gdb.execute("set $rax = %s" % os.environ["HYDIR_NATIVE_RAX"])
 
 visits = []
+step_registers = []
 max_visits = int(os.environ.get("HYDIR_NATIVE_MAX_VISITS", str(len(instructions) + 1)))
 for _ in range(max_visits):
     pc = int(gdb.parse_and_eval("$rip"))
@@ -72,6 +73,13 @@ for _ in range(max_visits):
         raise RuntimeError("native bytes at 0x%x differ from Ghidra snapshot" % pc)
     visits.append(pc)
     gdb.execute("si", to_string=True)
+    step_registers.append({
+        "address": "0x%x" % pc,
+        "rax": int(gdb.parse_and_eval("$rax")) & ((1 << 64) - 1),
+        "rsp": int(gdb.parse_and_eval("$rsp")) & ((1 << 64) - 1),
+        "return_slot": int.from_bytes(
+            bytes(gdb.selected_inferior().read_memory(entry_rsp, 8)), "little"),
+    })
     if pc == observed_instruction:
         observed_eflags = int(gdb.parse_and_eval("$eflags"))
         observed_flags = {
@@ -84,6 +92,7 @@ else:
 flags = int(gdb.parse_and_eval("$eflags"))
 result = {
     "instruction_visits": ["0x%x" % pc for pc in visits],
+    "step_registers": step_registers,
     "return_pc": "0x%x" % int(gdb.parse_and_eval("$rip")),
     "stack_delta": int(gdb.parse_and_eval("$rsp")) - entry_rsp,
     "registers": {
