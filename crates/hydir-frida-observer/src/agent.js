@@ -36,12 +36,14 @@ function witness(address) {
   } catch (_) {}
   return { address: p.toString(), bytes: bytes };
 }
+// Interceptor replaces the entry bytes; attest them before installing it.
+const selectedWitness = witness(selected);
 record({ type: 'meta', base: moduleBase.toString() });
 Interceptor.attach(selected, {
   onEnter() {
     if (depth++ !== 0) return;
     activeThread = this.threadId;
-    emit({ kind: 'entry', source: witness(selected), target: null });
+    emit({ kind: 'entry', source: selectedWitness, target: null });
     Stalker.follow(activeThread, {
       events: { call: true, ret: false, block: true, exec: false, compile: false },
       onReceive(raw) {
@@ -61,7 +63,7 @@ Interceptor.attach(selected, {
     if (--depth !== 0) return;
     Stalker.unfollow(activeThread);
     Stalker.flush();
-    emit({ kind: 'exit', source: witness(selected), target: null });
+    emit({ kind: 'exit', source: selectedWitness, target: null });
     record({ type: 'done', lost: lost });
   }
 });
