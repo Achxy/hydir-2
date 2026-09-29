@@ -41,6 +41,7 @@ use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod compare;
 mod frida;
+mod frida_seed;
 mod ghidra_calls;
 mod local;
 mod passes;
@@ -65,6 +66,7 @@ const HELP: &str = "Hydir: Ghidra-backed binary lifting and reverse engineering
 Usage:
   hydirctl doctor
   hydirctl observe frida <elf> <input.json> --function <0xelf-vaddr> [--snapshot <snapshot.json>] [--output <trace.json>]
+  hydirctl observe seed <elf> <input.json> <snapshot.json> <trace.json> [--output <seed.json>]
   hydirctl compare-executions <elf> <seed.json> <engine-evidence.json>... [--output <comparison.json>]
   hydirctl inspect <elf>
   hydirctl disassemble <elf>
@@ -236,6 +238,9 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("observe") if args.get(1).is_some_and(|value| value == "seed") => {
+            frida_seed::run(&args[2..])?
+        }
         Some("observe") => frida::run(&args)?,
         Some("compare-executions") => compare::run(&args[1..])?,
         Some("ghidra-project") if args.len() == 4 && args[1] == "save" => {

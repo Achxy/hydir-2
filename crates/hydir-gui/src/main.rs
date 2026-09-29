@@ -33,7 +33,8 @@ use hydir_decompile::{
     PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
     PcodeStandalonePrefixArtifact, decompile_function_at, decompile_symbol, discover_functions,
     emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_image, emit_pcode_exact_operation_llvm,
-    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
+    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, frida_entry_pcode_seed,
+    measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, DynamicTrace, MAX_ANALYSIS_RECIPE_JSON_BYTES, MAX_INPUT_SPEC_BYTES, StopPoint,
@@ -8710,6 +8711,28 @@ impl AnalystApp {
                             && let Ok(json) = serde_json::to_string_pretty(trace) {
                                 ui.ctx().copy_text(json);
                             }
+                        if ui.button("Use captured entry registers as P-code seed").clicked() {
+                            let seed = (|| -> Result<String, String> {
+                                let binary_path = self.current_local_path.as_ref()
+                                    .ok_or("No local ELF is open")?;
+                                let binary = bounded_read(binary_path)?;
+                                let input_bytes = fs::read(self.frida_input_path.trim())
+                                    .map_err(|error| error.to_string())?;
+                                if input_bytes.len() > MAX_INPUT_SPEC_BYTES {
+                                    return Err("InputSpec exceeds size limit".into());
+                                }
+                                let input = parse_input_spec(&input_bytes)?;
+                                let seed = frida_entry_pcode_seed(&binary, &input, snapshot, trace)?;
+                                String::from_utf8(seed).map_err(|error| error.to_string())
+                            })();
+                            match seed {
+                                Ok(seed) => {
+                                    self.ghidra_trace_seed_json = seed;
+                                    self.status = "Captured entry registers loaded as a P-code seed; memory remains unknown".to_owned();
+                                }
+                                Err(error) => self.status = format!("Cannot use Frida entry registers: {error}"),
+                            }
+                        }
                         egui::ScrollArea::vertical().id_salt("frida_observed_events")
                             .max_height(240.0)
                             .show_rows(ui, 18.0, trace.events.len(), |ui, range| {

@@ -264,6 +264,10 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("observe", "frida"))
         self.assertEqual(run.call_args.args[-2:], ("--function", "0x401000"))
         with patch.object(self.client, "_run", return_value=json.dumps({
+            **trace, "schema_version": 2,
+        }).encode()):
+            self.client.observe(self.binary, input_path, function=0x401000)
+        with patch.object(self.client, "_run", return_value=json.dumps({
             **trace, "selected_elf_vaddr": 0x401001,
         }).encode()):
             with self.assertRaises(RuntimeError):
@@ -273,3 +277,26 @@ class LocalGhidraTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.client.observe(self.binary, input_path, function=0x401000)
             run.assert_not_called()
+
+    def test_observation_seed_uses_checked_cli_bridge(self):
+        input_path = Path(self.directory.name) / "input.json"
+        trace_path = Path(self.directory.name) / "trace.json"
+        input_path.write_text("{}", encoding="utf-8")
+        trace_path.write_text("{}", encoding="utf-8")
+        selected = {"space": "ram", "offset": "0x401000"}
+        self.snapshot.write_text(json.dumps({
+            "binary_sha256": self.digest,
+            "selected_function": {"entry": selected},
+        }), encoding="utf-8")
+        seed = {"schema_version": 1, "binary_sha256": self.digest,
+                "entry": selected, "registers": [], "memory": []}
+        with patch.object(self.client, "_run", return_value=json.dumps(seed).encode()) as run:
+            self.assertEqual(self.client.seed_from_observation(
+                self.binary, input_path, self.snapshot, trace_path), seed)
+        self.assertEqual(run.call_args.args[:2], ("observe", "seed"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            **seed, "memory": [{"space": "ram"}],
+        }).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.seed_from_observation(
+                    self.binary, input_path, self.snapshot, trace_path)

@@ -485,11 +485,36 @@ class LocalGhidra:
             args.extend(["--snapshot", str(snapshot_path)])
         data = json.loads(self._run(*args))
         if (
-            not isinstance(data, dict) or data.get("schema_version") != 1
+            not isinstance(data, dict) or data.get("schema_version") not in (1, 2)
             or data.get("binary_sha256") != digest
             or data.get("selected_elf_vaddr") != function
             or not isinstance(data.get("input_sha256"), str)
             or len(data["input_sha256"]) != 64
         ):
             raise RuntimeError("Hydir observation belongs to another binary, input, or function")
+        return data
+
+    def seed_from_observation(
+        self,
+        binary: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+    ) -> dict[str, Any]:
+        """Map one non-rebased Frida v2 entry context to a partial P-code seed."""
+        binary_path = Path(binary).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        digest = self._digest(binary_path)
+        selected = self._snapshot(snapshot_path, digest).get("selected_function", {}).get("entry")
+        data = json.loads(self._run(
+            "observe", "seed", str(binary_path), str(input_path),
+            str(snapshot_path), str(trace_path),
+        ))
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or data.get("binary_sha256") != digest or data.get("entry") != selected
+                or not isinstance(data.get("registers"), list)
+                or data.get("memory") != []):
+            raise RuntimeError("Frida-derived seed is invalid or belongs to another binary")
         return data

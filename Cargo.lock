@@ -2323,6 +2323,7 @@ dependencies = [
  "hydir-backend",
  "hydir-c",
  "hydir-core",
+ "hydir-execution",
  "hydir-ir",
  "hydir-loader",
  "hydir-semantics",

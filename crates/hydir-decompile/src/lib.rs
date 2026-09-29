@@ -7,6 +7,8 @@
 
 mod expression;
 pub use expression::lower_expression_ir;
+mod frida_seed;
+pub use frida_seed::frida_entry_pcode_seed;
 mod pcode_assessment;
 pub use pcode_assessment::{
     PCODE_FUNCTION_ASSESSMENT_VERSION, PcodeAssessedCall, PcodeFunctionAssessment,
