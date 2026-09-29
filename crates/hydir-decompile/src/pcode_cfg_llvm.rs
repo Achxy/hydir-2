@@ -532,13 +532,6 @@ fn emit_interprocedural_call(
         PcodeCfgLlvmStatus::CallDepth,
         "call depth budget exhausted",
     );
-    stop_site(
-        sites,
-        &source.source_address,
-        Some(operation_index),
-        PcodeCfgLlvmStatus::RecursiveCall,
-        "recursive call requires a separate bounded model",
-    );
     let target_value =
         if indirect {
             stop_site(
@@ -614,10 +607,9 @@ fn emit_interprocedural_call(
         body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
     }
     for (_, callee_index) in routes {
-        let callee_owner = context.owners[callee_index];
         body.push_str(&format!(
-            "call_route_{id}_{callee_index}:\n  %active_ptr_{id}_{callee_index} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {callee_owner}\n  %active_value_{id}_{callee_index} = load i8, ptr %active_ptr_{id}_{callee_index}\n  %recursive_{id}_{callee_index} = icmp ne i8 %active_value_{id}_{callee_index}, 0\n  br i1 %recursive_{id}_{callee_index}, label %{}, label %call_enter_{id}_{callee_index}\ncall_enter_{id}_{callee_index}:\n  store i8 1, ptr %active_ptr_{id}_{callee_index}\n  %return_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %depth_{id}\n  store i32 {return_index}, ptr %return_slot_{id}_{callee_index}\n  %address_slot_{id}_{callee_index} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %depth_{id}\n  store i64 {}, ptr %address_slot_{id}_{callee_index}\n  %width_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_widths, i32 0, i32 %depth_{id}\n  store i32 {continuation_width}, ptr %width_slot_{id}_{callee_index}\n  %depth_next_{id}_{callee_index} = add i32 %depth_{id}, 1\n  store i32 %depth_next_{id}_{callee_index}, ptr %call_depth\n",
-            stop_label(PcodeCfgLlvmStatus::RecursiveCall), continuation_key.1
+            "call_route_{id}_{callee_index}:\n  %return_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %depth_{id}\n  store i32 {return_index}, ptr %return_slot_{id}_{callee_index}\n  %address_slot_{id}_{callee_index} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %depth_{id}\n  store i64 {}, ptr %address_slot_{id}_{callee_index}\n  %width_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_widths, i32 0, i32 %depth_{id}\n  store i32 {continuation_width}, ptr %width_slot_{id}_{callee_index}\n  %depth_next_{id}_{callee_index} = add i32 %depth_{id}, 1\n  store i32 %depth_next_{id}_{callee_index}, ptr %call_depth\n",
+            continuation_key.1
         ));
         body.push_str(&log_event(
             id,
@@ -632,7 +624,6 @@ fn emit_interprocedural_call(
 fn emit_interprocedural_return(
     source: &PcodeOperation,
     id: usize,
-    owner: usize,
     return_sites: &BTreeSet<usize>,
     body: &mut String,
     sites: &mut Vec<PcodeCfgLlvmStopSite>,
@@ -697,7 +688,7 @@ fn emit_interprocedural_return(
         name
     };
     body.push_str(&format!(
-        "  %return_address_slot_{id} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %return_prev_{id}\n  %return_expected_{id} = load i64, ptr %return_address_slot_{id}\n  %return_matches_{id} = icmp eq i64 {value}, %return_expected_{id}\n  br i1 %return_matches_{id}, label %return_dispatch_{id}, label %{}\nreturn_dispatch_{id}:\n  store i32 %return_prev_{id}, ptr %call_depth\n  %returned_active_{id} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {owner}\n  store i8 0, ptr %returned_active_{id}\n  %return_site_slot_{id} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %return_prev_{id}\n  %return_site_{id} = load i32, ptr %return_site_slot_{id}\n  switch i32 %return_site_{id}, label %{} [\n",
+        "  %return_address_slot_{id} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %return_prev_{id}\n  %return_expected_{id} = load i64, ptr %return_address_slot_{id}\n  %return_matches_{id} = icmp eq i64 {value}, %return_expected_{id}\n  br i1 %return_matches_{id}, label %return_dispatch_{id}, label %{}\nreturn_dispatch_{id}:\n  store i32 %return_prev_{id}, ptr %call_depth\n  %return_site_slot_{id} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %return_prev_{id}\n  %return_site_{id} = load i32, ptr %return_site_slot_{id}\n  switch i32 %return_site_{id}, label %{} [\n",
         stop_label(PcodeCfgLlvmStatus::ReturnMismatch),
         stop_label(PcodeCfgLlvmStatus::ReturnMismatch)
     ));
@@ -1916,16 +1907,10 @@ fn emit_pcode_cfg_llvm_semantic(
              call void @llvm.memcpy.p0.p0.i64(ptr %process_known, ptr @hydir_process_initial_known, i64 {len}, i1 false)\n"
         ));
     }
-    if let Some(context) = call_context {
+    if call_context.is_some() {
         body.push_str(
-            "  %call_depth = alloca i32\n  store i32 0, ptr %call_depth\n  %return_sites = alloca [16 x i32]\n  %return_addresses = alloca [16 x i64]\n  %return_widths = alloca [16 x i32]\n  %active_functions = alloca [128 x i8]\n"
+            "  %call_depth = alloca i32\n  store i32 0, ptr %call_depth\n  %return_sites = alloca [16 x i32]\n  %return_addresses = alloca [16 x i64]\n  %return_widths = alloca [16 x i32]\n"
         );
-        for owner in 0..context.snapshots.len() {
-            body.push_str(&format!(
-                "  %initial_active_{owner} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {owner}\n  store i8 {}, ptr %initial_active_{owner}\n",
-                u8::from(owner == 0)
-            ));
-        }
     }
     body.push_str(&format!("  br label %ins_{start_index}\n"));
     for (instruction_index, instruction) in semantic.instructions.iter().enumerate() {
@@ -2153,7 +2138,6 @@ fn emit_pcode_cfg_llvm_semantic(
                             emit_interprocedural_return(
                                 source,
                                 id,
-                                context.owners[instruction_index],
                                 return_sites
                                     .as_ref()
                                     .expect("call context has return sites"),
@@ -4186,14 +4170,23 @@ mod tests {
                 .unwrap();
         assert!(matches!(recursive.stop,
             hydir_ir::pcode::PcodeCallPathStop::CallBoundary { ref reason, .. }
-                if reason.contains("recursive")));
+                if reason.contains("depth")));
+        assert_eq!(recursive.calls.len(), 4);
+        let mut recursive_guest = GuestTestMemory {
+            space_id: 433,
+            base: 0x6fffc0,
+            bytes: vec![None; 0x48],
+            expected: Vec::new(),
+            expected_state: Vec::new(),
+        };
+        recursive_guest.bytes[0x40..0x48].copy_from_slice(&guest.bytes[8..16]);
         run_lli_with_guest(
             &artifact.llvm,
             &recursive_seed,
-            &guest,
+            &recursive_guest,
             128,
-            PcodeCfgLlvmStatus::RecursiveCall,
-            &source_event_ids(&artifact.llvm, &recursive.segments[0].path),
+            PcodeCfgLlvmStatus::CallDepth,
+            &call_event_ids(&artifact.llvm, &recursive),
             Some(0x7c),
         );
 

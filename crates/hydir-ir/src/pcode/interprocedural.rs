@@ -10,7 +10,7 @@ use super::{
 use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub const PCODE_CALL_PATH_VERSION: u32 = 2;
 pub const PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION: u32 = 3;
@@ -241,7 +241,7 @@ pub fn unloaded_call_target(
     Ok(Some(target))
 }
 
-/// Follow direct and concretely resolved indirect, nonrecursive calls in a
+/// Follow direct and concretely resolved indirect calls in a
 /// bounded set of snapshots. The first snapshot is the root. Unknown,
 /// mismatched, or missing call evidence stops explicitly. Shared register and RAM state follows raw
 /// P-code; no ABI clobbers or return values are invented.
@@ -381,8 +381,6 @@ fn execute_concrete_call_path_inner(
     let mut start = root.selected_function.entry.clone();
     let mut state = initial_state.clone();
     let mut frames = Vec::<Frame>::new();
-    let mut active_entries = BTreeSet::new();
-    active_entries.insert(key(&start)?);
     let mut segments = Vec::new();
     let mut calls = Vec::new();
     let mut executed_operations = 0usize;
@@ -472,12 +470,6 @@ fn execute_concrete_call_path_inner(
                         reason: MISSING_CALLEE_REASON.to_owned(),
                     };
                 };
-                if !active_entries.insert(key(&target)?) {
-                    break PcodeCallPathStop::CallBoundary {
-                        source,
-                        reason: "recursive call requires a separate bounded model".to_owned(),
-                    };
-                }
                 calls.push(PcodeCallTransition {
                     caller_entry: snapshot.selected_function.entry.clone(),
                     callee_entry: target.clone(),
@@ -527,7 +519,6 @@ fn execute_concrete_call_path_inner(
                             .to_owned(),
                     };
                 }
-                active_entries.remove(&key(&snapshot.selected_function.entry)?);
                 current = frame.caller_index;
                 start = frame.return_address;
             }
