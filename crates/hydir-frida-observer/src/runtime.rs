@@ -293,6 +293,8 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
         thread::sleep(Duration::from_millis(10));
     };
     if !exit.success() {
+        let stages =
+            fs::read_to_string(scratch.path().join(".hydir-trace.json.stages")).unwrap_or_default();
         let stdout = fs::File::open(&stdout_path)
             .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
             .unwrap_or_default();
@@ -300,9 +302,10 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
             .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
             .unwrap_or_default();
         return Err(format!(
-            "isolated Frida helper failed (exit={:?}, signal={:?}, stdout={:?}, stderr={:?})",
+            "isolated Frida helper failed (exit={:?}, signal={:?}, stages={:?}, stdout={:?}, stderr={:?})",
             exit.code(),
             exit.signal(),
+            stages,
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         ));
@@ -339,6 +342,8 @@ pub fn inside(args: &[String]) -> Result<(), String> {
         return Err("invalid InputSpec digest".into());
     }
     let result_path = &args[4];
+    let stage_path = format!("{result_path}.stages");
+    stage(&stage_path, "start");
     let program = &args[5];
     let elf = fs::read(program).map_err(|error| error.to_string())?;
     let file = object::File::parse(elf.as_slice()).map_err(|error| error.to_string())?;
@@ -350,34 +355,44 @@ pub fn inside(args: &[String]) -> Result<(), String> {
         .replace("__OFFSET__", &format!("0x{offset:x}"))
         .replace("__CAP__", &MAX_EVENTS.to_string());
     let frida = unsafe { Frida::obtain() };
+    stage(&stage_path, "frida initialized");
     let manager = DeviceManager::obtain(&frida);
+    stage(&stage_path, "device manager acquired");
     let mut device = manager
         .get_local_device()
         .map_err(|error| error.to_string())?;
+    stage(&stage_path, "local device acquired");
     let argv = std::iter::once(program.as_str()).chain(args[6..].iter().map(String::as_str));
     let options = SpawnOptions::new().argv(argv).stdio(SpawnStdio::Inherit);
     let pid = device
         .spawn(program, &options)
         .map_err(|error| error.to_string())?;
+    stage(&stage_path, "target spawned paused");
     let result = (|| {
         let session = device.attach(pid).map_err(|error| error.to_string())?;
+        stage(&stage_path, "target attached");
         let mut script_options = ScriptOption::new()
             .set_name("hydir-observer")
             .set_runtime(ScriptRuntime::QJS);
         let mut script = session
             .create_script(&source, &mut script_options)
             .map_err(|error| error.to_string())?;
+        stage(&stage_path, "script created");
         let collector = Arc::new(Mutex::new(Collector::default()));
         script
             .handle_message(Handler(collector.clone()))
             .map_err(|error| error.to_string())?;
+        stage(&stage_path, "message handler installed");
         script.load().map_err(|error| error.to_string())?;
+        stage(&stage_path, "script loaded");
         device.resume(pid).map_err(|error| error.to_string())?;
+        stage(&stage_path, "target resumed");
         let start = Instant::now();
         while !session.is_detached() && start.elapsed() < Duration::from_millis(timeout_ms) {
             thread::sleep(Duration::from_millis(10));
         }
         let timed_out = !session.is_detached();
+        stage(&stage_path, "target detached or timed out");
         thread::sleep(Duration::from_millis(50));
         let state = collector.lock().map_err(|_| "collector lock poisoned")?;
         let base = state.base.ok_or("Frida agent did not report module base")?;
@@ -455,6 +470,12 @@ pub fn inside(args: &[String]) -> Result<(), String> {
 fn parse_address(value: &str) -> Result<u64, String> {
     u64::from_str_radix(value.trim_start_matches("0x"), 16)
         .map_err(|_| "invalid hex address".into())
+}
+
+fn stage(path: &str, label: &str) {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{label}");
+    }
 }
 
 fn file_backed_byte(file: &object::File<'_>, elf: &[u8], address: u64) -> Option<u8> {
