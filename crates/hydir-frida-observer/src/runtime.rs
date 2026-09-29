@@ -12,7 +12,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -256,7 +256,9 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
                 (libc::RLIMIT_AS, memory),
                 (libc::RLIMIT_CPU, cpu_seconds),
                 (libc::RLIMIT_CORE, 0),
-                (libc::RLIMIT_FSIZE, 1024 * 1024),
+                // Frida materializes its agent through a memfd. A 1 MiB file
+                // limit aborts injection before the target starts.
+                (libc::RLIMIT_FSIZE, 256 * 1024 * 1024),
             ] {
                 let value = libc::rlimit {
                     rlim_cur: limit,
@@ -288,7 +290,9 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
         thread::sleep(Duration::from_millis(10));
     };
     if !exit.success() {
-        let stderr = fs::read(&stderr_path).unwrap_or_default();
+        let stderr = fs::File::open(&stderr_path)
+            .and_then(|file| file.take(4096).bytes().collect::<std::io::Result<Vec<_>>>())
+            .unwrap_or_default();
         return Err(format!(
             "isolated Frida helper failed: {}",
             String::from_utf8_lossy(&stderr[..stderr.len().min(4096)])
@@ -297,6 +301,12 @@ pub fn observe(elf: &[u8], input: &InputSpec, selected: u64) -> Result<DynamicTr
     let json =
         fs::read(result_path).map_err(|error| format!("Frida trace file missing: {error}"))?;
     let mut trace = hydir_execution::parse_dynamic_trace(&json)?;
+    for path in [&stdout_path, &stderr_path] {
+        if fs::metadata(path).map_err(|error| error.to_string())?.len() > input.budget.output_bytes
+        {
+            return Err("observed target output exceeded InputSpec budget".into());
+        }
+    }
     let stdout = fs::read(stdout_path).map_err(|error| error.to_string())?;
     let stderr = fs::read(stderr_path).map_err(|error| error.to_string())?;
     if stdout.len() + stderr.len() > input.budget.output_bytes as usize {
