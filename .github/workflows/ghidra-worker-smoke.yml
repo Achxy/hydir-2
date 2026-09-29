@@ -1,0 +1,524 @@
+name: Ghidra worker smoke
+
+on:
+  push:
+    branches: [hydir-launch]
+    paths:
+      - .github/workflows/ghidra-worker-smoke.yml
+      - crates/hydir-ghidra-worker/**
+      - crates/hydir-cli/**
+      - crates/hydir-decompile/**
+      - crates/hydir-hlc/**
+      - crates/hydir-model/**
+      - crates/hydir-gui/**
+      - crates/hydir-ir/**
+      - crates/hydir-server/**
+      - integrations/ghidra/Dockerfile.worker
+      - integrations/ghidra/HydIRSnapshot.java
+      - scripts/demo-ghidra-password-lift.sh
+      - scripts/check-ghidra-opt-matrix.py
+      - scripts/check-ghidra-call-loop.py
+      - scripts/check-ghidra-aggregate-walk.py
+      - scripts/check-ghidra-float-compare.py
+      - scripts/check-ghidra-frame-holdout.py
+      - tests/fixtures/hydir_password_demo.c
+      - tests/fixtures/hydir_aggregate_walk.c
+      - tests/fixtures/ghidra_float_compare.S
+      - tests/fixtures/hydir_frame_holdout.c
+      - tests/fixtures/ghidra_frame_holdout_native.gdb
+      - tests/fixtures/prism_bit_gate_native.gdb
+      - tests/fixtures/ghidra_matrix_native.gdb
+      - tests/fixtures/ghidra_aggregate_native.gdb
+      - tests/fixtures/ghidra_prototype.elf
+      - tests/fixtures/ghidra_add_zero.S
+      - tests/fixtures/ghidra_add_zero.elf
+      - tests/fixtures/ghidra_add_zero_v2.json
+      - 'tests/fixtures/ghidra_userop_rdtsc*'
+      - 'tests/fixtures/ghidra_division*'
+      - tests/fixtures/ghidra_indirect_jump.S
+      - tests/fixtures/ghidra_indirect_jump.elf
+      - tests/fixtures/ghidra_indirect_jump_v2.json
+      - 'tests/fixtures/ghidra_choose_*'
+      - tests/fixtures/hydir-password-gate-stripped.elf
+      - tests/fixtures/ghidra_password_mix_o1_v2.json
+  pull_request:
+    paths:
+      - .github/workflows/ghidra-worker-smoke.yml
+      - crates/hydir-ghidra-worker/**
+      - crates/hydir-cli/**
+      - crates/hydir-decompile/**
+      - crates/hydir-hlc/**
+      - crates/hydir-model/**
+      - crates/hydir-gui/**
+      - crates/hydir-ir/**
+      - crates/hydir-server/**
+      - integrations/ghidra/Dockerfile.worker
+      - integrations/ghidra/HydIRSnapshot.java
+      - scripts/demo-ghidra-password-lift.sh
+      - scripts/check-ghidra-opt-matrix.py
+      - scripts/check-ghidra-call-loop.py
+      - scripts/check-ghidra-aggregate-walk.py
+      - scripts/check-ghidra-float-compare.py
+      - scripts/check-ghidra-frame-holdout.py
+      - tests/fixtures/hydir_password_demo.c
+      - tests/fixtures/hydir_aggregate_walk.c
+      - tests/fixtures/ghidra_float_compare.S
+      - tests/fixtures/hydir_frame_holdout.c
+      - tests/fixtures/ghidra_frame_holdout_native.gdb
+      - tests/fixtures/prism_bit_gate_native.gdb
+      - tests/fixtures/ghidra_matrix_native.gdb
+      - tests/fixtures/ghidra_aggregate_native.gdb
+      - tests/fixtures/ghidra_prototype.elf
+      - tests/fixtures/ghidra_add_zero.S
+      - tests/fixtures/ghidra_add_zero.elf
+      - tests/fixtures/ghidra_add_zero_v2.json
+      - 'tests/fixtures/ghidra_userop_rdtsc*'
+      - 'tests/fixtures/ghidra_division*'
+      - tests/fixtures/ghidra_indirect_jump.S
+      - tests/fixtures/ghidra_indirect_jump.elf
+      - tests/fixtures/ghidra_indirect_jump_v2.json
+      - 'tests/fixtures/ghidra_choose_*'
+      - tests/fixtures/hydir-password-gate-stripped.elf
+      - tests/fixtures/ghidra_password_mix_o1_v2.json
+  workflow_dispatch:
+
+jobs:
+  container-frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Run Hydir's automatic container worker on a real ELF
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            tests/fixtures/ghidra_prototype.elf \
+            --output "$RUNNER_TEMP/ghidra-snapshot.json" \
+            --function 0x101320
+          cargo run --locked -p hydir-cli -- ghidra-snapshot verify \
+            tests/fixtures/ghidra_prototype.elf \
+            "$RUNNER_TEMP/ghidra-snapshot.json"
+          python3 - "$RUNNER_TEMP/ghidra-snapshot.json" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          binary = pathlib.Path('tests/fixtures/ghidra_prototype.elf').read_bytes()
+          assert snapshot['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          selected = snapshot['selected_function']
+          assert selected['entry']['offset'] == '0x101320'
+          assert selected['instructions']
+          assert any(row['pcode'] for row in selected['instructions'])
+          high = selected.get('high_pcode')
+          assert high and high['source'] == 'ghidra_decompiler'
+          assert high['status'] == 'complete' and high['operations']
+          PY
+      - name: Import and lift a stripped demo ELF without manual Ghidra work
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            tests/fixtures/hydir-password-gate-stripped.elf \
+            --function 0x2015d0 \
+            --output "$RUNNER_TEMP/hydir-password-snapshot.json"
+          python3 - "$RUNNER_TEMP/hydir-password-snapshot.json" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          binary = pathlib.Path('tests/fixtures/hydir-password-gate-stripped.elf').read_bytes()
+          assert snapshot['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          assert len(snapshot['functions']) == 7
+          selected = snapshot['selected_function']
+          assert selected['entry']['offset'] == '0x2015d0'
+          operations = [op for row in selected['instructions'] for op in row['pcode']]
+          assert len(operations) == 105
+          imul = [op for op in operations if op['source_address']['offset'] == '0x2015ee']
+          assert len(imul) == 8
+          assert len([op for op in imul if op['output'] and op['output']['size'] == 16]) == 4
+          PY
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg \
+            tests/fixtures/hydir-password-gate-stripped.elf \
+            "$RUNNER_TEMP/hydir-password-snapshot.json" \
+            --output "$RUNNER_TEMP/hydir-password-llvm.json"
+          python3 - "$RUNNER_TEMP/hydir-password-llvm.json" \
+            "$RUNNER_TEMP/hydir-password.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert len(artifact['source_operations']) == 105
+          assert 'mul i128' in artifact['llvm_ir']
+          assert not any(site['address']['offset'] == '0x2015ee' and
+                         site['status'] == 'opaque_effect'
+                         for site in artifact['stop_sites'])
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/hydir-password.ll" \
+            -o "$RUNNER_TEMP/hydir-password.o"
+      - name: Probe the Hydir desktop import path with the container worker
+        env:
+          HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-demo.sqlite
+        run: |
+          cargo run --locked -p hydir-gui --bin hydir -- \
+            --probe-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf 0x2015d0
+          cargo run --locked -p hydir-gui --bin hydir -- \
+            --probe-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf 0x2016d0
+      - name: Render the automatic Hydir and Ghidra desktop workflow
+        env:
+          HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-render.sqlite
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libxkbcommon-x11-0 tesseract-ocr
+          xvfb-run -a -s "-screen 0 1600x1000x24" \
+            target/debug/hydir \
+              --render-ghidra-demo tests/fixtures/hydir-password-gate-stripped.elf \
+              0x2016d0 "$RUNNER_TEMP/hydir-gui-render"
+          python3 - "$RUNNER_TEMP/hydir-gui-render" <<'PY'
+          import json
+          import pathlib
+          import struct
+          import subprocess
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          manifest = json.loads((output / 'manifest.json').read_text())
+          assert manifest['selected_function'] == '0x2016d0'
+          assert manifest['function_count'] >= 7
+          assert manifest['pcode_rows'] > 0
+          assert manifest['state_rows'] > 0
+          assert manifest['llvm_source_operations'] > 0
+          assert manifest['disassembly_instructions'] > 0
+          for name in manifest['screenshots']:
+              image = output / name
+              data = image.read_bytes()
+              assert data[:8] == b'\x89PNG\r\n\x1a\n', name
+              width, height = struct.unpack('>II', data[16:24])
+              assert width >= 1200 and height >= 700, (name, width, height)
+              ocr = subprocess.run(
+                  ['tesseract', str(image), 'stdout', '--psm', '11'],
+                  check=True, capture_output=True, text=True,
+              ).stdout.casefold()
+              (output / f'{name}.txt').write_text(ocr)
+              assert 'hydir' in ocr, (name, ocr)
+              if name == 'ghidra-pcode.png':
+                  assert 'ghidra' in ocr and 'p-code' in ocr, ocr
+              else:
+                  assert 'disassembly' in ocr and 'instructions' in ocr, ocr
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hydir-gui-render-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hydir-gui-render/
+          if-no-files-found: warn
+      - name: Reproduce the stripped password lifting demo
+        run: bash scripts/demo-ghidra-password-lift.sh
+      - name: Differential Ghidra matrix across optimization and DWARF variants
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdb
+          python3 scripts/check-ghidra-opt-matrix.py \
+            --output-dir "$RUNNER_TEMP/ghidra-opt-matrix"
+      - name: Differential Ghidra loop and repeated-call paths
+        run: |
+          python3 scripts/check-ghidra-call-loop.py \
+            --matrix-dir "$RUNNER_TEMP/ghidra-opt-matrix"
+      - name: Differential Ghidra aggregate pointer traversal
+        run: |
+          python3 scripts/check-ghidra-aggregate-walk.py \
+            --output-dir "$RUNNER_TEMP/ghidra-aggregate-walk"
+      - name: Differential Ghidra floating-point comparisons
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18
+          PATH="/usr/lib/llvm-18/bin:$PATH" python3 scripts/check-ghidra-float-compare.py \
+            --output-dir "$RUNNER_TEMP/ghidra-float-compare"
+      - name: Differential stripped frame parser holdout
+        run: |
+          python3 scripts/check-ghidra-frame-holdout.py \
+            --output-dir "$RUNNER_TEMP/ghidra-frame-holdout"
+      - name: Import a closed analyst-edited Ghidra project
+        run: |
+          project="$RUNNER_TEMP/ghidra-analyst-project"
+          mkdir -p "$project"
+          unzip -q tests/fixtures/ghidra_userop_rdtsc_project.zip -d "$project"
+          find "$project" -type f -print0 | sort -z | xargs -0 sha256sum \
+            > "$RUNNER_TEMP/ghidra-project-before.sha256"
+          cargo run --locked -p hydir-cli -- ghidra import-project \
+            tests/fixtures/ghidra_userop_rdtsc.elf \
+            "$project/HydirAuto.gpr" \
+            --program ghidra_userop_rdtsc.elf --function 0x201174 \
+            --output "$RUNNER_TEMP/ghidra-analyst-snapshot.json"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot verify \
+            tests/fixtures/ghidra_userop_rdtsc.elf \
+            "$RUNNER_TEMP/ghidra-analyst-snapshot.json"
+          python3 - "$RUNNER_TEMP/ghidra-analyst-snapshot.json" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          binary = pathlib.Path('tests/fixtures/ghidra_userop_rdtsc.elf').read_bytes()
+          assert snapshot['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          assert snapshot['selected_function']['entry']['offset'] == '0x201174'
+          assert any(f['entry']['offset'] == '0x201174' and
+                     f['name'] == 'hydir_analyst_rdtsc'
+                     for f in snapshot['functions'])
+          PY
+          find "$project" -type f -print0 | sort -z | xargs -0 sha256sum \
+            > "$RUNNER_TEMP/ghidra-project-after.sha256"
+          diff -u "$RUNNER_TEMP/ghidra-project-before.sha256" \
+            "$RUNNER_TEMP/ghidra-project-after.sha256"
+          if cargo run --locked -p hydir-cli -- ghidra import-project \
+            tests/fixtures/ghidra_prototype.elf \
+            "$project/HydirAuto.gpr" \
+            --program ghidra_userop_rdtsc.elf --function 0x201174 \
+            --output "$RUNNER_TEMP/ghidra-wrong-binary-snapshot.json"; then
+            echo 'Mismatched binary was accepted' >&2
+            exit 1
+          fi
+          test ! -f "$RUNNER_TEMP/ghidra-wrong-binary-snapshot.json"
+      - name: Export real unsigned and signed division P-code
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            tests/fixtures/ghidra_division.elf --function 0x201174 \
+            --output "$RUNNER_TEMP/ghidra-divide-unsigned.json"
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            tests/fixtures/ghidra_division.elf --function 0x201177 \
+            --output "$RUNNER_TEMP/ghidra-divide-signed.json"
+          python3 - "$RUNNER_TEMP/ghidra-divide-unsigned.json" \
+            "$RUNNER_TEMP/ghidra-divide-signed.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          for path, expected in [(sys.argv[1], {33, 35}),
+                                 (sys.argv[2], {34, 36})]:
+              snapshot = json.loads(pathlib.Path(path).read_text())
+              selected = snapshot['selected_function']
+              opcodes = {op['opcode'] for row in selected['instructions']
+                         for op in row['pcode']}
+              assert expected <= opcodes
+              assert selected['high_pcode']['status'] == 'complete'
+          PY
+      - name: Rewrite one real Ghidra raw P-code operation
+        run: |
+          clang -nostdlib -no-pie tests/fixtures/ghidra_add_zero.S \
+            -o "$RUNNER_TEMP/ghidra-add-zero.elf"
+          entry="0x$(nm -g "$RUNNER_TEMP/ghidra-add-zero.elf" | awk '$3 == "hydir_add_zero" { print $1 }')"
+          test "$entry" != 0x
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            "$RUNNER_TEMP/ghidra-add-zero.elf" \
+            --output "$RUNNER_TEMP/ghidra-add-zero-snapshot.json" \
+            --function "$entry"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot simplify \
+            "$RUNNER_TEMP/ghidra-add-zero.elf" \
+            "$RUNNER_TEMP/ghidra-add-zero-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-add-zero-rewrite.json"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-simplified \
+            "$RUNNER_TEMP/ghidra-add-zero.elf" \
+            "$RUNNER_TEMP/ghidra-add-zero-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-add-zero-llvm.json"
+          python3 - "$RUNNER_TEMP/ghidra-add-zero-rewrite.json" "$RUNNER_TEMP/ghidra-add-zero-llvm.json" "$RUNNER_TEMP/ghidra-add-zero.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert artifact['source'] == 'hydir_checked_pcode_simplification'
+          assert artifact['verification'] == 'not_run'
+          assert artifact['semantic_fidelity'] == 'unknown'
+          assert len(artifact['rewrites']) == 1
+          rewrite = artifact['rewrites'][0]
+          assert rewrite['rule'] == 'add_zero_to_copy'
+          assert rewrite['before']['mnemonic'] == 'INT_ADD'
+          assert rewrite['after']['mnemonic'] == 'COPY'
+          assert rewrite['source_address'] == rewrite['before']['source_address']
+          assert artifact['after']['source'] == artifact['source']
+          transformed = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          assert transformed['simplification'] == artifact
+          assert transformed['binary_sha256'] == artifact['binary_sha256']
+          assert transformed['verification'] == 'not_run'
+          assert transformed['llvm']['verification'] == 'not_run'
+          assert any(op['mnemonic'] == 'COPY' and op['address'] == rewrite['source_address']
+                     for op in transformed['llvm']['source_operations'])
+          pathlib.Path(sys.argv[3]).write_text(transformed['llvm']['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/ghidra-add-zero.ll" -o "$RUNNER_TEMP/ghidra-add-zero.o"
+      - name: Stop explicitly at a real Ghidra user operation
+        run: |
+          clang -nostdlib -no-pie tests/fixtures/ghidra_userop_rdtsc.S \
+            -o "$RUNNER_TEMP/ghidra-userop.elf"
+          entry="0x$(nm -g "$RUNNER_TEMP/ghidra-userop.elf" | awk '$3 == "hydir_rdtsc" { print $1 }')"
+          test "$entry" != 0x
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            "$RUNNER_TEMP/ghidra-userop.elf" \
+            --output "$RUNNER_TEMP/ghidra-userop-snapshot.json" \
+            --function "$entry"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg \
+            "$RUNNER_TEMP/ghidra-userop.elf" \
+            "$RUNNER_TEMP/ghidra-userop-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-userop-llvm.json"
+          python3 - "$RUNNER_TEMP/ghidra-userop-snapshot.json" "$RUNNER_TEMP/ghidra-userop-llvm.json" "$RUNNER_TEMP/ghidra-userop.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          llvm = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          userop = snapshot['selected_function']['instructions'][0]['pcode'][0]
+          assert userop['mnemonic'] == 'CALLOTHER'
+          assert userop['userop_name'] == 'rdtsc'
+          assert llvm['semantic_fidelity'] == 'unknown'
+          assert llvm['source_operations'][0]['userop_name'] == 'rdtsc'
+          assert any(site['status'] == 'opaque_effect' and
+                     site['address'] == userop['source_address'] and
+                     site['operation_index'] == 0 for site in llvm['stop_sites'])
+          pathlib.Path(sys.argv[3]).write_text(llvm['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/ghidra-userop.ll" \
+            -o "$RUNNER_TEMP/ghidra-userop.o"
+      - name: Follow a direct call with automatic callee export
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra trace-calls \
+            demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json \
+            --function 0x2013a9 --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-call-trace.json"
+          python3 - "$RUNNER_TEMP/ghidra-call-trace.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          trace = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert trace['stop']['kind'] == 'return'
+          assert len(trace['segments']) == 3
+          assert len(trace['calls']) == 1
+          assert trace['calls'][0]['callee_entry']['offset'] == '0x2013a2'
+          assert trace['final_state']['register_bytes']['0'] == 12
+          assert trace['snapshot_diagnostics'] == []
+          PY
+      - name: Resolve a concrete indirect call with automatic callee export
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra trace-calls \
+            tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json \
+            --function 0x20117c --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-indirect-call-trace.json"
+          python3 - "$RUNNER_TEMP/ghidra-indirect-call-trace.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          trace = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert trace['stop']['kind'] == 'return'
+          assert len(trace['segments']) == 3
+          assert len(trace['calls']) == 1
+          assert trace['calls'][0]['callee_entry']['offset'] == '0x201174'
+          assert trace['final_state']['register_bytes']['0'] == 7
+          assert trace['snapshot_diagnostics'] == []
+          PY
+      - name: Lift the automatically reached callee into one LLVM module
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls \
+            tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json \
+            --function 0x20117c --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-call-module.json"
+          python3 - "$RUNNER_TEMP/ghidra-call-module.json" "$RUNNER_TEMP/ghidra-call-module.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert len(artifact['function_entries']) == 2
+          assert artifact['function_entries'][1]['offset'] == '0x201174'
+          assert len(artifact['snapshot_sha256']) == 2
+          assert artifact['snapshot_diagnostics'] == []
+          assert artifact['semantic_fidelity'] == 'unknown'
+          assert any(op['mnemonic'] == 'CALLIND' for op in artifact['llvm']['source_operations'])
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm']['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/ghidra-call-module.ll" \
+            -o "$RUNNER_TEMP/ghidra-call-module.o"
+      - name: Export only the reached callee under a two-function budget
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra trace-calls \
+            tests/fixtures/ghidra_choose_calls.elf \
+            tests/fixtures/ghidra_choose_left_seed_v1.json \
+            --function 0x201174 --max-functions 2 \
+            --output "$RUNNER_TEMP/ghidra-chosen-call-trace.json"
+          python3 - "$RUNNER_TEMP/ghidra-chosen-call-trace.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          trace = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert trace['stop']['kind'] == 'return'
+          assert len(trace['calls']) == 1
+          assert trace['calls'][0]['callee_entry']['offset'] == '0x20118d'
+          assert len(trace['segments']) == 3
+          assert all(segment['function_entry']['offset'] != '0x201185'
+                     for segment in trace['segments'])
+          assert trace['final_state']['register_bytes']['0'] == 1
+          assert trace['snapshot_diagnostics'] == []
+          PY
+      - name: Export and compile a real indirect-jump LLVM path
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra analyze \
+            tests/fixtures/ghidra_indirect_jump.elf \
+            --function 0x201174 \
+            --output "$RUNNER_TEMP/ghidra-indirect-jump-snapshot.json"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg \
+            tests/fixtures/ghidra_indirect_jump.elf \
+            "$RUNNER_TEMP/ghidra-indirect-jump-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-indirect-jump-llvm.json"
+          python3 - "$RUNNER_TEMP/ghidra-indirect-jump-llvm.json" "$RUNNER_TEMP/ghidra-indirect-jump.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert any(op['mnemonic'] == 'BRANCHIND' for op in artifact['source_operations'])
+          assert 'switch i64 %indirect_value_' in artifact['llvm_ir']
+          assert artifact['semantic_fidelity'] == 'unknown'
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/ghidra-indirect-jump.ll" \
+            -o "$RUNNER_TEMP/ghidra-indirect-jump.o"
+      - name: Run the automatic v3 RPC against the same container worker
+        run: |
+          cargo test --locked -p hydir-server --bin hydird \
+            automatic_ghidra_worker_exports_selected_real_elf -- --ignored
+      - name: Trace a direct call through the automatic v3 RPC
+        run: |
+          cargo test --locked -p hydir-server --bin hydird \
+            automatic_ghidra_call_trace_collects_real_prism_callee -- --ignored
+      - name: Retain snapshot and Ghidra diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-worker-smoke
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/ghidra-snapshot.json
+            ${{ runner.temp }}/ghidra-analyst-snapshot.json
+            ${{ runner.temp }}/ghidra-divide-unsigned.json
+            ${{ runner.temp }}/ghidra-divide-signed.json
+            ${{ runner.temp }}/ghidra-add-zero-snapshot.json
+            ${{ runner.temp }}/ghidra-add-zero-rewrite.json
+            ${{ runner.temp }}/ghidra-add-zero-llvm.json
+            ${{ runner.temp }}/ghidra-call-trace.json
+            ${{ runner.temp }}/ghidra-indirect-call-trace.json
+            ${{ runner.temp }}/ghidra-chosen-call-trace.json
+            ${{ runner.temp }}/ghidra-indirect-jump-snapshot.json
+            ${{ runner.temp }}/ghidra-indirect-jump-llvm.json
+            target/demo-ghidra-password-lift/run.*/
+            ${{ runner.temp }}/ghidra-opt-matrix/report.json
+            ${{ runner.temp }}/ghidra-float-compare/report.json
+            ${{ runner.temp }}/ghidra-frame-holdout/report.json

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use hydir_analysis::{analyze_elf, analyze_spec_elf};
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, extract_symbol_code, import_elf, lift_at,
@@ -13,13 +15,31 @@ use hydir_core::{
 };
 use hydir_decompile::{
     NativeDecompilation, decompile_function_at, decompile_function_unit_at,
-    decompile_indexed_function_unit, decompile_symbol, decompile_symbol_unit,
-    discover_function_candidates, discover_functions, export_function_ir_llvm,
-    lift_machine_function, lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
-    measure_native_coverage,
+    decompile_indexed_function, decompile_indexed_function_unit, decompile_symbol,
+    decompile_symbol_unit, discover_function_candidates, discover_functions,
+    export_function_ir_llvm, lift_machine_function, lift_machine_function_at, lower_cir,
+    lower_expression_ir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
+use hydir_execution::{
+    InputSpec, ProbeLocation, ReplayBudget, ReplayGoal, build_snapshot_resume_plan,
+    input_with_origin_candidate, parse_execution_snapshot, parse_input_spec, parse_origin_probe,
+    parse_snapshot_resume_plan, probe_origin, validate_execution_snapshot, validate_input_spec,
+    validate_origin_probe, validate_snapshot_bridge_result, validate_snapshot_resume_plan,
+};
+use hydir_ghidra_worker as ghidra_worker;
+use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
+use hydir_ir::pcode::{
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeReadOnlyElfImage,
+    PcodeSliceTarget, parse_ghidra_snapshot, parse_pcode_seed,
+};
+use hydir_model::{
+    import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
+};
+use hydir_project::{LocalProjectStore, default_db_path};
+use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod ghidra_calls;
 mod local;
 mod passes;
 mod patch;
@@ -38,7 +58,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELP: &str = "HydIR native x86-64 ELF vertical slice
+const HELP: &str = "Hydir: Ghidra-backed binary lifting and reverse engineering
 
 Usage:
   hydirctl doctor
@@ -48,6 +68,31 @@ Usage:
   hydirctl triton <elf> <function-symbol>
   hydirctl triton-console < request.json
   hydirctl analyze <linked-elf>
+  hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
+  hydirctl ghidra llvm-cfg-image <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-image.json>]
+  hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
+  hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra-project save <elf> <snapshot.json>
+  hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
+  hydirctl ghidra-snapshot verify <binary> <snapshot.json>
+  hydirctl ghidra-snapshot pcode <binary> <snapshot.json> [--output <pcode-ir.json>]
+  hydirctl ghidra-snapshot simplify <binary> <snapshot.json> [--output <simplification.json>]
+  hydirctl ghidra-snapshot semantics <binary> <snapshot.json> [--output <semantic-ir.json>]
+  hydirctl ghidra-snapshot state <binary> <snapshot.json> [--output <state-ir.json>]
+  hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
+  hydirctl ghidra-snapshot coverage <binary> <snapshot.json> [--output <coverage.json>]
+  hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
+  hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
+  hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-image <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-image.json>]
+  hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
+  hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
   hydirctl hydir-spec-region <hydir-spec.pb> <linked-elf> <block-uid> [--output <region.json>]
@@ -58,14 +103,35 @@ Usage:
   hydirctl region <elf> <function-symbol>
   hydirctl cfg-at <linked-elf> <virtual-address-hex> <size-bytes>
   hydirctl lift <elf> <function-symbol> --assume-u64x2 [--output <file.ll>]
-  hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|function|cir|llvm>
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir <machine|state|expression|function|cir|llvm>
+  hydirctl lift <elf> --function <function-id-or-symbol> --ir <high-level|high-level-cfg> --model <model.json>
   hydirctl lift-model <linked-elf> <function-symbol> <program-spec.json> [--output <file.ll>]
   hydirctl lift-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.ll>]
   hydirctl decompile <elf> <function-symbol> --assume-u64x2 [--output <file.c>]
   hydirctl decompile <elf> --function <function-id-or-symbol> --view <low|structured|unit>
+  hydirctl decompile <elf> --function <function-id-or-symbol> --view typed --model <model.json>
   hydirctl decompile-all <elf> --output-dir <new-directory>
   hydirctl explain <elf> --function <function-id-or-symbol> [--address <hex-address>]
   hydirctl coverage <elf>
+  hydirctl model init <elf> [--output <model.json>]
+  hydirctl model verify <elf> <model.json>
+  hydirctl model import-dwarf <elf> <model.json> [--output <new-model.json>]
+  hydirctl model import-ghidra <elf> <model.json> <snapshot.json> [--output <new-model.json>]
+  hydirctl model infer <elf> <model.json> [--output <new-model.json>]
+  hydirctl vm-profile <linked-elf> <profile.json>
+  hydirctl vm-explore <linked-elf> <profile.json>
+  hydirctl replay init <linked-elf> [--output <input.json>]
+  hydirctl replay verify <linked-elf> <input.json>
+  hydirctl replay <linked-elf> <input.json> [--output <report.json>]
+  hydirctl capture <linked-elf> <input.json> (--function <symbol> | --address <elf-vaddr>) [--output <snapshot.json>]
+  hydirctl snapshot verify <linked-elf> <input.json> <snapshot.json>
+  hydirctl snapshot probe-origin <linked-elf> <input.json> <snapshot.json> <origin-id> --register <name> [--output <probe.json>]
+  hydirctl snapshot verify-origin <linked-elf> <input.json> <snapshot.json> <probe.json>
+  hydirctl snapshot plan-return <linked-elf> <input.json> <snapshot.json> <probe.json> --code-bytes <n> --return <u64> [--output <plan.json>]
+  hydirctl snapshot verify-plan <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json>
+  hydirctl solve snapshot-return <linked-elf> <input.json> <snapshot.json> <probe.json> <plan.json> [--candidate-output <input.json>] [--slice-output <slice.json>] [--claim-output <claim.json>] [--recipe-output <recipe.json>] [--output <report.json>]
+  hydirctl recipe verify <linked-elf> <recipe.json> [--output <verification.json>]
+  hydirctl recipe replay <linked-elf> <recipe.json> [--output <replay.json>]
   hydirctl decompile-unit <elf> <function-symbol> --assume-u64x2 [--output <unit.json>]
   hydirctl decompile-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 [--output <file.c>]
   hydirctl patch <linked-elf> <patch-v1.json> --trusted-fixture --assume-u64x2 --assume-entry-only --output <new.elf>
@@ -77,6 +143,9 @@ Usage:
   hydirctl validate-c-at <linked-elf> <virtual-address-hex> <size-bytes> --assume-u64x2 --trusted-fixture [--clang <path>] [--random-cases <n>]
   hydirctl local <project|inspect|analyze-spec|annotations> <elf> [--db <private-sqlite>]
   hydirctl local annotate <elf> <revision> <idempotency-key> <name|comment|assumption> <hex-address|-> <scope> <value> [--db <private-sqlite>]
+  hydirctl local model <elf> [--db <private-sqlite>]
+  hydirctl local model-put <elf> <revision> <idempotency-key> <model.json> [--db <private-sqlite>]
+  hydirctl local decompile-typed <elf> <function-id-or-symbol> [--db <private-sqlite>]
   hydirctl remote <operation> ...
 
 Legacy symbol mode requires a non-stripped function symbol. Native --function
@@ -88,6 +157,16 @@ address mode requires an analyst-supplied virtual entry and exact byte extent,
 and works on stripped linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
+Replay uses an experimental local Linux Bubblewrap runner. Other hosts return
+an unsupported-host report. See docs/REPLAY_PROTOCOL.md for its current scope.
+Capture uses GDB/MI in the same Linux isolation and stops at a simple C symbol
+or a file-backed executable ELF virtual address, including stripped PIE code.
+It currently supports one thread and emits a sparse snapshot.
+An origin probe checks bytes at an analyst-selected register location against
+one InputSpec origin. A match is byte equality, not channel provenance.
+Snapshot return solving is experimental and limited to a captured pure code
+extent. A Triton function witness becomes native-validated only after fresh
+original-ELF replay meets the InputSpec goal.
 Rebuild supports local and authenticated-loopback operations for a narrow
 freestanding static x86-64 ELF subset; it requires pinned Clang/LLVM 14.0.6
 and is not a hostile-binary sandbox. The remote server never executes samples.
@@ -100,6 +179,46 @@ command. ELF bytes are never written to that database.
 
 const EMBEDDED_TRITON_HELPER: &str = include_str!("../../../scripts/triton_bridge.py");
 
+fn probe_bubblewrap_isolation() -> bool {
+    if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
+        return false;
+    }
+    let Ok(mut child) = Command::new("bwrap")
+        .args([
+            "--unshare-user",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("hydirctl: {err}");
@@ -110,6 +229,1224 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("ghidra-project") if args.len() == 4 && args[1] == "save" => {
+            let binary = read_binary(&args[2])?;
+            let spec = import_elf(&binary)?;
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &spec.binary_sha256,
+            )?;
+            let mut store = LocalProjectStore::open(&default_db_path()?)?;
+            let project = store.open_binary(Path::new(&args[2]), &spec)?;
+            store.save_ghidra_snapshot(&project, &snapshot)?;
+            let mut model = match store.load_model(&project)? {
+                Some(model) => model,
+                None => init_model(&binary)?,
+            };
+            let previous = model.clone();
+            import_ghidra_functions(&binary, &mut model, &snapshot)?;
+            let project = if model != previous {
+                let snapshot_json = serde_json::to_vec(&snapshot)?;
+                let key = format!(
+                    "ghidra-{:x}-r{}",
+                    sha2::Sha256::digest(snapshot_json),
+                    project.revision
+                );
+                store.save_model(&project, &model, &key)?
+            } else {
+                project
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "project_id": project.id,
+                    "revision": project.revision,
+                    "binary_sha256": project.binary_sha256,
+                    "selected_function": snapshot.selected_function.entry,
+                }))?
+            );
+        }
+        Some("ghidra-project")
+            if (args.len() == 5 || args.len() == 7 && args[5] == "--output")
+                && args[1] == "get"
+                && args[3] == "--function" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let spec = import_elf(&binary)?;
+            let address = parse_u64_auto(&args[4], "Ghidra function entry")?;
+            let entry = hydir_ir::pcode::PcodeAddress {
+                space: "ram".to_owned(),
+                offset: format!("0x{address:x}"),
+            };
+            let mut store = LocalProjectStore::open(&default_db_path()?)?;
+            let project = store.open_binary(Path::new(&args[2]), &spec)?;
+            let snapshot = store
+                .load_ghidra_snapshot(&project, &entry)?
+                .ok_or("No saved Ghidra snapshot for that binary and function")?;
+            let content = serde_json::to_vec_pretty(&snapshot)?;
+            if args.len() == 7 {
+                write_new_or_identical(&args[6], &content)?;
+            } else {
+                println!("{}", String::from_utf8(content)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if args.len() >= 4
+                && matches!(
+                    args[1].as_str(),
+                    "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-simplified"
+                ) =>
+        {
+            let mut start_address = None;
+            let mut output_path = None;
+            let mut options = args[4..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--start" if start_address.is_none() => {
+                        start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: format!("0x{address:x}"),
+            });
+            let bytes = match args[1].as_str() {
+                "llvm-cfg-simplified" => serde_json::to_vec_pretty(
+                    &hydir_decompile::emit_pcode_simplified_cfg_llvm(&snapshot, start.as_ref())?,
+                )?,
+                "llvm-cfg-image" => {
+                    let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot)?;
+                    let window =
+                        image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+                    serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm_with_image(
+                        &snapshot,
+                        start.as_ref(),
+                        &window,
+                    )?)?
+                }
+                _ => serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm(
+                    &snapshot,
+                    start.as_ref(),
+                )?)?,
+            };
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg-calls" => {
+            let mut callee_paths = Vec::new();
+            let mut max_depth = 4usize;
+            let mut depth_seen = false;
+            let mut output_path = None;
+            let mut options = args[4..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--callee" if callee_paths.len() < 127 => callee_paths.push(pair[1].as_str()),
+                    "--max-depth" if !depth_seen => {
+                        max_depth = pair[1].parse()?;
+                        depth_seen = true;
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let digest = format!("{:x}", sha2::Sha256::digest(read_binary(&args[2])?));
+            let mut snapshots = vec![parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?];
+            for path in callee_paths {
+                snapshots.push(parse_ghidra_snapshot(
+                    &read_bounded_json(path, MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                    &digest,
+                )?);
+            }
+            let bytes = serde_json::to_vec_pretty(
+                &hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?,
+            )?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot") if args.len() >= 8 && args[1] == "slice" => {
+            if args[4] != "--instruction" || args[6] != "--op" {
+                return Err(HELP.into());
+            }
+            let instruction_index = args[5].parse::<u32>()?;
+            let operation_index = args[7].parse::<u32>()?;
+            let mut input_index = None;
+            let mut output_path = None;
+            let mut options = args[8..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--input" if input_index.is_none() => {
+                        input_index = Some(pair[1].parse::<u32>()?)
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let slice = snapshot.backward_pcode_slice(PcodeSliceTarget {
+                instruction_index,
+                operation_index,
+                input_index,
+            })?;
+            let bytes = serde_json::to_vec_pretty(&slice)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra") if args.len() >= 6 && args[1] == "trace-calls" => {
+            ghidra_calls::run_automatic(&args[2..])?;
+        }
+        Some("ghidra") if args.len() >= 6 && args[1] == "llvm-cfg-calls" => {
+            ghidra_calls::run_automatic_llvm(&args[2..])?;
+        }
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-calls" => {
+            ghidra_calls::run_snapshots(&args[2..])?;
+        }
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-path" => {
+            let mut max_operations = 4096usize;
+            let mut max_visits = 1024usize;
+            let mut start_address = None;
+            let mut output_path = None;
+            let mut options = args[5..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--start" if start_address.is_none() => {
+                        start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
+                    }
+                    "--max-ops" => {
+                        max_operations = pair[1].parse()?;
+                        if max_operations > 262_144 {
+                            return Err(
+                                "P-code path operation budget exceeds artifact limit".into()
+                            );
+                        }
+                    }
+                    "--max-visits" => {
+                        max_visits = pair[1].parse()?;
+                        if max_visits > 262_144 {
+                            return Err("P-code path visit budget exceeds artifact limit".into());
+                        }
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let initial = parse_pcode_seed(
+                &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
+                &snapshot,
+            )?;
+            let image = pcode_image_or_legacy(&binary, &snapshot)?;
+            let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: format!("0x{address:x}"),
+            });
+            let trace = if let Some(image) = &image {
+                snapshot.execute_concrete_path_with_image(
+                    &initial,
+                    image,
+                    start.as_ref(),
+                    max_operations,
+                    max_visits,
+                )?
+            } else {
+                snapshot.execute_concrete_path(
+                    &initial,
+                    start.as_ref(),
+                    max_operations,
+                    max_visits,
+                )?
+            };
+            let bytes = serde_json::to_vec_pretty(&trace)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-prefix" => {
+            let mut max_operations = 4096usize;
+            let mut output_path = None;
+            let mut options = args[5..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--max-ops" => {
+                        max_operations = pair[1].parse()?;
+                        if max_operations > 262_144 {
+                            return Err(
+                                "P-code trace operation budget exceeds artifact limit".into()
+                            );
+                        }
+                    }
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let initial = parse_pcode_seed(
+                &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
+                &snapshot,
+            )?;
+            let trace = snapshot
+                .pcode_function_ir()?
+                .execute_exact_prefix(&initial, max_operations)?;
+            let bytes = serde_json::to_vec_pretty(&trace)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if (args.len() == 8 || args.len() == 10 && args[8] == "--output")
+                && args[1] == "llvm-op"
+                && args[4] == "--instruction"
+                && args[6] == "--op" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let requested_address = parse_u64_auto(&args[5], "P-code instruction address")?;
+            let operation_index = args[7].parse::<usize>()?;
+            let semantic = snapshot.pcode_function_ir()?.lower_semantics();
+            let mut matches = semantic.instructions.iter().filter(|instruction| {
+                parse_u64_auto(&instruction.address.offset, "P-code instruction address").ok()
+                    == Some(requested_address)
+            });
+            let instruction = matches
+                .next()
+                .ok_or("P-code instruction address is absent from snapshot")?;
+            if matches.next().is_some() {
+                return Err("P-code instruction address is ambiguous across address spaces".into());
+            }
+            let operation = instruction
+                .operations
+                .get(operation_index)
+                .ok_or("P-code operation index is absent from instruction")?;
+            let llvm = hydir_decompile::emit_pcode_exact_operation_llvm(operation)?;
+            if args.len() == 10 {
+                write_new_or_identical(&args[9], llvm.as_bytes())?;
+            } else {
+                print!("{llvm}");
+            }
+        }
+        Some("ghidra") if args.len() >= 4 && args[1] == "import-project" => {
+            let mut program = None;
+            let mut selected = None;
+            let mut output = None;
+            let mut options = args[4..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--program" if program.is_none() && !pair[1].is_empty() => {
+                        program = Some(pair[1].as_str());
+                    }
+                    "--function" if selected.is_none() => {
+                        selected = Some(parse_u64_auto(&pair[1], "Ghidra function entry")?);
+                    }
+                    "--output" if output.is_none() && !pair[1].is_empty() => {
+                        output = Some(pair[1].as_str());
+                    }
+                    _ => return Err("invalid Ghidra project import option".into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err("Ghidra project import options require values".into());
+            }
+            let program = program.ok_or("Ghidra project import requires --program")?;
+            let output = output.ok_or("Ghidra project import requires --output")?;
+            let snapshot = ghidra_worker::import_project(
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                program,
+                selected,
+                Path::new(output),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "snapshot_path": output,
+                    "binary_sha256": snapshot.binary_sha256,
+                    "functions": snapshot.functions.len(),
+                    "selected_function": snapshot.selected_function.entry,
+                    "instructions": snapshot.selected_function.instructions.len(),
+                    "flow_edges": snapshot.selected_function.flow_edges.len(),
+                    "call_targets": snapshot.selected_function.call_targets.len(),
+                }))?
+            );
+        }
+        Some("ghidra") if args.len() >= 5 && args[1] == "analyze" => {
+            let mut selected = None;
+            let mut output = None;
+            let mut options = args[3..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--function" if selected.is_none() => {
+                        selected = Some(parse_u64_auto(&pair[1], "Ghidra function entry")?);
+                    }
+                    "--output" if output.is_none() && !pair[1].is_empty() => {
+                        output = Some(pair[1].as_str());
+                    }
+                    _ => return Err("invalid Ghidra analysis option".into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err("Ghidra analysis options require values".into());
+            }
+            let output = output.ok_or("Ghidra analysis requires --output")?;
+            let snapshot =
+                ghidra_worker::analyze(Path::new(&args[2]), selected, Path::new(output))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "snapshot_path": output,
+                    "binary_sha256": snapshot.binary_sha256,
+                    "functions": snapshot.functions.len(),
+                    "selected_function": snapshot.selected_function.entry,
+                    "instructions": snapshot.selected_function.instructions.len(),
+                    "flow_edges": snapshot.selected_function.flow_edges.len(),
+                    "call_targets": snapshot.selected_function.call_targets.len(),
+                }))?
+            );
+        }
+        Some("ghidra") if args.len() >= 3 && args[1] == "llvm-cfg-image" => {
+            let mut selected = None;
+            let mut start_address = None;
+            let mut output_path = None;
+            let mut options = args[3..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--function" if selected.is_none() => {
+                        selected = Some(parse_u64_auto(&pair[1], "Ghidra function entry")?);
+                    }
+                    "--start" if start_address.is_none() => {
+                        start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
+                    }
+                    "--output" if output_path.is_none() && !pair[1].is_empty() => {
+                        output_path = Some(pair[1].as_str());
+                    }
+                    _ => return Err("invalid automatic Ghidra image LLVM option".into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err("Ghidra image LLVM options require values".into());
+            }
+            let binary = read_binary(&args[2])?;
+            let scratch = tempfile::tempdir()?;
+            let snapshot = ghidra_worker::analyze(
+                Path::new(&args[2]),
+                selected,
+                &scratch.path().join("snapshot.json"),
+            )?;
+            let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot)?;
+            let window =
+                image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+            let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
+                space: snapshot.selected_function.entry.space.clone(),
+                offset: format!("0x{address:x}"),
+            });
+            let artifact = hydir_decompile::emit_pcode_cfg_llvm_with_image(
+                &snapshot,
+                start.as_ref(),
+                &window,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&artifact)?;
+            if let Some(path) = output_path {
+                write_new_or_identical(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
+                && matches!(
+                    args[1].as_str(),
+                    "verify"
+                        | "pcode"
+                        | "simplify"
+                        | "semantics"
+                        | "state"
+                        | "cfg"
+                        | "coverage"
+                        | "llvm-prefix"
+                        | "llvm-standalone"
+                ) =>
+        {
+            if args[1] == "verify" && args.len() != 4 {
+                return Err(HELP.into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let ir = snapshot.pcode_function_ir()?;
+            if args[1] == "verify" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": snapshot.schema_version,
+                        "binary_sha256": snapshot.binary_sha256,
+                        "program": snapshot.program.name,
+                        "language_id": snapshot.program.language_id,
+                        "functions": snapshot.functions.len(),
+                        "selected_function": ir.entry,
+                        "instructions": ir.instructions.len(),
+                        "pcode_operations": ir.instructions.iter().map(|instruction| instruction.pcode.len()).sum::<usize>(),
+                        "flow_edges": snapshot.selected_function.flow_edges.len(),
+                        "call_targets": snapshot.selected_function.call_targets.len(),
+                        "semantic_fidelity": ir.semantic_fidelity,
+                    }))?
+                );
+            } else {
+                let output = match args[1].as_str() {
+                    "simplify" => serde_json::to_vec_pretty(&ir.simplify_checked()?)?,
+                    "semantics" => serde_json::to_vec_pretty(&ir.lower_semantics())?,
+                    "state" => serde_json::to_vec_pretty(&ir.lower_state())?,
+                    "cfg" => serde_json::to_vec_pretty(&snapshot.pcode_cfg_ir()?)?,
+                    "coverage" => serde_json::to_vec_pretty(&snapshot.pcode_coverage_report()?)?,
+                    "llvm-prefix" => serde_json::to_vec_pretty(
+                        &hydir_decompile::emit_pcode_linear_prefix_llvm(&snapshot)?,
+                    )?,
+                    "llvm-standalone" => serde_json::to_vec_pretty(
+                        &hydir_decompile::emit_pcode_standalone_prefix_llvm(&snapshot)?,
+                    )?,
+                    _ => serde_json::to_vec_pretty(&ir)?,
+                };
+                if args.len() == 6 {
+                    write_new_or_identical(&args[5], &output)?;
+                } else {
+                    println!("{}", String::from_utf8(output)?);
+                }
+            }
+        }
+        Some("capture")
+            if (args.len() == 5 || args.len() == 7 && args[5] == "--output")
+                && matches!(args[3].as_str(), "--function" | "--address") =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[2],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            validate_input_spec(&bytes, &spec)?;
+            let address = if args[3] == "--address" {
+                Some(parse_u64_auto(&args[4], "ELF virtual address")?)
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let snapshot = if let Some(address) = address {
+                hydir_execution::capture_elf_address(&bytes, &spec, address)?
+            } else {
+                hydir_execution::capture_function_entry(&bytes, &spec, &args[4])?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let _ = address;
+            #[cfg(not(target_os = "linux"))]
+            let snapshot = hydir_execution::ExecutionSnapshot {
+                schema_version: hydir_execution::EXECUTION_SNAPSHOT_VERSION,
+                binary_sha256: spec.binary_sha256.clone(),
+                input_sha256: hydir_execution::input_sha256(&spec)?,
+                status: hydir_execution::SnapshotStatus::UnsupportedHost,
+                stop: None,
+                thread_id: None,
+                thread_count: 0,
+                registers: Default::default(),
+                mappings: Vec::new(),
+                pages: Vec::new(),
+                runner: "unavailable".into(),
+                diagnostics: vec![
+                    "native capture currently requires Linux, Bubblewrap, and GDB".into(),
+                ],
+            };
+            validate_execution_snapshot(&bytes, &spec, &snapshot)?;
+            let json = serde_json::to_vec_pretty(&snapshot)?;
+            if args.len() == 7 {
+                write_new_or_identical(&args[6], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("probe-origin")
+                && (args.len() == 8 || args.len() == 10 && args[8] == "--output")
+                && args[6] == "--register" =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let report = probe_origin(
+                &bytes,
+                &spec,
+                &snapshot,
+                &args[5],
+                ProbeLocation::Register {
+                    name: args[7].clone(),
+                    offset: 0,
+                },
+            )?;
+            let json = serde_json::to_vec_pretty(&report)?;
+            if args.len() == 10 {
+                write_new_or_identical(&args[9], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("verify-origin") && args.len() == 6 =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let report = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            validate_origin_probe(&bytes, &spec, &snapshot, &report)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": report.schema_version,
+                    "valid": true,
+                    "origin_id": report.origin_id,
+                    "status": report.status,
+                    "evidence": report.evidence,
+                    "runtime_address": report.runtime_address,
+                }))?
+            );
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("plan-return")
+                && (args.len() == 10 || args.len() == 12 && args[10] == "--output")
+                && args[6] == "--code-bytes"
+                && args[8] == "--return" =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let probe = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            let code_bytes = args[7].parse::<usize>()?;
+            let return_equals = parse_u64_auto(&args[9], "return value")?;
+            let plan = build_snapshot_resume_plan(
+                &bytes,
+                &spec,
+                &snapshot,
+                &probe,
+                code_bytes,
+                return_equals,
+            )?;
+            let json = serde_json::to_vec_pretty(&plan)?;
+            if args.len() == 12 {
+                write_new_or_identical(&args[11], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("verify-plan") && args.len() == 7 =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let probe = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            let plan = parse_snapshot_resume_plan(&read_bounded_json(
+                &args[6],
+                hydir_execution::MAX_SNAPSHOT_RESUME_JSON_BYTES,
+            )?)?;
+            validate_snapshot_resume_plan(&bytes, &spec, &snapshot, &probe, &plan)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": plan.schema_version,
+                    "valid": true,
+                    "operation": plan.operation,
+                    "binary_sha256": plan.binary_sha256,
+                    "snapshot_sha256": plan.snapshot_sha256,
+                    "origin_id": plan.symbolic_origin.id,
+                    "code_bytes": plan.code_hex.len() / 2,
+                    "present_pages": plan.pages.len(),
+                }))?
+            );
+        }
+        Some("snapshot")
+            if args.get(1).map(String::as_str) == Some("verify") && args.len() == 5 =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            validate_execution_snapshot(&bytes, &spec, &snapshot)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": snapshot.schema_version,
+                    "valid": true,
+                    "status": snapshot.status,
+                    "binary_sha256": snapshot.binary_sha256,
+                    "input_sha256": snapshot.input_sha256,
+                    "thread_count": snapshot.thread_count,
+                    "mappings": snapshot.mappings.len(),
+                    "present_pages": snapshot.pages.iter().filter(|page| matches!(page.value, hydir_execution::MemoryPageState::Present { .. })).count(),
+                    "unavailable_pages": snapshot.pages.iter().filter(|page| matches!(page.value, hydir_execution::MemoryPageState::Unavailable { .. })).count(),
+                    "stop": snapshot.stop,
+                }))?
+            );
+        }
+        Some("solve")
+            if args.get(1).map(String::as_str) == Some("snapshot-return")
+                && (7..=17).contains(&args.len())
+                && args.len() % 2 == 1 =>
+        {
+            let mut candidate_output = None;
+            let mut slice_output = None;
+            let mut claim_output = None;
+            let mut recipe_output = None;
+            let mut report_output = None;
+            for pair in args[7..].chunks_exact(2) {
+                match pair[0].as_str() {
+                    "--candidate-output" if candidate_output.is_none() => {
+                        candidate_output = Some(pair[1].as_str());
+                    }
+                    "--slice-output" if slice_output.is_none() => {
+                        slice_output = Some(pair[1].as_str());
+                    }
+                    "--claim-output" if claim_output.is_none() => {
+                        claim_output = Some(pair[1].as_str());
+                    }
+                    "--recipe-output" if recipe_output.is_none() => {
+                        recipe_output = Some(pair[1].as_str());
+                    }
+                    "--output" if report_output.is_none() => {
+                        report_output = Some(pair[1].as_str());
+                    }
+                    _ => return Err(HELP.into()),
+                }
+            }
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let snapshot = parse_execution_snapshot(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_EXECUTION_SNAPSHOT_JSON_BYTES,
+            )?)?;
+            let probe = parse_origin_probe(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_ORIGIN_PROBE_JSON_BYTES,
+            )?)?;
+            let plan = parse_snapshot_resume_plan(&read_bounded_json(
+                &args[6],
+                hydir_execution::MAX_SNAPSHOT_RESUME_JSON_BYTES,
+            )?)?;
+            validate_snapshot_resume_plan(&bytes, &spec, &snapshot, &probe, &plan)?;
+            let request = serde_json::to_value(&plan)?;
+            let bridge = run_triton_bridge(&request)?;
+            validate_snapshot_bridge_result(&plan, &bridge)?;
+            if let Some(path) = slice_output {
+                if bridge["input_condition_slice"].is_null() {
+                    return Err("no completed failing seed trace is available for a slice".into());
+                }
+                write_new_or_identical(
+                    path,
+                    &serde_json::to_vec_pretty(&bridge["input_condition_slice"])?,
+                )?;
+            }
+            let mut claim = "no_function_witness";
+            let mut candidate_spec = None;
+            let mut native_replay = None;
+            if let Some(candidate_hex) = bridge["candidate_hex"].as_str() {
+                let candidate = input_with_origin_candidate(
+                    &bytes,
+                    &spec,
+                    &plan.symbolic_origin.id,
+                    candidate_hex,
+                )?;
+                if let Some(path) = candidate_output {
+                    write_new_or_identical(path, &serde_json::to_vec_pretty(&candidate)?)?;
+                }
+                #[cfg(target_os = "linux")]
+                let replay = hydir_execution::replay_local(&bytes, &candidate)?;
+                #[cfg(not(target_os = "linux"))]
+                let replay = hydir_execution::NativeReplayReport {
+                    schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                    binary_sha256: candidate.binary_sha256.clone(),
+                    input_sha256: hydir_execution::input_sha256(&candidate)?,
+                    status: hydir_execution::ReplayStatus::UnsupportedHost,
+                    exit_code: None,
+                    signal: None,
+                    stdout_hex: String::new(),
+                    stderr_hex: String::new(),
+                    elapsed_ms: 0,
+                    runner: "unavailable".into(),
+                    diagnostic: Some("native replay requires Linux with Bubblewrap".into()),
+                };
+                hydir_execution::validate_replay_report(&bytes, &candidate, &replay)?;
+                claim = if replay.status == hydir_execution::ReplayStatus::GoalMatched {
+                    "native_validated_candidate"
+                } else {
+                    "function_witness"
+                };
+                candidate_spec = Some(candidate);
+                native_replay = Some(replay);
+            }
+            #[cfg(target_os = "linux")]
+            let original_replay = if native_replay
+                .as_ref()
+                .is_some_and(|replay| replay.status == hydir_execution::ReplayStatus::GoalMatched)
+                && !bridge["input_condition_slice"].is_null()
+            {
+                let observed = hydir_execution::replay_local(&bytes, &spec)?;
+                hydir_execution::validate_replay_report(&bytes, &spec, &observed)?;
+                Some(observed)
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let original_replay: Option<hydir_execution::NativeReplayReport> = None;
+            let recipe = match (&candidate_spec, &native_replay, &original_replay) {
+                (Some(candidate), Some(replay), Some(original))
+                    if replay.status == hydir_execution::ReplayStatus::GoalMatched
+                        && original.status == hydir_execution::ReplayStatus::GoalMismatched
+                        && !bridge["input_condition_slice"].is_null()
+                        && hydir_execution::candidate_links_failed_trace(&plan, &bridge) =>
+                {
+                    Some(hydir_execution::build_analysis_recipe(
+                        &bytes, &spec, &snapshot, &probe, &plan, &bridge, candidate, original,
+                        replay,
+                    )?)
+                }
+                _ => None,
+            };
+            if let Some(path) = claim_output {
+                let claim = &recipe
+                    .as_ref()
+                    .ok_or("no native-validated failing-seed claim is available")?
+                    .claim;
+                write_new_or_identical(path, &serde_json::to_vec_pretty(claim)?)?;
+            }
+            if let Some(path) = recipe_output {
+                let recipe = recipe
+                    .as_ref()
+                    .ok_or("no native-validated failing-seed recipe is available")?;
+                write_new_or_identical(path, &serde_json::to_vec_pretty(recipe)?)?;
+            }
+            let report = json!({
+                "schema_version": 1,
+                "operation": "snapshot_return",
+                "claim": claim,
+                "binary_sha256": plan.binary_sha256,
+                "input_sha256": plan.input_sha256,
+                "snapshot_sha256": plan.snapshot_sha256,
+                "probe_sha256": plan.probe_sha256,
+                "origin_probe_evidence": plan.origin_probe_evidence,
+                "assumptions": plan.assumptions,
+                "bridge": bridge,
+                "candidate_input": candidate_spec,
+                "original_replay": original_replay,
+                "native_replay": native_replay,
+                "investigation_claim": recipe.as_ref().map(|recipe| &recipe.claim),
+            });
+            let json = serde_json::to_vec_pretty(&report)?;
+            if let Some(path) = report_output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("recipe")
+            if matches!(args.get(1).map(String::as_str), Some("verify" | "replay"))
+                && (args.len() == 4 || args.len() == 6 && args[4] == "--output") =>
+        {
+            let bytes = read_binary(&args[2])?;
+            let recipe = hydir_execution::parse_analysis_recipe(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_ANALYSIS_RECIPE_JSON_BYTES,
+            )?)?;
+            hydir_execution::validate_analysis_recipe(&bytes, &recipe)?;
+            let result = if args[1] == "verify" {
+                json!({
+                    "schema_version": 1,
+                    "operation": "recipe_verify",
+                    "valid": true,
+                    "claim": recipe.claim,
+                    "verification_scope": "recorded_artifact_consistency_only",
+                    "fresh_original_replay": null,
+                    "fresh_candidate_replay": null,
+                })
+            } else {
+                #[cfg(target_os = "linux")]
+                let original = hydir_execution::replay_local(&bytes, &recipe.original_input)?;
+                #[cfg(target_os = "linux")]
+                let replay = hydir_execution::replay_local(&bytes, &recipe.candidate_input)?;
+                #[cfg(not(target_os = "linux"))]
+                let original = hydir_execution::NativeReplayReport {
+                    schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                    binary_sha256: recipe.original_input.binary_sha256.clone(),
+                    input_sha256: hydir_execution::input_sha256(&recipe.original_input)?,
+                    status: hydir_execution::ReplayStatus::UnsupportedHost,
+                    exit_code: None,
+                    signal: None,
+                    stdout_hex: String::new(),
+                    stderr_hex: String::new(),
+                    elapsed_ms: 0,
+                    runner: "unavailable".into(),
+                    diagnostic: Some("recipe replay requires Linux with Bubblewrap".into()),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let replay = hydir_execution::NativeReplayReport {
+                    schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                    binary_sha256: recipe.candidate_input.binary_sha256.clone(),
+                    input_sha256: hydir_execution::input_sha256(&recipe.candidate_input)?,
+                    status: hydir_execution::ReplayStatus::UnsupportedHost,
+                    exit_code: None,
+                    signal: None,
+                    stdout_hex: String::new(),
+                    stderr_hex: String::new(),
+                    elapsed_ms: 0,
+                    runner: "unavailable".into(),
+                    diagnostic: Some("recipe replay requires Linux with Bubblewrap".into()),
+                };
+                hydir_execution::validate_replay_report(&bytes, &recipe.original_input, &original)?;
+                hydir_execution::validate_replay_report(&bytes, &recipe.candidate_input, &replay)?;
+                json!({
+                    "schema_version": 1,
+                    "operation": "recipe_replay",
+                    "claim_reproduced": original.status == hydir_execution::ReplayStatus::GoalMismatched
+                        && replay.status == hydir_execution::ReplayStatus::GoalMatched,
+                    "recorded_original_replay": recipe.recorded_original_replay,
+                    "recorded_candidate_replay": recipe.recorded_native_replay,
+                    "fresh_original_replay": original,
+                    "fresh_candidate_replay": replay,
+                    "claim": recipe.claim,
+                })
+            };
+            let output = serde_json::to_vec_pretty(&result)?;
+            if args.len() == 6 {
+                write_new_or_identical(&args[5], &output)?;
+            } else {
+                std::io::stdout().write_all(&output)?;
+                println!();
+            }
+        }
+        Some("replay")
+            if !matches!(args.get(1).map(String::as_str), Some("init" | "verify"))
+                && (args.len() == 3 || args.len() == 5 && args[3] == "--output") =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[2],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            validate_input_spec(&bytes, &spec)?;
+            #[cfg(target_os = "linux")]
+            let report = hydir_execution::replay_local(&bytes, &spec)?;
+            #[cfg(not(target_os = "linux"))]
+            let report = hydir_execution::NativeReplayReport {
+                schema_version: hydir_execution::NATIVE_REPLAY_REPORT_VERSION,
+                binary_sha256: spec.binary_sha256.clone(),
+                input_sha256: hydir_execution::input_sha256(&spec)?,
+                status: hydir_execution::ReplayStatus::UnsupportedHost,
+                exit_code: None,
+                signal: None,
+                stdout_hex: String::new(),
+                stderr_hex: String::new(),
+                elapsed_ms: 0,
+                runner: "unavailable".into(),
+                diagnostic: Some("native replay currently requires Linux with Bubblewrap".into()),
+            };
+            hydir_execution::validate_replay_report(&bytes, &spec, &report)?;
+            let json = serde_json::to_vec_pretty(&report)?;
+            if args.len() == 5 {
+                write_new_or_identical(&args[4], &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("replay")
+            if args.get(1).map(String::as_str) == Some("init")
+                && (args.len() == 3 || args.len() == 5) =>
+        {
+            let output = if args.len() == 5 {
+                if args[3] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[4].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let spec = InputSpec {
+                schema_version: hydir_execution::INPUT_SPEC_VERSION,
+                binary_sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
+                argv_hex: Vec::new(),
+                stdin_hex: String::new(),
+                files: Vec::new(),
+                origins: Vec::new(),
+                goal: ReplayGoal {
+                    exit_code: Some(0),
+                    stdout_contains_hex: None,
+                    stderr_contains_hex: None,
+                },
+                budget: ReplayBudget {
+                    timeout_ms: 5000,
+                    memory_bytes: 256 * 1024 * 1024,
+                    output_bytes: 64 * 1024,
+                },
+            };
+            validate_input_spec(&bytes, &spec)?;
+            let json = serde_json::to_vec_pretty(&spec)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("replay") if args.get(1).map(String::as_str) == Some("verify") && args.len() == 4 => {
+            let bytes = read_binary(&args[2])?;
+            let spec = parse_input_spec(&read_bounded_json(
+                &args[3],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            validate_input_spec(&bytes, &spec)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schema_version": 1,
+                    "valid": true,
+                    "binary_sha256": spec.binary_sha256,
+                    "input_sha256": hydir_execution::input_sha256(&spec)?,
+                    "argv": spec.argv_hex.len(),
+                    "files": spec.files.len(),
+                    "origins": spec.origins.len(),
+                }))?
+            );
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("init")
+                && (args.len() == 3 || args.len() == 5) =>
+        {
+            let output = if args.len() == 5 {
+                if args[3] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[4].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let model = init_model(&bytes)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("model") if args.get(1).map(String::as_str) == Some("verify") && args.len() == 4 => {
+            let bytes = read_binary(&args[2])?;
+            let model = parse_model(&fs::read(&args[3])?)?;
+            validate_model(&bytes, &model)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"schema_version": 1, "valid": true, "binary_sha256": model.binary_sha256, "model_revision": model.revision, "types": model.types.len(), "functions": model.functions.len()})
+                )?
+            );
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("import-dwarf")
+                && (args.len() == 4 || args.len() == 6) =>
+        {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let mut model = parse_model(&fs::read(&args[3])?)?;
+            validate_model(&bytes, &model)?;
+            import_dwarf(&bytes, &mut model)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("import-ghidra")
+                && (args.len() == 5 || args.len() == 7) =>
+        {
+            let output = if args.len() == 7 {
+                if args[5] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[6].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let mut model =
+                parse_model(&read_bounded_json(&args[3], hydir_model::MAX_MODEL_BYTES)?)?;
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[4], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &model.binary_sha256,
+            )?;
+            import_ghidra_functions(&bytes, &mut model, &snapshot)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+            }
+        }
+        Some("model")
+            if args.get(1).map(String::as_str) == Some("infer")
+                && (args.len() == 4 || args.len() == 6) =>
+        {
+            let output = if args.len() == 6 {
+                if args[4] != "--output" {
+                    return Err(HELP.into());
+                }
+                Some(args[5].as_str())
+            } else {
+                None
+            };
+            let bytes = read_binary(&args[2])?;
+            let mut model = parse_model(&fs::read(&args[3])?)?;
+            validate_model(&bytes, &model)?;
+            let index = discover_function_candidates(&bytes)?;
+            let mut native = Vec::new();
+            let mut lift_failures = Vec::new();
+            for row in index.functions.iter().take(256) {
+                match decompile_indexed_function(&bytes, &index, &row.id) {
+                    Ok(value) => native.push(value),
+                    Err(error) => {
+                        lift_failures.push(json!({"function_id": row.id, "error": error}))
+                    }
+                }
+            }
+            let inputs = native
+                .iter()
+                .map(|unit| (&unit.machine_ir, &unit.function_ir))
+                .collect::<Vec<_>>();
+            let mut report = infer_model(&mut model, &inputs)?;
+            report.skipped_functions +=
+                index.functions.len().saturating_sub(256) + lift_failures.len();
+            report.bounded |= index.functions.len() > 256 || !lift_failures.is_empty();
+            validate_model(&bytes, &model)?;
+            let json = serde_json::to_vec_pretty(&model)?;
+            let summary = json!({"inference": report, "index_functions": index.functions.len(), "lift_failures": lift_failures});
+            if let Some(path) = output {
+                write_new_or_identical(path, &json)?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                std::io::stdout().write_all(&json)?;
+                println!();
+                eprintln!("inference: {}", serde_json::to_string(&summary)?);
+            }
+        }
         Some("disassemble") if args.len() == 2 => {
             let bytes = read_binary(&args[1])?;
             println!(
@@ -130,6 +1467,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "{}",
                 serde_json::to_string_pretty(&measure_native_coverage(&bytes)?)?
             );
+        }
+        Some("vm-profile" | "vm-explore") if args.len() == 3 => {
+            const MAX_VM_PROFILE_BYTES: u64 = 1024 * 1024;
+            if fs::metadata(&args[2])?.len() > MAX_VM_PROFILE_BYTES {
+                return Err("VM profile exceeds the 1 MiB size limit".into());
+            }
+            let bytes = read_binary(&args[1])?;
+            let profile: VmProfile = serde_json::from_slice(&fs::read(&args[2])?)?;
+            if args[0] == "vm-profile" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&validate_profile(&bytes, &profile)?)?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&explore_profile(&bytes, &profile)?)?
+                );
+            }
         }
         Some("explain") if (args.len() == 4 || args.len() == 6) && args[2] == "--function" => {
             let requested_address = if args.len() == 6 {
@@ -172,6 +1528,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Some("doctor") if args.len() == 1 => {
+            let gdb_version = Command::new("gdb")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.lines().next().map(str::to_owned));
+            let bwrap_version = Command::new("bwrap")
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|value| value.lines().next().map(str::to_owned));
             let clang = Command::new("clang").arg("--version").output();
             let clang_version = clang
                 .ok()
@@ -213,6 +1583,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .and_then(|value| value.lines().next().map(str::to_owned));
             let triton_helper_available =
                 triton_helper.exists() || env::var_os("HYDIR_TRITON_HELPER").is_none();
+            let bubblewrap_isolation_ready =
+                bwrap_version.is_some() && probe_bubblewrap_isolation();
+            let replay_ready = bubblewrap_isolation_ready;
+            let capture_ready = replay_ready && gdb_version.is_some();
+            let snapshot_solve_ready =
+                capture_ready && triton_helper_available && triton_module_version.is_some();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -235,6 +1611,37 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_elf_import": true,
                     "native_decompiler": true,
                     "native_decompiler_scope": "ProgramSpec v5 -> FunctionIndex v1 -> MachineIR -> StateIR -> FunctionIR -> CIR -> C11; symbol, unwind-FDE, entry, direct-call and init/fini seeds; partial results fail closed",
+                    "analysis_model_v1": true,
+                    "analysis_model_scope": "ELF SHA-256-bound JSON with bounded DWARF import, aggregate inference, visible conflicts, and revision-checked local analyst edits",
+                    "expression_ir_v1": true,
+                    "expression_ir_scope": "supported scalar writes, condition flags/predicates, little-endian MOV loads/stores with complete alias-region dependencies, 64/32-bit LEA, and component SSA joins; unsupported effects remain residual",
+                    "typed_c_v1": true,
+                    "typed_c_scope": "v1: complete linear functions with supported 64-bit operations, fixed frame spills, aggregate fields, and bounded fixed direct calls; v3 CFG: supported 64-bit scalar branches, joins and loops, normalized MOV memory effects, LEA, model-backed fields and arrays, with goto fallback; unsupported functions retain low-level C",
+                    "typed_cfg_v2": false,
+                    "typed_cfg_v3": true,
+                    "typed_c_local_cache": true,
+                    "execution_snapshot_v1": capture_ready,
+                    "execution_snapshot_schema_v1": true,
+                    "gdb_mi_parser_v1": true,
+                    "gdb_mi_parser_scope": "bounded result, async, and stream records with nested tuples/lists and C-style escaped bytes; named and stripped PIE address capture passed the Ubuntu 24.04 semantic gate",
+                    "gdb_capture_v1": capture_ready,
+                    "gdb_capture_scope": "experimental single-thread x86-64 ELF capture at a named function or relocated file-backed address; up to eight selected pages; missing state and runner failures remain explicit",
+                    "input_spec_v1": true,
+                    "origin_probe_v1": true,
+                    "origin_probe_scope": "analyst-selected captured register versus input-origin bytes; exact snapshot-bound byte equality only, not channel provenance",
+                    "snapshot_resume_plan_v1": true,
+                    "snapshot_resume_scope": "exact digest-bound snapshot/probe/code/page/register handoff for up to 32 original bytes and a selected 4096-byte pure validator; one captured-state solve and native replay passed the Ubuntu 24.04 semantic gate",
+                    "snapshot_return_solve_v1": snapshot_solve_ready,
+                    "snapshot_return_solve_scope": "experimental pure validator return goal from matched captured origin bytes; bounded seeds, instructions, solver queries and wall time; a function witness is not a native success until fresh replay matches",
+                    "native_replay_v1": replay_ready,
+                    "native_replay_scope": "local Linux x86-64 Bubblewrap replay with private network namespace, bounded argv/stdin/files, exact exit/output goals and explicit setup/timeout/output-limit failures; Ubuntu 24.04 smoke gate passed",
+                    "bubblewrap_installed": bwrap_version.is_some(),
+                    "bubblewrap_isolation_ready": bubblewrap_isolation_ready,
+                    "bubblewrap_version": bwrap_version,
+                    "gdb_installed": gdb_version.is_some(),
+                    "gdb_version": gdb_version,
+                    "vm_profile_v1": true,
+                    "vm_explorer_scope": "bounded host/VPC exploration; guest CFG and rewrite readiness are not established",
                     "native_loader_metadata": "ELF64 program headers, GNU-versioned dynamic symbols, location-aware relocations, PLT/GOT/TLS ranges, linked .eh_frame FDEs, init/fini arrays, and symbol-backed ET_REL lifting",
                     "direct_cfg_scalar_llvm_lift": true,
                     "symbol_scoped_cfg_export": true,
@@ -244,6 +1651,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "llvm_opt": opt_version,
                     "named_pass_pipeline_available": opt_version.as_deref().is_some_and(|version| version.contains("LLVM version 14.0.6")),
                     "ghidra_required": false,
+                    "ghidra_frontend": ghidra_worker::runtime_status(),
                     "remote_api": true,
                     "local_project_annotations": true,
                     "local_project_scope": "private path-bound SQLite ledger, digest-scoped names/comments/assumptions, revisioned CLI/GUI writes; no automatic remote sync",
@@ -580,6 +1988,26 @@ fn run() -> Result<(), Box<dyn Error>> {
             let cfg = recover_at_cfg(&bytes, address, size)?;
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
+        Some("lift")
+            if args.len() == 8
+                && args[2] == "--function"
+                && args[4] == "--ir"
+                && matches!(args[5].as_str(), "high-level" | "high-level-cfg")
+                && args[6] == "--model" =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let model = parse_model(&fs::read(&args[7])?)?;
+            validate_model(&bytes, &model)?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let native = decompile_native_selection(&bytes, &selection)?;
+            if args[5] == "high-level-cfg" {
+                let ir = lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)?;
+                println!("{}", serde_json::to_string_pretty(&ir)?);
+            } else {
+                let ir = lower_high_level_cir(&native.machine_ir, &native.function_ir, &model)?;
+                println!("{}", serde_json::to_string_pretty(&ir)?);
+            }
+        }
         Some("lift") if args.len() == 6 && args[2] == "--function" && args[4] == "--ir" => {
             let bytes = read_binary(&args[1])?;
             let selection = resolve_native_function(&bytes, &args[3])?;
@@ -590,6 +2018,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "{}",
                     serde_json::to_string_pretty(&lower_state_ir(&machine)?)?
                 ),
+                "expression" => {
+                    let state = lower_state_ir(&machine)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&lower_expression_ir(&machine, &state)?)?
+                    );
+                }
                 "function" => {
                     let state = lower_state_ir(&machine)?;
                     println!(
@@ -611,7 +2046,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     print!("{}", export_function_ir_llvm(&function)?);
                 }
                 _ => {
-                    return Err("native --ir must be machine, state, function, cir, or llvm".into());
+                    return Err(
+                        "native --ir must be machine, state, expression, function, cir, or llvm"
+                            .into(),
+                    );
                 }
             }
         }
@@ -674,6 +2112,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                 write_new_or_identical(path, ir.as_bytes())?;
             } else {
                 print!("{ir}");
+            }
+        }
+        Some("decompile")
+            if args.len() == 8
+                && args[2] == "--function"
+                && args[4] == "--view"
+                && args[5] == "typed"
+                && args[6] == "--model" =>
+        {
+            let bytes = read_binary(&args[1])?;
+            let model = parse_model(&fs::read(&args[7])?)?;
+            validate_model(&bytes, &model)?;
+            let selection = resolve_native_function(&bytes, &args[3])?;
+            let native = decompile_native_selection(&bytes, &selection)?;
+            match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
+                Ok(ir) => print!("{}", emit_typed_c(&ir, &model)?),
+                Err(linear_error) => {
+                    let ir =
+                        lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model)
+                            .map_err(|cfg_error| {
+                            format!("typed C unavailable: linear: {linear_error}; CFG: {cfg_error}")
+                        })?;
+                    print!("{}", emit_typed_cfg_c(&ir, &model)?);
+                }
             }
         }
         Some("decompile") if args.len() == 6 && args[2] == "--function" && args[4] == "--view" => {
@@ -1315,6 +2777,19 @@ fn read_validation_cases(path: &str) -> Result<Vec<(u64, u64)>, Box<dyn Error>> 
         .collect()
 }
 
+fn pcode_image_or_legacy(
+    binary: &[u8],
+    snapshot: &GhidraSnapshot,
+) -> Result<Option<PcodeReadOnlyElfImage>, String> {
+    if !PcodeReadOnlyElfImage::has_eligible_blocks(snapshot) {
+        eprintln!(
+            "Hydir: Ghidra snapshot has no loaded read-only RAM blocks; using seed-only P-code memory"
+        );
+        return Ok(None);
+    }
+    PcodeReadOnlyElfImage::from_elf(binary, snapshot).map(Some)
+}
+
 fn read_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     let path = path.as_ref();
     if fs::metadata(path)?.len() > MAX_BINARY_BYTES as u64 {
@@ -1326,6 +2801,17 @@ fn read_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_BINARY_BYTES {
         return Err("binary changed during read and exceeds 64 MiB import limit".into());
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_json(path: impl AsRef<Path>, limit: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err("JSON artifact exceeds size limit".into());
     }
     Ok(bytes)
 }
@@ -1540,6 +3026,8 @@ int main(int argc, char **argv) {
 #[cfg(test)]
 mod tests {
     use super::read_validation_cases;
+    use hydir_execution::{candidate_links_failed_trace, validate_input_condition_slice};
+    use sha2::Digest;
 
     #[test]
     fn external_cases_preserve_full_width_inputs() {
@@ -1552,5 +3040,86 @@ mod tests {
         );
         std::fs::write(&path, r#"[[18446744073709551615,"0"]]"#).unwrap();
         assert!(read_validation_cases(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn input_condition_slice_rejects_changed_identity_and_origin_range() {
+        let plan = hydir_execution::SnapshotResumePlan {
+            schema_version: 1,
+            operation: "snapshot_return".into(),
+            binary_sha256: "0".repeat(64),
+            input_sha256: "1".repeat(64),
+            snapshot_sha256: "2".repeat(64),
+            probe_sha256: "3".repeat(64),
+            code_address: 0x1000,
+            code_hex: "c3".into(),
+            registers: Default::default(),
+            pages: vec![],
+            symbolic_origin: hydir_execution::InputOrigin {
+                id: "byte0".into(),
+                channel: hydir_execution::InputChannel::Stdin,
+                offset: 0,
+                length: 1,
+                encoding: hydir_execution::InputEncoding::Raw,
+                alphabet_hex: String::new(),
+            },
+            origin_address: 0x2000,
+            seed_hex: "42".into(),
+            origin_probe_evidence: hydir_execution::ProbeEvidence::ByteEqualityOnly,
+            assumptions: vec![],
+            return_equals: 1,
+            max_seeds: 4,
+            max_instructions_per_seed: 8,
+            max_solver_queries: 4,
+            wall_timeout_ms: 1000,
+            solver_timeout_ms: 100,
+        };
+        let mut slice = serde_json::json!({
+            "schema_version": 1,
+            "kind": "input_condition_slice",
+            "scope": "captured_seed_trace_structural_dependencies",
+            "binary_sha256": plan.binary_sha256,
+            "input_sha256": plan.input_sha256,
+            "snapshot_sha256": plan.snapshot_sha256,
+            "probe_sha256": plan.probe_sha256,
+            "code_sha256": format!("{:x}", sha2::Sha256::digest([0xc3])),
+            "code_address": 0x1000,
+            "origin_id": "byte0",
+            "channel": {"kind": "stdin"},
+            "channel_offset": 0,
+            "seed_hex": "42",
+            "observed_return": 0,
+            "return_equals": 1,
+            "ast_walk_complete": true,
+            "relevant_origin_offsets": [0],
+            "source_occurrences": [],
+            "instructions": [{"index": 0, "address": 0x1000,
+                              "code_offset": 0, "disassembly": "ret"}],
+            "decisions": [{"kind": "return", "occurrence": 0,
+                           "address": 0x1000, "observed_value": 0,
+                           "origin_offsets": [0], "source_occurrences": []}],
+            "unresolved_dependencies": [
+                "origin_channel_provenance_unproven_byte_equality_only",
+                "other_paths_and_environment_not_in_this_trace",
+                "symbolic_memory_address_dependencies_not_analyzed"
+            ]
+        });
+        validate_input_condition_slice(&plan, &slice).unwrap();
+        slice["decisions"][0]["origin_offsets"] = serde_json::json!([1]);
+        assert!(validate_input_condition_slice(&plan, &slice).is_err());
+        slice["decisions"][0]["origin_offsets"] = serde_json::json!([0]);
+        slice["code_sha256"] = serde_json::json!("4".repeat(64));
+        assert!(validate_input_condition_slice(&plan, &slice).is_err());
+        slice["code_sha256"] = serde_json::json!(format!("{:x}", sha2::Sha256::digest([0xc3])));
+        slice["ast_walk_complete"] = serde_json::json!(false);
+        assert!(validate_input_condition_slice(&plan, &slice).is_err());
+
+        let mut bridge = serde_json::json!({
+            "candidate_hex": "41",
+            "input_condition_slice": {"relevant_origin_offsets": [0]}
+        });
+        assert!(candidate_links_failed_trace(&plan, &bridge));
+        bridge["input_condition_slice"]["relevant_origin_offsets"] = serde_json::json!([]);
+        assert!(!candidate_links_failed_trace(&plan, &bridge));
     }
 }

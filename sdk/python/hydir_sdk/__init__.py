@@ -19,8 +19,12 @@ from . import hydir_v3_pb2 as proto_v3
 from .hydir_pb2_grpc import HydirStub
 from .hydir_v2_pb2_grpc import HydirV2Stub
 from .hydir_v3_pb2_grpc import HydirV3Stub
+from .ghidra import LocalGhidra
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
+MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
+MAX_PCODE_SEED_BYTES = 1024 * 1024
+MAX_ANALYSIS_MODEL_BYTES = 16 * 1024 * 1024
 
 
 class HydirClient:
@@ -108,8 +112,11 @@ class HydirClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _call(self, method, request):
-        return method(request, metadata=self._metadata, timeout=self._timeout)
+    def _call(self, method, request, *, timeout: float | None = None):
+        return method(
+            request, metadata=self._metadata,
+            timeout=self._timeout if timeout is None else timeout,
+        )
 
     def discover(self):
         reply = self._call(self._stub.Discover, proto.DiscoverRequest())
@@ -158,10 +165,14 @@ class HydirClient:
             "cir": ("application/vnd.hydir.cir+json;version=1", 1),
             "llvm": ("text/x-llvm-ir", None),
             "unit": ("application/vnd.hydir.decompilation-unit+json;version=2", 2),
+            "analysis_model": ("application/vnd.hydir.analysis-model+json;version=1", 1),
+            "high_level_cir": ("application/vnd.hydir.high-level-cir+json;version=1", 1),
+            "high_level_cfg_cir": ("application/vnd.hydir.high-level-cfg-cir+json;version=3", 3),
+            "typed_c": ("text/x-c;view=typed", None),
         }
         if stage not in media_types:
             raise ValueError("Unsupported native artifact stage")
-        function_scoped = stage in {"machine", "state", "function", "cir", "llvm", "unit"}
+        function_scoped = stage in {"machine", "state", "function", "cir", "llvm", "unit", "high_level_cir", "high_level_cfg_cir", "typed_c"}
         if function_scoped and not function_selector:
             raise ValueError("Function-scoped native artifact requires a selector")
         if not function_scoped and function_selector:
@@ -190,6 +201,355 @@ class HydirClient:
         if not isinstance(value, dict) or value.get("schema_version") != schema_version:
             raise RuntimeError("Native artifact schema version verification failed")
         return value
+
+    def get_analysis_model(self, project_id: str, revision: int) -> dict:
+        """Read the binary-bound AnalysisModel at a project revision."""
+        reply = self._call(
+            self._stub_v3.GetAnalysisModel,
+            proto_v3.AnalysisModelRequest(
+                project_id=project_id, expected_revision=revision,
+            ),
+        )
+        return self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type="application/vnd.hydir.analysis-model+json;version=1",
+            schema_version=1,
+        )
+
+    def save_analysis_model(
+        self, project_id: str, revision: int, model: dict | bytes,
+        *, idempotency_key: str | None = None,
+    ):
+        """Save a complete model edit with an optimistic project revision check."""
+        if not isinstance(revision, int) or revision < 0:
+            raise ValueError("Project revision must be nonnegative")
+        if isinstance(model, dict):
+            raw = json.dumps(model, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        elif isinstance(model, bytes):
+            raw = model
+        else:
+            raise TypeError("Model must be a JSON object or UTF-8 JSON bytes")
+        if not 0 < len(raw) <= MAX_ANALYSIS_MODEL_BYTES:
+            raise ValueError("AnalysisModel exceeds the 16 MiB limit")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ValueError("Expected AnalysisModel v1 JSON object")
+        key = idempotency_key or str(uuid4())
+        if not 0 < len(key.encode("utf-8")) <= 128 or any(ord(ch) < 32 for ch in key):
+            raise ValueError("Idempotency key exceeds the supported bounds")
+        reply = self._call(
+            self._stub_v3.SaveAnalysisModel,
+            proto_v3.SaveAnalysisModelRequest(
+                project_id=project_id,
+                expected_revision=revision,
+                idempotency_key=key,
+                model_json=raw,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.revision != revision + 1
+            or len(reply.binary_sha256) != 64
+        ):
+            raise RuntimeError("Model revision or binary identity differs from request")
+        return reply
+
+    def analyze_ghidra_snapshot(
+        self,
+        project_id: str,
+        revision: int,
+        snapshot: bytes | str | os.PathLike[str],
+        stage: str,
+        *,
+        start_address: int | str | None = None,
+        instruction_index: int | None = None,
+        operation_index: int | None = None,
+        input_index: int | None = None,
+        selected_function_entry: int | str | None = None,
+        automatic: bool = False,
+    ) -> dict:
+        """Analyze a Ghidra export bound to this project's uploaded binary.
+
+        The service checks the binary digest and revision, runs the bounded
+        analysis in an isolated worker, and returns a versioned JSON artifact.
+        """
+        media_types = {
+            "snapshot": ("application/vnd.hydir.ghidra-snapshot+json;version=2", 2),
+            "pcode": ("application/vnd.hydir.pcode-ir+json;version=1", 1),
+            "simplify": ("application/vnd.hydir.pcode-simplification+json;version=1", 1),
+            "semantics": ("application/vnd.hydir.pcode-semantic-ir+json;version=1", 1),
+            "state": ("application/vnd.hydir.pcode-state-ir+json;version=1", 1),
+            "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
+            "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
+            "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
+            "llvm-cfg-image": ("application/vnd.hydir.pcode-cfg-llvm+json;version=3", 3),
+            "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
+            "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
+        }
+        if stage not in media_types:
+            raise ValueError("Unsupported Ghidra snapshot artifact stage")
+        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-simplified"}:
+            raise ValueError("Start address is supported only for CFG LLVM stages")
+        if stage == "slice":
+            if instruction_index is None or operation_index is None:
+                raise ValueError("Slice requires instruction and operation indices")
+            for label, index in (("instruction", instruction_index),
+                                 ("operation", operation_index), ("input", input_index)):
+                if index is not None and (
+                    not isinstance(index, int) or not 0 <= index <= 0xFFFFFFFF
+                ):
+                    raise ValueError(f"{label} index must be a 32-bit unsigned integer")
+        elif any(index is not None for index in
+                 (instruction_index, operation_index, input_index)):
+            raise ValueError("Operation indices are supported only for slice")
+        if isinstance(start_address, int):
+            if not 0 <= start_address <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("Start address must fit in 64 bits")
+            start_address = f"0x{start_address:x}"
+        if start_address is not None and (
+            not start_address.startswith("0x")
+            or not 1 <= len(start_address[2:]) <= 16
+            or any(character not in "0123456789abcdef" for character in start_address[2:])
+        ):
+            raise ValueError("Start address must be 0x plus 1..=16 lowercase hex digits")
+        if selected_function_entry is not None and not automatic:
+            raise ValueError("Selected function entry requires automatic Ghidra analysis")
+        if isinstance(selected_function_entry, int):
+            if not 0 <= selected_function_entry <= 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("Selected function entry must fit in 64 bits")
+            selected_function_entry = f"0x{selected_function_entry:x}"
+        if selected_function_entry is not None and (
+            not selected_function_entry.startswith("0x")
+            or not 1 <= len(selected_function_entry[2:]) <= 16
+            or any(character not in "0123456789abcdef" for character in selected_function_entry[2:])
+        ):
+            raise ValueError("Selected function entry must be 0x plus 1..=16 lowercase hex digits")
+        if isinstance(snapshot, bytes):
+            content = snapshot
+        else:
+            path = Path(snapshot)
+            if path.stat().st_size > MAX_GHIDRA_SNAPSHOT_BYTES:
+                raise ValueError("Ghidra snapshot exceeds 16 MiB")
+            content = path.read_bytes()
+        if len(content) > MAX_GHIDRA_SNAPSHOT_BYTES or (not automatic and not content):
+            raise ValueError("Ghidra snapshot must be 1..=16 MiB")
+        if automatic and content:
+            raise ValueError("Automatic Ghidra analysis does not accept a caller snapshot")
+        request = proto_v3.GhidraSnapshotArtifactRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            snapshot_json=content,
+            stage=stage,
+            start_address=start_address or "",
+            selected_function_entry=selected_function_entry or "",
+            automatic=automatic,
+        )
+        if stage == "slice":
+            request.instruction_index = instruction_index
+            request.operation_index = operation_index
+            if input_index is not None:
+                request.input_index = input_index
+        reply = self._call(self._stub_v3.AnalyzeGhidraSnapshot, request)
+        expected_media_type, schema_version = media_types[stage]
+        artifact = self._checked_json_artifact(
+            reply,
+            revision=revision,
+            media_type=expected_media_type,
+            schema_version=schema_version,
+        )
+        if stage == "slice" and artifact.get("path_proven") is not False:
+            raise RuntimeError("P-code slice has an unsupported path-proof claim")
+        if stage == "llvm-cfg-image":
+            image = artifact.get("read_only_image")
+            if (
+                not isinstance(image, dict)
+                or not isinstance(image.get("space"), str)
+                or type(image.get("base")) is not int
+                or type(image.get("byte_len")) is not int
+                or type(image.get("known_byte_count")) is not int
+                or not 0 <= image["base"] <= 0xFFFFFFFFFFFFFFFF
+                or not 1 <= image["known_byte_count"] <= image["byte_len"] <= 65_536
+                or not isinstance(image.get("contents_sha256"), str)
+                or len(image["contents_sha256"]) != 64
+                or any(character not in "0123456789abcdef"
+                       for character in image["contents_sha256"])
+            ):
+                raise RuntimeError("Image-backed CFG LLVM lacks a valid ELF image binding")
+        return artifact
+
+    def analyze_ghidra_binary(
+        self,
+        project_id: str,
+        revision: int,
+        stage: str,
+        *,
+        selected_function_entry: int | str | None = None,
+        start_address: int | str | None = None,
+        instruction_index: int | None = None,
+        operation_index: int | None = None,
+        input_index: int | None = None,
+    ) -> dict:
+        """Analyze the project's uploaded ELF with managed headless Ghidra."""
+        return self.analyze_ghidra_snapshot(
+            project_id, revision, b"", stage,
+            selected_function_entry=selected_function_entry,
+            start_address=start_address,
+            instruction_index=instruction_index,
+            operation_index=operation_index,
+            input_index=input_index,
+            automatic=True,
+        )
+
+    def trace_ghidra_calls(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Trace a seeded direct-call path through the uploaded ELF."""
+        return self._ghidra_call_artifact(
+            project_id, revision, seed, function_entry=function_entry, llvm=False,
+            max_functions=max_functions, max_operations=max_operations,
+            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+        )
+
+    def build_ghidra_call_cfg_llvm(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Emit bounded interprocedural CFG LLVM from an uploaded ELF and seed."""
+        return self._ghidra_call_artifact(
+            project_id, revision, seed, function_entry=function_entry, llvm=True,
+            max_functions=max_functions, max_operations=max_operations,
+            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+        )
+
+    def _ghidra_call_artifact(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        llvm: bool,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Validate and request a seeded Ghidra call artifact."""
+        if isinstance(function_entry, bool):
+            raise ValueError("Function entry must be a 64-bit address")
+        if isinstance(function_entry, int):
+            entry = function_entry
+        elif isinstance(function_entry, str) and function_entry.startswith("0x"):
+            digits = function_entry[2:]
+            if not 1 <= len(digits) <= 16 or any(
+                character not in "0123456789abcdef" for character in digits
+            ):
+                raise ValueError("Function entry must be lowercase hexadecimal")
+            entry = int(digits, 16)
+        else:
+            raise ValueError("Function entry must be a 64-bit address")
+        if not 0 <= entry <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("Function entry must fit in 64 bits")
+        function_hex = f"0x{entry:x}"
+        if isinstance(seed, bytes):
+            content = seed
+        else:
+            path = Path(seed)
+            if path.stat().st_size > MAX_PCODE_SEED_BYTES:
+                raise ValueError("P-code call seed exceeds 1 MiB")
+            content = path.read_bytes()
+        if not 1 <= len(content) <= MAX_PCODE_SEED_BYTES:
+            raise ValueError("P-code call seed must be 1..=1 MiB")
+        try:
+            seed_json = json.loads(content)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError("P-code call seed is invalid JSON") from error
+        if (
+            not isinstance(seed_json, dict)
+            or seed_json.get("schema_version") != 1
+            or not isinstance(seed_json.get("entry"), dict)
+            or seed_json["entry"].get("offset") != function_hex
+            or not isinstance(seed_json.get("binary_sha256"), str)
+            or len(seed_json["binary_sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in seed_json["binary_sha256"])
+        ):
+            raise ValueError("P-code call seed version, entry, or digest is invalid")
+        limits = (
+            ("max_functions", max_functions, 1, 8),
+            ("max_operations", max_operations, 0, 65_536),
+            ("max_visits", max_visits, 0, 65_536),
+            ("max_depth", max_depth, 0, 16),
+        )
+        for name, value, minimum, maximum in limits:
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(f"{name} must be {minimum}..={maximum}")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        request = proto_v3.GhidraCallTraceRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            function_entry=function_hex,
+            seed_json=content,
+        )
+        for name, value, _, _ in limits:
+            if value is not None:
+                setattr(request, name, value)
+        reply = self._call(
+            self._stub_v3.BuildGhidraCallCfgLlvm if llvm else self._stub_v3.TraceGhidraCalls,
+            request,
+            timeout=max(self._timeout, 180.0) if timeout is None else timeout,
+        )
+        artifact = self._checked_json_artifact(
+            reply, revision=revision,
+            media_type=(
+                "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
+                if llvm else "application/vnd.hydir.pcode-call-trace+json;version=2"
+            ),
+            schema_version=1 if llvm else 2,
+        )
+        if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
+            raise RuntimeError("Ghidra call artifact belongs to another binary")
+        if llvm:
+            entries = artifact.get("function_entries")
+            module = artifact.get("llvm")
+            if (
+                not isinstance(entries, list) or not entries
+                or not isinstance(entries[0], dict)
+                or entries[0] != seed_json["entry"]
+                or not isinstance(module, dict)
+                or module.get("binary_sha256") != seed_json["binary_sha256"]
+                or module.get("schema_version") != 2
+                or module.get("start") != seed_json["entry"]
+                or not isinstance(module.get("llvm_ir"), str)
+            ):
+                raise RuntimeError("Ghidra call LLVM artifact differs from the requested binary or function")
+        elif artifact.get("root_entry", {}).get("offset") != function_hex:
+            raise RuntimeError("Ghidra call trace differs from the requested function")
+        return artifact
 
     def start_program_analysis(
         self, project_id: str, revision: int, *, idempotency_key: str | None = None,

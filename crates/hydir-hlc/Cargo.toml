@@ -1,0 +1,17 @@
+[package]
+name = "hydir-hlc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hydir-core = { path = "../hydir-core" }
+hydir-decompile = { path = "../hydir-decompile" }
+hydir-ir = { path = "../hydir-ir" }
+hydir-model = { path = "../hydir-model" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3.23"

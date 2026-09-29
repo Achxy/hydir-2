@@ -11,13 +11,96 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Install native tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm gcc python3-venv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc python3-venv bubblewrap gdb apparmor-profiles apparmor-utils
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true
       - name: Install Triton binary-analysis bindings
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install triton-library
+          .venv/bin/python -m pip install triton-library==1.0.0rc4
       - name: Rust tests
         run: cargo test --locked --workspace
+      - name: Remote GUI model edit over live RPC
+        run: |
+          set -euo pipefail
+          umask 077
+          cargo build --locked --bin hydird --bin hydirctl --bin hydir
+          probe_dir="$RUNNER_TEMP/remote-model-gui"
+          mkdir -p "$probe_dir"
+          clang -O0 -no-pie -DHYDIR_FUNCTION=hydir_max2 \
+            tests/fixtures/max2.S tests/fixtures/scalar_main.c \
+            -o "$probe_dir/max2.elf"
+          target/debug/hydird identity create "$probe_dir/projects.sqlite" analyst \
+            | awk '/credential \(save securely/ {print $NF}' > "$probe_dir/analyst.token"
+          test "$(wc -c < "$probe_dir/analyst.token")" -eq 65
+          target/debug/hydird serve "$probe_dir/projects.sqlite" 127.0.0.1:50571 \
+            > "$probe_dir/server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          export HYDIR_ENDPOINT=http://127.0.0.1:50571
+          export HYDIR_TOKEN_FILE="$probe_dir/analyst.token"
+          for attempt in {1..120}; do
+            if target/debug/hydirctl remote discover \
+              > "$probe_dir/discovery.json" 2> "$probe_dir/discover.err"; then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          if ! test -s "$probe_dir/discovery.json"; then
+            cat "$probe_dir/server.log" >&2
+            cat "$probe_dir/discover.err" >&2
+            exit 1
+          fi
+          target/debug/hydir --probe-remote-model "$HYDIR_ENDPOINT" \
+            "$HYDIR_TOKEN_FILE" "$probe_dir/max2.elf" hydir_max2 \
+            > "$probe_dir/probe.txt"
+          cat "$probe_dir/probe.txt"
+          grep -q 'typed C available true' "$probe_dir/probe.txt"
+      - name: Python SDK tests
+        run: |
+          .venv/bin/python -m pip install -e sdk/python
+          PYTHONPATH=sdk/python .venv/bin/python -m unittest discover -s sdk/python/tests -q
+      - name: Exact PRISM bit-gate native differential
+        run: |
+          cargo build --locked -p hydir-cli --bin hydirctl
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_bit_gate_native_test.py -q
+      - name: Stripped password function native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/password_mix_native_test.py -q
+      - name: Stripped password comparison native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/password_secure_equals_native_test.py -q
+      - name: Direct-call PRISM native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/prism_call_chain_native_test.py -q
+      - name: Concrete indirect-call native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/ghidra_indirect_call_native_test.py -q
+      - name: Concrete indirect-jump native differential
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" python3 tests/ghidra_indirect_jump_native_test.py -q
+      - name: Native execution of checked P-code rewrite fixture
+        run: |
+          clang -O0 -no-pie -DHYDIR_NO_START \
+            tests/fixtures/ghidra_add_zero.S tests/fixtures/ghidra_add_zero_main.c \
+            -o "$RUNNER_TEMP/ghidra-add-zero-native"
+          for value in 0 1 255 18446744073709551615; do
+            test "$("$RUNNER_TEMP/ghidra-add-zero-native" "$value")" = "$value"
+          done
+      - name: Transformed Ghidra LLVM versus native ELF
+        run: |
+          HYDIRCTL_BIN="$PWD/target/debug/hydirctl" \
+            python3 tests/ghidra_add_zero_transformed_native_test.py -q
+      - name: Checked scalar patch and native replay
+        run: bash scripts/demo-patch.sh
+      - name: Native replay smoke
+        run: python3 scripts/replay-smoke.py
       - name: Fuzz target build
         run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
       - name: Native ELF decompiler artifacts and C11
@@ -26,6 +109,14 @@ jobs:
         env:
           HYDIR_TRITON_PYTHON: .venv/bin/python
         run: python3 tests/triton_bridge_test.py -q
+      - name: Captured-state solve and native replay smoke
+        env:
+          HYDIR_TRITON_PYTHON: .venv/bin/python
+        run: python3 scripts/snapshot-solve-smoke.py
+      - name: Live runtime capability report
+        env:
+          HYDIR_TRITON_PYTHON: .venv/bin/python
+        run: python3 scripts/doctor-live-gate.py
       - name: Semantic report protocol tests
         run: python3 tests/semantic_gate_report_test.py -q
       - name: Compiler-output semantic gate

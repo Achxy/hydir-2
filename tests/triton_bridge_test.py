@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +71,200 @@ class TritonBridgeTests(unittest.TestCase):
         result = self.run_bridge({"schema_version": 999})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsupported request schema", result.stderr)
+
+    def test_solver_uncertainty_does_not_discard_a_path_as_unsat(self) -> None:
+        specification = importlib.util.spec_from_file_location("hydir_triton_bridge", BRIDGE)
+        assert specification is not None and specification.loader is not None
+        bridge = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(bridge)
+
+        solver_state = types.SimpleNamespace(
+            SAT=1, UNSAT=2, TIMEOUT=3, UNKNOWN=4, OUTOFMEM=5
+        )
+        branch = types.SimpleNamespace(
+            isMultipleBranches=lambda: True,
+            getBranchConstraints=lambda: [{"constraint": "selected_path"}],
+        )
+        for status, label in ((3, "timeout"), (4, "unknown"), (5, "outofmem")):
+            context = types.SimpleNamespace(
+                getPathConstraints=lambda: [branch],
+                getModel=lambda predicate, **options: ({}, status, 2000),
+            )
+            with self.subTest(status=label), patch.dict(
+                sys.modules, {"triton": types.SimpleNamespace(SOLVER_STATE=solver_state)}
+            ):
+                with self.assertRaisesRegex(ValueError, label):
+                    bridge.path_witness(context, (0,))
+
+        context = types.SimpleNamespace(
+            getPathConstraints=lambda: [branch],
+            getModel=lambda predicate, **options: ({}, solver_state.UNSAT, 2),
+        )
+        with patch.dict(sys.modules, {"triton": types.SimpleNamespace(SOLVER_STATE=solver_state)}):
+            self.assertIsNone(bridge.path_witness(context, (0,)))
+
+    @staticmethod
+    def snapshot_request() -> dict:
+        # movzx eax, byte ptr [rdi]; cmp eax, 0x41; sete al;
+        # movzx eax, al; ret. The seed is 'B' and the goal needs 'A'.
+        code = bytes.fromhex("0fb60783f8410f94c00fb6c0c3")
+        code_page = code + bytes(4096 - len(code))
+        input_page = b"B" + bytes(4095)
+        stack_page = (0x4000).to_bytes(8, "little") + bytes(4088)
+        registers = {name: 0 for name in (
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9",
+            "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags",
+        )}
+        registers.update(rip=0x1000, rdi=0x2000, rsp=0x3000, eflags=0x202)
+        return {
+            "schema_version": 1,
+            "operation": "snapshot_return",
+            "binary_sha256": "0" * 64,
+            "input_sha256": "1" * 64,
+            "snapshot_sha256": "2" * 64,
+            "probe_sha256": "3" * 64,
+            "code_address": 0x1000,
+            "code_hex": code.hex(),
+            "registers": registers,
+            "pages": [
+                {"address": 0x1000, "bytes_hex": code_page.hex(),
+                 "writable": False, "executable": True},
+                {"address": 0x2000, "bytes_hex": input_page.hex(),
+                 "writable": True, "executable": False},
+                {"address": 0x3000, "bytes_hex": stack_page.hex(),
+                 "writable": True, "executable": False},
+            ],
+            "symbolic_origin": {
+                "id": "byte0", "channel": {"kind": "stdin"}, "offset": 0,
+                "length": 1, "encoding": "raw", "alphabet_hex": "",
+            },
+            "origin_address": 0x2000,
+            "seed_hex": "42",
+            "origin_probe_evidence": "byte_equality_only",
+            "assumptions": [
+                "analyst_selected_origin_address_has_input_channel_bytes",
+                "selected_code_extent_and_captured_pages_cover_this_function_path",
+            ],
+            "return_equals": 1,
+            "max_seeds": 4,
+            "max_instructions_per_seed": 32,
+            "max_solver_queries": 32,
+            "wall_timeout_ms": 20000,
+            "solver_timeout_ms": 1000,
+        }
+
+    def test_snapshot_request_rejects_uncaptured_register_or_memory(self) -> None:
+        missing_register = self.snapshot_request()
+        del missing_register["registers"]["rbx"]
+        result = self.run_bridge(missing_register)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("captured integer register set", result.stderr)
+
+        missing_input_page = self.snapshot_request()
+        missing_input_page["pages"] = missing_input_page["pages"][:1]
+        result = self.run_bridge(missing_input_page)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not capture byte", result.stderr)
+
+        forged_code = self.snapshot_request()
+        forged_code["code_hex"] = "90" + forged_code["code_hex"][2:]
+        result = self.run_bridge(forged_code)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("code_hex disagrees", result.stderr)
+
+        overlapping = self.snapshot_request()
+        overlapping["origin_address"] = 0x1000
+        overlapping["seed_hex"] = "0f"
+        result = self.run_bridge(overlapping)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("origin overlaps captured code", result.stderr)
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_return_finds_byte_function_witness(self) -> None:
+        result = self.run_bridge(self.snapshot_request())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "function_witness")
+        self.assertEqual(report["candidate_hex"], "41")
+        self.assertEqual(report["origin_probe_evidence"], "byte_equality_only")
+        self.assertEqual(report["return_equals"], 1)
+        self.assertRegex(report["backend_version"], r"^\d+\.\d+\.\d+$")
+        trace = report["input_condition_slice"]
+        self.assertEqual(trace["scope"], "captured_seed_trace_structural_dependencies")
+        self.assertEqual(trace["relevant_origin_offsets"], [0])
+        self.assertEqual(trace["instructions"][0]["address"], 0x1000)
+        self.assertEqual(trace["decisions"][-1]["kind"], "return")
+        self.assertTrue(trace["ast_walk_complete"])
+        self.assertIn("origin_channel_provenance_unproven_byte_equality_only",
+                      trace["unresolved_dependencies"])
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_return_flips_a_branch_after_failed_seed(self) -> None:
+        request = self.snapshot_request()
+        code = bytes.fromhex("8a073c417506b801000000c331c0c3")
+        request["code_hex"] = code.hex()
+        request["pages"][0]["bytes_hex"] = (code + bytes(4096 - len(code))).hex()
+        result = self.run_bridge(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "function_witness")
+        self.assertEqual(report["candidate_hex"], "41")
+        self.assertGreaterEqual(report["explored_seeds"], 2)
+        trace = report["input_condition_slice"]
+        self.assertEqual(trace["relevant_origin_offsets"], [0])
+        self.assertEqual(trace["decisions"][0]["kind"], "branch")
+        self.assertEqual(trace["decisions"][0]["address"], 0x1004)
+        self.assertEqual(trace["decisions"][0]["origin_offsets"], [0])
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_slice_excludes_unread_origin_byte(self) -> None:
+        request = self.snapshot_request()
+        request["seed_hex"] = "425a"
+        request["symbolic_origin"]["length"] = 2
+        request["pages"][1]["bytes_hex"] = (b"BZ" + bytes(4094)).hex()
+        report = json.loads(self.run_bridge(request).stdout)
+        self.assertEqual(report["status"], "function_witness")
+        self.assertEqual(report["candidate_hex"], "415a")
+        self.assertEqual(report["input_condition_slice"]["relevant_origin_offsets"], [0])
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_return_reports_query_budget_without_unsat_claim(self) -> None:
+        request = self.snapshot_request()
+        request["max_solver_queries"] = 1
+        code = bytes.fromhex("8a073c417506b801000000c331c0c3")
+        request["code_hex"] = code.hex()
+        request["pages"][0]["bytes_hex"] = (code + bytes(4096 - len(code))).hex()
+        result = self.run_bridge(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "budget_exhausted")
+        self.assertIsNone(report["candidate_hex"])
+        self.assertEqual(report["solver_queries"], 1)
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_return_reports_instruction_budget_on_loop(self) -> None:
+        request = self.snapshot_request()
+        request["code_hex"] = "ebfe"
+        request["pages"][0]["bytes_hex"] = (bytes.fromhex("ebfe") + bytes(4094)).hex()
+        request["max_instructions_per_seed"] = 8
+        result = self.run_bridge(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "budget_exhausted")
+        self.assertIsNone(report["candidate_hex"])
+        self.assertEqual(report["processed_instructions"], 8)
+
+    @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
+    def test_snapshot_return_marks_uncaptured_runtime_read_unsupported(self) -> None:
+        request = self.snapshot_request()
+        request["registers"]["rdi"] = 0x5000
+        result = self.run_bridge(request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "unsupported_effect")
+        self.assertIsNone(report["candidate_hex"])
+        self.assertIn("uncaptured memory", report["diagnostic"])
+        self.assertIsNone(report["input_condition_slice"])
 
     @unittest.skipUnless(TRITON_PYTHON, "Triton Python bindings are optional")
     def test_symbolic_add2(self) -> None:

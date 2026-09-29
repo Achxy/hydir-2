@@ -26,8 +26,9 @@ if _version_not_supported:
 
 
 class HydirV3Stub:
-    """Native whole-program analysis contract. v1 and v2 remain available for
-    compatibility; this service never requires an external decompiler.
+    """Native whole-program and Ghidra-backed analysis contract.
+    v1 and v2 remain available for compatibility. A caller can provide a
+    snapshot, or request automatic headless analysis of the uploaded binary.
     """
 
     def __init__(self, channel):
@@ -66,6 +67,31 @@ class HydirV3Stub:
                 request_serializer=hydir__v3__pb2.ProgramArtifactRequest.SerializeToString,
                 response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.GetAnalysisModel = channel.unary_unary(
+                '/hydir.v3.HydirV3/GetAnalysisModel',
+                request_serializer=hydir__v3__pb2.AnalysisModelRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
+        self.SaveAnalysisModel = channel.unary_unary(
+                '/hydir.v3.HydirV3/SaveAnalysisModel',
+                request_serializer=hydir__v3__pb2.SaveAnalysisModelRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.MutationReply.FromString,
+                _registered_method=True)
+        self.AnalyzeGhidraSnapshot = channel.unary_unary(
+                '/hydir.v3.HydirV3/AnalyzeGhidraSnapshot',
+                request_serializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
+        self.TraceGhidraCalls = channel.unary_unary(
+                '/hydir.v3.HydirV3/TraceGhidraCalls',
+                request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
+        self.BuildGhidraCallCfgLlvm = channel.unary_unary(
+                '/hydir.v3.HydirV3/BuildGhidraCallCfgLlvm',
+                request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
         self.UpdateAnalystFact = channel.unary_unary(
                 '/hydir.v3.HydirV3/UpdateAnalystFact',
                 request_serializer=hydir__v3__pb2.AnalystFactRequest.SerializeToString,
@@ -74,8 +100,9 @@ class HydirV3Stub:
 
 
 class HydirV3Servicer:
-    """Native whole-program analysis contract. v1 and v2 remain available for
-    compatibility; this service never requires an external decompiler.
+    """Native whole-program and Ghidra-backed analysis contract.
+    v1 and v2 remain available for compatibility. A caller can provide a
+    snapshot, or request automatic headless analysis of the uploaded binary.
     """
 
     def Discover(self, request, context):
@@ -109,6 +136,36 @@ class HydirV3Servicer:
         raise NotImplementedError('Method not implemented!')
 
     def GetProgramArtifact(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetAnalysisModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SaveAnalysisModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AnalyzeGhidraSnapshot(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TraceGhidraCalls(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def BuildGhidraCallCfgLlvm(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -153,6 +210,31 @@ def add_HydirV3Servicer_to_server(servicer, server):
                     request_deserializer=hydir__v3__pb2.ProgramArtifactRequest.FromString,
                     response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
             ),
+            'GetAnalysisModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetAnalysisModel,
+                    request_deserializer=hydir__v3__pb2.AnalysisModelRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'SaveAnalysisModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.SaveAnalysisModel,
+                    request_deserializer=hydir__v3__pb2.SaveAnalysisModelRequest.FromString,
+                    response_serializer=hydir__v3__pb2.MutationReply.SerializeToString,
+            ),
+            'AnalyzeGhidraSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnalyzeGhidraSnapshot,
+                    request_deserializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'TraceGhidraCalls': grpc.unary_unary_rpc_method_handler(
+                    servicer.TraceGhidraCalls,
+                    request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'BuildGhidraCallCfgLlvm': grpc.unary_unary_rpc_method_handler(
+                    servicer.BuildGhidraCallCfgLlvm,
+                    request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
             'UpdateAnalystFact': grpc.unary_unary_rpc_method_handler(
                     servicer.UpdateAnalystFact,
                     request_deserializer=hydir__v3__pb2.AnalystFactRequest.FromString,
@@ -167,8 +249,9 @@ def add_HydirV3Servicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class HydirV3:
-    """Native whole-program analysis contract. v1 and v2 remain available for
-    compatibility; this service never requires an external decompiler.
+    """Native whole-program and Ghidra-backed analysis contract.
+    v1 and v2 remain available for compatibility. A caller can provide a
+    snapshot, or request automatic headless analysis of the uploaded binary.
     """
 
     @staticmethod
@@ -322,6 +405,141 @@ class HydirV3:
             target,
             '/hydir.v3.HydirV3/GetProgramArtifact',
             hydir__v3__pb2.ProgramArtifactRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetAnalysisModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/GetAnalysisModel',
+            hydir__v3__pb2.AnalysisModelRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SaveAnalysisModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/SaveAnalysisModel',
+            hydir__v3__pb2.SaveAnalysisModelRequest.SerializeToString,
+            hydir__v3__pb2.MutationReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AnalyzeGhidraSnapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/AnalyzeGhidraSnapshot',
+            hydir__v3__pb2.GhidraSnapshotArtifactRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TraceGhidraCalls(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/TraceGhidraCalls',
+            hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BuildGhidraCallCfgLlvm(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/BuildGhidraCallCfgLlvm',
+            hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
             hydir__v3__pb2.ArtifactReply.FromString,
             options,
             channel_credentials,

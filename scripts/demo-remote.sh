@@ -86,6 +86,8 @@ grep -q 'stale project revision' "$demo_dir/stale.err"
   > "$demo_dir/gui-transfer-probe.txt"
 "$gui_bin" --probe-remote "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" "$alice_id" hydir_max2 \
   > "$demo_dir/gui-remote-probe.txt"
+"$gui_bin" --probe-remote-model "$HYDIR_ENDPOINT" "$HYDIR_TOKEN_FILE" \
+  "$demo_dir/max2-original" hydir_max2 > "$demo_dir/gui-remote-model-probe.txt"
 "$client_bin" remote lift "$alice_id" 1 hydir_max2 --assume-u64x2 \
   --output "$demo_dir/remote-lift.ll" > "$demo_dir/lift.json"
 "$client_bin" remote decompile "$alice_id" 1 hydir_max2 --assume-u64x2 \

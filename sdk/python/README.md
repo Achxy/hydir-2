@@ -1,5 +1,48 @@
 # HydIR Python SDK (compatible v1/v2 plus additive v3)
 
+For local Ghidra-backed lifting, `LocalGhidra` calls the same `hydirctl`
+worker as the desktop app. It needs no service credentials:
+
+```python
+from hydir_sdk import LocalGhidra
+
+client = LocalGhidra("hydirctl")
+snapshot = client.analyze("sample.elf", "snapshot.json")
+state = client.artifact("state", "sample.elf", "snapshot.json")
+```
+
+`analyze(..., function=0x...)` selects another function from the managed
+Ghidra project. `artifact` also accepts `pcode`, `simplify`, `semantics`, `cfg`,
+`llvm-prefix`, and `llvm-standalone`;
+`llvm_operation` emits LLVM for one exact P-code operation. Artifacts are
+checked against the binary SHA-256, and a function-level state artifact is
+an effect inventory rather than an executable lift. `llvm-standalone` provides
+a runnable byte-state module for the supported straight-line prefix, with an
+explicit stop reason; it does not claim whole-function equivalence.
+`import_project(binary, project_gpr, "folder/program.elf", snapshot,
+function=0x...)` exports one program from a closed, analyst-edited Ghidra
+project. The CLI stages an isolated copy, checks that the selected program
+matches the original ELF, and runs fresh on each call so later analyst edits
+are visible.
+`trace_prefix(binary, snapshot, seed, max_operations=4096)` runs the bounded
+concrete interpreter against a binary-bound JSON seed and returns its trace.
+`trace_path(...)` follows a bounded path through selected instructions and
+returns source-linked branch events and its explicit stop reason.
+`LocalGhidra.trace_calls(binary, seed, function=...)` follows bounded direct
+calls and automatically collects callee snapshots. For an uploaded project,
+`HydirClient.trace_ghidra_calls(project_id, revision, seed, function_entry=...)`
+provides the same artifact through the authenticated v3 service.
+`LocalGhidra.llvm_cfg_calls(binary, root_snapshot, (callee_snapshot,))`
+emits one bounded LLVM state machine across validated loaded callees. Its
+fidelity claim remains unknown until a concrete path is compared with an
+execution oracle.
+`LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
+managed worker and collects only callees reached by the seed before lifting.
+`HydirClient.build_ghidra_call_cfg_llvm(project_id, revision, seed,
+function_entry=...)` runs that bounded lift for an uploaded ELF through the
+v3 service and returns a revision-bound LLVM artifact. The returned module
+exposes source operations and explicit stops; it is not a whole-program lift.
+
 This SDK is backed by the same protobuf schema as `hydirctl remote` and
 `hydird`. It supports authenticated loopback or TLS discovery, project creation,
 explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
@@ -14,6 +57,36 @@ digest/media/schema/revision-checked ProgramSpec, FunctionIndex, coverage,
 MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
 artifacts. `get_program_artifact(...)` never executes the input and requires a
 FunctionIndex selector for function-scoped stages.
+
+`get_analysis_model(project_id, revision)` returns the current validated
+AnalysisModel v1 as JSON. Edit that document and call
+`save_analysis_model(project_id, revision, model, idempotency_key=...)` with
+the project revision you read. The model's own `revision` must increase by one.
+The server checks the binary digest and layout, retains machine evidence,
+persists the edit, and returns the new project revision. Later typed C and
+high-level CIR artifact requests use the saved model. Reuse the same
+idempotency key when retrying an uncertain save.
+
+`analyze_ghidra_snapshot(project_id, revision, snapshot, stage)` sends an
+exported Ghidra snapshot as bytes or a file path to the v3 service. The
+project must already contain the same binary. The server checks the snapshot
+digest against that binary and runs a bounded worker. Supported stages are
+`snapshot`, `pcode`, `simplify`, `semantics`, `state`, `cfg`, `coverage`, `llvm-cfg`, and `slice`. The
+`simplify` stage returns original and rewritten raw P-code with per-operation
+preconditions; its local bitvector identities do not claim native equivalence. For
+`llvm-cfg`, pass `start_address=0x...` to select a CFG entry. For `slice`, pass
+`instruction_index` and `operation_index`, plus optional `input_index`. The SDK checks the
+artifact hash, media type, schema version, and project revision before
+returning JSON.
+`analyze_ghidra_binary(project_id, revision, "snapshot")` asks the service to
+run its managed Ghidra worker on the already uploaded ELF, returning the
+validated function index and selected function snapshot. Pass
+`selected_function_entry=0x...` for another Ghidra function, then request
+`pcode`, `state`, `llvm-cfg`, or `slice`. The explicit automatic flag prevents an
+empty legacy snapshot request from starting analysis.
+For local snapshots, `LocalGhidra.slice(binary, snapshot, instruction_index,
+operation_index, input_index=None)` returns a bounded backward P-code value
+slice with source operations and explicit unresolved boundaries.
 
 v2 methods expose digest-checked
 `RegionSpec` v3, `PhysicalRegionIR` v1, and `DecompilationUnit` v1 JSON, compile scalar patch v1 into

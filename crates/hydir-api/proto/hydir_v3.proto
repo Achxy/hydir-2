@@ -1,8 +1,9 @@
 syntax = "proto3";
 package hydir.v3;
 
-// Native whole-program analysis contract. v1 and v2 remain available for
-// compatibility; this service never requires an external decompiler.
+// Native whole-program and Ghidra-backed analysis contract.
+// v1 and v2 remain available for compatibility. A caller can provide a
+// snapshot, or request automatic headless analysis of the uploaded binary.
 service HydirV3 {
   rpc Discover (DiscoverRequest) returns (DiscoverReply);
   rpc StartProgramAnalysis (StartProgramAnalysisRequest) returns (JobReply);
@@ -10,6 +11,11 @@ service HydirV3 {
   rpc CancelAnalysisJob (JobRequest) returns (JobReply);
   rpc StreamAnalysisEvents (JobEventRequest) returns (stream JobEvent);
   rpc GetProgramArtifact (ProgramArtifactRequest) returns (ArtifactReply);
+  rpc GetAnalysisModel (AnalysisModelRequest) returns (ArtifactReply);
+  rpc SaveAnalysisModel (SaveAnalysisModelRequest) returns (MutationReply);
+  rpc AnalyzeGhidraSnapshot (GhidraSnapshotArtifactRequest) returns (ArtifactReply);
+  rpc TraceGhidraCalls (GhidraCallTraceRequest) returns (ArtifactReply);
+  rpc BuildGhidraCallCfgLlvm (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
 
@@ -26,6 +32,27 @@ message DiscoverReply {
   string stable_contract = 9;
   bool isolated_analysis_jobs = 10;
   bool analyst_fact_updates = 11;
+  bool ghidra_snapshot_analysis = 12;
+  bool automatic_ghidra_analysis = 13;
+  bool revisioned_analysis_model_edits = 14;
+  bool ghidra_call_tracing = 15;
+  bool ghidra_call_cfg_llvm = 16;
+}
+
+// Returns the newest saved model for the current binary, or an inferred v1
+// model when no analyst edit has been saved yet.
+message AnalysisModelRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+}
+
+// model_json is the full AnalysisModel v1 document. Its model revision must be
+// one greater than the model returned at expected_revision.
+message SaveAnalysisModelRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+  bytes model_json = 4;
 }
 
 message StartProgramAnalysisRequest {
@@ -64,7 +91,8 @@ message JobEvent {
 }
 
 // stage is one of program_spec, function_index, coverage, machine, state,
-// function, cir, llvm, or unit. Function-scoped stages require a FunctionIndex
+// function, cir, llvm, unit, analysis_model, high_level_cir, or typed_c.
+// Function-scoped stages require a FunctionIndex
 // id or an unambiguous discovered name in function_selector.
 message ProgramArtifactRequest {
   string project_id = 1;
@@ -78,6 +106,48 @@ message ArtifactReply {
   string media_type = 2;
   bytes content = 3;
   uint64 project_revision = 4;
+}
+
+// The caller supplies an exporter snapshot for the current project binary, or
+// sets automatic=true with empty snapshot_json to run the managed Ghidra
+// worker. This explicit flag keeps malformed legacy requests inert.
+// stage is snapshot, pcode, semantics, state, cfg, coverage, llvm-cfg, or slice. Only
+// llvm-cfg accepts start_address, a 0x-prefixed address in the selected function
+// space. Only slice accepts the operation selector. Both indices are required
+// for slice; input_index is optional and restricts the slice to one input.
+// The server validates the snapshot digest against the uploaded binary and
+// runs the bounded Rust analysis in its isolated worker process.
+// selected_function_entry applies only to automatic analysis and uses a
+// Ghidra RAM address (0x-prefixed lowercase hex). Empty selects the first
+// analyzed function. A selected entry is kept separate from llvm-cfg's
+// start_address, which selects a path inside that function.
+message GhidraSnapshotArtifactRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  bytes snapshot_json = 3;
+  string stage = 4;
+  string start_address = 5;
+  optional uint32 instruction_index = 6;
+  optional uint32 operation_index = 7;
+  optional uint32 input_index = 8;
+  string selected_function_entry = 9;
+  bool automatic = 10;
+}
+
+// Runs the managed Ghidra worker on the project's uploaded ELF, collects a
+// bounded set of direct callees, then executes one seeded path in isolated
+// Rust analysis. Omitted budgets use the documented server defaults.
+// BuildGhidraCallCfgLlvm uses the same seed and collection budgets to emit
+// PcodeInterproceduralCfgLlvmArtifact v1 for the collected call path.
+message GhidraCallTraceRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string function_entry = 3;
+  bytes seed_json = 4;
+  optional uint32 max_functions = 5;
+  optional uint32 max_operations = 6;
+  optional uint32 max_visits = 7;
+  optional uint32 max_depth = 8;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.

@@ -15,7 +15,8 @@ use hydir_api::v2::{
     VerifyPatchRequest, hydir_v2_client::HydirV2Client,
 };
 use hydir_api::v3::{
-    ArtifactReply as ArtifactReplyV3, ProgramArtifactRequest, hydir_v3_client::HydirV3Client,
+    AnalysisModelRequest, ArtifactReply as ArtifactReplyV3, ProgramArtifactRequest,
+    SaveAnalysisModelRequest, hydir_v3_client::HydirV3Client,
 };
 use hydir_backend::{
     MAX_BINARY_BYTES, disassemble_elf, import_elf, lift_physical_region, lift_symbol,
@@ -28,30 +29,60 @@ use hydir_core::{
     overlay_analyst_assumptions, parse_program_spec_json,
 };
 use hydir_decompile::{
-    NativeCoverageReport, NativeDecompilation, decompile_function_at, decompile_symbol,
-    discover_functions, measure_native_coverage,
+    NativeCoverageReport, NativeDecompilation, PCODE_CFG_ELF_IMAGE_MAX_BYTES, PcodeCfgLlvmArtifact,
+    PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
+    PcodeStandalonePrefixArtifact, decompile_function_at, decompile_symbol, discover_functions,
+    emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_image, emit_pcode_exact_operation_llvm,
+    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
+};
+use hydir_execution::{
+    AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
+    validate_analysis_recipe,
+};
+use hydir_ghidra_worker::{GhidraRuntimeStatus, runtime_status};
+use hydir_hlc::{
+    HighCfgStatement, HighCfgTerminator, HighLevelCfgCir, HighLevelCir, HighStatement,
+    emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir,
+};
+use hydir_ir::pcode::{
+    GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeBackwardSlice,
+    PcodeCoverageReport, PcodeEffect, PcodeInterproceduralTrace, PcodePathDestination,
+    PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage, PcodeSemanticFunctionIr,
+    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
     MachineOperation, StateFunctionIr,
 };
+use hydir_model::{
+    AnalysisModel, ModelConflict, ModelEvidence, ModelPrototype, ModelSource, TypeDefinitionKind,
+    TypeRef, import_dwarf, import_ghidra_functions, infer_model, init_model,
+};
 use hydir_patch::{
     PatchBundle, PatchDocument, PlacementStrategy, compile_patch_binary, parse_patch_bundle_json,
     parse_patch_document,
 };
-use hydir_project::{LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings};
+use hydir_project::{
+    LocalAnnotationInput, LocalProject, LocalProjectStore, WorkbenchSettings, default_db_path,
+};
 use hydir_recompile::rebuild_bytes;
 use hydir_transform::{parse_passes, transform};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender},
+    process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tonic::{Request, metadata::MetadataValue, transport::Channel};
 
@@ -69,16 +100,108 @@ const CONSOLE_MAX_HEIGHT: f32 = 900.0;
 const MAIN_VIEW_MIN_HEIGHT: f32 = 120.0;
 const PINNED_OPT: &str = "/usr/bin/opt-14";
 const PINNED_CLANG: &str = "/usr/bin/clang-14";
+const GHIDRA_LOCAL_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+const GHIDRA_DOCKER_TIMEOUT: Duration = Duration::from_secs(46 * 60);
+const GHIDRA_MAX_CALLEES: u64 = 8;
+const GHIDRA_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+fn ghidra_task_timeout(mode: Option<&str>, trace_calls: bool) -> Duration {
+    let first_analysis = if mode == Some("local")
+        || (mode.is_none() && std::env::var_os("HYDIR_GHIDRA_HOME").is_some())
+    {
+        GHIDRA_LOCAL_TIMEOUT
+    } else {
+        GHIDRA_DOCKER_TIMEOUT
+    };
+    if trace_calls {
+        // Docker image setup happens once; each later callee has an analysis limit.
+        first_analysis + GHIDRA_LOCAL_TIMEOUT * GHIDRA_MAX_CALLEES as u32
+    } else {
+        first_analysis
+    }
+}
 
 fn resized_console_height(current: f32, drag_delta_y: f32, maximum: f32) -> f32 {
     (current - drag_delta_y).clamp(CONSOLE_MIN_HEIGHT, maximum)
+}
+
+fn probe_ghidra_runtime(ctx: &egui::Context) -> Receiver<(GhidraRuntimeStatus, bool)> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let repaint = ctx.clone();
+    thread::spawn(move || {
+        let _ = sender.send((runtime_status(), hydirctl_available()));
+        repaint.request_repaint();
+    });
+    receiver
+}
+
+fn ghidra_readiness_copy(status: &GhidraRuntimeStatus) -> (&'static str, &'static str) {
+    match (
+        status.mode,
+        status.runtime_ready,
+        status.worker_image_cached,
+    ) {
+        ("local", true, _) => (
+            "Local Ghidra executable found",
+            "Ready to analyze. HydIR checks the version and snapshot during analysis.",
+        ),
+        ("local", false, _) => (
+            "Local Ghidra executable missing",
+            "Correct HYDIR_GHIDRA_HOME to the Ghidra installation directory, then restart HydIR.",
+        ),
+        ("docker", true, Some(true)) => (
+            "Docker ready · worker image cached",
+            "Ready to analyze a local ELF.",
+        ),
+        ("docker", true, _) => (
+            "Docker ready · worker image needed",
+            "Analyze a local ELF to build the pinned worker image on first use.",
+        ),
+        ("docker", false, _) => (
+            "Docker engine unavailable",
+            "Start Docker and refresh, or set HYDIR_GHIDRA_HOME to a local Ghidra installation and restart HydIR.",
+        ),
+        _ => (
+            "Ghidra runtime unavailable",
+            "Check the Ghidra runtime setup, then refresh.",
+        ),
+    }
 }
 
 enum Task {
     LoadWorkbench,
     SaveWorkbench(WorkbenchSettings),
     Open(PathBuf),
+    OpenRecipe(PathBuf),
     OpenGhidraGraph(PathBuf),
+    AnalyzeGhidra {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: Option<String>,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
+    TraceGhidraPath {
+        snapshot: Box<GhidraSnapshot>,
+        seed_json: String,
+        start_text: String,
+    },
+    TraceGhidraCalls {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: String,
+        seed_json: String,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
+    EmitGhidraCallLlvm {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: String,
+        seed_json: String,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
     OpenRemote {
         endpoint: String,
         token_file: PathBuf,
@@ -101,7 +224,26 @@ enum Task {
         selector: String,
         entry: Location,
     },
-    Disassemble,
+    RenameModel {
+        binary_sha256: String,
+        expected_revision: u64,
+        model: AnalysisModel,
+        target: ModelRenameTarget,
+        name: String,
+        native: Box<NativeDecompilation>,
+        key: String,
+    },
+    EditModel {
+        binary_sha256: String,
+        expected_revision: u64,
+        model: AnalysisModel,
+        edit: ModelEdit,
+        native: Box<NativeDecompilation>,
+        key: String,
+    },
+    Disassemble {
+        automatic: bool,
+    },
     Triton {
         path: PathBuf,
         symbol: String,
@@ -178,7 +320,29 @@ enum Event {
         spec: ProgramSpec,
         function_index: Result<FunctionIndex, String>,
     },
+    RecipeLoaded(Result<AnalysisRecipe, String>),
     GhidraGraphLoaded(Result<GhidraGraph, String>),
+    GhidraAnalyzed {
+        binary_sha256: String,
+        result: Result<(GhidraSnapshot, Option<String>), String>,
+    },
+    GhidraPathTraced {
+        binary_sha256: String,
+        function: PcodeAddress,
+        seed_json: String,
+        start_text: String,
+        result: Result<PcodePathTrace, String>,
+    },
+    GhidraCallsTraced {
+        binary_sha256: String,
+        function: String,
+        result: Result<PcodeInterproceduralTrace, String>,
+    },
+    GhidraCallLlvmEmitted {
+        binary_sha256: String,
+        function: String,
+        result: Result<PcodeInterproceduralCfgLlvmArtifact, String>,
+    },
     RemoteProjectCreated(String),
     Selected {
         symbol: String,
@@ -191,8 +355,27 @@ enum Event {
     NativeSelected {
         label: String,
         native: Box<Result<NativeDecompilation, String>>,
+        typed: Box<Result<TypedNativeView, String>>,
+        project_revision: Option<u64>,
     },
-    Disassembled(Result<DisassemblyReport, String>),
+    ModelRenamed {
+        binary_sha256: String,
+        entry: Location,
+        revision: u64,
+        remote: bool,
+        typed: Box<Result<TypedNativeView, String>>,
+    },
+    ModelEdited {
+        binary_sha256: String,
+        entry: Location,
+        revision: u64,
+        remote: bool,
+        typed: Box<Result<TypedNativeView, String>>,
+    },
+    Disassembled {
+        result: Result<DisassemblyReport, String>,
+        automatic: bool,
+    },
     Triton(Result<serde_json::Value, String>),
     TritonConsole {
         commands: Vec<String>,
@@ -500,6 +683,139 @@ async fn remote_function_index(access: &RemoteAccess) -> Result<FunctionIndex, S
         "application/vnd.hydir.function-index+json;version=1",
     )
     .await
+}
+
+async fn remote_analysis_model(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+) -> Result<AnalysisModel, String> {
+    let mut client = remote_v3_client(access).await?;
+    let artifact = client
+        .get_analysis_model(authorized(
+            AnalysisModelRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| format!("Remote analysis model recovery failed: {error}"))?
+        .into_inner();
+    let model: AnalysisModel = decode_v3_artifact(
+        artifact,
+        access,
+        "application/vnd.hydir.analysis-model+json;version=1",
+    )?;
+    hydir_model::validate_structure(&model)?;
+    if model.binary_sha256 != binary_sha256 {
+        return Err("Remote analysis model has the wrong binary".to_owned());
+    }
+    Ok(model)
+}
+
+enum RemoteModelSaveError {
+    Preflight(String),
+    Uncertain(String),
+}
+
+fn validate_remote_model_save(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+    displayed: &AnalysisModel,
+    candidate: &AnalysisModel,
+) -> Result<(), String> {
+    if displayed.binary_sha256 != binary_sha256
+        || candidate.binary_sha256 != binary_sha256
+        || candidate.revision
+            != displayed
+                .revision
+                .checked_add(1)
+                .ok_or("Analysis model revision overflow")?
+        || access.revision.checked_add(1).is_none()
+    {
+        return Err("Model edit binary or revision differs from the open project".to_owned());
+    }
+    Ok(())
+}
+
+async fn save_remote_analysis_model(
+    access: &RemoteAccess,
+    binary_sha256: &str,
+    displayed: &AnalysisModel,
+    candidate: &AnalysisModel,
+    key: &str,
+) -> Result<(u64, Result<AnalysisModel, String>), RemoteModelSaveError> {
+    validate_remote_model_save(access, binary_sha256, displayed, candidate)
+        .map_err(RemoteModelSaveError::Preflight)?;
+    let current = remote_analysis_model(access, binary_sha256)
+        .await
+        .map_err(RemoteModelSaveError::Preflight)?;
+    if &current != displayed {
+        return Err(RemoteModelSaveError::Preflight(
+            "Model view is stale; reselect the function before editing".to_owned(),
+        ));
+    }
+    let payload = serde_json::to_vec(candidate)
+        .map_err(|error| RemoteModelSaveError::Preflight(error.to_string()))?;
+    let mut client = remote_v3_client(access)
+        .await
+        .map_err(RemoteModelSaveError::Preflight)?;
+    // Once dispatched, even a transport error may mean the server committed.
+    let reply = client
+        .save_analysis_model(authorized(
+            SaveAnalysisModelRequest {
+                project_id: access.project_id.clone(),
+                expected_revision: access.revision,
+                idempotency_key: key.to_owned(),
+                model_json: payload,
+            },
+            &access.token,
+        ))
+        .await
+        .map_err(|error| RemoteModelSaveError::Uncertain(error.to_string()))?
+        .into_inner();
+    if reply.project_id != access.project_id
+        || reply.binary_sha256 != binary_sha256
+        || Some(reply.revision) != access.revision.checked_add(1)
+    {
+        return Err(RemoteModelSaveError::Uncertain(
+            "Remote model save returned an unexpected project, binary, or revision".to_owned(),
+        ));
+    }
+    let updated = RemoteAccess {
+        revision: reply.revision,
+        ..access.clone()
+    };
+    let saved = remote_analysis_model(&updated, binary_sha256).await;
+    Ok((reply.revision, saved))
+}
+
+async fn persist_remote_model_change(
+    access: &mut RemoteAccess,
+    binary_sha256: &str,
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    mut candidate: AnalysisModel,
+    native: &NativeDecompilation,
+    key: &str,
+) -> Result<(u64, Result<TypedNativeView, String>), RemoteModelSaveError> {
+    if access.revision != expected_revision || native.machine_ir.binary_sha256 != binary_sha256 {
+        return Err(RemoteModelSaveError::Preflight(
+            "Model view is stale or belongs to a different binary; reselect the function"
+                .to_owned(),
+        ));
+    }
+    candidate.revision = displayed.revision.checked_add(1).ok_or_else(|| {
+        RemoteModelSaveError::Preflight("Analysis model revision overflow".to_owned())
+    })?;
+    hydir_model::validate_structure(&candidate).map_err(RemoteModelSaveError::Preflight)?;
+    let (revision, saved) =
+        save_remote_analysis_model(access, binary_sha256, displayed, &candidate, key).await?;
+    access.revision = revision;
+    Ok((
+        revision,
+        saved.and_then(|model| typed_view_with_model(model, native)),
+    ))
 }
 
 async fn remote_native_decompilation(
@@ -1599,7 +1915,7 @@ async fn patch_remote(
     Ok((reply.revision, spec, reply.binary_sha256))
 }
 
-fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
+fn bounded_read(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = fs::metadata(path).map_err(|e| format!("Cannot read binary metadata: {e}"))?;
     if metadata.len() > MAX_BINARY_BYTES as u64 {
         return Err("Binary exceeds the 64 MiB import limit.".to_owned());
@@ -1614,6 +1930,45 @@ fn bounded_read(path: &PathBuf) -> Result<Vec<u8>, String> {
         return Err("Binary changed while reading and exceeds the import limit.".to_owned());
     }
     Ok(bytes)
+}
+
+fn bounded_read_recipe(path: &Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| format!("Cannot open investigation recipe: {error}"))?
+        .take((MAX_ANALYSIS_RECIPE_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Cannot read investigation recipe: {error}"))?;
+    if bytes.len() > MAX_ANALYSIS_RECIPE_JSON_BYTES {
+        return Err("Investigation recipe exceeds the 24 MiB limit".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn recipe_elf_address(recipe: &AnalysisRecipe, runtime_address: u64) -> Option<u64> {
+    let stop = recipe.snapshot.stop.as_ref()?;
+    let code_length = recipe.resume_plan.code_hex.len() / 2;
+    captured_code_elf_address(
+        stop,
+        recipe.resume_plan.code_address,
+        code_length,
+        runtime_address,
+    )
+}
+
+fn captured_code_elf_address(
+    stop: &StopPoint,
+    code_address: u64,
+    code_length: usize,
+    runtime_address: u64,
+) -> Option<u64> {
+    let code_end = code_address.checked_add(code_length as u64)?;
+    if stop.runtime_pc != code_address || !(code_address..code_end).contains(&runtime_address) {
+        return None;
+    }
+    let offset = runtime_address.checked_sub(stop.runtime_pc)?;
+    let translated = runtime_address.checked_sub(stop.load_bias?)?;
+    (translated == stop.elf_vaddr?.checked_add(offset)?).then_some(translated)
 }
 
 fn hydirctl_path() -> PathBuf {
@@ -1632,6 +1987,840 @@ fn hydirctl_path() -> PathBuf {
     } else {
         "hydirctl"
     })
+}
+
+fn hydirctl_available() -> bool {
+    let executable = hydirctl_path();
+    executable.is_file()
+        || std::env::var_os("PATH").is_some_and(|search_path| {
+            std::env::split_paths(&search_path)
+                .any(|directory| directory.join(&executable).is_file())
+        })
+}
+
+fn ghidra_snapshot_path(binary_sha256: &str, function: Option<&str>) -> Result<PathBuf, String> {
+    if binary_sha256.len() != 64
+        || !binary_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Invalid opened binary digest for Ghidra cache".to_owned());
+    }
+    let key = match function {
+        Some(entry) => {
+            let digits = entry
+                .strip_prefix("0x")
+                .ok_or("Ghidra function entry must be a hex address".to_owned())?;
+            let address = u64::from_str_radix(digits, 16)
+                .map_err(|_| "Invalid Ghidra function entry".to_owned())?;
+            format!("entry-{address:016x}")
+        }
+        None => "default".to_owned(),
+    };
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .ok_or("Cannot determine the Windows user cache directory".to_owned())?;
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Caches"))
+        .ok_or("Cannot determine the macOS user cache directory".to_owned())?;
+    #[cfg(target_os = "linux")]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .ok_or("Cannot determine the Linux user cache directory".to_owned())?;
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let base = std::env::temp_dir();
+    let output_dir = base.join("HydIR").join("ghidra").join(binary_sha256);
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("Could not prepare Ghidra cache directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not protect Ghidra cache directory: {error}"))?;
+    }
+    Ok(output_dir.join(format!("{key}.json")))
+}
+
+fn ghidra_output_tail(file: &mut fs::File) -> Result<Vec<u8>, String> {
+    const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(MAX_OUTPUT_BYTES)))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+fn kill_ghidra_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // The CLI is launched in its own group, which includes local Ghidra.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_ghidra_command(
+    command: &mut Command,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<Output, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("Ghidra task cancelled".to_owned());
+    }
+    let scratch = tempfile::tempdir()
+        .map_err(|error| format!("Could not create Ghidra task scratch: {error}"))?;
+    let cancel_path = scratch.path().join("cancel");
+    let mut stdout = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(scratch.path().join("stdout.log"))
+        .map_err(|error| format!("Could not create Ghidra stdout log: {error}"))?;
+    let mut stderr = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(scratch.path().join("stderr.log"))
+        .map_err(|error| format!("Could not create Ghidra stderr log: {error}"))?;
+    command
+        .env("HYDIR_GHIDRA_CANCEL_FILE", &cancel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            stdout.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().map_err(|error| error.to_string())?,
+        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Could not spawn {}: {error}",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+    let started = Instant::now();
+    let mut stopping: Option<(&str, Instant)> = None;
+    loop {
+        if stopping.is_none() {
+            let reason = if cancel.load(Ordering::Acquire) {
+                Some("Ghidra task cancelled")
+            } else if started.elapsed() >= timeout {
+                Some("Ghidra task timed out")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                // The worker removes Docker containers and local Java descendants.
+                // Keep a short fallback for a worker blocked outside its poll loop.
+                let _ = fs::write(&cancel_path, []);
+                stopping = Some((reason, Instant::now()));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if let Some((reason, _)) = stopping {
+                    return Err(reason.to_owned());
+                }
+                return Ok(Output {
+                    status,
+                    stdout: ghidra_output_tail(&mut stdout)?,
+                    stderr: ghidra_output_tail(&mut stderr)?,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                kill_ghidra_process_tree(&mut child);
+                return Err(format!("Could not monitor Ghidra task: {error}"));
+            }
+        }
+        if let Some((reason, requested_at)) = stopping
+            && requested_at.elapsed() >= Duration::from_secs(3)
+        {
+            kill_ghidra_process_tree(&mut child);
+            return Err(reason.to_owned());
+        }
+        thread::sleep(GHIDRA_POLL_INTERVAL);
+    }
+}
+
+fn run_ghidra_cli(
+    binary: &Path,
+    binary_sha256: &str,
+    function: Option<&str>,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<(GhidraSnapshot, Option<String>), String> {
+    let snapshot_path = ghidra_snapshot_path(binary_sha256, function)?;
+    {
+        let mut command = Command::new(hydirctl_path());
+        command
+            .args(["ghidra", "analyze"])
+            .arg(binary)
+            .arg("--output")
+            .arg(&snapshot_path);
+        if let Some(function) = function {
+            command.arg("--function").arg(function);
+        }
+        let output = run_ghidra_command(&mut command, cancel, timeout)
+            .map_err(|error| format!("Could not start automatic Ghidra analysis: {error}"))?;
+        if !output.status.success() {
+            let detail = if output.stderr.is_empty() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            let detail = String::from_utf8_lossy(detail);
+            return Err(format!(
+                "Ghidra analysis failed ({}): {}",
+                output.status,
+                detail.chars().take(4096).collect::<String>().trim()
+            ));
+        }
+        let size = fs::metadata(&snapshot_path)
+            .map_err(|error| format!("Ghidra did not produce a snapshot: {error}"))?
+            .len();
+        if size == 0 || size > MAX_GHIDRA_SNAPSHOT_BYTES as u64 {
+            return Err("Ghidra snapshot is empty or exceeds the GUI import limit".to_owned());
+        }
+        let bytes = fs::read(&snapshot_path)
+            .map_err(|error| format!("Could not read Ghidra snapshot: {error}"))?;
+        let snapshot = parse_ghidra_snapshot(&bytes, binary_sha256)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("Ghidra task cancelled".to_owned());
+        }
+        let persistence_warning = (|| {
+            let database = default_db_path()?;
+            persist_ghidra_snapshot(&database, binary, binary_sha256, &snapshot)
+        })()
+        .err()
+        .map(|error| format!("Ghidra snapshot is available but project update failed: {error}"));
+        Ok((snapshot, persistence_warning))
+    }
+}
+
+fn run_ghidra_call_trace(
+    binary: &Path,
+    binary_sha256: &str,
+    function: &str,
+    seed_json: &str,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<PcodeInterproceduralTrace, String> {
+    if seed_json.len() > MAX_PCODE_SEED_BYTES {
+        return Err("Ghidra call seed exceeds the JSON input limit".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let seed_path = scratch.path().join("seed.json");
+    let trace_path = scratch.path().join("calls.json");
+    fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let mut command = Command::new(hydirctl_path());
+    command
+        .args(["ghidra", "trace-calls"])
+        .arg(binary)
+        .arg(&seed_path)
+        .arg("--function")
+        .arg(function)
+        .arg("--max-functions")
+        .arg("8")
+        .arg("--output")
+        .arg(&trace_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)
+        .map_err(|error| format!("Could not start Ghidra call tracing: {error}"))?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Ghidra call tracing failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(detail)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+                .trim()
+        ));
+    }
+    let size = fs::metadata(&trace_path)
+        .map_err(|error| format!("Ghidra call tracing produced no artifact: {error}"))?
+        .len();
+    if size == 0 || size > 16 * 1024 * 1024 {
+        return Err("Ghidra call trace exceeds the GUI artifact limit".to_owned());
+    }
+    let trace: PcodeInterproceduralTrace =
+        serde_json::from_slice(&fs::read(&trace_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("Invalid Ghidra call trace: {error}"))?;
+    if trace.schema_version != hydir_ir::pcode::PCODE_CALL_PATH_VERSION
+        || trace.binary_sha256 != binary_sha256
+        || trace.root_entry.offset != function
+    {
+        return Err("Ghidra call trace differs from the opened binary or function".to_owned());
+    }
+    Ok(trace)
+}
+
+fn run_ghidra_call_llvm(
+    binary: &Path,
+    binary_sha256: &str,
+    function: &str,
+    seed_json: &str,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    if seed_json.len() > MAX_PCODE_SEED_BYTES {
+        return Err("Ghidra call seed exceeds the JSON input limit".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let seed_path = scratch.path().join("seed.json");
+    let artifact_path = scratch.path().join("call-cfg-llvm.json");
+    fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let mut command = Command::new(hydirctl_path());
+    command
+        .args(["ghidra", "llvm-cfg-calls"])
+        .arg(binary)
+        .arg(&seed_path)
+        .arg("--function")
+        .arg(function)
+        .arg("--max-functions")
+        .arg("8")
+        .arg("--output")
+        .arg(&artifact_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)
+        .map_err(|error| format!("Could not start Ghidra call LLVM generation: {error}"))?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Ghidra call LLVM generation failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(detail)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+                .trim()
+        ));
+    }
+    let size = fs::metadata(&artifact_path)
+        .map_err(|error| format!("Ghidra call LLVM produced no artifact: {error}"))?
+        .len();
+    if size == 0 || size > 32 * 1024 * 1024 {
+        return Err("Ghidra call LLVM exceeds the GUI artifact limit".to_owned());
+    }
+    let artifact: PcodeInterproceduralCfgLlvmArtifact =
+        serde_json::from_slice(&fs::read(&artifact_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("Invalid Ghidra call LLVM artifact: {error}"))?;
+    if artifact.schema_version != 1
+        || artifact.binary_sha256 != binary_sha256
+        || artifact.llvm.binary_sha256 != binary_sha256
+        || artifact
+            .function_entries
+            .first()
+            .map(|entry| entry.offset.as_str())
+            != Some(function)
+    {
+        return Err("Ghidra call LLVM differs from the opened binary or function".to_owned());
+    }
+    Ok(artifact)
+}
+
+fn persist_ghidra_snapshot(
+    database: &Path,
+    binary: &Path,
+    binary_sha256: &str,
+    snapshot: &GhidraSnapshot,
+) -> Result<(), String> {
+    let original = bounded_read(binary)?;
+    let spec = import_elf(&original)
+        .map_err(|error| format!("Could not import ELF for local project: {error}"))?;
+    if spec.binary_sha256 != binary_sha256 {
+        return Err("Opened ELF changed during Ghidra analysis".to_owned());
+    }
+    let mut store = LocalProjectStore::open(database)?;
+    let project = store.open_binary(binary, &spec)?;
+    store.save_ghidra_snapshot(&project, snapshot)?;
+    let mut model = match store.load_model(&project)? {
+        Some(model) => model,
+        None => init_model(&original)?,
+    };
+    let previous = model.clone();
+    import_ghidra_functions(&original, &mut model, snapshot)?;
+    if model != previous {
+        let snapshot_json = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+        let digest = format!("{:x}", Sha256::digest(snapshot_json));
+        let key = format!("ghidra-{digest}-r{}", project.revision);
+        store.save_model(&project, &model, &key)?;
+    }
+    Ok(())
+}
+
+fn pcode_varnode(varnode: &PcodeVarnode) -> String {
+    format!("{}:{}[{}]", varnode.space, varnode.offset, varnode.size)
+}
+
+fn high_pcode_varnode(node: &GhidraHighVarnodeEvidence) -> String {
+    let name = node
+        .high_name
+        .as_deref()
+        .filter(|name| !name.is_empty() && *name != "UNNAMED")
+        .unwrap_or("?");
+    let data_type = node
+        .high_type
+        .as_ref()
+        .map(|data_type| data_type.display_name.as_str())
+        .unwrap_or("?");
+    format!("{name}:{data_type}#{}", node.ssa_id)
+}
+
+fn ghidra_composite_evidence(snapshot: &GhidraSnapshot) -> Vec<GhidraDataTypeEvidence> {
+    fn collect(
+        ty: &GhidraDataTypeEvidence,
+        depth: usize,
+        layouts: &mut std::collections::BTreeMap<String, GhidraDataTypeEvidence>,
+    ) {
+        if depth >= 4 {
+            return;
+        }
+        if matches!(
+            ty.kind,
+            GhidraDataTypeKind::Struct | GhidraDataTypeKind::Union
+        ) {
+            layouts
+                .entry(ty.path.clone())
+                .and_modify(|existing| {
+                    if ty.fields.len() > existing.fields.len() {
+                        *existing = ty.clone();
+                    }
+                })
+                .or_insert_with(|| ty.clone());
+        }
+        if let Some(target) = &ty.target_type {
+            collect(target, depth + 1, layouts);
+        }
+        for field in &ty.fields {
+            collect(&field.data_type, depth + 1, layouts);
+        }
+    }
+
+    let mut layouts = std::collections::BTreeMap::new();
+    if let Some(prototype) = snapshot
+        .functions
+        .iter()
+        .find(|function| function.entry == snapshot.selected_function.entry)
+        .and_then(|function| function.prototype.as_ref())
+    {
+        collect(&prototype.return_type, 0, &mut layouts);
+        for parameter in &prototype.parameters {
+            collect(&parameter.data_type, 0, &mut layouts);
+        }
+    }
+    if let Some(high) = &snapshot.selected_function.high_pcode {
+        for operation in high.operations.iter().take(1024) {
+            for node in operation.output.iter().chain(operation.inputs.iter()) {
+                if let Some(ty) = &node.high_type {
+                    collect(ty, 0, &mut layouts);
+                }
+            }
+        }
+    }
+    layouts.into_values().collect()
+}
+
+fn ghidra_seed_template(snapshot: &GhidraSnapshot) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "binary_sha256": snapshot.binary_sha256,
+        "entry": snapshot.selected_function.entry,
+        "registers": [],
+        "memory": []
+    }))
+    .unwrap_or_default()
+}
+
+fn ghidra_trace_start(snapshot: &GhidraSnapshot, text: &str) -> Result<PcodeAddress, String> {
+    let digits = text
+        .trim()
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("trace start must be a 0x-prefixed instruction address")?;
+    let offset = u64::from_str_radix(digits, 16)
+        .map_err(|_| "trace start exceeds a 64-bit address".to_owned())?;
+    Ok(PcodeAddress {
+        space: snapshot.selected_function.entry.space.clone(),
+        offset: format!("0x{offset:x}"),
+    })
+}
+
+fn trace_ghidra_path(
+    snapshot: &GhidraSnapshot,
+    seed_json: &str,
+    start_text: &str,
+    binary: Option<&[u8]>,
+) -> Result<PcodePathTrace, String> {
+    let initial = parse_pcode_seed(seed_json.as_bytes(), snapshot)?;
+    let start = ghidra_trace_start(snapshot, start_text)?;
+    if let Some(binary) = binary
+        && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
+    {
+        let image = PcodeReadOnlyElfImage::from_elf(binary, snapshot)?;
+        snapshot.execute_concrete_path_with_image(&initial, &image, Some(&start), 4096, 1024)
+    } else {
+        snapshot.execute_concrete_path(&initial, Some(&start), 4096, 1024)
+    }
+}
+
+fn emit_ghidra_image_cfg_llvm(
+    snapshot: &GhidraSnapshot,
+    start_text: &str,
+    binary_path: &Path,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    let start = ghidra_trace_start(snapshot, start_text)?;
+    let binary = bounded_read(binary_path)?;
+    let image = PcodeReadOnlyElfImage::from_elf(&binary, snapshot)?;
+    let window = image.materialize_window(PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+    emit_pcode_cfg_llvm_with_image(snapshot, Some(&start), &window)
+}
+
+/// Translate Ghidra's imported RAM image back to linked ELF virtual addresses.
+/// The GUI's shared selection uses linked addresses; P-code and trace inputs
+/// continue to use the addresses in the Ghidra snapshot.
+struct GhidraAddressMap {
+    ghidra_base: u64,
+    elf_base: u64,
+    mapped_ranges: Vec<(u64, u64)>,
+}
+
+impl GhidraAddressMap {
+    fn new(snapshot: &GhidraSnapshot, spec: &ProgramSpec) -> Option<Self> {
+        if snapshot.program.image_base.space != "ram" {
+            return None;
+        }
+        let ghidra_base = parse_ghidra_offset(&snapshot.program.image_base.offset)?;
+        let mapped_ranges: Vec<_> = spec
+            .mapped_segments
+            .iter()
+            .filter(|segment| segment.address_space == 0 && segment.memory_size > 0)
+            .filter_map(|segment| {
+                Some((
+                    segment.virtual_address.0,
+                    segment.virtual_address.0.checked_add(segment.memory_size)?,
+                ))
+            })
+            .collect();
+        let elf_base = mapped_ranges.iter().map(|(start, _)| *start).min()?;
+        Some(Self {
+            ghidra_base,
+            elf_base,
+            mapped_ranges,
+        })
+    }
+
+    fn contains_linked(&self, address: u64) -> bool {
+        self.mapped_ranges
+            .iter()
+            .any(|&(start, end)| start <= address && address < end)
+    }
+
+    fn to_linked(&self, space: &str, offset: &str) -> Option<u64> {
+        if space != "ram" {
+            return None;
+        }
+        self.to_linked_raw(parse_ghidra_offset(offset)?)
+    }
+
+    fn to_linked_raw(&self, address: u64) -> Option<u64> {
+        let linked = address
+            .checked_sub(self.ghidra_base)?
+            .checked_add(self.elf_base)?;
+        self.contains_linked(linked).then_some(linked)
+    }
+
+    fn to_ghidra(&self, linked: u64) -> Option<u64> {
+        if !self.contains_linked(linked) {
+            return None;
+        }
+        linked
+            .checked_sub(self.elf_base)?
+            .checked_add(self.ghidra_base)
+    }
+}
+
+fn parse_ghidra_offset(offset: &str) -> Option<u64> {
+    u64::from_str_radix(offset.strip_prefix("0x")?, 16).ok()
+}
+
+fn selected_ghidra_trace_address(
+    snapshot: &GhidraSnapshot,
+    address_map: Option<&GhidraAddressMap>,
+    selected: Option<u64>,
+) -> Option<u64> {
+    let address = address_map?.to_ghidra(selected?)?;
+    snapshot
+        .selected_function
+        .instructions
+        .iter()
+        .any(|instruction| {
+            instruction.address.space == "ram"
+                && parse_ghidra_offset(&instruction.address.offset) == Some(address)
+        })
+        .then_some(address)
+}
+
+fn ghidra_trace_lines(trace: &PcodePathTrace) -> Vec<(Option<u64>, String)> {
+    let address = |source: &PcodeAddress| u64::from_str_radix(&source.offset[2..], 16).ok();
+    trace
+        .events
+        .iter()
+        .map(|event| match event {
+            PcodePathEvent::Effect { operation } => {
+                let source = &operation.source;
+                let detail = operation
+                    .memory_access
+                    .as_ref()
+                    .map(|access| {
+                        format!(
+                            " · {:?} {}:0x{:x}[{}] = 0x{:x}",
+                            access.kind,
+                            access.space,
+                            access.byte_offset,
+                            access.width_bytes,
+                            access.value
+                        )
+                    })
+                    .unwrap_or_default();
+                (
+                    address(&source.source_address),
+                    format!(
+                        "{} #{} {}{}",
+                        source.source_address.offset,
+                        source.sequence_index,
+                        source.mnemonic,
+                        detail
+                    ),
+                )
+            }
+            PcodePathEvent::Branch {
+                source,
+                branch_kind,
+                taken,
+                destination,
+            } => {
+                let target = match destination {
+                    PcodePathDestination::IntraInstruction {
+                        instruction,
+                        sequence_index,
+                    } => format!("{} #{sequence_index}", instruction.offset),
+                    PcodePathDestination::Instruction { address } => address.offset.clone(),
+                    PcodePathDestination::FallthroughPending => "analyzed fallthrough".to_owned(),
+                };
+                let decision = taken.map_or(String::new(), |value| format!(" ({value})"));
+                (
+                    address(&source.source_address),
+                    format!(
+                        "{} #{} {:?}{decision} → {target}",
+                        source.source_address.offset, source.sequence_index, branch_kind
+                    ),
+                )
+            }
+            PcodePathEvent::Fallthrough { source, target } => (
+                address(source),
+                format!("{} fallthrough → {}", source.offset, target.offset),
+            ),
+        })
+        .collect()
+}
+
+fn ghidra_call_trace_lines(trace: &PcodeInterproceduralTrace) -> Vec<(Option<u64>, String)> {
+    let mut lines = Vec::new();
+    let mut next_call = 0;
+    for (index, segment) in trace.segments.iter().enumerate() {
+        lines.push((
+            parse_ghidra_offset(&segment.function_entry.offset),
+            format!(
+                "Function {} · segment {}",
+                segment.function_entry.offset,
+                index + 1
+            ),
+        ));
+        lines.extend(ghidra_trace_lines(&segment.path));
+        if let PcodePathStop::Call { source } = &segment.path.stop {
+            if let Some(call) = trace.calls.get(next_call) {
+                if call.caller_entry == segment.function_entry
+                    && segment.path.instruction_visits.last() == Some(&call.call_site)
+                {
+                    let mnemonic = if source.opcode == 8 {
+                        "CALLIND"
+                    } else {
+                        "CALL"
+                    };
+                    lines.push((
+                        parse_ghidra_offset(&call.call_site.offset),
+                        format!(
+                            "{mnemonic} {} → {} · resume {}",
+                            call.call_site.offset,
+                            call.callee_entry.offset,
+                            call.return_address.offset
+                        ),
+                    ));
+                    next_call += 1;
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn pcode_display_lines(
+    snapshot: &GhidraSnapshot,
+    semantics: Option<&PcodeSemanticFunctionIr>,
+) -> Vec<(Option<u64>, String)> {
+    let mut lines = Vec::new();
+    for (instruction_index, instruction) in
+        snapshot.selected_function.instructions.iter().enumerate()
+    {
+        let address =
+            u64::from_str_radix(instruction.address.offset.trim_start_matches("0x"), 16).ok();
+        lines.push((
+            address,
+            format!(
+                "{}:{}  {:<20} {}",
+                instruction.address.space,
+                instruction.address.offset,
+                instruction.bytes,
+                instruction.mnemonic
+            ),
+        ));
+        for (operation_index, operation) in instruction.pcode.iter().enumerate() {
+            let effect = semantics
+                .and_then(|semantics| semantics.instructions.get(instruction_index))
+                .and_then(|instruction| instruction.operations.get(operation_index))
+                .map(|operation| match &operation.effect {
+                    PcodeEffect::Assign { operation, .. } => format!(" [exact {operation:?}]"),
+                    PcodeEffect::Opaque { reason, .. } => format!(" [opaque: {reason}]"),
+                })
+                .unwrap_or_default();
+            let output = operation
+                .output
+                .as_ref()
+                .map(|varnode| format!("{} = ", pcode_varnode(varnode)))
+                .unwrap_or_default();
+            let inputs = operation
+                .inputs
+                .iter()
+                .map(pcode_varnode)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let userop = operation
+                .userop_name
+                .as_ref()
+                .map(|name| format!(" [{name}]"))
+                .unwrap_or_default();
+            lines.push((
+                address,
+                format!(
+                    "    {}:{} #{}:{}  {}{}{}({}){}",
+                    operation.source_address.space,
+                    operation.source_address.offset,
+                    operation.sequence_index,
+                    operation.sequence_time,
+                    output,
+                    operation.mnemonic,
+                    userop,
+                    inputs,
+                    effect
+                ),
+            ));
+        }
+    }
+    lines
+}
+
+fn pcode_line_target(snapshot: &GhidraSnapshot, mut row: usize) -> Option<PcodeSliceTarget> {
+    for (instruction_index, instruction) in
+        snapshot.selected_function.instructions.iter().enumerate()
+    {
+        if row == 0 {
+            return None;
+        }
+        row -= 1;
+        if row < instruction.pcode.len() {
+            return Some(PcodeSliceTarget {
+                instruction_index: instruction_index as u32,
+                operation_index: row as u32,
+                input_index: None,
+            });
+        }
+        row -= instruction.pcode.len();
+    }
+    None
+}
+
+fn pcode_state_lines(state: &PcodeStateFunctionIr) -> Vec<(Option<u64>, String)> {
+    let mut lines = Vec::new();
+    for instruction in &state.instructions {
+        let address =
+            u64::from_str_radix(instruction.address.offset.trim_start_matches("0x"), 16).ok();
+        for (index, operation) in instruction.operations.iter().enumerate() {
+            let accesses = operation
+                .accesses
+                .iter()
+                .map(|access| {
+                    let ordinal = access
+                        .input_index
+                        .map_or(String::new(), |index| format!("{index}:"));
+                    format!(
+                        "{:?} {ordinal}{}:{}[{}]",
+                        access.kind,
+                        access.varnode.space,
+                        access.varnode.offset,
+                        access.varnode.size
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            let effect = match &operation.effect {
+                PcodeEffect::Assign { operation, .. } => format!("{operation:?}"),
+                PcodeEffect::Opaque { class, .. } => format!("opaque {class:?}"),
+            };
+            lines.push((
+                address,
+                format!(
+                    "{}:{} #{index} {:<20} {accesses}{}",
+                    instruction.address.space,
+                    instruction.address.offset,
+                    effect,
+                    if operation.may_clobber_unlisted_state {
+                        "  possible unlisted state clobber"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+    }
+    lines
 }
 
 fn run_triton_cli(path: &Path, symbol: &str) -> Result<serde_json::Value, String> {
@@ -1763,6 +2952,18 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 }
                 Err(error) => Event::Failed(error),
             },
+            Task::OpenRecipe(path) => {
+                let result = match &source {
+                    Source::Local(elf) => bounded_read_recipe(&path).and_then(|json| {
+                        let recipe = parse_analysis_recipe(&json)?;
+                        validate_analysis_recipe(elf, &recipe)
+                            .map_err(|error| format!("Recipe verification failed: {error}"))?;
+                        Ok(recipe)
+                    }),
+                    _ => Err("Open the matching local ELF before loading a recipe".to_owned()),
+                };
+                Event::RecipeLoaded(result)
+            }
             Task::OpenGhidraGraph(path) => match fs::read_to_string(&path)
                 .map_err(|error| format!("Could not read Ghidra graph: {error}"))
                 .and_then(|text| {
@@ -1771,6 +2972,105 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 }) {
                 Ok(graph) => Event::GhidraGraphLoaded(Ok(graph)),
                 Err(error) => Event::GhidraGraphLoaded(Err(error)),
+            },
+            Task::AnalyzeGhidra {
+                binary,
+                binary_sha256,
+                function,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_cli(
+                        &binary,
+                        &binary_sha256,
+                        function.as_deref(),
+                        &cancel,
+                        timeout,
+                    );
+                    let _ = completion.send(Event::GhidraAnalyzed {
+                        binary_sha256,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::TraceGhidraPath {
+                snapshot,
+                seed_json,
+                start_text,
+            } => {
+                let binary = match &source {
+                    Source::Local(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                };
+                let result = trace_ghidra_path(&snapshot, &seed_json, &start_text, binary);
+                Event::GhidraPathTraced {
+                    binary_sha256: snapshot.binary_sha256.clone(),
+                    function: snapshot.selected_function.entry.clone(),
+                    seed_json,
+                    start_text,
+                    result,
+                }
+            },
+            Task::TraceGhidraCalls {
+                binary,
+                binary_sha256,
+                function,
+                seed_json,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_call_trace(
+                        &binary,
+                        &binary_sha256,
+                        &function,
+                        &seed_json,
+                        &cancel,
+                        timeout,
+                    );
+                    let _ = completion.send(Event::GhidraCallsTraced {
+                        binary_sha256,
+                        function,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::EmitGhidraCallLlvm {
+                binary,
+                binary_sha256,
+                function,
+                seed_json,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_call_llvm(
+                        &binary,
+                        &binary_sha256,
+                        &function,
+                        &seed_json,
+                        &cancel,
+                        timeout,
+                    );
+                    let _ = completion.send(Event::GhidraCallLlvmEmitted {
+                        binary_sha256,
+                        function,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
             },
             Task::OpenRemote {
                 endpoint,
@@ -1883,23 +3183,177 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 label,
                 selector,
                 entry,
-            } => Event::NativeSelected {
-                native: Box::new(match &source {
+            } => {
+                let native = match &source {
                     Source::Local(bytes) => decompile_function_at(bytes, entry),
                     Source::Remote(access) => {
                         runtime.block_on(remote_native_decompilation(access, &selector))
                     }
                     Source::None => Err("Open an ELF before selecting a function".to_owned()),
-                }),
-                label,
-            },
-            Task::Disassemble => Event::Disassembled(match &source {
-                Source::Local(bytes) => disassemble_elf(bytes).map_err(|error| error.to_string()),
-                Source::Remote(_) => {
-                    Err("Whole-ELF disassembly is currently local-only.".to_owned())
+                };
+                let mut project_revision = None;
+                let typed = match (&source, &native) {
+                    (Source::Local(bytes), Ok(native)) => (|| {
+                        let project = local_project
+                            .as_ref()
+                            .ok_or("Open a local project before inspecting typed C")?;
+                        // Ghidra imports can save a model from a background thread.
+                        // Refresh before reading so the GUI sees its new revision.
+                        let spec = import_elf(bytes).map_err(|error| error.to_string())?;
+                        let refreshed = attach_local_project(&project.path, &spec)?;
+                        project_revision = Some(refreshed.revision);
+                        local_project = Some(refreshed);
+                        local_typed_view(bytes, local_project.as_ref(), native)
+                    })(),
+                    (Source::Remote(access), Ok(native)) => {
+                        project_revision = Some(access.revision);
+                        runtime
+                            .block_on(remote_analysis_model(access, &native.machine_ir.binary_sha256))
+                            .and_then(|model| typed_view_with_model(model, native))
+                    }
+                    (_, Err(error)) => Err(error.clone()),
+                    _ => Err("Open a local ELF to inspect typed C".to_owned()),
+                };
+                Event::NativeSelected {
+                    native: Box::new(native),
+                    typed: Box::new(typed),
+                    project_revision,
+                    label,
                 }
-                Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
-            }),
+            }
+            Task::RenameModel {
+                binary_sha256,
+                expected_revision,
+                model,
+                target,
+                name,
+                native,
+                key,
+            } => {
+                let result = match &mut source {
+                    Source::Local(bytes) => (|| {
+                        let project = local_project
+                            .as_ref()
+                            .ok_or("Open a local project before editing its model")?;
+                        if project.binary_sha256 != binary_sha256 {
+                            return Err("Model edit binary differs from the open ELF".to_owned());
+                        }
+                        let mut store = LocalProjectStore::open_default()?;
+                        let (updated, _) = persist_local_model_rename(
+                            &mut store, project, bytes, expected_revision, &model, &target, &name,
+                            &key,
+                        )?;
+                        let typed = local_typed_view(bytes, Some(&updated), &native);
+                        let revision = updated.revision;
+                        local_project = Some(updated);
+                        Ok((revision, typed, false))
+                    })()
+                    .map_err(RemoteModelSaveError::Preflight),
+                    Source::Remote(access) => match prepare_model_rename(&model, &target, &name) {
+                        Ok(candidate) => runtime
+                            .block_on(persist_remote_model_change(
+                                access,
+                                &binary_sha256,
+                                expected_revision,
+                                &model,
+                                candidate,
+                                &native,
+                                &key,
+                            ))
+                            .map(|(revision, typed)| (revision, typed, true)),
+                        Err(error) => Err(RemoteModelSaveError::Preflight(error)),
+                    },
+                    Source::None => Err(RemoteModelSaveError::Preflight(
+                        "Open a local ELF or remote project before editing its model".to_owned(),
+                    )),
+                };
+                match result {
+                    Ok((revision, typed, remote)) => Event::ModelRenamed {
+                        binary_sha256,
+                        entry: native.machine_ir.entry,
+                        revision,
+                        remote,
+                        typed: Box::new(typed),
+                    },
+                    Err(RemoteModelSaveError::Preflight(error)) => {
+                        Event::Failed(format!("Could not save model rename: {error}"))
+                    }
+                    Err(RemoteModelSaveError::Uncertain(error)) => Event::MutationUncertain(
+                        format!("{error} Mutation key {key}. Reopen the remote project before another mutation; the model save may have committed."),
+                    ),
+                }
+            }
+            Task::EditModel {
+                binary_sha256,
+                expected_revision,
+                model,
+                edit,
+                native,
+                key,
+            } => {
+                let result = match &mut source {
+                    Source::Local(bytes) => (|| {
+                        let project = local_project.as_ref()
+                            .ok_or("Open a local project before editing its model")?;
+                        if project.binary_sha256 != binary_sha256 {
+                            return Err("Model edit binary differs from the open ELF".to_owned());
+                        }
+                        let mut store = LocalProjectStore::open_default()?;
+                        let (updated, _) = persist_local_model_edit(
+                            &mut store, project, bytes, expected_revision, &model, &edit, &key,
+                        )?;
+                        let typed = local_typed_view(bytes, Some(&updated), &native);
+                        let revision = updated.revision;
+                        local_project = Some(updated);
+                        Ok((revision, typed, false))
+                    })()
+                    .map_err(RemoteModelSaveError::Preflight),
+                    Source::Remote(access) => match prepare_model_edit(&model, &edit) {
+                        Ok(candidate) => runtime
+                            .block_on(persist_remote_model_change(
+                                access,
+                                &binary_sha256,
+                                expected_revision,
+                                &model,
+                                candidate,
+                                &native,
+                                &key,
+                            ))
+                            .map(|(revision, typed)| (revision, typed, true)),
+                        Err(error) => Err(RemoteModelSaveError::Preflight(error)),
+                    },
+                    Source::None => Err(RemoteModelSaveError::Preflight(
+                        "Open a local ELF or remote project before editing its model".to_owned(),
+                    )),
+                };
+                match result {
+                    Ok((revision, typed, remote)) => Event::ModelEdited {
+                        binary_sha256,
+                        entry: native.machine_ir.entry,
+                        revision,
+                        remote,
+                        typed: Box::new(typed),
+                    },
+                    Err(RemoteModelSaveError::Preflight(error)) => {
+                        Event::Failed(format!("Could not save model edit: {error}"))
+                    }
+                    Err(RemoteModelSaveError::Uncertain(error)) => Event::MutationUncertain(
+                        format!("{error} Mutation key {key}. Reopen the remote project before another mutation; the model save may have committed."),
+                    ),
+                }
+            }
+            Task::Disassemble { automatic } => Event::Disassembled {
+                result: match &source {
+                    Source::Local(bytes) => {
+                        disassemble_elf(bytes).map_err(|error| error.to_string())
+                    }
+                    Source::Remote(_) => {
+                        Err("Whole-ELF disassembly is currently local-only.".to_owned())
+                    }
+                    Source::None => Err("Open a local ELF before disassembling it.".to_owned()),
+                },
+                automatic,
+            },
             Task::Triton { path, symbol } => Event::Triton(run_triton_cli(&path, &symbol)),
             Task::TritonConsole { commands } => Event::TritonConsole {
                 result: run_triton_console_cli(&commands),
@@ -2263,6 +3717,8 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
     Overview,
+    GhidraPcode,
+    Investigation,
     RegionStudio,
     Native,
     Bytes,
@@ -2304,6 +3760,8 @@ enum GraphMode {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum NativeViewMode {
     Summary,
+    TypedC,
+    Types,
     LowLevelC,
     StructuredC,
     MachineIr,
@@ -2311,6 +3769,618 @@ enum NativeViewMode {
     FunctionIr,
     Cir,
     Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModelRenameTarget {
+    Function(Location),
+    Type(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModelEditTarget {
+    Prototype(Location),
+    Field { type_id: String, field_index: usize },
+}
+
+#[derive(Clone, Debug)]
+enum ModelEditDraft {
+    Prototype {
+        entry: Location,
+        json: String,
+    },
+    Field {
+        type_id: String,
+        field_index: usize,
+        name: String,
+        offset: String,
+        type_json: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum ModelEdit {
+    Prototype {
+        entry: Location,
+        value: ModelPrototype,
+    },
+    Field {
+        type_id: String,
+        field_index: usize,
+        name: String,
+        offset_bytes: u64,
+        ty: TypeRef,
+    },
+}
+
+fn model_edit_draft(
+    model: &AnalysisModel,
+    target: ModelEditTarget,
+) -> Result<ModelEditDraft, String> {
+    match target {
+        ModelEditTarget::Prototype(entry) => {
+            let function = model
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .ok_or("Selected function is absent from the analysis model")?;
+            let value = function.prototype.clone().unwrap_or(ModelPrototype {
+                parameters: Vec::new(),
+                return_type: TypeRef::Primitive {
+                    name: hydir_model::PrimitiveType::U64,
+                },
+                calling_convention: "sysv_amd64".to_owned(),
+                variadic: false,
+            });
+            Ok(ModelEditDraft::Prototype {
+                entry,
+                json: serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?,
+            })
+        }
+        ModelEditTarget::Field {
+            type_id,
+            field_index,
+        } => {
+            let definition = model
+                .types
+                .iter()
+                .find(|ty| ty.id == type_id)
+                .ok_or("Selected type is absent from the analysis model")?;
+            let fields = match &definition.kind {
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
+                    fields
+                }
+                _ => return Err("Selected type has no editable fields".to_owned()),
+            };
+            let field = fields
+                .get(field_index)
+                .ok_or("Selected field is absent from the analysis model")?;
+            Ok(ModelEditDraft::Field {
+                type_id,
+                field_index,
+                name: field.name.clone(),
+                offset: format!("0x{:x}", field.offset_bytes),
+                type_json: serde_json::to_string_pretty(&field.ty)
+                    .map_err(|error| error.to_string())?,
+            })
+        }
+    }
+}
+
+fn parse_model_edit_draft(draft: &ModelEditDraft) -> Result<ModelEdit, String> {
+    match draft {
+        ModelEditDraft::Prototype { entry, json } => {
+            if json.len() > 16_384 {
+                return Err("Prototype JSON exceeds 16 KiB".to_owned());
+            }
+            let value = serde_json::from_str(json)
+                .map_err(|error| format!("Invalid prototype JSON: {error}"))?;
+            Ok(ModelEdit::Prototype {
+                entry: *entry,
+                value,
+            })
+        }
+        ModelEditDraft::Field {
+            type_id,
+            field_index,
+            name,
+            offset,
+            type_json,
+        } => {
+            if name.len() > 128 || !valid_model_rename(name) {
+                return Err(
+                    "Field name must be a C identifier of at most 128 characters".to_owned(),
+                );
+            }
+            if type_json.len() > 16_384 {
+                return Err("Field type JSON exceeds 16 KiB".to_owned());
+            }
+            let offset_bytes = if let Some(hex) = offset.trim().strip_prefix("0x") {
+                u64::from_str_radix(hex, 16)
+            } else {
+                offset.trim().parse()
+            }
+            .map_err(|_| {
+                "Field offset must be a nonnegative decimal or 0x hexadecimal integer".to_owned()
+            })?;
+            let ty = serde_json::from_str(type_json)
+                .map_err(|error| format!("Invalid field type JSON: {error}"))?;
+            Ok(ModelEdit::Field {
+                type_id: type_id.clone(),
+                field_index: *field_index,
+                name: name.clone(),
+                offset_bytes,
+                ty,
+            })
+        }
+    }
+}
+
+struct TypedNativeView {
+    model: AnalysisModel,
+    ir: Option<HighLevelCir>,
+    cfg_ir: Option<HighLevelCfgCir>,
+    c: Option<String>,
+    diagnostic: Option<String>,
+}
+
+fn valid_model_rename(name: &str) -> bool {
+    // These names can become file-scope C declarations, where leading
+    // underscores are reserved to the implementation.
+    !name.starts_with('_')
+        && !matches!(name, "asm" | "typeof")
+        && hydir_model::is_c11_identifier(name)
+}
+
+fn prepare_model_rename(
+    displayed: &AnalysisModel,
+    target: &ModelRenameTarget,
+    name: &str,
+) -> Result<AnalysisModel, String> {
+    if name.len() > 128 || !valid_model_rename(name) {
+        return Err("Model name must be a C identifier of at most 128 characters".to_owned());
+    }
+    let mut edited = displayed.clone();
+    let previous_name = match target {
+        ModelRenameTarget::Function(entry) => {
+            let function = edited
+                .functions
+                .iter_mut()
+                .find(|function| function.entry == *entry)
+                .ok_or("Selected function is absent from the analysis model")?;
+            std::mem::replace(&mut function.name, name.to_owned())
+        }
+        ModelRenameTarget::Type(id) => {
+            let definition = edited
+                .types
+                .iter_mut()
+                .find(|definition| definition.id == *id)
+                .ok_or("Selected type is absent from the analysis model")?;
+            std::mem::replace(&mut definition.name, name.to_owned())
+        }
+    };
+    if previous_name == name {
+        return Err("Choose a different name before saving".to_owned());
+    }
+    hydir_model::validate_structure(&edited)?;
+    Ok(edited)
+}
+
+fn persist_local_model_rename(
+    store: &mut LocalProjectStore,
+    project: &LocalProject,
+    bytes: &[u8],
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    target: &ModelRenameTarget,
+    name: &str,
+    key: &str,
+) -> Result<(LocalProject, AnalysisModel), String> {
+    if project.revision != expected_revision {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    hydir_model::validate_model(bytes, displayed)?;
+    if let Some(saved) = store.load_model(project)?
+        && saved != *displayed
+    {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    let edited = prepare_model_rename(displayed, target, name)?;
+    hydir_model::validate_model(bytes, &edited)?;
+    let updated = store.save_model(project, &edited, key)?;
+    let saved = store
+        .load_model(&updated)?
+        .ok_or("Saved analysis model could not be reloaded")?;
+    Ok((updated, saved))
+}
+
+fn prepare_model_edit(
+    displayed: &AnalysisModel,
+    edit: &ModelEdit,
+) -> Result<AnalysisModel, String> {
+    let mut edited = displayed.clone();
+    let conflict = match edit {
+        ModelEdit::Prototype { entry, value } => {
+            let function = edited
+                .functions
+                .iter_mut()
+                .find(|function| function.entry == *entry)
+                .ok_or("Selected function is absent from the analysis model")?;
+            if function.prototype.as_ref() == Some(value) {
+                return Err("Choose a different prototype before saving".to_owned());
+            }
+            let machine = function
+                .evidence
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.source,
+                        ModelSource::Dwarf | ModelSource::GhidraAnalysis
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let conflict = function.prototype.as_ref().filter(|_| !machine.is_empty()).map(|previous| ModelConflict {
+                subject: format!("function:0x{:x}:prototype", entry.value.0),
+                detail: format!("analyst prototype {value:?} differs from prior model prototype {previous:?}; earlier evidence retained"),
+                evidence: machine,
+            });
+            function.prototype = Some(value.clone());
+            conflict
+        }
+        ModelEdit::Field {
+            type_id,
+            field_index,
+            name,
+            offset_bytes,
+            ty,
+        } => {
+            if name.len() > 128 || !valid_model_rename(name) {
+                return Err(
+                    "Field name must be a C identifier of at most 128 characters".to_owned(),
+                );
+            }
+            let definition = edited
+                .types
+                .iter_mut()
+                .find(|definition| definition.id == *type_id)
+                .ok_or("Selected type is absent from the analysis model")?;
+            let fields = match &mut definition.kind {
+                TypeDefinitionKind::Struct { fields } | TypeDefinitionKind::Union { fields } => {
+                    fields
+                }
+                _ => return Err("Selected type has no editable fields".to_owned()),
+            };
+            let field = fields
+                .get_mut(*field_index)
+                .ok_or("Selected field is absent from the analysis model")?;
+            if field.name == *name && field.offset_bytes == *offset_bytes && field.ty == *ty {
+                return Err(
+                    "Choose a different field name, offset, or type before saving".to_owned(),
+                );
+            }
+            let old_offset = field.offset_bytes;
+            let old_type = field.ty.clone();
+            let machine = field
+                .evidence
+                .iter()
+                .filter(|item| item.source != ModelSource::AnalystAssertion)
+                .cloned()
+                .collect::<Vec<_>>();
+            let conflict = if !machine.is_empty()
+                && (old_offset != *offset_bytes || old_type != *ty)
+            {
+                Some(ModelConflict {
+                    subject: format!("type:{type_id}:field:{old_offset}"),
+                    detail: format!(
+                        "analyst field offset/type ({offset_bytes}, {ty:?}) differs from prior model ({old_offset}, {old_type:?}); earlier evidence retained"
+                    ),
+                    evidence: machine,
+                })
+            } else {
+                None
+            };
+            field.name = name.clone();
+            field.offset_bytes = *offset_bytes;
+            field.ty = ty.clone();
+            let assertion = ModelEvidence {
+                source: ModelSource::AnalystAssertion,
+                detail: "analyst field edit".to_owned(),
+                site: None,
+            };
+            if !field.evidence.contains(&assertion) {
+                field.evidence.push(assertion);
+            }
+            conflict
+        }
+    };
+    if let Some(conflict) = conflict
+        && !edited.conflicts.contains(&conflict)
+    {
+        edited.conflicts.push(conflict);
+    }
+    hydir_model::validate_structure(&edited)?;
+    Ok(edited)
+}
+
+fn persist_local_model_edit(
+    store: &mut LocalProjectStore,
+    project: &LocalProject,
+    bytes: &[u8],
+    expected_revision: u64,
+    displayed: &AnalysisModel,
+    edit: &ModelEdit,
+    key: &str,
+) -> Result<(LocalProject, AnalysisModel), String> {
+    if project.revision != expected_revision {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    hydir_model::validate_model(bytes, displayed)?;
+    if let Some(saved) = store.load_model(project)?
+        && saved != *displayed
+    {
+        return Err("Model view is stale; reselect the function before editing".to_owned());
+    }
+    let edited = prepare_model_edit(displayed, edit)?;
+    hydir_model::validate_model(bytes, &edited)?;
+    let updated = store.save_model(project, &edited, key)?;
+    let saved = store
+        .load_model(&updated)?
+        .ok_or("Saved analysis model could not be reloaded")?;
+    Ok((updated, saved))
+}
+
+fn local_typed_view(
+    bytes: &[u8],
+    project: Option<&LocalProject>,
+    native: &NativeDecompilation,
+) -> Result<TypedNativeView, String> {
+    let saved = project
+        .map(|project| LocalProjectStore::open_default()?.load_model(project))
+        .transpose()?
+        .flatten();
+    let model = if let Some(model) = saved {
+        model
+    } else {
+        let mut model = init_model(bytes)?;
+        let _ = import_dwarf(bytes, &mut model)?;
+        infer_model(&mut model, &[(&native.machine_ir, &native.function_ir)])?;
+        model
+    };
+    hydir_model::validate_model(bytes, &model)?;
+    typed_view_with_model(model, native)
+}
+
+fn typed_view_with_model(
+    model: AnalysisModel,
+    native: &NativeDecompilation,
+) -> Result<TypedNativeView, String> {
+    hydir_model::validate_structure(&model)?;
+    if model.binary_sha256 != native.machine_ir.binary_sha256 {
+        return Err("Analysis model binary differs from selected function".to_owned());
+    }
+    let (ir, cfg_ir, c, diagnostic) =
+        match lower_high_level_cir(&native.machine_ir, &native.function_ir, &model) {
+            Ok(ir) => match emit_typed_c(&ir, &model) {
+                Ok(c) => (Some(ir), None, Some(c), None),
+                Err(error) => (Some(ir), None, None, Some(error)),
+            },
+            Err(linear_error) => {
+                match lower_high_level_cfg_cir(&native.machine_ir, &native.function_ir, &model) {
+                    Ok(cfg) => match emit_typed_cfg_c(&cfg, &model) {
+                        Ok(c) => (None, Some(cfg), Some(c), None),
+                        Err(error) => (None, Some(cfg), None, Some(error)),
+                    },
+                    Err(cfg_error) => (
+                        None,
+                        None,
+                        None,
+                        Some(format!("Linear: {linear_error}; CFG: {cfg_error}")),
+                    ),
+                }
+            }
+        };
+    // The model remains available for type inspection even when typed C is
+    // outside the current lowering contract.
+    Ok(TypedNativeView {
+        model,
+        ir,
+        cfg_ir,
+        c,
+        diagnostic,
+    })
+}
+
+fn typed_source_sites(
+    ui: &mut egui::Ui,
+    ir: &HighLevelCir,
+    selected_address: Option<u64>,
+) -> Option<u64> {
+    let mut selected = None;
+    for statement in &ir.statements {
+        let (label, site) = match statement {
+            HighStatement::Let { name, site, .. } => (format!("local {name}"), site),
+            HighStatement::StoreField { field, site, .. } => (format!("store {field}"), site),
+            HighStatement::Return { site, .. } => ("return".to_owned(), site),
+        };
+        if ui
+            .selectable_label(
+                selected_address == Some(site.value.0),
+                format!("0x{:x} · {label}", site.value.0),
+            )
+            .clicked()
+        {
+            selected = Some(site.value.0);
+        }
+    }
+    selected
+}
+
+fn typed_cfg_source_sites(
+    ui: &mut egui::Ui,
+    ir: &HighLevelCfgCir,
+    selected_address: Option<u64>,
+) -> Option<u64> {
+    let mut selected = None;
+    for block in &ir.blocks {
+        for statement in &block.statements {
+            let (label, site) = match statement {
+                HighCfgStatement::Assign { target, site, .. } => (target.as_str(), site),
+                HighCfgStatement::Load { target, site, .. } => (target.as_str(), site),
+                HighCfgStatement::Store { site, .. } => ("store", site),
+            };
+            if ui
+                .selectable_label(
+                    selected_address == Some(site.value.0),
+                    format!("0x{:x} · {label}", site.value.0),
+                )
+                .clicked()
+            {
+                selected = Some(site.value.0);
+            }
+        }
+        let (label, site) = match &block.terminator {
+            HighCfgTerminator::Goto { site, .. } => ("goto", site),
+            HighCfgTerminator::Branch { site, .. } => ("branch", site),
+            HighCfgTerminator::Return { site, .. } => ("return", site),
+        };
+        if ui
+            .selectable_label(
+                selected_address == Some(site.value.0),
+                format!("0x{:x} · {label}", site.value.0),
+            )
+            .clicked()
+        {
+            selected = Some(site.value.0);
+        }
+    }
+    selected
+}
+
+fn typed_types_view(
+    ui: &mut egui::Ui,
+    model: &AnalysisModel,
+    function_entry: Location,
+) -> (
+    Option<u64>,
+    Option<ModelRenameTarget>,
+    Option<ModelEditTarget>,
+) {
+    ui.label(format!(
+        "Model revision {} · {} types · {} functions · {} unresolved conflicts",
+        model.revision,
+        model.types.len(),
+        model.functions.len(),
+        model.conflicts.len()
+    ));
+    let mut selected = None;
+    let mut rename = None;
+    let mut edit = None;
+    if let Some(function) = model
+        .functions
+        .iter()
+        .find(|function| function.entry == function_entry)
+    {
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Function 0x{:x}: {}",
+                function_entry.value.0, function.name
+            ));
+            if ui.small_button("Rename").clicked() {
+                rename = Some(ModelRenameTarget::Function(function_entry));
+            }
+            if ui.small_button("Edit prototype").clicked() {
+                edit = Some(ModelEditTarget::Prototype(function_entry));
+            }
+        });
+        if let Some(prototype) = &function.prototype {
+            ui.label(format!(
+                "Prototype: {:?} -> {:?} · {}{}",
+                prototype.parameters,
+                prototype.return_type,
+                prototype.calling_convention,
+                if prototype.variadic {
+                    " · variadic"
+                } else {
+                    ""
+                }
+            ));
+        } else {
+            ui.label("Prototype: no assertion");
+        }
+        for evidence in &function.evidence {
+            ui.label(format!("  {:?}: {}", evidence.source, evidence.detail));
+        }
+    }
+    for ty in &model.types {
+        ui.horizontal(|ui| {
+            ui.label(format!("Type {}", ty.id));
+            if ui.small_button("Rename").clicked() {
+                rename = Some(ModelRenameTarget::Type(ty.id.clone()));
+            }
+        });
+        ui.collapsing(
+            format!(
+                "{} · {} bytes{}",
+                ty.name,
+                ty.size_bytes,
+                if ty.size_is_lower_bound {
+                    " or more"
+                } else {
+                    ""
+                }
+            ),
+            |ui| {
+                for evidence in &ty.evidence {
+                    ui.label(format!("{:?}: {}", evidence.source, evidence.detail));
+                }
+                match &ty.kind {
+                    TypeDefinitionKind::Struct { fields }
+                    | TypeDefinitionKind::Union { fields } => {
+                        for (field_index, field) in fields.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "+0x{:x}  {}: {:?}",
+                                    field.offset_bytes, field.name, field.ty
+                                ));
+                                if ui.small_button("Edit field").clicked() {
+                                    edit = Some(ModelEditTarget::Field {
+                                        type_id: ty.id.clone(),
+                                        field_index,
+                                    });
+                                }
+                            });
+                            for evidence in &field.evidence {
+                                if let Some(site) = evidence.site {
+                                    if ui
+                                        .small_button(format!(
+                                            "0x{:x} · {:?}: {}",
+                                            site.value.0, evidence.source, evidence.detail
+                                        ))
+                                        .clicked()
+                                    {
+                                        selected = Some(site.value.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TypeDefinitionKind::Enum { variants, .. } => {
+                        for (name, value) in variants {
+                            ui.label(format!("{name} = {value}"));
+                        }
+                    }
+                    TypeDefinitionKind::Alias { target } => {
+                        ui.label(format!("Alias of {target:?}"));
+                    }
+                }
+            },
+        );
+    }
+    for conflict in &model.conflicts {
+        ui.colored_label(ACCENT, format!("{}: {}", conflict.subject, conflict.detail));
+    }
+    (selected, rename, edit)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2346,14 +4416,86 @@ struct WorkbenchGraphEdge {
     unresolved: bool,
 }
 
+struct ActiveGhidraTask {
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+    timeout: Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderSmokeStage {
+    AwaitAnalysis,
+    PcodeReady,
+    PcodeCapturePending,
+    DisassemblyReady,
+    DisassemblyCapturePending,
+}
+
+struct RenderSmoke {
+    selector: String,
+    output_dir: PathBuf,
+    started: Instant,
+    stage: RenderSmokeStage,
+    selection_requested: bool,
+}
+
+fn render_smoke_fail(output_dir: &Path, reason: &str) -> ! {
+    let _ = fs::write(output_dir.join("failure.txt"), reason);
+    eprintln!("HydIR rendered Ghidra demo failed: {reason}");
+    std::process::exit(1);
+}
+
+fn save_render_smoke_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    let [width, height] = image.size;
+    if width < 100 || height < 100 || image.pixels.len() != width * height {
+        return Err("Rendered GUI screenshot has invalid dimensions".to_owned());
+    }
+    let width = u32::try_from(width).map_err(|error| error.to_string())?;
+    let height = u32::try_from(height).map_err(|error| error.to_string())?;
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+    let rgba = image
+        .pixels
+        .iter()
+        .flat_map(|pixel| pixel.to_array())
+        .collect::<Vec<_>>();
+    writer
+        .write_image_data(&rgba)
+        .map_err(|error| error.to_string())
+}
+
+fn ghidra_progress(ui: &mut egui::Ui, task: &ActiveGhidraTask, label: &str) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        let elapsed = task.started.elapsed().as_secs();
+        let limit = task.timeout.as_secs();
+        let description = if task.cancel.load(Ordering::Acquire) {
+            "Stopping Ghidra…".to_owned()
+        } else {
+            format!(
+                "{label} · {}m {:02}s elapsed · {}m limit",
+                elapsed / 60,
+                elapsed % 60,
+                limit / 60
+            )
+        };
+        ui.label(description);
+    });
+}
+
 struct AnalystApp {
     tasks: SyncSender<Task>,
     events: Receiver<Event>,
     path_input: String,
+    recipe_path_input: String,
     ghidra_graph_path: String,
     workbench: WorkbenchSettings,
     workbench_loaded: bool,
     startup_open_local: Option<PathBuf>,
+    startup_recipe_path: Option<PathBuf>,
     current_local_path: Option<PathBuf>,
     remote_endpoint: String,
     remote_token_file: String,
@@ -2391,6 +4533,37 @@ struct AnalystApp {
     function_index: Option<FunctionIndex>,
     function_index_error: Option<String>,
     ghidra_graph: Option<GhidraGraph>,
+    ghidra_snapshot: Option<GhidraSnapshot>,
+    ghidra_semantics: Option<PcodeSemanticFunctionIr>,
+    ghidra_coverage: Option<PcodeCoverageReport>,
+    ghidra_slice: Option<Result<PcodeBackwardSlice, String>>,
+    ghidra_pcode_lines: Vec<(Option<u64>, String)>,
+    ghidra_state_lines: Vec<(Option<u64>, String)>,
+    ghidra_exact_operations: Vec<(usize, usize, Option<u64>)>,
+    ghidra_llvm_operation: Option<String>,
+    ghidra_llvm_prefix: Option<Result<PcodeStandalonePrefixArtifact, String>>,
+    ghidra_llvm_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
+    ghidra_llvm_image_cfg: Option<Result<PcodeCfgLlvmArtifact, String>>,
+    ghidra_llvm_simplified: Option<Result<PcodeSimplifiedCfgLlvmArtifact, String>>,
+    ghidra_simplification: Option<Result<PcodeSimplificationArtifact, String>>,
+    ghidra_trace_seed_json: String,
+    ghidra_trace_start: String,
+    ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
+    ghidra_path_lines: Vec<(Option<u64>, String)>,
+    ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
+    ghidra_call_lines: Vec<(Option<u64>, String)>,
+    ghidra_call_busy: bool,
+    ghidra_call_llvm: Option<Result<PcodeInterproceduralCfgLlvmArtifact, String>>,
+    ghidra_call_llvm_busy: bool,
+    ghidra_busy: bool,
+    ghidra_task: Option<ActiveGhidraTask>,
+    ghidra_call_task: Option<ActiveGhidraTask>,
+    ghidra_call_llvm_task: Option<ActiveGhidraTask>,
+    ghidra_runtime_status: Option<GhidraRuntimeStatus>,
+    ghidra_cli_available: Option<bool>,
+    ghidra_runtime_probe: Option<Receiver<(GhidraRuntimeStatus, bool)>>,
+    pending_ghidra: Option<(PathBuf, String)>,
+    render_smoke: Option<RenderSmoke>,
     symbol: Option<String>,
     cfg: Option<FunctionCfg>,
     ir: Option<String>,
@@ -2404,10 +4577,16 @@ struct AnalystApp {
     decompilation_error: Option<String>,
     native_decompilation: Option<NativeDecompilation>,
     native_decompilation_error: Option<String>,
+    typed_native_view: Option<TypedNativeView>,
+    typed_native_error: Option<String>,
+    model_rename_target: Option<ModelRenameTarget>,
+    model_rename_name: String,
+    model_edit_draft: Option<ModelEditDraft>,
     native_coverage: Option<NativeCoverageReport>,
     native_coverage_error: Option<String>,
     analysis: Option<AnalysisReport>,
     disassembly_report: Option<DisassemblyReport>,
+    investigation_recipe: Option<AnalysisRecipe>,
     triton_result: Option<serde_json::Value>,
     triton_console_result: Option<serde_json::Value>,
     triton_console_commands: Vec<String>,
@@ -2425,6 +4604,8 @@ struct AnalystApp {
     job_symbol: Option<String>,
     last_job_poll: std::time::Instant,
     selected_address: Option<u64>,
+    pending_recipe_address: Option<u64>,
+    pending_disassembly_scroll: Option<u64>,
     selection_target_tab: Option<Tab>,
     tab: Tab,
     region_studio_mode: RegionStudioMode,
@@ -2459,10 +4640,12 @@ impl AnalystApp {
             tasks: task_sender,
             events: event_receiver,
             path_input: String::new(),
+            recipe_path_input: String::new(),
             ghidra_graph_path: String::new(),
             workbench: WorkbenchSettings::default(),
             workbench_loaded: false,
             startup_open_local: None,
+            startup_recipe_path: None,
             current_local_path: None,
             remote_endpoint: "http://127.0.0.1:50051".to_owned(),
             remote_token_file: String::new(),
@@ -2500,6 +4683,37 @@ impl AnalystApp {
             function_index: None,
             function_index_error: None,
             ghidra_graph: None,
+            ghidra_snapshot: None,
+            ghidra_semantics: None,
+            ghidra_coverage: None,
+            ghidra_slice: None,
+            ghidra_pcode_lines: Vec::new(),
+            ghidra_state_lines: Vec::new(),
+            ghidra_exact_operations: Vec::new(),
+            ghidra_llvm_operation: None,
+            ghidra_llvm_prefix: None,
+            ghidra_llvm_cfg: None,
+            ghidra_llvm_image_cfg: None,
+            ghidra_llvm_simplified: None,
+            ghidra_simplification: None,
+            ghidra_trace_seed_json: String::new(),
+            ghidra_trace_start: String::new(),
+            ghidra_path_trace: None,
+            ghidra_path_lines: Vec::new(),
+            ghidra_call_trace: None,
+            ghidra_call_lines: Vec::new(),
+            ghidra_call_busy: false,
+            ghidra_call_llvm: None,
+            ghidra_call_llvm_busy: false,
+            ghidra_busy: false,
+            ghidra_task: None,
+            ghidra_call_task: None,
+            ghidra_call_llvm_task: None,
+            ghidra_runtime_status: None,
+            ghidra_cli_available: None,
+            ghidra_runtime_probe: Some(probe_ghidra_runtime(ctx)),
+            pending_ghidra: None,
+            render_smoke: None,
             symbol: None,
             cfg: None,
             ir: None,
@@ -2513,10 +4727,16 @@ impl AnalystApp {
             decompilation_error: None,
             native_decompilation: None,
             native_decompilation_error: None,
+            typed_native_view: None,
+            typed_native_error: None,
+            model_rename_target: None,
+            model_rename_name: String::new(),
+            model_edit_draft: None,
             native_coverage: None,
             native_coverage_error: None,
             analysis: None,
             disassembly_report: None,
+            investigation_recipe: None,
             triton_result: None,
             triton_console_result: None,
             triton_console_commands: Vec::new(),
@@ -2534,6 +4754,8 @@ impl AnalystApp {
             job_symbol: None,
             last_job_poll: std::time::Instant::now(),
             selected_address: None,
+            pending_recipe_address: None,
+            pending_disassembly_scroll: None,
             selection_target_tab: None,
             tab: Tab::Overview,
             region_studio_mode: RegionStudioMode::Contract,
@@ -2560,9 +4782,217 @@ impl AnalystApp {
         }
     }
 
+    fn enqueue_ghidra(&mut self, binary: PathBuf, binary_sha256: String, function: Option<String>) {
+        if self.ghidra_busy {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let timeout = ghidra_task_timeout(
+            self.ghidra_runtime_status
+                .as_ref()
+                .map(|status| status.mode),
+            false,
+        );
+        match self.tasks.try_send(Task::AnalyzeGhidra {
+            binary,
+            binary_sha256,
+            function,
+            cancel: Arc::clone(&cancel),
+            timeout,
+        }) {
+            Ok(()) => {
+                self.ghidra_busy = true;
+                self.ghidra_task = Some(ActiveGhidraTask {
+                    cancel,
+                    started: Instant::now(),
+                    timeout,
+                });
+                self.status = "Analyzing ELF with Ghidra…".to_owned();
+                self.failure = None;
+            }
+            Err(_) => {
+                self.failure = Some("Analysis queue is full. Retry Ghidra analysis.".to_owned());
+            }
+        }
+    }
+
+    fn render_smoke_before_frame(&mut self, ctx: &egui::Context) {
+        let Some(mut smoke) = self.render_smoke.take() else {
+            return;
+        };
+        if smoke.started.elapsed() > Duration::from_secs(20 * 60) {
+            render_smoke_fail(&smoke.output_dir, "Rendered Ghidra demo timed out");
+        }
+        let screenshot = ctx.input(|input| {
+            input.events.iter().find_map(|event| {
+                if let egui::Event::Screenshot { image, .. } = event {
+                    Some(Arc::clone(image))
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(image) = screenshot {
+            let (filename, next_stage) = match smoke.stage {
+                RenderSmokeStage::PcodeCapturePending => {
+                    ("ghidra-pcode.png", RenderSmokeStage::DisassemblyReady)
+                }
+                RenderSmokeStage::DisassemblyCapturePending => (
+                    "disassembly.png",
+                    RenderSmokeStage::DisassemblyCapturePending,
+                ),
+                _ => render_smoke_fail(&smoke.output_dir, "Unexpected GUI screenshot reply"),
+            };
+            if let Err(error) = save_render_smoke_png(&smoke.output_dir.join(filename), &image) {
+                render_smoke_fail(&smoke.output_dir, &error);
+            }
+            if smoke.stage == RenderSmokeStage::DisassemblyCapturePending {
+                let snapshot = self.ghidra_snapshot.as_ref().expect("ready snapshot");
+                let llvm = self
+                    .ghidra_llvm_cfg
+                    .as_ref()
+                    .expect("ready LLVM")
+                    .as_ref()
+                    .expect("valid LLVM");
+                let report = self.disassembly_report.as_ref().expect("ready disassembly");
+                let manifest = serde_json::json!({
+                    "binary_sha256": snapshot.binary_sha256,
+                    "selected_function": snapshot.selected_function.entry.offset,
+                    "function_count": snapshot.functions.len(),
+                    "pcode_rows": self.ghidra_pcode_lines.len(),
+                    "state_rows": self.ghidra_state_lines.len(),
+                    "llvm_source_operations": llvm.source_operations.len(),
+                    "disassembly_instructions": report.instructions.len(),
+                    "linked_address": self.selected_address.map(|address| format!("0x{address:x}")),
+                    "screenshots": ["ghidra-pcode.png", "disassembly.png"]
+                });
+                let path = smoke.output_dir.join("manifest.json");
+                if let Err(error) = fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&manifest).expect("static manifest"),
+                ) {
+                    render_smoke_fail(&smoke.output_dir, &error.to_string());
+                }
+                println!("HydIR rendered Ghidra demo passed: {}", path.display());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            smoke.stage = next_stage;
+        }
+        if smoke.stage == RenderSmokeStage::AwaitAnalysis {
+            if !self.ghidra_busy
+                && self.ghidra_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.selected_function.entry.offset == smoke.selector
+                })
+                && let Some(Err(error)) = &self.ghidra_llvm_cfg
+            {
+                render_smoke_fail(
+                    &smoke.output_dir,
+                    &format!("Desktop CFG LLVM generation failed: {error}"),
+                );
+            }
+            if self.status == "Whole-ELF disassembly failed"
+                || self.status == "Disassembly discarded"
+            {
+                render_smoke_fail(
+                    &smoke.output_dir,
+                    self.failure
+                        .as_deref()
+                        .unwrap_or("Desktop did not produce disassembly"),
+                );
+            }
+            if !self.ghidra_busy
+                && let Some(snapshot) = &self.ghidra_snapshot
+                && snapshot.selected_function.entry.offset != smoke.selector
+                && !smoke.selection_requested
+            {
+                let binary = self.current_local_path.clone().expect("opened local ELF");
+                let digest = snapshot.binary_sha256.clone();
+                self.enqueue_ghidra(binary, digest, Some(smoke.selector.clone()));
+                smoke.selection_requested = true;
+            }
+            if !self.ghidra_busy
+                && self.workbench_loaded
+                && self.pending_ghidra.is_none()
+                && let Some(error) = &self.failure
+            {
+                render_smoke_fail(&smoke.output_dir, error);
+            }
+            if !self.ghidra_busy
+                && let (Some(spec), Some(snapshot), Some(report), Some(Ok(llvm))) = (
+                    self.spec.as_ref(),
+                    self.ghidra_snapshot.as_ref(),
+                    self.disassembly_report.as_ref(),
+                    self.ghidra_llvm_cfg.as_ref(),
+                )
+                && snapshot.selected_function.entry.offset == smoke.selector
+            {
+                let linked = GhidraAddressMap::new(snapshot, spec).and_then(|map| {
+                    map.to_linked(
+                        &snapshot.selected_function.entry.space,
+                        &snapshot.selected_function.entry.offset,
+                    )
+                });
+                if linked.is_none()
+                    || linked != self.selected_address
+                    || report.binary_sha256 != spec.binary_sha256
+                    || snapshot.binary_sha256 != spec.binary_sha256
+                    || self.ghidra_pcode_lines.is_empty()
+                    || self.ghidra_state_lines.is_empty()
+                    || llvm.source_operations.is_empty()
+                    || !llvm.llvm_ir.contains("define ")
+                {
+                    render_smoke_fail(&smoke.output_dir, "Rendered workbench state is incomplete");
+                }
+                self.tab = Tab::GhidraPcode;
+                smoke.stage = RenderSmokeStage::PcodeReady;
+            }
+        }
+        if smoke.stage == RenderSmokeStage::DisassemblyReady {
+            self.tab = Tab::Bytes;
+            self.pending_disassembly_scroll = self.selected_address;
+        }
+        self.render_smoke = Some(smoke);
+    }
+
+    fn render_smoke_after_frame(&mut self, ctx: &egui::Context) {
+        let Some(smoke) = &mut self.render_smoke else {
+            return;
+        };
+        smoke.stage = match smoke.stage {
+            RenderSmokeStage::PcodeReady => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                RenderSmokeStage::PcodeCapturePending
+            }
+            RenderSmokeStage::DisassemblyReady => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                RenderSmokeStage::DisassemblyCapturePending
+            }
+            stage => stage,
+        };
+    }
+
     fn poll(&mut self) {
+        if let Some(probe) = &self.ghidra_runtime_probe {
+            match probe.try_recv() {
+                Ok((status, cli_available)) => {
+                    self.ghidra_runtime_status = Some(status);
+                    self.ghidra_cli_available = Some(cli_available);
+                    self.ghidra_runtime_probe = None;
+                }
+                Err(TryRecvError::Disconnected) => self.ghidra_runtime_probe = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         while let Ok(event) = self.events.try_recv() {
-            self.busy = false;
+            if !matches!(
+                &event,
+                Event::GhidraAnalyzed { .. }
+                    | Event::GhidraCallsTraced { .. }
+                    | Event::GhidraCallLlvmEmitted { .. }
+            ) {
+                self.busy = false;
+            }
             match event {
                 Event::WorkbenchLoaded(result) => {
                     self.workbench_loaded = true;
@@ -2602,6 +5032,17 @@ impl AnalystApp {
                     function_index,
                 } => {
                     let binary_sha256 = spec.binary_sha256.clone();
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_some_and(|old| old.binary_sha256 != binary_sha256)
+                        && let Some(task) = &self.ghidra_task
+                    {
+                        task.cancel.store(true, Ordering::Release);
+                    }
+                    if let Some(task) = &self.ghidra_call_task {
+                        task.cancel.store(true, Ordering::Release);
+                    }
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.current_local_path = if remote {
@@ -2638,12 +5079,38 @@ impl AnalystApp {
                     self.native_coverage = None;
                     self.native_coverage_error = None;
                     self.disassembly_report = None;
+                    self.ghidra_snapshot = None;
+                    self.ghidra_semantics = None;
+                    self.ghidra_coverage = None;
+                    self.ghidra_pcode_lines.clear();
+                    self.ghidra_slice = None;
+                    self.ghidra_state_lines.clear();
+                    self.ghidra_exact_operations.clear();
+                    self.ghidra_llvm_operation = None;
+                    self.ghidra_llvm_prefix = None;
+                    self.ghidra_llvm_cfg = None;
+                    self.ghidra_llvm_image_cfg = None;
+                    self.ghidra_llvm_simplified = None;
+                    self.ghidra_simplification = None;
+                    self.ghidra_trace_seed_json.clear();
+                    self.ghidra_trace_start.clear();
+                    self.ghidra_path_trace = None;
+                    self.ghidra_path_lines.clear();
+                    self.ghidra_call_trace = None;
+                    self.ghidra_call_lines.clear();
+                    self.ghidra_call_llvm = None;
+                    if let Some(task) = &self.ghidra_call_llvm_task {
+                        task.cancel.store(true, Ordering::Release);
+                    }
+                    self.investigation_recipe = None;
                     self.triton_result = None;
                     self.console_json = false;
                     self.annotations.clear();
                     self.job = None;
                     self.job_symbol = None;
                     self.selected_address = None;
+                    self.pending_recipe_address = None;
+                    self.pending_disassembly_scroll = None;
                     self.transform_before = None;
                     self.transform_after = None;
                     self.transform_report = None;
@@ -2663,10 +5130,56 @@ impl AnalystApp {
                         self.select(symbol);
                     }
                     self.enqueue(
-                        Task::RefreshAnnotations { binary_sha256 },
+                        Task::RefreshAnnotations {
+                            binary_sha256: binary_sha256.clone(),
+                        },
                         "Loading revisioned analyst annotations…",
                     );
+                    if !remote && let Some(path) = self.startup_recipe_path.take() {
+                        self.recipe_path_input = path.display().to_string();
+                        self.enqueue(Task::OpenRecipe(path), "Verifying investigation recipe…");
+                    }
+                    if let Some(binary) = self.current_local_path.clone() {
+                        self.pending_ghidra = Some((binary, binary_sha256));
+                        if !self.ghidra_busy
+                            && let Some((binary, digest)) = self.pending_ghidra.take()
+                        {
+                            self.enqueue_ghidra(binary, digest, None);
+                        }
+                        self.enqueue(
+                            Task::Disassemble { automatic: true },
+                            "Preparing linked ELF disassembly…",
+                        );
+                    } else {
+                        self.pending_ghidra = None;
+                    }
                 }
+                Event::RecipeLoaded(result) => match result {
+                    Ok(recipe) => {
+                        if self
+                            .spec
+                            .as_ref()
+                            .is_none_or(|spec| spec.binary_sha256 != recipe.claim.binary_sha256)
+                        {
+                            self.failure =
+                                Some("Recipe binary digest differs from the open ELF".to_owned());
+                            self.status = "Investigation recipe discarded".to_owned();
+                        } else {
+                            self.selected_address =
+                                recipe_elf_address(&recipe, recipe.claim.failed_decision_address);
+                            self.status = "Verified investigation recipe loaded".to_owned();
+                            self.history.push(self.status.clone());
+                            self.investigation_recipe = Some(recipe);
+                            self.tab = Tab::Investigation;
+                            self.failure = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.status = "Investigation recipe rejected".to_owned();
+                        self.history.push(error.clone());
+                        self.failure = Some(error);
+                    }
+                },
                 Event::GhidraGraphLoaded(result) => match result {
                     Ok(graph) => {
                         if graph.schema_version != 1 || graph.source != "ghidra" {
@@ -2687,6 +5200,236 @@ impl AnalystApp {
                         self.failure = Some(error);
                     }
                 },
+                Event::GhidraAnalyzed {
+                    binary_sha256,
+                    result,
+                } => {
+                    self.ghidra_busy = false;
+                    let cancelled = self
+                        .ghidra_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                    {
+                        if let Some((binary, digest)) = self.pending_ghidra.take() {
+                            self.enqueue_ghidra(binary, digest, None);
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok((snapshot, persistence_warning)) => {
+                            if (self.selected_address.is_none() || self.tab == Tab::GhidraPcode)
+                                && let Some(spec) = self.spec.as_ref()
+                            {
+                                self.selected_address = GhidraAddressMap::new(&snapshot, spec)
+                                    .and_then(|map| {
+                                        map.to_linked(
+                                            &snapshot.selected_function.entry.space,
+                                            &snapshot.selected_function.entry.offset,
+                                        )
+                                    });
+                            }
+                            if self.ghidra_snapshot.is_none() && self.tab == Tab::Overview {
+                                self.tab = Tab::GhidraPcode;
+                            }
+                            self.ghidra_slice = None;
+                            self.status = format!(
+                                "Ghidra analyzed {} functions; raw P-code is ready",
+                                snapshot.functions.len()
+                            );
+                            self.history.push(self.status.clone());
+                            self.ghidra_coverage = snapshot.pcode_coverage_report().ok();
+                            self.ghidra_semantics = snapshot
+                                .pcode_function_ir()
+                                .ok()
+                                .map(|source| source.lower_semantics());
+                            self.ghidra_pcode_lines =
+                                pcode_display_lines(&snapshot, self.ghidra_semantics.as_ref());
+                            self.ghidra_state_lines = self
+                                .ghidra_semantics
+                                .as_ref()
+                                .map(|semantic| pcode_state_lines(&semantic.lower_state()))
+                                .unwrap_or_default();
+                            self.ghidra_exact_operations = self
+                                .ghidra_semantics
+                                .as_ref()
+                                .map(|semantic| {
+                                    semantic
+                                        .instructions
+                                        .iter()
+                                        .enumerate()
+                                        .flat_map(|(instruction_index, instruction)| {
+                                            instruction
+                                                .operations
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, operation)| {
+                                                    matches!(
+                                                        operation.effect,
+                                                        PcodeEffect::Assign { .. }
+                                                    )
+                                                })
+                                                .map(move |(operation_index, _)| {
+                                                    let address = u64::from_str_radix(
+                                                        instruction
+                                                            .address
+                                                            .offset
+                                                            .trim_start_matches("0x"),
+                                                        16,
+                                                    )
+                                                    .ok();
+                                                    (instruction_index, operation_index, address)
+                                                })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            self.ghidra_llvm_operation = None;
+                            self.ghidra_llvm_prefix = None;
+                            self.ghidra_llvm_cfg = Some(emit_pcode_cfg_llvm(
+                                &snapshot,
+                                Some(&snapshot.selected_function.entry),
+                            ));
+                            self.ghidra_llvm_image_cfg = None;
+                            self.ghidra_llvm_simplified = None;
+                            self.ghidra_simplification = None;
+                            self.ghidra_trace_seed_json = ghidra_seed_template(&snapshot);
+                            self.ghidra_trace_start =
+                                snapshot.selected_function.entry.offset.clone();
+                            self.ghidra_path_trace = None;
+                            self.ghidra_path_lines.clear();
+                            self.ghidra_call_trace = None;
+                            self.ghidra_call_lines.clear();
+                            self.ghidra_call_llvm = None;
+                            if let Some(task) = &self.ghidra_call_llvm_task {
+                                task.cancel.store(true, Ordering::Release);
+                            }
+                            self.ghidra_snapshot = Some(snapshot);
+                            self.failure = persistence_warning.clone();
+                            if let Some(warning) = persistence_warning {
+                                self.history.push(warning);
+                            }
+                        }
+                        Err(error) => {
+                            if cancelled {
+                                self.status = "Ghidra analysis cancelled".to_owned();
+                                self.history.push(self.status.clone());
+                                self.failure = None;
+                            } else {
+                                self.status = "Ghidra analysis failed".to_owned();
+                                self.history.push(error.clone());
+                                self.failure = Some(error);
+                            }
+                        }
+                    }
+                    if let Some((binary, digest)) = self.pending_ghidra.take() {
+                        self.enqueue_ghidra(binary, digest, None);
+                    }
+                }
+                Event::GhidraPathTraced {
+                    binary_sha256,
+                    function,
+                    seed_json,
+                    start_text,
+                    result,
+                } => {
+                    if self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                        snapshot.binary_sha256 != binary_sha256
+                            || snapshot.selected_function.entry != function
+                    }) || self.ghidra_trace_seed_json != seed_json
+                        || self.ghidra_trace_start != start_text
+                    {
+                        continue;
+                    }
+                    self.ghidra_path_lines =
+                        result.as_ref().map(ghidra_trace_lines).unwrap_or_default();
+                    self.status = match &result {
+                        Ok(trace) => format!(
+                            "Traced {} Ghidra instruction visits",
+                            trace.instruction_visits.len()
+                        ),
+                        Err(_) => "Ghidra path trace failed".to_owned(),
+                    };
+                    self.ghidra_path_trace = Some(result);
+                }
+                Event::GhidraCallsTraced {
+                    binary_sha256,
+                    function,
+                    result,
+                } => {
+                    self.ghidra_call_busy = false;
+                    let cancelled = self
+                        .ghidra_call_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.selected_function.entry.offset != function
+                        })
+                    {
+                        continue;
+                    }
+                    if cancelled && result.is_err() {
+                        self.status = "Ghidra call tracing cancelled".to_owned();
+                        self.ghidra_call_trace = None;
+                        self.ghidra_call_lines.clear();
+                        continue;
+                    }
+                    self.ghidra_call_lines = result
+                        .as_ref()
+                        .map(ghidra_call_trace_lines)
+                        .unwrap_or_default();
+                    self.status = match &result {
+                        Ok(trace) => format!(
+                            "Ghidra call trace: {} calls, {} instruction visits",
+                            trace.calls.len(),
+                            trace.instruction_visits
+                        ),
+                        Err(_) => "Ghidra call tracing failed".to_owned(),
+                    };
+                    self.ghidra_call_trace = Some(result);
+                }
+                Event::GhidraCallLlvmEmitted {
+                    binary_sha256,
+                    function,
+                    result,
+                } => {
+                    self.ghidra_call_llvm_busy = false;
+                    let cancelled = self
+                        .ghidra_call_llvm_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.selected_function.entry.offset != function
+                        })
+                    {
+                        continue;
+                    }
+                    if cancelled {
+                        self.status = "Ghidra call LLVM generation cancelled".to_owned();
+                        self.ghidra_call_llvm = None;
+                        continue;
+                    }
+                    self.status = match &result {
+                        Ok(artifact) => format!(
+                            "Ghidra call LLVM: {} functions, {} source operations",
+                            artifact.function_entries.len(),
+                            artifact.llvm.source_operations.len()
+                        ),
+                        Err(_) => "Ghidra call LLVM generation failed".to_owned(),
+                    };
+                    self.ghidra_call_llvm = Some(result);
+                }
                 Event::RemoteProjectCreated(project_id) => {
                     self.remote_project_id = project_id.clone();
                     self.status = format!(
@@ -2788,15 +5531,27 @@ impl AnalystApp {
                         format!("{symbol} is outside the current recovery contract")
                     };
                     self.history.push(self.status.clone());
+                    if let Some(address) = self.pending_recipe_address.take() {
+                        self.selected_address = Some(address);
+                    }
                     self.tab = self
                         .selection_target_tab
                         .take()
                         .unwrap_or(Tab::RegionStudio);
                 }
-                Event::NativeSelected { label, native } => {
+                Event::NativeSelected {
+                    label,
+                    native,
+                    typed,
+                    project_revision,
+                } => {
                     if self.symbol.as_deref() != Some(&label) {
                         continue;
                     }
+                    self.project_revision = project_revision;
+                    self.model_rename_target = None;
+                    self.model_rename_name.clear();
+                    self.model_edit_draft = None;
                     match *native {
                         Ok(value) => {
                             self.selected_address = Some(value.machine_ir.entry.value.0);
@@ -2812,10 +5567,114 @@ impl AnalystApp {
                             self.failure = Some(error);
                         }
                     }
+                    match *typed {
+                        Ok(view) => {
+                            self.typed_native_view = Some(view);
+                            self.typed_native_error = None;
+                        }
+                        Err(error) => {
+                            self.typed_native_view = None;
+                            self.typed_native_error = Some(error);
+                        }
+                    }
                     self.history.push(self.status.clone());
+                    if let Some(address) = self.pending_recipe_address.take() {
+                        self.selected_address = Some(address);
+                    }
                     self.tab = self.selection_target_tab.take().unwrap_or(Tab::Native);
                 }
-                Event::Disassembled(result) => match result {
+                Event::ModelRenamed {
+                    binary_sha256,
+                    entry,
+                    revision,
+                    remote,
+                    typed,
+                } => {
+                    if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
+                        != Some(binary_sha256.as_str())
+                    {
+                        continue;
+                    }
+                    self.project_revision = Some(revision);
+                    self.model_rename_target = None;
+                    self.model_rename_name.clear();
+                    if self
+                        .native_decompilation
+                        .as_ref()
+                        .is_some_and(|native| native.machine_ir.entry == entry)
+                    {
+                        match *typed {
+                            Ok(view) => {
+                                self.typed_native_view = Some(view);
+                                self.typed_native_error = None;
+                            }
+                            Err(error) => {
+                                self.typed_native_view = None;
+                                self.typed_native_error = Some(error.clone());
+                                self.failure = Some(format!(
+                                    "Model saved, but typed C refresh failed: {error}"
+                                ));
+                            }
+                        }
+                    } else if self.native_decompilation.is_some() {
+                        self.typed_native_view = None;
+                        self.typed_native_error = Some(
+                            "Analysis model changed; reselect this function to refresh typed C"
+                                .to_owned(),
+                        );
+                    }
+                    self.status = format!(
+                        "Saved model rename in {} revision {revision}",
+                        if remote { "remote" } else { "local" }
+                    );
+                    self.history.push(self.status.clone());
+                }
+                Event::ModelEdited {
+                    binary_sha256,
+                    entry,
+                    revision,
+                    remote,
+                    typed,
+                } => {
+                    if self.spec.as_ref().map(|spec| spec.binary_sha256.as_str())
+                        != Some(binary_sha256.as_str())
+                    {
+                        continue;
+                    }
+                    self.project_revision = Some(revision);
+                    self.model_edit_draft = None;
+                    if self
+                        .native_decompilation
+                        .as_ref()
+                        .is_some_and(|native| native.machine_ir.entry == entry)
+                    {
+                        match *typed {
+                            Ok(view) => {
+                                self.typed_native_view = Some(view);
+                                self.typed_native_error = None;
+                            }
+                            Err(error) => {
+                                self.typed_native_view = None;
+                                self.typed_native_error = Some(error.clone());
+                                self.failure = Some(format!(
+                                    "Model saved, but typed C refresh failed: {error}"
+                                ));
+                            }
+                        }
+                    } else if self.native_decompilation.is_some() {
+                        self.typed_native_view = None;
+                        self.typed_native_error = Some(
+                            "Analysis model changed; reselect this function to refresh typed C"
+                                .to_owned(),
+                        );
+                    }
+                    self.status = format!(
+                        "Saved analysis model edit in {} revision {revision}",
+                        if remote { "remote" } else { "local" }
+                    );
+                    self.history.push(self.status.clone());
+                }
+                Event::Disassembled { result, automatic } => match result {
                     Ok(report) => {
                         let digest_matches = self
                             .spec
@@ -2828,16 +5687,22 @@ impl AnalystApp {
                             );
                             self.status = "Disassembly discarded".to_owned();
                         } else {
-                            self.status = format!(
+                            let status = format!(
                                 "Disassembled {} instructions across {} executable sections",
                                 report.instructions.len(),
                                 report.sections.len()
                             );
-                            self.history.push(self.status.clone());
+                            self.history.push(status.clone());
                             self.disassembly_report = Some(report);
-                            self.console_json = false;
-                            self.tab = Tab::Bytes;
-                            self.failure = None;
+                            if let Some(address) = self.pending_recipe_address.take() {
+                                self.selected_address = Some(address);
+                            }
+                            if !automatic {
+                                self.status = status;
+                                self.console_json = false;
+                                self.tab = Tab::Bytes;
+                                self.failure = None;
+                            }
                         }
                     }
                     Err(error) => {
@@ -3368,6 +6233,11 @@ impl AnalystApp {
         self.decompilation_error = None;
         self.native_decompilation = None;
         self.native_decompilation_error = None;
+        self.typed_native_view = None;
+        self.typed_native_error = None;
+        self.model_rename_target = None;
+        self.model_rename_name.clear();
+        self.model_edit_draft = None;
         self.region_studio_mode = RegionStudioMode::Contract;
         self.native_view_mode = NativeViewMode::Summary;
     }
@@ -3404,6 +6274,82 @@ impl AnalystApp {
             },
             "Running bounded native decompilation…",
         );
+    }
+
+    fn open_recipe_site(&mut self, runtime_address: u64, target: Tab) {
+        let Some(recipe) = &self.investigation_recipe else {
+            return;
+        };
+        let Some(address) = recipe_elf_address(recipe, runtime_address) else {
+            self.failure = Some("Captured address has no verified ELF translation".to_owned());
+            return;
+        };
+        let entry = recipe_elf_address(recipe, recipe.resume_plan.code_address);
+        let already_selected = entry.is_some_and(|entry| {
+            self.native_decompilation
+                .as_ref()
+                .is_some_and(|native| native.machine_ir.entry.value.0 == entry)
+        });
+        self.selected_address = Some(address);
+        self.pending_disassembly_scroll = Some(address);
+        if target == Tab::Bytes {
+            if self.disassembly_report.is_some() {
+                self.tab = Tab::Bytes;
+            } else {
+                self.pending_recipe_address = Some(address);
+                self.enqueue(
+                    Task::Disassemble { automatic: false },
+                    "Locating recipe site in ELF disassembly…",
+                );
+            }
+            return;
+        }
+        if already_selected {
+            self.tab = target;
+            if target == Tab::Native {
+                self.native_view_mode = NativeViewMode::TypedC;
+            } else if target == Tab::Graph {
+                self.graph_mode = GraphMode::Function;
+            }
+            return;
+        }
+        let action = self.function_index.as_ref().and_then(|index| {
+            index
+                .functions
+                .iter()
+                .find(|function| Some(function.entry.value.0) == entry)
+                .map(|function| indexed_function_action(function, self.spec.as_ref()))
+        });
+        if let Some(GraphNodeAction::Function {
+            label,
+            selector,
+            entry,
+            legacy_symbol,
+        }) = action
+        {
+            if legacy_symbol {
+                self.select(label);
+            } else {
+                self.select_native(label, selector, entry);
+            }
+            self.pending_recipe_address = Some(address);
+            self.pending_disassembly_scroll = Some(address);
+            self.selection_target_tab = Some(target);
+            if target == Tab::Native {
+                self.native_view_mode = NativeViewMode::TypedC;
+            } else if target == Tab::Graph {
+                self.graph_mode = GraphMode::Function;
+            }
+        } else if self.disassembly_report.is_some() {
+            self.tab = Tab::Bytes;
+            self.status = "No exact recovered function entry; showing ELF disassembly".to_owned();
+        } else {
+            self.pending_recipe_address = Some(address);
+            self.enqueue(
+                Task::Disassemble { automatic: false },
+                "Locating recipe site in ELF disassembly…",
+            );
+        }
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -3506,11 +6452,35 @@ impl AnalystApp {
             egui::Button::new("Disassemble ELF"),
         );
         if disassemble.clicked() {
-            self.enqueue(Task::Disassemble, "Disassembling executable ELF sections…");
+            self.enqueue(
+                Task::Disassemble { automatic: false },
+                "Disassembling executable ELF sections…",
+            );
         }
         disassemble.on_disabled_hover_text(
             "Open a local ELF first. Whole-ELF disassembly is currently local-only.",
         );
+        ui.separator();
+        ui.label(RichText::new("Investigation recipe").strong().color(ACCENT));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.recipe_path_input)
+                .hint_text("/absolute/path/to/recipe.json")
+                .desired_width(f32::INFINITY),
+        );
+        let load_recipe = ui.add_enabled(
+            !self.busy
+                && !self.remote
+                && self.spec.is_some()
+                && !self.recipe_path_input.trim().is_empty(),
+            egui::Button::new("Verify and open recipe"),
+        );
+        if load_recipe.clicked() {
+            self.enqueue(
+                Task::OpenRecipe(PathBuf::from(self.recipe_path_input.trim())),
+                "Verifying investigation recipe…",
+            );
+        }
+        load_recipe.on_disabled_hover_text("Open the matching local ELF first.");
         let triton = ui.add_enabled(
             !self.busy
                 && !self.remote
@@ -3534,12 +6504,98 @@ impl AnalystApp {
         ui.separator();
         egui::CollapsingHeader::new("Ghidra bridge")
             .id_salt("ghidra_bridge")
+            .default_open(true)
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Load HydIRExport.java JSON as external evidence; native HydIR facts stay separate.")
+                    RichText::new("Hydir runs headless Ghidra for local ELFs and imports its validated P-code snapshot.")
                         .size(11.0)
                         .color(MUTED),
                 );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SETUP").size(10.0).strong().color(MUTED));
+                    if ui
+                        .add_enabled(
+                            self.ghidra_runtime_probe.is_none(),
+                            egui::Button::new("Refresh"),
+                        )
+                        .clicked()
+                    {
+                        self.ghidra_runtime_status = None;
+                        self.ghidra_cli_available = None;
+                        self.ghidra_runtime_probe = Some(probe_ghidra_runtime(ui.ctx()));
+                    }
+                });
+                if let Some(status) = &self.ghidra_runtime_status {
+                    let (headline, action) = ghidra_readiness_copy(status);
+                    ui.label(
+                        RichText::new(format!("{headline} · Ghidra {}", status.pinned_version))
+                            .size(11.0)
+                            .strong()
+                            .color(if status.runtime_ready { GOOD } else { BAD }),
+                    );
+                    ui.label(RichText::new(&status.detail).size(11.0).color(MUTED));
+                    ui.label(RichText::new(action).size(11.0).color(MUTED));
+                    if self.ghidra_cli_available == Some(false) {
+                        ui.label(
+                            RichText::new("hydirctl missing: install it beside Hydir or on PATH, then Refresh.")
+                                .size(11.0)
+                                .color(BAD),
+                        );
+                    }
+                } else if self.ghidra_runtime_probe.is_some() {
+                    ui.label(RichText::new("Checking Ghidra runtime…").size(11.0).color(MUTED));
+                } else {
+                    ui.label(RichText::new("Could not check Ghidra runtime. Refresh to retry.").size(11.0).color(BAD));
+                }
+                let analyze = ui.add_enabled(
+                    !self.busy
+                        && !self.ghidra_busy
+                        && self.ghidra_cli_available == Some(true)
+                        && self
+                            .ghidra_runtime_status
+                            .as_ref()
+                            .is_some_and(|status| status.runtime_ready)
+                        && self.current_local_path.is_some()
+                        && self.spec.is_some(),
+                    egui::Button::new("Analyze with Ghidra"),
+                );
+                if analyze.clicked()
+                    && let (Some(binary), Some(spec)) =
+                        (self.current_local_path.clone(), self.spec.as_ref())
+                {
+                    self.enqueue_ghidra(binary, spec.binary_sha256.clone(), None);
+                }
+                if let Some(task) = &self.ghidra_task {
+                    ghidra_progress(ui, task, "Analyzing ELF");
+                    if ui
+                        .add_enabled(
+                            !task.cancel.load(Ordering::Acquire),
+                            egui::Button::new("Cancel Ghidra analysis"),
+                        )
+                        .clicked()
+                    {
+                        task.cancel.store(true, Ordering::Release);
+                        self.status = "Stopping Ghidra analysis…".to_owned();
+                        self.pending_ghidra = None;
+                    }
+                }
+                if let Some(snapshot) = &self.ghidra_snapshot {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} functions · {} · selected {}",
+                            snapshot.functions.len(),
+                            snapshot.program.ghidra_version,
+                            snapshot.selected_function.entry.offset
+                        ))
+                        .size(11.0)
+                        .color(ACCENT),
+                    );
+                    if ui.button("Browse raw P-code").clicked() {
+                        self.tab = Tab::GhidraPcode;
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Legacy v1 graph import").size(11.0).color(MUTED));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.ghidra_graph_path)
                         .hint_text("/absolute/path/to/ghidra-graph.json")
@@ -3676,17 +6732,21 @@ impl AnalystApp {
                 }
             });
         ui.separator();
-        if let Some(spec) = &self.spec {
-            ui.label(
-                RichText::new(format!("FUNCTIONS  ·  {}", spec.functions.len()))
-                    .size(11.0)
-                    .strong()
-                    .color(MUTED),
-            );
+        if self.spec.is_some() {
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search functions")
                     .desired_width(f32::INFINITY),
+            );
+        }
+        if let Some(spec) = &self.spec
+            && !spec.functions.is_empty()
+        {
+            ui.label(
+                RichText::new(format!("SYMBOL FUNCTIONS  ·  {}", spec.functions.len()))
+                    .size(11.0)
+                    .strong()
+                    .color(MUTED),
             );
             let query = self.search.to_lowercase();
             let filtered: Vec<usize> = spec
@@ -3717,7 +6777,7 @@ impl AnalystApp {
             if let Some(name) = clicked {
                 self.select(name);
             }
-        } else {
+        } else if self.spec.is_none() {
             ui.add_space(16.0);
             ui.label(RichText::new("No functions yet").strong());
             ui.label(
@@ -3728,13 +6788,10 @@ impl AnalystApp {
         if let Some(index) = &self.function_index {
             ui.separator();
             ui.label(
-                RichText::new(format!(
-                    "NATIVE FUNCTION INDEX  ·  {}",
-                    index.functions.len()
-                ))
-                .size(11.0)
-                .strong()
-                .color(ACCENT),
+                RichText::new(format!("RECOVERED FUNCTIONS  ·  {}", index.functions.len()))
+                    .size(11.0)
+                    .strong()
+                    .color(ACCENT),
             );
             let query = self.search.to_lowercase();
             let candidates = index
@@ -4426,7 +7483,14 @@ impl AnalystApp {
         if let Some(failure) = &self.failure {
             ui.colored_label(BAD, failure);
         } else {
-            ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
+            ui.colored_label(
+                if self.busy || self.ghidra_busy {
+                    ACCENT
+                } else {
+                    GOOD
+                },
+                &self.status,
+            );
         }
         ui.add_space(12.0);
         ui.separator();
@@ -4497,6 +7561,8 @@ impl AnalystApp {
         ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
+                (Tab::GhidraPcode, "Ghidra P-code"),
+                (Tab::Investigation, "Investigation"),
                 (Tab::RegionStudio, "Region Studio"),
                 (Tab::Native, "Native decompiler"),
                 (Tab::Bytes, "Disassembly"),
@@ -4517,6 +7583,12 @@ impl AnalystApp {
         ui.separator();
         match self.tab {
             Tab::Overview => self.overview_view(ui),
+            Tab::GhidraPcode => {
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_workbench_scroll")
+                    .show(ui, |ui| self.ghidra_pcode_view(ui));
+            }
+            Tab::Investigation => self.investigation_view(ui),
             Tab::RegionStudio => self.region_studio(ui),
             Tab::Native => self.native_explorer_view(ui),
             Tab::Bytes => self.disassembly(ui),
@@ -4527,6 +7599,1533 @@ impl AnalystApp {
             Tab::Passes => self.passes_view(ui),
             Tab::Analysis => self.analysis_view(ui),
             Tab::C => self.c_view(ui),
+        }
+    }
+
+    fn ghidra_pcode_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Ghidra function index and raw P-code").color(ACCENT));
+        let Some(snapshot) = &self.ghidra_snapshot else {
+            ui.label(
+                RichText::new("Open a local ELF to run automatic Ghidra analysis, or retry from the Program pane.")
+                    .color(MUTED),
+            );
+            return;
+        };
+        let address_map = self
+            .spec
+            .as_ref()
+            .and_then(|spec| GhidraAddressMap::new(snapshot, spec));
+        ui.label(
+            RichText::new(format!(
+                "Snapshot v{} · {} · {} · binary SHA-256 {}",
+                snapshot.schema_version,
+                snapshot.program.language_id,
+                snapshot.program.compiler_spec_id,
+                snapshot.binary_sha256
+            ))
+            .size(11.0)
+            .color(MUTED),
+        );
+        ui.label(
+            RichText::new("P-code is imported evidence. Semantic lowering and equivalence are separate checks.")
+                .size(11.0)
+                .color(MUTED),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Instruction CFG: {} nodes · {} analyzed edges · {} calls · incomplete",
+                snapshot.selected_function.instructions.len(),
+                snapshot.selected_function.flow_edges.len(),
+                snapshot.selected_function.call_targets.len()
+            ))
+            .size(11.0)
+            .color(MUTED),
+        );
+        if let Some(Ok(llvm)) = &self.ghidra_llvm_cfg {
+            ui.label(
+                RichText::new(format!(
+                    "Hydir LLVM CFG: {} linked source operations · {} explicit stop sites · {:?} fidelity",
+                    llvm.source_operations.len(),
+                    llvm.stop_sites.len(),
+                    llvm.semantic_fidelity
+                ))
+                .size(11.0)
+                .color(ACCENT),
+            );
+        }
+        ui.separator();
+        ui.label(RichText::new("FUNCTIONS").strong().color(ACCENT));
+        let mut requested = None;
+        let mut path_trace_task = None;
+        egui::ScrollArea::vertical()
+            .id_salt("ghidra_function_index")
+            .max_height(150.0)
+            .show_rows(ui, 26.0, snapshot.functions.len(), |ui, range| {
+                for row in range {
+                    let function = &snapshot.functions[row];
+                    let selected = function.entry == snapshot.selected_function.entry;
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.ghidra_busy,
+                            egui::Button::selectable(
+                                selected,
+                                format!(
+                                    "{}:{}  {}  ({} bytes)",
+                                    function.entry.space,
+                                    function.entry.offset,
+                                    function.name,
+                                    function.size
+                                ),
+                            ),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        requested = Some(function.entry.offset.clone());
+                        self.selected_address = address_map.as_ref().and_then(|map| {
+                            map.to_linked(&function.entry.space, &function.entry.offset)
+                        });
+                    }
+                }
+            });
+        let mut jump_to_raw_pcode = false;
+        let mut open_disassembly = None;
+        let entry_address = address_map.as_ref().and_then(|map| {
+            map.to_linked(
+                &snapshot.selected_function.entry.space,
+                &snapshot.selected_function.entry.offset,
+            )
+        });
+        ui.horizontal(|ui| {
+            jump_to_raw_pcode = ui.button("View raw P-code").clicked();
+            if ui
+                .add_enabled(
+                    !self.busy && entry_address.is_some(),
+                    egui::Button::new("Open linked disassembly"),
+                )
+                .clicked()
+            {
+                open_disassembly = entry_address;
+            }
+        });
+        ui.separator();
+        if !snapshot.memory_blocks.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Ghidra memory map ({})",
+                snapshot.memory_blocks.len()
+            ))
+            .id_salt("ghidra_memory_blocks")
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Analyzed Ghidra ranges and permissions; these are project evidence.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_memory_block_rows")
+                    .max_height(160.0)
+                    .show_rows(ui, 26.0, snapshot.memory_blocks.len(), |ui, range| {
+                        for row in range {
+                            let block = &snapshot.memory_blocks[row];
+                            let address = address_map.as_ref().and_then(|map| {
+                                map.to_linked(&block.start.space, &block.start.offset)
+                            });
+                            let label = format!(
+                                "{} {}:{}..{} · {} bytes · {}{}{} · {}",
+                                block.name,
+                                block.start.space,
+                                block.start.offset,
+                                block.end.offset,
+                                block.size,
+                                if block.read { "r" } else { "-" },
+                                if block.write { "w" } else { "-" },
+                                if block.execute { "x" } else { "-" },
+                                if block.initialized {
+                                    "initialized"
+                                } else {
+                                    "uninitialized"
+                                }
+                            );
+                            if ui
+                                .add_enabled(
+                                    address.is_some(),
+                                    egui::Button::selectable(
+                                        address.is_some() && self.selected_address == address,
+                                        RichText::new(label).monospace().size(11.0),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.selected_address = address;
+                            }
+                        }
+                    });
+            });
+        }
+        if !snapshot.symbols.is_empty() {
+            egui::CollapsingHeader::new(format!("Ghidra symbols ({})", snapshot.symbols.len()))
+                .id_salt("ghidra_symbols")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Defined program and external symbols with Ghidra source evidence.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("ghidra_symbol_rows")
+                        .max_height(160.0)
+                        .show_rows(ui, 26.0, snapshot.symbols.len(), |ui, range| {
+                            for row in range {
+                                let symbol = &snapshot.symbols[row];
+                                let address = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(&symbol.address.space, &symbol.address.offset)
+                                });
+                                let label = format!(
+                                    "{}:{} {}::{} · {} · {}",
+                                    symbol.address.space,
+                                    symbol.address.offset,
+                                    symbol.namespace,
+                                    symbol.name,
+                                    symbol.symbol_type,
+                                    symbol.source_type
+                                );
+                                if ui
+                                    .add_enabled(
+                                        address.is_some(),
+                                        egui::Button::selectable(
+                                            address.is_some() && self.selected_address == address,
+                                            RichText::new(label).monospace().size(11.0),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_address = address;
+                                }
+                            }
+                        });
+                });
+        }
+        if let Some(report) = &self.ghidra_coverage {
+            egui::CollapsingHeader::new(format!(
+                "P-code coverage: {} exact assignments / {} operations",
+                report.exact_assignments, report.operations
+            ))
+            .id_salt("ghidra_pcode_coverage")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Counts describe Hydir's P-code value lowering. They are not a machine-code equivalence claim.")
+                    .size(11.0).color(MUTED));
+                for row in &report.by_opcode {
+                    ui.label(RichText::new(format!(
+                        "{:>3} {:<18} {:>5} total · {:>5} exact · {:>5} opaque",
+                        row.opcode, row.mnemonic, row.operations,
+                        row.exact_assignments, row.opaque_effects
+                    )).monospace().size(11.0));
+                }
+                if report.omitted_opaque_sites > 0 {
+                    ui.label(RichText::new(format!("{} additional opaque sites omitted from this view", report.omitted_opaque_sites))
+                        .size(11.0).color(MUTED));
+                }
+                egui::ScrollArea::vertical().id_salt("ghidra_coverage_opaque_sites")
+                    .max_height(140.0)
+                    .show_rows(ui, 18.0, report.opaque_sites.len(), |ui, range| {
+                        for row in range {
+                            let site = &report.opaque_sites[row];
+                            let address = address_map.as_ref().and_then(|map| {
+                                map.to_linked(&site.address.space, &site.address.offset)
+                            });
+                            let label = format!("{} #{} {}: {}", site.address.offset,
+                                site.sequence_index, site.mnemonic, site.reason);
+                            if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                RichText::new(label).monospace().size(11.0)).clicked() {
+                                    if address.is_some() { self.selected_address = address; }
+                                }
+                        }
+                    });
+            });
+        }
+        if let Some(semantics) = &self.ghidra_semantics {
+            let exact = semantics
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.operations)
+                .filter(|operation| matches!(operation.effect, PcodeEffect::Assign { .. }))
+                .count();
+            let opaque = semantics.diagnostics.len();
+            ui.label(
+                RichText::new(format!(
+                    "Rust semantic pass: {exact} exact operations · {opaque} opaque operations · function equivalence unverified"
+                ))
+                .size(11.0)
+                .color(if opaque == 0 { GOOD } else { ACCENT }),
+            );
+            if opaque > 0 {
+                egui::CollapsingHeader::new(format!("Opaque effect diagnostics ({opaque})"))
+                    .id_salt("ghidra_semantic_diagnostics")
+                    .show(ui, |ui| {
+                        for diagnostic in semantics.diagnostics.iter().take(30) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}:{} #{} · {}",
+                                    diagnostic.source_address.space,
+                                    diagnostic.source_address.offset,
+                                    diagnostic.sequence_index,
+                                    diagnostic.message
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(BAD),
+                            );
+                        }
+                        if opaque > 30 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} more; all are marked in raw P-code below",
+                                    opaque - 30
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                    });
+            }
+        }
+        egui::CollapsingHeader::new(format!("Ordered state effects ({})", self.ghidra_state_lines.len()))
+            .id_salt("ghidra_ordered_state")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new("Reads and writes follow source P-code order. Possible effects and unlisted clobbers remain explicit.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Copy state effects").clicked() {
+                    ui.ctx().copy_text(self.ghidra_state_lines.iter()
+                        .map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n"));
+                }
+                egui::ScrollArea::both().id_salt("ghidra_ordered_state_rows")
+                    .max_height(180.0)
+                    .show_rows(ui, 18.0, self.ghidra_state_lines.len(), |ui, range| {
+                        for row in range {
+                            let (address, line) = &self.ghidra_state_lines[row];
+                            let linked = address.and_then(|value| address_map.as_ref()
+                                .and_then(|map| map.to_linked_raw(value)));
+                            if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                RichText::new(line).monospace().size(11.0)).clicked() {
+                                if linked.is_some() { self.selected_address = linked; }
+                            }
+                        }
+                    });
+            });
+        let mut selected_exact = None;
+        egui::CollapsingHeader::new(format!("LLVM for exact operations ({})", self.ghidra_exact_operations.len()))
+            .id_salt("ghidra_exact_llvm")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Each selection emits one P-code value operation. This is not a whole-function lift.")
+                    .size(11.0).color(MUTED));
+                egui::ScrollArea::vertical().id_salt("ghidra_exact_llvm_rows")
+                    .max_height(120.0)
+                    .show_rows(ui, 18.0, self.ghidra_exact_operations.len(), |ui, range| {
+                        for row in range {
+                            let (instruction_index, operation_index, address) = self.ghidra_exact_operations[row];
+                            if let Some(semantic) = self.ghidra_semantics.as_ref()
+                                && let Some(instruction) = semantic.instructions.get(instruction_index)
+                                && let Some(operation) = instruction.operations.get(operation_index) {
+                                let label = format!("{}:{}  #{} {}", instruction.address.space,
+                                    instruction.address.offset, operation_index, operation.source.mnemonic);
+                                let linked = address.and_then(|value| address_map.as_ref()
+                                    .and_then(|map| map.to_linked_raw(value)));
+                                if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                    RichText::new(label).monospace().size(11.0)).clicked() {
+                                    selected_exact = Some((instruction_index, operation_index, linked));
+                                }
+                            }
+                        }
+                    });
+                if let Some(llvm) = &self.ghidra_llvm_operation {
+                    if ui.button("Copy LLVM operation").clicked() {
+                        ui.ctx().copy_text(llvm.clone());
+                    }
+                    egui::ScrollArea::both().id_salt("ghidra_exact_llvm_source")
+                        .max_height(180.0).show(ui, |ui| {
+                            ui.label(RichText::new(llvm).monospace().size(11.0));
+                        });
+                }
+            });
+        if let Some((instruction_index, operation_index, address)) = selected_exact {
+            self.selected_address = address;
+            self.ghidra_llvm_operation = self
+                .ghidra_semantics
+                .as_ref()
+                .and_then(|semantic| semantic.instructions.get(instruction_index))
+                .and_then(|instruction| instruction.operations.get(operation_index))
+                .map(|operation| {
+                    emit_pcode_exact_operation_llvm(operation)
+                        .unwrap_or_else(|error| format!("LLVM emission failed: {error}"))
+                });
+        }
+        egui::CollapsingHeader::new("Concrete path trace")
+            .id_salt("ghidra_concrete_path")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Seed known register or RAM bytes, then follow one bounded path. Unknown values and unsupported effects stop explicitly; the trace is not a whole-function proof.")
+                    .size(11.0).color(MUTED));
+                if self.current_local_path.is_some()
+                    && PcodeReadOnlyElfImage::has_eligible_blocks(snapshot)
+                {
+                    ui.label(RichText::new("File-backed read-only ELF bytes are loaded automatically; seed input and mutable RAM bytes.")
+                        .size(11.0).color(MUTED));
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Start instruction");
+                    if ui.text_edit_singleline(&mut self.ghidra_trace_start).changed() {
+                        self.ghidra_path_trace = None;
+                        self.ghidra_path_lines.clear();
+                        self.ghidra_llvm_cfg = None;
+                        self.ghidra_llvm_image_cfg = None;
+                        self.ghidra_llvm_simplified = None;
+                    }
+                    if let Some(address) = selected_ghidra_trace_address(
+                        snapshot,
+                        address_map.as_ref(),
+                        self.selected_address,
+                    ) && ui.button("Use selected").clicked() {
+                            self.ghidra_trace_start = format!("0x{address:x}");
+                            self.ghidra_path_trace = None;
+                            self.ghidra_path_lines.clear();
+                            self.ghidra_llvm_cfg = None;
+                            self.ghidra_llvm_image_cfg = None;
+                            self.ghidra_llvm_simplified = None;
+                        }
+                });
+                ui.label(RichText::new("Seed JSON · offsets and values use 0x hexadecimal")
+                    .size(11.0).color(MUTED));
+                    if ui.add(egui::TextEdit::multiline(&mut self.ghidra_trace_seed_json)
+                    .code_editor().desired_rows(8).desired_width(f32::INFINITY)).changed() {
+                        self.ghidra_path_trace = None;
+                        self.ghidra_path_lines.clear();
+                        self.ghidra_call_trace = None;
+                        self.ghidra_call_lines.clear();
+                        self.ghidra_call_llvm = None;
+                        if let Some(task) = &self.ghidra_call_llvm_task {
+                            task.cancel.store(true, Ordering::Release);
+                        }
+                    }
+                if ui.add_enabled(!self.busy && !self.ghidra_busy, egui::Button::new("Trace path")).clicked() {
+                    self.ghidra_path_trace = None;
+                    self.ghidra_path_lines.clear();
+                    path_trace_task = Some(Task::TraceGhidraPath {
+                        snapshot: Box::new(snapshot.clone()),
+                        seed_json: self.ghidra_trace_seed_json.clone(),
+                        start_text: self.ghidra_trace_start.clone(),
+                    });
+                }
+                match &self.ghidra_path_trace {
+                    Some(Ok(trace)) => {
+                        let stop = serde_json::to_value(&trace.stop).unwrap_or_default();
+                        let kind = stop.get("kind").and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        ui.label(RichText::new(format!("{} instruction visits · {} events · stop: {kind}",
+                            trace.instruction_visits.len(), trace.events.len()))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy trace JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(trace) {
+                                ui.ctx().copy_text(json);
+                            }
+                        egui::CollapsingHeader::new("Stop detail")
+                            .id_salt("ghidra_trace_stop_detail")
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(stop.to_string()).monospace().size(11.0));
+                            });
+                        egui::ScrollArea::vertical().id_salt("ghidra_trace_events")
+                            .max_height(180.0)
+                            .show_rows(ui, 18.0, self.ghidra_path_lines.len(), |ui, range| {
+                                for row in range {
+                                    let (address, line) = &self.ghidra_path_lines[row];
+                                    let linked = address.and_then(|value| address_map.as_ref()
+                                        .and_then(|map| map.to_linked_raw(value)));
+                                    if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                        RichText::new(line).monospace().size(11.0)).clicked() {
+                                            if linked.is_some() { self.selected_address = linked; }
+                                        }
+                                }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("Call trace")
+            .id_salt("ghidra_direct_call_trace")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Use the seed JSON above to follow direct calls and concrete indirect targets through automatically analyzed functions. Unknown targets, missing callees, recursion, and budget limits stop explicitly.")
+                    .size(11.0).color(MUTED));
+                let can_trace = !self.ghidra_busy
+                    && !self.ghidra_call_busy
+                    && !self.ghidra_call_llvm_busy
+                    && self.current_local_path.is_some();
+                if ui.add_enabled(can_trace, egui::Button::new("Trace calls")).clicked() {
+                    let result = parse_pcode_seed(
+                        self.ghidra_trace_seed_json.as_bytes(), snapshot,
+                    );
+                    match result {
+                        Err(error) => {
+                            self.ghidra_call_trace = Some(Err(error));
+                            self.ghidra_call_lines.clear();
+                        }
+                        Ok(_) => {
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            let timeout = ghidra_task_timeout(
+                                self.ghidra_runtime_status.as_ref().map(|status| status.mode),
+                                true,
+                            );
+                            let task = Task::TraceGhidraCalls {
+                                binary: self.current_local_path.clone().expect("checked above"),
+                                binary_sha256: snapshot.binary_sha256.clone(),
+                                function: snapshot.selected_function.entry.offset.clone(),
+                                seed_json: self.ghidra_trace_seed_json.clone(),
+                                cancel: Arc::clone(&cancel),
+                                timeout,
+                            };
+                            match self.tasks.try_send(task) {
+                                Ok(()) => {
+                                    self.ghidra_call_busy = true;
+                                    self.ghidra_call_task = Some(ActiveGhidraTask {
+                                        cancel,
+                                        started: Instant::now(),
+                                        timeout,
+                                    });
+                                    self.ghidra_call_trace = None;
+                                    self.ghidra_call_lines.clear();
+                                    self.status = "Collecting Ghidra callees and tracing…".to_owned();
+                                }
+                                Err(_) => {
+                                    self.ghidra_call_trace = Some(Err(
+                                        "Analysis queue is full. Retry the call trace.".to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.ghidra_call_busy {
+                    if let Some(task) = &self.ghidra_call_task {
+                        ghidra_progress(ui, task, "Analyzing callees");
+                        if ui
+                            .add_enabled(
+                                !task.cancel.load(Ordering::Acquire),
+                                egui::Button::new("Cancel call trace"),
+                            )
+                            .clicked()
+                        {
+                            task.cancel.store(true, Ordering::Release);
+                            self.status = "Stopping Ghidra call trace…".to_owned();
+                        }
+                    }
+                }
+                match &self.ghidra_call_trace {
+                    Some(Ok(trace)) => {
+                        let stop = serde_json::to_value(&trace.stop).unwrap_or_default();
+                        let kind = stop.get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        ui.label(RichText::new(format!(
+                            "{} calls · {} function segments · {} visits · stop: {kind}",
+                            trace.calls.len(), trace.segments.len(), trace.instruction_visits
+                        )).size(11.0).color(ACCENT));
+                        if ui.button("Copy call trace JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(trace) {
+                                ui.ctx().copy_text(json);
+                            }
+                        for diagnostic in &trace.snapshot_diagnostics {
+                            ui.label(RichText::new(diagnostic).size(11.0).color(BAD));
+                        }
+                        egui::CollapsingHeader::new("Stop detail")
+                            .id_salt("ghidra_call_stop_detail")
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(stop.to_string()).monospace().size(11.0));
+                            });
+                        egui::ScrollArea::vertical().id_salt("ghidra_call_events")
+                            .max_height(220.0)
+                            .show_rows(ui, 18.0, self.ghidra_call_lines.len(), |ui, range| {
+                                for row in range {
+                                    let (address, line) = &self.ghidra_call_lines[row];
+                                    let linked = address.and_then(|value| address_map.as_ref()
+                                        .and_then(|map| map.to_linked_raw(value)));
+                                    if ui.selectable_label(
+                                        linked.is_some() && self.selected_address == linked,
+                                        RichText::new(line).monospace().size(11.0),
+                                    ).clicked() && linked.is_some() {
+                                        self.selected_address = linked;
+                                    }
+                                }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("LLVM across analyzed calls")
+            .id_salt("ghidra_call_llvm")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Uses the seed JSON above to collect reached callees, then emits a bounded LLVM CFG across those functions. Unknown calls, unsupported effects, recursion, and budget limits remain explicit stops. Binary equivalence is unverified.")
+                    .size(11.0).color(MUTED));
+                let can_generate = !self.ghidra_busy
+                    && !self.ghidra_call_busy
+                    && !self.ghidra_call_llvm_busy
+                    && self.current_local_path.is_some();
+                if ui.add_enabled(can_generate, egui::Button::new("Generate call CFG LLVM")).clicked() {
+                    match parse_pcode_seed(self.ghidra_trace_seed_json.as_bytes(), snapshot) {
+                        Err(error) => self.ghidra_call_llvm = Some(Err(error)),
+                        Ok(_) => {
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            let timeout = ghidra_task_timeout(
+                                self.ghidra_runtime_status.as_ref().map(|status| status.mode),
+                                true,
+                            );
+                            let task = Task::EmitGhidraCallLlvm {
+                                binary: self.current_local_path.clone().expect("checked above"),
+                                binary_sha256: snapshot.binary_sha256.clone(),
+                                function: snapshot.selected_function.entry.offset.clone(),
+                                seed_json: self.ghidra_trace_seed_json.clone(),
+                                cancel: Arc::clone(&cancel),
+                                timeout,
+                            };
+                            match self.tasks.try_send(task) {
+                                Ok(()) => {
+                                    self.ghidra_call_llvm_busy = true;
+                                    self.ghidra_call_llvm_task = Some(ActiveGhidraTask {
+                                        cancel,
+                                        started: Instant::now(),
+                                        timeout,
+                                    });
+                                    self.ghidra_call_llvm = None;
+                                    self.status = "Collecting Ghidra callees and generating LLVM…".to_owned();
+                                }
+                                Err(_) => self.ghidra_call_llvm = Some(Err(
+                                    "Analysis queue is full. Retry call CFG LLVM generation.".to_owned(),
+                                )),
+                            }
+                        }
+                    }
+                }
+                if self.ghidra_call_llvm_busy
+                    && let Some(task) = &self.ghidra_call_llvm_task {
+                        ghidra_progress(ui, task, "Generating call CFG LLVM");
+                        if ui.add_enabled(
+                            !task.cancel.load(Ordering::Acquire),
+                            egui::Button::new("Cancel call CFG LLVM"),
+                        ).clicked() {
+                            task.cancel.store(true, Ordering::Release);
+                            self.status = "Stopping Ghidra call LLVM generation…".to_owned();
+                        }
+                    }
+                match &self.ghidra_call_llvm {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!(
+                            "{} loaded functions · {} source operations · {} static stop sites · max call depth {} · fidelity: {:?} · verification: {:?}",
+                            artifact.function_entries.len(),
+                            artifact.llvm.source_operations.len(),
+                            artifact.llvm.stop_sites.len(),
+                            artifact.max_call_depth,
+                            artifact.semantic_fidelity,
+                            artifact.verification,
+                        )).size(11.0).color(ACCENT));
+                        ui.label(RichText::new("Runnable path module; execution can stop at the listed boundaries. The generated code has not been verified against the binary.")
+                            .size(11.0).color(MUTED));
+                        for diagnostic in &artifact.snapshot_diagnostics {
+                            ui.label(RichText::new(diagnostic).size(11.0).color(BAD));
+                        }
+                        egui::CollapsingHeader::new(format!("Loaded functions ({})", artifact.function_entries.len()))
+                            .id_salt("ghidra_call_llvm_functions")
+                            .show(ui, |ui| {
+                                for entry in &artifact.function_entries {
+                                    let address = address_map.as_ref().and_then(|map|
+                                        map.to_linked(&entry.space, &entry.offset));
+                                    if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                        RichText::new(&entry.offset).monospace().size(11.0)).clicked()
+                                        && address.is_some() {
+                                            self.selected_address = address;
+                                        }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy call CFG artifact JSON").clicked()
+                                && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                    ui.ctx().copy_text(json);
+                                }
+                            if ui.button("Copy call CFG LLVM").clicked() {
+                                ui.ctx().copy_text(artifact.llvm.llvm_ir.clone());
+                            }
+                        });
+                        egui::CollapsingHeader::new(format!("Linked source operations ({})", artifact.llvm.source_operations.len()))
+                            .id_salt("ghidra_call_llvm_operations")
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(180.0)
+                                    .id_salt("ghidra_call_llvm_operation_rows")
+                                    .show_rows(ui, 18.0, artifact.llvm.source_operations.len(), |ui, range| {
+                                        for row in range {
+                                            let operation = &artifact.llvm.source_operations[row];
+                                            let address = address_map.as_ref().and_then(|map|
+                                                map.to_linked(&operation.address.space, &operation.address.offset));
+                                            let label = format!("{} #{}:{} {}{}", operation.address.offset,
+                                                operation.instruction_index, operation.operation_index, operation.mnemonic,
+                                                operation.userop_name.as_ref().map(|name| format!(" ({name})")).unwrap_or_default());
+                                            if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                                RichText::new(label).monospace().size(11.0)).clicked()
+                                                && address.is_some() {
+                                                    self.selected_address = address;
+                                                }
+                                        }
+                                    });
+                            });
+                        egui::CollapsingHeader::new(format!("Linked stop sites ({})", artifact.llvm.stop_sites.len()))
+                            .id_salt("ghidra_call_llvm_stops")
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(180.0)
+                                    .id_salt("ghidra_call_llvm_stop_rows")
+                                    .show_rows(ui, 18.0, artifact.llvm.stop_sites.len(), |ui, range| {
+                                        for row in range {
+                                            let site = &artifact.llvm.stop_sites[row];
+                                            let address = address_map.as_ref().and_then(|map|
+                                                map.to_linked(&site.address.space, &site.address.offset));
+                                            let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
+                                            if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                                RichText::new(label).monospace().size(11.0)).clicked()
+                                                && address.is_some() {
+                                                    self.selected_address = address;
+                                                }
+                                        }
+                                    });
+                            });
+                        egui::ScrollArea::both().id_salt("ghidra_call_llvm_source")
+                            .max_height(220.0).show(ui, |ui| {
+                                ui.label(RichText::new(&artifact.llvm.llvm_ir).monospace().size(11.0));
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("Checked P-code simplification")
+            .id_salt("ghidra_checked_simplification")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Rewrites exact add-zero value operations in raw P-code. Each rule has local bitvector preconditions; equivalence with the original binary has not been established.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Analyze selected function").clicked() {
+                    self.ghidra_simplification = Some(snapshot.pcode_function_ir()
+                        .and_then(|raw| raw.simplify_checked()));
+                }
+                match &self.ghidra_simplification {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!("{} local rewrites · binary verification: {:?}",
+                            artifact.rewrites.len(), artifact.verification))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy rewrite artifact JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                ui.ctx().copy_text(json);
+                            }
+                        egui::ScrollArea::vertical().id_salt("ghidra_checked_rewrites")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for rewrite in &artifact.rewrites {
+                                    let linked = address_map.as_ref().and_then(|map| {
+                                        map.to_linked(&rewrite.source_address.space,
+                                            &rewrite.source_address.offset)
+                                    });
+                                    let label = format!("{} op {}: {} → {} · {:?}",
+                                        rewrite.source_address.offset, rewrite.sequence_index,
+                                        rewrite.before.mnemonic, rewrite.after.mnemonic, rewrite.rule);
+                                    if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                        RichText::new(label).monospace().size(11.0)).clicked()
+                                        && linked.is_some() {
+                                            self.selected_address = linked;
+                                        }
+                                    ui.label(RichText::new(&rewrite.reason).size(11.0).color(MUTED));
+                                }
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("LLVM exact prefix")
+            .id_salt("ghidra_llvm_prefix")
+            .show(ui, |ui| {
+                ui.label(RichText::new("A bounded runnable state transition fragment. It stops at the first opaque effect or uncertain flow; the artifact maps Ghidra varnode bytes into a compact state buffer.")
+                    .size(11.0).color(MUTED));
+                if self.ghidra_llvm_prefix.is_none() && ui.button("Generate runnable LLVM prefix").clicked() {
+                    self.ghidra_llvm_prefix = Some(emit_pcode_standalone_prefix_llvm(snapshot));
+                }
+                match &self.ghidra_llvm_prefix {
+                    Some(Ok(prefix)) => {
+                        ui.label(RichText::new(format!("{} exact operations · {} state bytes · stop: {}", prefix.emitted_operations, prefix.state_bytes, prefix.stop_reason))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy LLVM prefix").clicked() {
+                            ui.ctx().copy_text(prefix.llvm_ir.clone());
+                        }
+                        egui::ScrollArea::both().id_salt("ghidra_llvm_prefix_source")
+                            .max_height(200.0).show(ui, |ui| {
+                                ui.label(RichText::new(&prefix.llvm_ir).monospace().size(11.0));
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("LLVM CFG path")
+            .id_salt("ghidra_llvm_cfg")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new("A bounded runnable LLVM path from the selected instruction. Stops retain source addresses; memory, calls, and unsupported effects remain explicit boundaries.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Generate CFG LLVM").clicked() {
+                    self.ghidra_llvm_cfg = Some(ghidra_trace_start(snapshot, &self.ghidra_trace_start)
+                        .and_then(|start| emit_pcode_cfg_llvm(snapshot, Some(&start))));
+                }
+                match &self.ghidra_llvm_cfg {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!("{} source operations · {} state bytes · {} static stop sites · fidelity: {:?}",
+                            artifact.source_operations.len(), artifact.state_bytes,
+                            artifact.stop_sites.len(), artifact.semantic_fidelity))
+                            .size(11.0).color(ACCENT));
+                        egui::ScrollArea::vertical().id_salt("ghidra_llvm_cfg_stops")
+                            .max_height(130.0)
+                            .show_rows(ui, 18.0, artifact.stop_sites.len(), |ui, range| {
+                                for row in range {
+                                    let site = &artifact.stop_sites[row];
+                                    let address = address_map.as_ref().and_then(|map| {
+                                        map.to_linked(&site.address.space, &site.address.offset)
+                                    });
+                                    let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
+                                    if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                        RichText::new(label).monospace().size(11.0)).clicked() {
+                                            if address.is_some() { self.selected_address = address; }
+                                        }
+                                }
+                            });
+                        if ui.button("Copy CFG LLVM").clicked() {
+                            ui.ctx().copy_text(artifact.llvm_ir.clone());
+                        }
+                        egui::ScrollArea::both().id_salt("ghidra_llvm_cfg_source")
+                            .max_height(200.0).show(ui, |ui| {
+                                ui.label(RichText::new(&artifact.llvm_ir).monospace().size(11.0));
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+                if let Some(path) = self.current_local_path.as_ref() {
+                    ui.separator();
+                    ui.label(RichText::new("Embed the matching ELF's validated read-only bytes in a v3 LLVM module. Mutable guest RAM remains a separate window; unresolved reads and effects stop explicitly.")
+                        .size(11.0).color(MUTED));
+                    if ui.button("Generate image-backed CFG LLVM").clicked() {
+                        self.ghidra_llvm_image_cfg = Some(emit_ghidra_image_cfg_llvm(
+                            snapshot,
+                            &self.ghidra_trace_start,
+                            path,
+                        ));
+                    }
+                    match &self.ghidra_llvm_image_cfg {
+                        Some(Ok(artifact)) => {
+                            ui.label(RichText::new(format!(
+                                "LLVM v{} · {} source operations · {} static stop sites · fidelity: {:?}",
+                                artifact.schema_version,
+                                artifact.source_operations.len(),
+                                artifact.stop_sites.len(),
+                                artifact.semantic_fidelity,
+                            )).size(11.0).color(ACCENT));
+                            ui.label(RichText::new(format!("Binary SHA-256: {}", artifact.binary_sha256))
+                                .monospace().size(11.0).color(MUTED));
+                            if let Some(image) = &artifact.read_only_image {
+                                ui.label(RichText::new(format!(
+                                    "Read-only ELF image: {} 0x{:x} · {} byte window · {} known bytes · contents SHA-256 {}",
+                                    image.space, image.base, image.byte_len,
+                                    image.known_byte_count, image.contents_sha256,
+                                )).monospace().size(11.0).color(MUTED));
+                            }
+                            egui::ScrollArea::vertical().id_salt("ghidra_llvm_image_cfg_stops")
+                                .max_height(130.0)
+                                .show_rows(ui, 18.0, artifact.stop_sites.len(), |ui, range| {
+                                    for row in range {
+                                        let site = &artifact.stop_sites[row];
+                                        let address = address_map.as_ref().and_then(|map| {
+                                            map.to_linked(&site.address.space, &site.address.offset)
+                                        });
+                                        let label = format!("{} {:?}: {}", site.address.offset, site.status, site.reason);
+                                        if ui.selectable_label(address.is_some() && self.selected_address == address,
+                                            RichText::new(label).monospace().size(11.0)).clicked()
+                                            && address.is_some() {
+                                            self.selected_address = address;
+                                        }
+                                    }
+                                });
+                            if ui.button("Copy image-backed CFG LLVM").clicked() {
+                                ui.ctx().copy_text(artifact.llvm_ir.clone());
+                            }
+                            if ui.button("Copy image-backed CFG artifact JSON").clicked()
+                                && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                ui.ctx().copy_text(json);
+                            }
+                            egui::ScrollArea::both().id_salt("ghidra_llvm_image_cfg_source")
+                                .max_height(200.0).show(ui, |ui| {
+                                    ui.label(RichText::new(&artifact.llvm_ir).monospace().size(11.0));
+                                });
+                        }
+                        Some(Err(error)) => {
+                            ui.label(RichText::new(format!("Image-backed CFG LLVM failed: {error}"))
+                                .size(11.0).color(BAD));
+                        }
+                        None => {}
+                    }
+                }
+            });
+        egui::CollapsingHeader::new("LLVM after checked P-code simplification")
+            .id_salt("ghidra_llvm_simplified")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Hydir applies the listed local identities to raw P-code and emits a bounded CFG path module. Binary equivalence is unverified.")
+                    .size(11.0).color(MUTED));
+                if ui.button("Generate simplified CFG LLVM").clicked() {
+                    self.ghidra_llvm_simplified = Some(
+                        ghidra_trace_start(snapshot, &self.ghidra_trace_start)
+                            .and_then(|start| emit_pcode_simplified_cfg_llvm(snapshot, Some(&start)))
+                    );
+                }
+                match &self.ghidra_llvm_simplified {
+                    Some(Ok(artifact)) => {
+                        ui.label(RichText::new(format!("{} rewrites · {} static stop sites · verification: {:?}",
+                            artifact.simplification.rewrites.len(),
+                            artifact.llvm.stop_sites.len(), artifact.verification))
+                            .size(11.0).color(ACCENT));
+                        if ui.button("Copy transformed LLVM artifact JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(artifact) {
+                                ui.ctx().copy_text(json);
+                            }
+                        if ui.button("Copy transformed LLVM module").clicked() {
+                            ui.ctx().copy_text(artifact.llvm.llvm_ir.clone());
+                        }
+                        egui::ScrollArea::both().id_salt("ghidra_llvm_simplified_source")
+                            .max_height(200.0).show(ui, |ui| {
+                                ui.label(RichText::new(&artifact.llvm.llvm_ir).monospace().size(11.0));
+                            });
+                    }
+                    Some(Err(error)) => {
+                        ui.label(RichText::new(error).size(11.0).color(BAD));
+                    }
+                    None => {}
+                }
+            });
+        if !snapshot.selected_function.call_targets.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Calls ({})",
+                snapshot.selected_function.call_targets.len()
+            ))
+            .id_salt("ghidra_call_targets")
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_call_rows")
+                    .max_height(120.0)
+                    .show_rows(
+                        ui,
+                        22.0,
+                        snapshot.selected_function.call_targets.len(),
+                        |ui, range| {
+                            for row in range {
+                                let call = &snapshot.selected_function.call_targets[row];
+                                let source = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(&call.call_site.space, &call.call_site.offset)
+                                });
+                                let target = call
+                                    .target
+                                    .as_ref()
+                                    .map(|address| format!("{}:{}", address.space, address.offset))
+                                    .unwrap_or_else(|| "unresolved target".to_owned());
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            source.is_some() && self.selected_address == source,
+                                            format!(
+                                                "{}:{} → {target}{}",
+                                                call.call_site.space,
+                                                call.call_site.offset,
+                                                if call.computed { " (computed)" } else { "" }
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        if source.is_some() {
+                                            self.selected_address = source;
+                                        }
+                                    }
+                                    if let Some(target) = &call.target
+                                        && snapshot
+                                            .functions
+                                            .iter()
+                                            .any(|function| function.entry == *target)
+                                        && ui.button("Open target").clicked()
+                                    {
+                                        requested = Some(target.offset.clone());
+                                        self.selected_address =
+                                            address_map.as_ref().and_then(|map| {
+                                                map.to_linked(&target.space, &target.offset)
+                                            });
+                                    }
+                                });
+                            }
+                        },
+                    );
+            });
+        }
+        if !snapshot.selected_function.flow_edges.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Analyzed flow edges ({})",
+                snapshot.selected_function.flow_edges.len()
+            ))
+            .id_salt("ghidra_flow_edges")
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("ghidra_flow_rows")
+                    .max_height(120.0)
+                    .show_rows(
+                        ui,
+                        18.0,
+                        snapshot.selected_function.flow_edges.len(),
+                        |ui, range| {
+                            for row in range {
+                                let edge = &snapshot.selected_function.flow_edges[row];
+                                let source = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(&edge.source.space, &edge.source.offset)
+                                });
+                                let target = edge
+                                    .target
+                                    .as_ref()
+                                    .map(|address| format!("{}:{}", address.space, address.offset))
+                                    .unwrap_or_else(|| "unresolved".to_owned());
+                                if ui
+                                    .selectable_label(
+                                        source.is_some() && self.selected_address == source,
+                                        RichText::new(format!(
+                                            "{}:{} → {target}  {:?}{}{}",
+                                            edge.source.space,
+                                            edge.source.offset,
+                                            edge.kind,
+                                            if edge.conditional { " conditional" } else { "" },
+                                            if edge.computed { " computed" } else { "" }
+                                        ))
+                                        .monospace()
+                                        .size(11.0),
+                                    )
+                                    .clicked()
+                                {
+                                    if source.is_some() {
+                                        self.selected_address = source;
+                                    }
+                                }
+                            }
+                        },
+                    );
+            });
+        }
+        let selected_name = snapshot
+            .functions
+            .iter()
+            .find(|function| function.entry == snapshot.selected_function.entry)
+            .map_or("selected function", |function| function.name.as_str());
+        if let Some(prototype) = snapshot
+            .functions
+            .iter()
+            .find(|function| function.entry == snapshot.selected_function.entry)
+            .and_then(|function| function.prototype.as_ref())
+        {
+            egui::CollapsingHeader::new("Ghidra prototype evidence")
+                .id_salt("ghidra_prototype_evidence")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "signature source: {} · convention: {} · return: {} ({})",
+                            prototype.signature_source,
+                            prototype.calling_convention.as_deref().unwrap_or("unknown"),
+                            prototype.return_type.display_name,
+                            prototype.return_source
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    for parameter in prototype.parameters.iter().take(16) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {} ({})",
+                                parameter.name,
+                                parameter.data_type.display_name,
+                                parameter.source_type
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                    }
+                    if prototype.parameters.len() > 16 {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} more parameters in snapshot",
+                                prototype.parameters.len() - 16
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                    }
+                });
+        }
+        let layouts = ghidra_composite_evidence(snapshot);
+        if !layouts.is_empty() {
+            egui::CollapsingHeader::new("Ghidra composite layout evidence")
+                .id_salt("ghidra_composite_layout_evidence")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Ghidra byte layouts from the prototype and up to 1,024 SSA operations; not asserted source types")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    for layout in layouts.iter().take(16) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {} · {} bytes{}",
+                                match layout.kind {
+                                    GhidraDataTypeKind::Struct => "struct",
+                                    _ => "union",
+                                },
+                                layout.display_name,
+                                layout
+                                    .size_bytes
+                                    .map_or("?".to_owned(), |size| size.to_string()),
+                                if layout.detail_truncated {
+                                    " · truncated"
+                                } else {
+                                    ""
+                                }
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                        for field in layout.fields.iter().take(32) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  +0x{:x}  {:>2} B  {}: {}",
+                                    field.offset_bytes,
+                                    field.size_bytes,
+                                    field.name.as_deref().unwrap_or("<unnamed>"),
+                                    field.data_type.display_name
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                        if layout.fields.len() > 32 {
+                            ui.label(format!(
+                                "  {} more fields in snapshot",
+                                layout.fields.len() - 32
+                            ));
+                        }
+                    }
+                    if layouts.len() > 16 {
+                        ui.label(format!(
+                            "{} more composites in snapshot",
+                            layouts.len() - 16
+                        ));
+                    }
+                });
+        }
+        if let Some(high) = &snapshot.selected_function.high_pcode {
+            egui::CollapsingHeader::new("Ghidra decompiler SSA and type hints")
+                .id_salt("ghidra_high_pcode_evidence")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{:?} · {} operations · analysis evidence; raw P-code drives Hydir's lift",
+                            high.status,
+                            high.operations.len()
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    if !high.detail.is_empty() {
+                        ui.label(RichText::new(&high.detail).size(11.0).color(MUTED));
+                    }
+                    egui::ScrollArea::both()
+                        .id_salt("ghidra_high_pcode")
+                        .max_height(220.0)
+                        .show_rows(ui, 18.0, high.operations.len(), |ui, range| {
+                            for row in range {
+                                let operation = &high.operations[row];
+                                let address = address_map.as_ref().and_then(|map| {
+                                    map.to_linked(
+                                        &operation.source_address.space,
+                                        &operation.source_address.offset,
+                                    )
+                                });
+                                let output = operation
+                                    .output
+                                    .as_ref()
+                                    .map(high_pcode_varnode)
+                                    .unwrap_or_else(|| "_".to_owned());
+                                let inputs = operation
+                                    .inputs
+                                    .iter()
+                                    .map(high_pcode_varnode)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let label = format!(
+                                    "{} #{} {output} = {}({inputs}){}",
+                                    operation.source_address.offset,
+                                    operation.index,
+                                    operation.mnemonic,
+                                    if operation.is_dead { " [dead]" } else { "" }
+                                );
+                                if ui
+                                    .selectable_label(
+                                        address.is_some() && self.selected_address == address,
+                                        RichText::new(label).monospace().size(11.0),
+                                    )
+                                    .clicked()
+                                {
+                                    if address.is_some() {
+                                        self.selected_address = address;
+                                    }
+                                }
+                            }
+                        });
+                });
+        }
+        ui.separator();
+        let raw_pcode_header = ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "RAW P-CODE · {} · {} instructions",
+                    selected_name,
+                    snapshot.selected_function.instructions.len()
+                ))
+                .strong()
+                .color(INFO),
+            );
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(
+                    self.ghidra_pcode_lines
+                        .iter()
+                        .map(|(_, line)| line.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        });
+        if jump_to_raw_pcode {
+            ui.scroll_to_rect(raw_pcode_header.response.rect, Some(egui::Align::Min));
+        }
+        egui::ScrollArea::both()
+            .id_salt("ghidra_raw_pcode")
+            .show_rows(ui, 18.0, self.ghidra_pcode_lines.len(), |ui, range| {
+                for row in range {
+                    let (address, line) = &self.ghidra_pcode_lines[row];
+                    let linked = address.and_then(|value| {
+                        address_map
+                            .as_ref()
+                            .and_then(|map| map.to_linked_raw(value))
+                    });
+                    if ui
+                        .selectable_label(
+                            linked.is_some() && self.selected_address == linked,
+                            RichText::new(line).monospace().size(11.0),
+                        )
+                        .clicked()
+                    {
+                        if linked.is_some() {
+                            self.selected_address = linked;
+                        }
+                        if let Some(target) = pcode_line_target(snapshot, row) {
+                            self.ghidra_slice = Some(snapshot.backward_pcode_slice(target));
+                        }
+                    }
+                }
+            });
+        if let Some(result) = &self.ghidra_slice {
+            egui::CollapsingHeader::new("Why this P-code value?")
+                .id_salt("ghidra_backward_slice")
+                .default_open(true)
+                .show(ui, |ui| match result {
+                    Ok(slice) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} source operations · {} unresolved boundaries · path proof: no",
+                                slice.steps.len(),
+                                slice.boundaries.len()
+                            ))
+                            .size(11.0)
+                            .color(ACCENT),
+                        );
+                        if ui.button("Copy slice JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(slice)
+                        {
+                            ui.ctx().copy_text(json);
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("ghidra_slice_steps")
+                            .max_height(160.0)
+                            .show_rows(ui, 19.0, slice.steps.len(), |ui, range| {
+                                for row in range {
+                                    let step = &slice.steps[row];
+                                    let address = address_map.as_ref().and_then(|map| {
+                                        map.to_linked(
+                                            &step.source.source_address.space,
+                                            &step.source.source_address.offset,
+                                        )
+                                    });
+                                    let label = format!(
+                                        "{} #{} {}",
+                                        step.source.source_address.offset,
+                                        step.site.operation_index,
+                                        step.source.mnemonic
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            address.is_some() && self.selected_address == address,
+                                            RichText::new(label).monospace().size(11.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        if address.is_some() {
+                                            self.selected_address = address;
+                                        }
+                                    }
+                                }
+                            });
+                        for boundary in slice.boundaries.iter().take(24) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:?}: {:?}",
+                                    boundary.kind, boundary.varnode
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                        if slice.boundaries.len() > 24 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} more boundaries in JSON",
+                                    slice.boundaries.len() - 24
+                                ))
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        ui.label(RichText::new(error).color(BAD));
+                    }
+                });
+        }
+        if let Some(task) = path_trace_task {
+            self.enqueue(task, "Tracing Ghidra path with linked ELF bytes…");
+        }
+        if let Some(function) = requested
+            && let (Some(binary), Some(spec)) =
+                (self.current_local_path.clone(), self.spec.as_ref())
+        {
+            self.enqueue_ghidra(binary, spec.binary_sha256.clone(), Some(function));
+        }
+        if let Some(address) = open_disassembly {
+            self.selected_address = Some(address);
+            self.pending_disassembly_scroll = Some(address);
+            if self.disassembly_report.is_some() {
+                self.tab = Tab::Bytes;
+            } else {
+                self.enqueue(
+                    Task::Disassemble { automatic: false },
+                    "Disassembling selected Ghidra function…",
+                );
+            }
+        }
+    }
+
+    fn investigation_view(&mut self, ui: &mut egui::Ui) {
+        let Some(recipe) = self.investigation_recipe.as_ref() else {
+            ui.heading("Investigation");
+            ui.label(RichText::new(
+                "Open a matching local ELF, then verify an exported recipe in the Program pane.",
+            ).color(MUTED));
+            return;
+        };
+        let claim = &recipe.claim;
+        let static_decision = recipe_elf_address(recipe, claim.failed_decision_address);
+        let mut jump = None;
+        ui.heading(RichText::new("Verified investigation record").color(ACCENT));
+        ui.label(RichText::new(&claim.statement).strong());
+        ui.label(
+            RichText::new("Recorded artifact checks passed. Native outcomes shown here are observations from the recipe; use recipe replay for fresh runs.")
+                .size(11.0)
+                .color(MUTED),
+        );
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            metric_readout(ui, "ORIGINAL", "GOAL MISSED", BAD);
+            metric_readout(ui, "CANDIDATE", "GOAL MET", GOOD);
+            metric_readout(
+                ui,
+                "CHANGED BYTES",
+                &claim.changed_bytes.len().to_string(),
+                ACCENT,
+            );
+            metric_readout(ui, "TRACE SCOPE", "ONE CAPTURED SEED", INFO);
+        });
+        ui.add_space(8.0);
+        field(ui, "ORIGIN", &claim.origin_id);
+        field(
+            ui,
+            "FAILED DECISION",
+            &format!(
+                "{} · occurrence {} · runtime 0x{:x}",
+                claim.failed_decision_kind,
+                claim.failed_decision_occurrence,
+                claim.failed_decision_address
+            ),
+        );
+        if let Some(address) = static_decision {
+            field(ui, "ELF ADDRESS", &format!("0x{address:x}"));
+        } else {
+            ui.colored_label(
+                ACCENT,
+                "No verified runtime-to-ELF address mapping; static navigation is unavailable.",
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy && static_decision.is_some(),
+                    egui::Button::new("Open C source sites"),
+                )
+                .clicked()
+            {
+                jump = Some((claim.failed_decision_address, Tab::Native));
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && static_decision.is_some(),
+                    egui::Button::new("Open CFG graph"),
+                )
+                .clicked()
+            {
+                jump = Some((claim.failed_decision_address, Tab::Graph));
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && static_decision.is_some(),
+                    egui::Button::new("Open disassembly"),
+                )
+                .clicked()
+            {
+                jump = Some((claim.failed_decision_address, Tab::Bytes));
+            }
+        });
+        ui.separator();
+        ui.heading(RichText::new("Input byte changes").size(16.0));
+        for change in &claim.changed_bytes {
+            let linked = claim
+                .relevant_origin_offsets
+                .contains(&change.origin_offset);
+            ui.label(
+                RichText::new(format!(
+                    "{} +{} (channel +{}): {:02x} → {:02x}{}",
+                    claim.origin_id,
+                    change.origin_offset,
+                    change.channel_offset,
+                    change.before,
+                    change.after,
+                    if linked {
+                        " · in failed trace slice"
+                    } else {
+                        ""
+                    }
+                ))
+                .monospace()
+                .color(if linked { GOOD } else { ACCENT }),
+            );
+        }
+        ui.add_space(6.0);
+        ui.heading(RichText::new("Source instructions").size(16.0));
+        let slice = &recipe.bridge_result["input_condition_slice"];
+        let instructions = slice["instructions"].as_array();
+        let source_indices = slice["source_occurrences"].as_array();
+        let sources = source_indices
+            .into_iter()
+            .flat_map(|indices| indices.iter())
+            .filter_map(|value| {
+                let index = value.as_u64()? as usize;
+                let instruction = instructions?.get(index)?;
+                let runtime = instruction["address"].as_u64()?;
+                let disassembly = instruction["disassembly"].as_str()?.to_owned();
+                Some((
+                    index,
+                    runtime,
+                    disassembly,
+                    recipe_elf_address(recipe, runtime),
+                ))
+            })
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical()
+            .id_salt("investigation_source_instructions")
+            .max_height(250.0)
+            .show_rows(ui, 24.0, sources.len(), |ui, range| {
+                for index in range {
+                    let (occurrence, runtime, disassembly, elf_address) = &sources[index];
+                    let label = if let Some(address) = elf_address {
+                        format!("#{occurrence} · ELF 0x{address:x} · {disassembly}")
+                    } else {
+                        format!("#{occurrence} · runtime 0x{runtime:x} · {disassembly}")
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.busy && elf_address.is_some(),
+                            egui::Button::new(RichText::new(label).monospace().size(11.0)),
+                        )
+                        .clicked()
+                    {
+                        jump = Some((*runtime, Tab::Bytes));
+                    }
+                }
+            });
+        ui.separator();
+        ui.label(
+            RichText::new("Unresolved dependencies and assumptions")
+                .strong()
+                .color(ACCENT),
+        );
+        for assumption in &claim.assumptions {
+            ui.label(
+                RichText::new(format!("Assumption: {assumption}"))
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        }
+        for unresolved in &claim.unresolved_dependencies {
+            ui.label(
+                RichText::new(format!("Unresolved: {unresolved}"))
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        }
+        if let Some((runtime, target)) = jump {
+            self.open_recipe_site(runtime, target);
         }
     }
 
@@ -4759,7 +9358,7 @@ impl AnalystApp {
             }
         } else if open_disassembly {
             self.enqueue(
-                Task::Disassemble,
+                Task::Disassemble { automatic: false },
                 "Disassembling executable ELF sections...",
             );
         } else if run_coverage {
@@ -5441,40 +10040,46 @@ impl AnalystApp {
                 .color(MUTED),
             );
             let mut clicked = None;
-            egui::ScrollArea::vertical()
-                .id_salt("native_bytes_view")
-                .show_rows(ui, 26.0, instructions.len(), |ui, range| {
-                    for position in range {
-                        let instruction = instructions[position];
-                        let opaque =
-                            matches!(instruction.operation, MachineOperation::OpaqueEffect { .. });
-                        let line = format!(
-                            "{}:0x{:016x}  {:<20} {:<10} {:?}",
-                            instruction.address.address_space,
-                            instruction.address.value.0,
-                            instruction.bytes_hex,
-                            instruction.mnemonic,
-                            instruction.operands
-                        );
-                        if ui
-                            .selectable_label(
-                                self.selected_address == Some(instruction.address.value.0),
-                                RichText::new(line).monospace().size(11.0).color(if opaque {
-                                    BAD
-                                } else {
-                                    TEXT
-                                }),
-                            )
-                            .on_hover_text(format!(
-                                "Operation: {:?}\nEffects: {:?}\nEdges: {:?}",
-                                instruction.operation, instruction.effects, instruction.edges
-                            ))
-                            .clicked()
-                        {
-                            clicked = Some(instruction.address.value.0);
-                        }
+            let mut scroll = egui::ScrollArea::vertical().id_salt("native_bytes_view");
+            if let Some(address) = self.pending_disassembly_scroll.take()
+                && let Some(position) = instructions
+                    .iter()
+                    .position(|instruction| instruction.address.value.0 == address)
+            {
+                scroll = scroll.vertical_scroll_offset(position as f32 * 26.0);
+            }
+            scroll.show_rows(ui, 26.0, instructions.len(), |ui, range| {
+                for position in range {
+                    let instruction = instructions[position];
+                    let opaque =
+                        matches!(instruction.operation, MachineOperation::OpaqueEffect { .. });
+                    let line = format!(
+                        "{}:0x{:016x}  {:<20} {:<10} {:?}",
+                        instruction.address.address_space,
+                        instruction.address.value.0,
+                        instruction.bytes_hex,
+                        instruction.mnemonic,
+                        instruction.operands
+                    );
+                    if ui
+                        .selectable_label(
+                            self.selected_address == Some(instruction.address.value.0),
+                            RichText::new(line).monospace().size(11.0).color(if opaque {
+                                BAD
+                            } else {
+                                TEXT
+                            }),
+                        )
+                        .on_hover_text(format!(
+                            "Operation: {:?}\nEffects: {:?}\nEdges: {:?}",
+                            instruction.operation, instruction.effects, instruction.edges
+                        ))
+                        .clicked()
+                    {
+                        clicked = Some(instruction.address.value.0);
                     }
-                });
+                }
+            });
             if let Some(address) = clicked {
                 self.selected_address = Some(address);
             }
@@ -5546,31 +10151,37 @@ impl AnalystApp {
         });
         let instructions = report.instructions;
         let mut clicked = None;
-        egui::ScrollArea::vertical()
-            .id_salt("whole_elf_disassembly")
-            .show_rows(ui, 25.0, instructions.len(), |ui, range| {
-                for index in range {
-                    let instruction = &instructions[index];
-                    let selected = self.selected_address == Some(instruction.address.0);
-                    let target = instruction
-                        .branch_target
-                        .map_or_else(String::new, |address| format!(" → 0x{:x}", address.0));
-                    let line = format!(
-                        "0x{:016x}  {:<18} {:<26} {:?}{}",
-                        instruction.address.0,
-                        instruction.bytes_hex,
-                        format!("{} {}", instruction.mnemonic, instruction.operands),
-                        instruction.flow,
-                        target,
-                    );
-                    if ui
-                        .selectable_label(selected, RichText::new(line).monospace().size(11.0))
-                        .clicked()
-                    {
-                        clicked = Some(instruction.address.0);
-                    }
+        let mut scroll = egui::ScrollArea::vertical().id_salt("whole_elf_disassembly");
+        if let Some(address) = self.pending_disassembly_scroll.take()
+            && let Some(position) = instructions
+                .iter()
+                .position(|instruction| instruction.address.0 == address)
+        {
+            scroll = scroll.vertical_scroll_offset(position as f32 * 25.0);
+        }
+        scroll.show_rows(ui, 25.0, instructions.len(), |ui, range| {
+            for index in range {
+                let instruction = &instructions[index];
+                let selected = self.selected_address == Some(instruction.address.0);
+                let target = instruction
+                    .branch_target
+                    .map_or_else(String::new, |address| format!(" → 0x{:x}", address.0));
+                let line = format!(
+                    "0x{:016x}  {:<18} {:<26} {:?}{}",
+                    instruction.address.0,
+                    instruction.bytes_hex,
+                    format!("{} {}", instruction.mnemonic, instruction.operands),
+                    instruction.flow,
+                    target,
+                );
+                if ui
+                    .selectable_label(selected, RichText::new(line).monospace().size(11.0))
+                    .clicked()
+                {
+                    clicked = Some(instruction.address.0);
                 }
-            });
+            }
+        });
         if let Some(address) = clicked {
             self.selected_address = Some(address);
         }
@@ -5709,7 +10320,14 @@ impl AnalystApp {
                         if let Some(failure) = &self.failure {
                             ui.colored_label(BAD, failure);
                         } else {
-                            ui.colored_label(if self.busy { ACCENT } else { GOOD }, &self.status);
+                            ui.colored_label(
+                                if self.busy || self.ghidra_busy {
+                                    ACCENT
+                                } else {
+                                    GOOD
+                                },
+                                &self.status,
+                            );
                         }
                         if let Some(report) = &self.disassembly_report {
                             for warning in report.warnings.iter().take(8) {
@@ -6881,6 +11499,8 @@ impl AnalystApp {
         ui.horizontal_wrapped(|ui| {
             for (mode, label) in [
                 (NativeViewMode::Summary, "Summary"),
+                (NativeViewMode::TypedC, "Typed C"),
+                (NativeViewMode::Types, "Types"),
                 (NativeViewMode::LowLevelC, "Low-level C"),
                 (NativeViewMode::StructuredC, "Structured C"),
                 (NativeViewMode::MachineIr, "MachineIR"),
@@ -6941,10 +11561,130 @@ impl AnalystApp {
         });
         ui.separator();
 
+        let mut rename_selection = None;
+        let mut rename_save = None;
+        let mut edit_selection = None;
+        let mut edit_cancel = false;
+        let mut edit_save = None;
         let clicked_address = match self.native_view_mode {
             NativeViewMode::Summary => {
                 native_summary_view(ui, native);
                 None
+            }
+            NativeViewMode::TypedC => {
+                if let Some(typed) = &self.typed_native_view {
+                    if let Some(c) = &typed.c {
+                        code_artifact_view(
+                            ui,
+                            "TYPED C11 - BOUNDED SUPPORTED OPERATIONS",
+                            c,
+                            "native_typed_c",
+                        );
+                    } else {
+                        ui.colored_label(
+                            ACCENT,
+                            typed
+                                .diagnostic
+                                .as_deref()
+                                .unwrap_or("Typed C is unavailable for this function."),
+                        );
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new(
+                            "Source addresses (select an address, then open MachineIR or Evidence)",
+                        )
+                        .color(MUTED),
+                    );
+                    typed
+                        .ir
+                        .as_ref()
+                        .and_then(|ir| typed_source_sites(ui, ir, self.selected_address))
+                        .or_else(|| {
+                            typed.cfg_ir.as_ref().and_then(|ir| {
+                                typed_cfg_source_sites(ui, ir, self.selected_address)
+                            })
+                        })
+                } else {
+                    ui.colored_label(
+                        ACCENT,
+                        self.typed_native_error
+                            .as_deref()
+                            .unwrap_or("Typed model is unavailable."),
+                    );
+                    None
+                }
+            }
+            NativeViewMode::Types => {
+                if let Some(typed) = &self.typed_native_view {
+                    if let Some(draft) = &mut self.model_edit_draft {
+                        ui.group(|ui| {
+                            match draft {
+                                ModelEditDraft::Prototype { entry, json } => {
+                                    ui.label(format!("Edit function 0x{:x} prototype · SysV AMD64", entry.value.0));
+                                    ui.label("Prototype JSON: return_type, parameters, calling_convention, variadic");
+                                    ui.add(egui::TextEdit::multiline(json).desired_rows(8).code_editor());
+                                }
+                                ModelEditDraft::Field { type_id, name, offset, type_json, .. } => {
+                                    ui.label(format!("Edit {type_id} field"));
+                                    ui.horizontal(|ui| {
+                                        ui.label("Name");
+                                        ui.text_edit_singleline(name);
+                                        ui.label("Byte offset");
+                                        ui.text_edit_singleline(offset);
+                                    });
+                                    ui.label("TypeRef JSON (primitive, named, pointer, array, or bytes)");
+                                    ui.add(egui::TextEdit::multiline(type_json).desired_rows(4).code_editor());
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!self.busy, egui::Button::new("Save model edit")).clicked() {
+                                    edit_save = Some((typed.model.clone(), native.clone()));
+                                }
+                                if ui.small_button("Cancel").clicked() {
+                                    edit_cancel = true;
+                                }
+                            });
+                            ui.label("Invalid layouts are rejected; prior machine evidence and conflicts remain visible.");
+                        });
+                        ui.separator();
+                    }
+                    if let Some(target) = &self.model_rename_target {
+                        ui.horizontal(|ui| {
+                            ui.label(match target {
+                                ModelRenameTarget::Function(_) => "Function name",
+                                ModelRenameTarget::Type(_) => "Type name",
+                            });
+                            ui.text_edit_singleline(&mut self.model_rename_name);
+                            if ui
+                                .add_enabled(!self.busy, egui::Button::new("Save rename"))
+                                .clicked()
+                            {
+                                rename_save = Some((typed.model.clone(), native.clone()));
+                            }
+                            if ui.small_button("Cancel").clicked() {
+                                rename_selection = Some(None);
+                            }
+                        });
+                        ui.label("Model evidence and unresolved conflicts remain visible after a rename.");
+                        ui.separator();
+                    }
+                    let (site, target, edit_target) =
+                        typed_types_view(ui, &typed.model, native.machine_ir.entry);
+                    if let Some(target) = target {
+                        rename_selection = Some(Some(target));
+                    }
+                    edit_selection = edit_target;
+                    site
+                } else {
+                    ui.colored_label(
+                        ACCENT,
+                        self.typed_native_error
+                            .as_deref()
+                            .unwrap_or("Typed model is unavailable."),
+                    );
+                    None
+                }
             }
             NativeViewMode::LowLevelC => {
                 code_artifact_view(
@@ -7004,6 +11744,104 @@ impl AnalystApp {
         };
         if let Some(address) = clicked_address {
             self.selected_address = Some(address);
+        }
+        if edit_cancel {
+            self.model_edit_draft = None;
+        }
+        if let Some(target) = edit_selection {
+            self.model_rename_target = None;
+            self.model_rename_name.clear();
+            match self
+                .typed_native_view
+                .as_ref()
+                .map(|view| model_edit_draft(&view.model, target))
+            {
+                Some(Ok(draft)) => self.model_edit_draft = Some(draft),
+                Some(Err(error)) => self.failure = Some(error),
+                None => {}
+            }
+        }
+        if let Some(target) = rename_selection {
+            self.model_edit_draft = None;
+            self.model_rename_name = match &target {
+                Some(ModelRenameTarget::Function(entry)) => self
+                    .typed_native_view
+                    .as_ref()
+                    .and_then(|view| {
+                        view.model
+                            .functions
+                            .iter()
+                            .find(|function| function.entry == *entry)
+                    })
+                    .map(|function| function.name.clone())
+                    .unwrap_or_default(),
+                Some(ModelRenameTarget::Type(id)) => self
+                    .typed_native_view
+                    .as_ref()
+                    .and_then(|view| {
+                        view.model
+                            .types
+                            .iter()
+                            .find(|definition| definition.id == *id)
+                    })
+                    .map(|definition| definition.name.clone())
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            self.model_rename_target = target;
+        }
+        if let Some((model, native)) = rename_save {
+            match (
+                self.spec.as_ref(),
+                self.project_revision,
+                self.model_rename_target.clone(),
+            ) {
+                (Some(spec), Some(expected_revision), Some(target)) => self.enqueue(
+                    Task::RenameModel {
+                        binary_sha256: spec.binary_sha256.clone(),
+                        expected_revision,
+                        model,
+                        target,
+                        name: self.model_rename_name.clone(),
+                        native: Box::new(native),
+                        key: uuid::Uuid::new_v4().to_string(),
+                    },
+                    "Saving revisioned analysis model rename…",
+                ),
+                _ => {
+                    self.failure = Some(
+                        "Open a local ELF or remote project and select a function before editing its model"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        if let Some((model, native)) = edit_save {
+            let parsed = self
+                .model_edit_draft
+                .as_ref()
+                .ok_or("Choose a field or prototype before saving".to_owned())
+                .and_then(parse_model_edit_draft);
+            match (self.spec.as_ref(), self.project_revision, parsed) {
+                (Some(spec), Some(expected_revision), Ok(edit)) => self.enqueue(
+                    Task::EditModel {
+                        binary_sha256: spec.binary_sha256.clone(),
+                        expected_revision,
+                        model,
+                        edit,
+                        native: Box::new(native),
+                        key: uuid::Uuid::new_v4().to_string(),
+                    },
+                    "Saving revisioned analysis model edit…",
+                ),
+                (_, _, Err(error)) => self.failure = Some(error),
+                _ => {
+                    self.failure = Some(
+                        "Open a local ELF or remote project and select a function before editing its model"
+                            .to_owned(),
+                    )
+                }
+            }
         }
     }
 
@@ -7909,6 +12747,7 @@ fn ir_slice(ir: &str, address: u64) -> Option<String> {
 impl eframe::App for AnalystApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        self.render_smoke_before_frame(ui.ctx());
         let dropped_path = ui.ctx().input(|input| {
             input
                 .raw
@@ -7982,11 +12821,253 @@ impl eframe::App for AnalystApp {
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| self.main_view(ui));
         });
+        self.render_smoke_after_frame(ui.ctx());
     }
+}
+
+/// Exercise the desktop's automatic import and selected-function event path without a window.
+/// The caller supplies a private HYDIR_LOCAL_DB so this does not touch the user's workbench.
+fn wait_for_demo_ghidra_snapshot(
+    app: &mut AnalystApp,
+    selected: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        app.poll();
+        if !app.ghidra_busy
+            && app.ghidra_snapshot.as_ref().is_some_and(|snapshot| {
+                selected.is_none_or(|entry| snapshot.selected_function.entry.offset == entry)
+            })
+        {
+            return Ok(());
+        }
+        if !app.busy
+            && !app.ghidra_busy
+            && app.workbench_loaded
+            && app.pending_ghidra.is_none()
+            && let Some(error) = &app.failure
+        {
+            return Err(error.clone());
+        }
+        if started.elapsed() >= timeout {
+            if let Some(task) = &app.ghidra_task {
+                task.cancel.store(true, Ordering::Release);
+            }
+            return Err(format!("Desktop Ghidra analysis exceeded {timeout:?}"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, String> {
+    if std::env::var_os("HYDIR_LOCAL_DB").is_none() {
+        return Err("Set HYDIR_LOCAL_DB to a private absolute test database path".to_owned());
+    }
+    let ctx = egui::Context::default();
+    let mut app = AnalystApp::new(&ctx);
+    app.startup_open_local = Some(binary.to_path_buf());
+    app.enqueue(Task::LoadWorkbench, "Loading demo workbench…");
+    let timeout = ghidra_task_timeout(None, false) + Duration::from_secs(30);
+    wait_for_demo_ghidra_snapshot(&mut app, None, timeout)?;
+    if let Some(entry) = selector {
+        let snapshot = app.ghidra_snapshot.as_ref().expect("checked above");
+        if !snapshot
+            .functions
+            .iter()
+            .any(|function| function.entry.offset == entry)
+        {
+            return Err(format!("Function {entry} is absent from Ghidra's index"));
+        }
+        if snapshot.selected_function.entry.offset != entry {
+            let path = app.current_local_path.clone().expect("opened local ELF");
+            let digest = snapshot.binary_sha256.clone();
+            app.enqueue_ghidra(path, digest, Some(entry.to_owned()));
+            wait_for_demo_ghidra_snapshot(&mut app, Some(entry), timeout)?;
+        }
+    }
+    let spec = app.spec.as_ref().ok_or("Desktop did not import the ELF")?;
+    if let Some(error) = &app.failure {
+        return Err(format!(
+            "Desktop Ghidra import did not persist cleanly: {error}"
+        ));
+    }
+    let snapshot = app.ghidra_snapshot.as_ref().ok_or("No Ghidra snapshot")?;
+    if snapshot.binary_sha256 != spec.binary_sha256 || snapshot.functions.is_empty() {
+        return Err("Desktop Ghidra function index differs from the open ELF".to_owned());
+    }
+    let map = GhidraAddressMap::new(snapshot, spec)
+        .ok_or("Desktop cannot map Ghidra addresses to the opened ELF")?;
+    let entry = map
+        .to_linked(
+            &snapshot.selected_function.entry.space,
+            &snapshot.selected_function.entry.offset,
+        )
+        .ok_or("Selected Ghidra function has no linked ELF address")?;
+    if app.ghidra_pcode_lines.is_empty()
+        || app.ghidra_state_lines.is_empty()
+        || app.ghidra_semantics.is_none()
+        || app.ghidra_coverage.is_none()
+        || !app
+            .ghidra_pcode_lines
+            .iter()
+            .any(|(address, _)| address.and_then(|raw| map.to_linked_raw(raw)).is_some())
+    {
+        return Err("Desktop did not populate linked P-code, state, and coverage".to_owned());
+    }
+    let llvm = app
+        .ghidra_llvm_cfg
+        .as_ref()
+        .ok_or("Desktop did not automatically generate CFG LLVM")?
+        .as_ref()
+        .map_err(|error| format!("Desktop CFG LLVM generation failed: {error}"))?;
+    if llvm.binary_sha256 != spec.binary_sha256
+        || llvm.start != snapshot.selected_function.entry
+        || llvm.source_operations.is_empty()
+        || !llvm.llvm_ir.contains("define ")
+        || !llvm.source_operations.iter().any(|operation| {
+            map.to_linked(&operation.address.space, &operation.address.offset)
+                .is_some()
+        })
+    {
+        return Err("Desktop CFG LLVM lacks matching linked source operations".to_owned());
+    }
+    let slice = (0..app.ghidra_pcode_lines.len())
+        .filter_map(|row| pcode_line_target(snapshot, row))
+        .take(64)
+        .find_map(|target| snapshot.backward_pcode_slice(target).ok())
+        .ok_or("Selected function has no backward P-code slice")?;
+    let slice_steps = slice.steps.len();
+    let binary_sha256 = spec.binary_sha256.clone();
+    let selected_ghidra_entry = snapshot.selected_function.entry.offset.clone();
+    let function_count = snapshot.functions.len();
+    let pcode_rows = app.ghidra_pcode_lines.len();
+    let state_rows = app.ghidra_state_lines.len();
+    let llvm_operations = llvm.source_operations.len();
+    let started = Instant::now();
+    while app.disassembly_report.is_none() {
+        app.poll();
+        if app.status == "Whole-ELF disassembly failed" || app.status == "Disassembly discarded" {
+            return Err(app
+                .failure
+                .clone()
+                .unwrap_or_else(|| "Desktop did not produce disassembly".to_owned()));
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err("Desktop disassembly timed out".to_owned());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let report = app.disassembly_report.as_ref().expect("checked above");
+    if report.binary_sha256 != binary_sha256
+        || app.selected_address != Some(entry)
+        || app.tab != Tab::GhidraPcode
+        || !report
+            .instructions
+            .iter()
+            .any(|instruction| instruction.address.0 == entry)
+    {
+        return Err("Desktop disassembly does not link to the selected function".to_owned());
+    }
+    let disassembly_count = report.instructions.len();
+    let mut image_trace_visits = None;
+    if binary_sha256 == "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288"
+        && selected_ghidra_entry == "0x2016d0"
+    {
+        let snapshot = app.ghidra_snapshot.as_ref().ok_or("No Ghidra snapshot")?;
+        let mut seed: serde_json::Value =
+            serde_json::from_str(&ghidra_seed_template(snapshot)).map_err(|e| e.to_string())?;
+        seed["registers"] = serde_json::json!([
+            {"offset": "0x38", "size": 8, "value": "0x210100"},
+            {"offset": "0x30", "size": 8, "value": "0xc"},
+            {"offset": "0x20", "size": 8, "value": "0x210000"},
+            {"offset": "0x0", "size": 8, "value": "0x0"},
+            {"offset": "0x8", "size": 8, "value": "0x0"}
+        ]);
+        seed["memory"] = serde_json::json!([
+            {"space": "ram", "byte_offset": "0x210000", "size": 8, "value": "0xdeadbeef"},
+            {"space": "ram", "byte_offset": "0x210100", "size": 8, "value": "0x43412d5249445948"},
+            {"space": "ram", "byte_offset": "0x210108", "size": 4, "value": "0x53534543"}
+        ]);
+        let seed_json = seed.to_string();
+        let start_text = "0x2016d0".to_owned();
+        let task = Task::TraceGhidraPath {
+            snapshot: Box::new(snapshot.clone()),
+            seed_json: seed_json.clone(),
+            start_text: start_text.clone(),
+        };
+        app.ghidra_trace_seed_json = seed_json;
+        app.ghidra_trace_start = start_text;
+        app.enqueue(task, "Checking image-backed Ghidra path trace…");
+        let started = Instant::now();
+        loop {
+            app.poll();
+            if let Some(result) = &app.ghidra_path_trace {
+                let trace = result
+                    .as_ref()
+                    .map_err(|error| format!("Desktop path trace failed: {error}"))?;
+                let rax = trace.final_state.read_varnode(&PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x0".to_owned(),
+                    size: 8,
+                })?;
+                if !matches!(trace.stop, PcodePathStop::Return { .. }) || rax != Some(1) {
+                    return Err("Desktop image-backed password path did not return 1".to_owned());
+                }
+                image_trace_visits = Some(trace.instruction_visits.len());
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(30) {
+                return Err("Desktop image-backed path trace timed out".to_owned());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(format!(
+        "{} Ghidra functions, selected 0x{entry:x}, {} P-code rows, {} state rows, {} CFG LLVM source operations, {slice_steps} slice steps, {disassembly_count} disassembly instructions{}",
+        function_count,
+        pcode_rows,
+        state_rows,
+        llvm_operations,
+        image_trace_visits.map_or(String::new(), |visits| format!(
+            ", {visits} image-backed path visits"
+        ))
+    ))
 }
 
 fn main() -> eframe::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let render_smoke = if let [flag, binary, selector, output_dir] = arguments.as_slice()
+        && flag == "--render-ghidra-demo"
+    {
+        let output_dir = PathBuf::from(output_dir);
+        if std::env::var_os("HYDIR_LOCAL_DB").is_none() {
+            eprintln!("Rendered Ghidra demo requires a private HYDIR_LOCAL_DB");
+            std::process::exit(2);
+        }
+        if let Err(error) = fs::create_dir_all(&output_dir) {
+            eprintln!("Could not create rendered Ghidra demo output: {error}");
+            std::process::exit(2);
+        }
+        Some((PathBuf::from(binary), selector.clone(), output_dir))
+    } else {
+        None
+    };
+    if let [probe, binary] | [probe, binary, _] = arguments.as_slice()
+        && probe == "--probe-ghidra-demo"
+    {
+        let selector = arguments.get(2).map(String::as_str);
+        match probe_ghidra_demo(Path::new(binary), selector) {
+            Ok(summary) => {
+                println!("HydIR desktop Ghidra demo probe passed: {summary}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR desktop Ghidra demo probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if arguments.as_slice() == ["--probe-triton-console"] {
         let commands = [
             "from triton import *",
@@ -8468,6 +13549,99 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    if let [probe, endpoint, token_file, binary, symbol] = arguments.as_slice()
+        && probe == "--probe-remote-model"
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime initialization");
+        let result = runtime.block_on(async {
+            let token_file = PathBuf::from(token_file);
+            let project_id = create_remote_project(
+                endpoint.clone(),
+                token_file.clone(),
+                "GUI model editor probe".to_owned(),
+            )
+            .await?;
+            let (mut access, spec) = upload_remote(
+                endpoint.clone(),
+                token_file,
+                project_id,
+                PathBuf::from(binary),
+            )
+            .await?;
+            let native = remote_native_decompilation(&access, symbol).await?;
+            let baseline = remote_analysis_model(&access, &spec.binary_sha256).await?;
+            let entry = native.machine_ir.entry;
+            let old_evidence = baseline
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .ok_or("Selected function is absent from remote model")?
+                .evidence
+                .clone();
+            let candidate = prepare_model_rename(
+                &baseline,
+                &ModelRenameTarget::Function(entry),
+                "hydir_gui_remote_renamed",
+            )?;
+            let expected_revision = access.revision;
+            let (revision, typed) = match persist_remote_model_change(
+                &mut access,
+                &spec.binary_sha256,
+                expected_revision,
+                &baseline,
+                candidate,
+                &native,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(
+                    RemoteModelSaveError::Preflight(error) | RemoteModelSaveError::Uncertain(error),
+                ) => return Err(error),
+            };
+            let typed = typed?;
+            let saved = remote_analysis_model(&access, &spec.binary_sha256).await?;
+            let function = saved
+                .functions
+                .iter()
+                .find(|function| function.entry == entry)
+                .ok_or("Saved remote function is absent")?;
+            if revision != access.revision
+                || saved != typed.model
+                || saved.revision != baseline.revision + 1
+                || function.name != "hydir_gui_remote_renamed"
+                || !old_evidence
+                    .iter()
+                    .all(|evidence| function.evidence.contains(evidence))
+            {
+                return Err("Remote model edit lost revision, identity, or evidence".to_owned());
+            }
+            if !typed
+                .c
+                .as_ref()
+                .is_some_and(|c| c.contains("hydir_gui_remote_renamed"))
+            {
+                return Err("Typed C did not refresh after remote model rename".to_owned());
+            }
+            Ok::<_, String>((revision, saved.revision, typed.c.is_some()))
+        });
+        match result {
+            Ok((revision, model_revision, typed_c)) => {
+                println!(
+                    "HydIR GUI remote model probe passed: project revision {revision}, model revision {model_revision}, typed C available {typed_c}"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("HydIR GUI remote model probe failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let [probe, endpoint, token_file, project_id, symbol] = arguments.as_slice()
         && probe == "--probe-remote"
     {
@@ -8545,7 +13719,16 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
-    let open_local = if let [flag, path] = arguments.as_slice()
+    let open_recipe = if let [flag, _, recipe] = arguments.as_slice()
+        && flag == "--open-recipe"
+    {
+        Some(PathBuf::from(recipe))
+    } else {
+        None
+    };
+    let open_local = if let Some((binary, _, _)) = &render_smoke {
+        Some((binary.clone(), None))
+    } else if let [flag, path] = arguments.as_slice()
         && flag == "--open-local"
     {
         Some((PathBuf::from(path), None))
@@ -8553,11 +13736,15 @@ fn main() -> eframe::Result<()> {
         && flag == "--open-local"
     {
         Some((PathBuf::from(path), Some(symbol.clone())))
+    } else if let [flag, path, _] = arguments.as_slice()
+        && flag == "--open-recipe"
+    {
+        Some((PathBuf::from(path), None))
     } else if arguments.is_empty() {
         None
     } else {
         eprintln!(
-            "Usage: hydir [--open-local <elf> [function-symbol] | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
+            "Usage: hydir [--open-local <elf> [function-symbol] | --open-recipe <elf> <recipe.json> | --probe-ghidra-demo <elf> [0xfunction-entry] (requires HYDIR_LOCAL_DB) | --render-ghidra-demo <elf> <0xfunction-entry> <output-dir> (requires HYDIR_LOCAL_DB) | --probe-workbench <elf> (requires HYDIR_LOCAL_DB) | --probe-local-annotation <elf> (requires HYDIR_LOCAL_DB) | --probe-remote <endpoint> <token-file> <project-id> <symbol> | --probe-remote-model <endpoint> <token-file> <elf> <symbol> | --probe-create-upload <endpoint> <token-file> <elf> | --probe-annotation <endpoint> <token-file> <elf> | --probe-transform <endpoint> <token-file> <elf> <symbol> | --probe-rebuild <endpoint> <token-file> <elf> <new-output-file> | --probe-local-pass <elf> <symbol> <new-output-dir> | --probe-local-rebuild <elf> <new-output-dir> | --probe-local-patch <elf> <symbol> <replacement> <new-output-file> | --probe-remote-patch <endpoint> <token-file> <elf> <symbol> <replacement> <new-output-file>]"
         );
         std::process::exit(2);
     };
@@ -8578,6 +13765,16 @@ fn main() -> eframe::Result<()> {
                 app.initial_symbol = symbol;
                 app.startup_open_local = Some(path);
             }
+            if let Some((_, selector, output_dir)) = render_smoke {
+                app.render_smoke = Some(RenderSmoke {
+                    selector,
+                    output_dir,
+                    started: Instant::now(),
+                    stage: RenderSmokeStage::AwaitAnalysis,
+                    selection_requested: false,
+                });
+            }
+            app.startup_recipe_path = open_recipe;
             Ok(Box::new(app))
         }),
     )
@@ -8586,21 +13783,958 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalystApp, COutputSource, Event, GraphNodeAction, GraphNodeTone, NativeViewMode, Tab,
-        WorkbenchGraphEdge, WorkbenchGraphNode, indexed_function_action, ir_slice,
-        local_region_artifacts, native_function_excerpt, native_instruction_count,
-        native_opaque_instruction_count, preview_patch_local, resized_console_height,
-        valid_bearer_token, validate_endpoint, workbench_graph_layout,
+        AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
+        ModelEdit, ModelEditDraft, ModelEditTarget, ModelRenameTarget, NativeViewMode, Tab,
+        WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
+        emit_ghidra_image_cfg_llvm, ghidra_composite_evidence, ghidra_readiness_copy,
+        ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start, high_pcode_varnode,
+        indexed_function_action, ir_slice, local_region_artifacts, native_function_excerpt,
+        native_instruction_count, native_opaque_instruction_count, parse_model_edit_draft,
+        pcode_display_lines, pcode_line_target, pcode_state_lines, persist_ghidra_snapshot,
+        persist_local_model_edit, persist_local_model_rename, prepare_model_rename,
+        preview_patch_local, resized_console_height, run_ghidra_command, save_render_smoke_png,
+        selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
+        validate_remote_model_save, workbench_graph_layout,
     };
     use egui_graph::NodeId;
-    use hydir_backend::{import_elf, lift_symbol};
+    use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
     use hydir_core::{
         AnalystAnnotation, AnnotationKind, FactProvenance, FactSource, ProgramSpec, RecoveryState,
     };
     use hydir_decompile::{
-        decompile_function_at, decompile_symbol, discover_functions, measure_native_coverage,
+        PCODE_CFG_ELF_IMAGE_MAX_BYTES, decompile_function_at, decompile_symbol, discover_functions,
+        measure_native_coverage,
     };
-    use std::sync::mpsc;
+    use hydir_execution::StopPoint;
+    use hydir_ghidra_worker::GhidraRuntimeStatus;
+    use hydir_ir::pcode::{
+        GhidraSnapshot, PcodeEffect, PcodePathStop, parse_ghidra_snapshot, parse_pcode_seed,
+    };
+    use hydir_model::{
+        ModelConflict, ModelEvidence, ModelField, ModelParameter, ModelPrototype, ModelSource,
+        PrimitiveType, TypeDefinition, TypeDefinitionKind, TypeRef, init_model,
+    };
+    use hydir_project::LocalProjectStore;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn rendered_smoke_writes_decodable_gui_png() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("gui.png");
+        let image = eframe::egui::ColorImage::filled(
+            [128, 128],
+            eframe::egui::Color32::from_rgb(24, 38, 51),
+        );
+        save_render_smoke_png(&path, &image).unwrap();
+        let decoder = png::Decoder::new(std::io::BufReader::new(fs::File::open(path).unwrap()));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (128, 128));
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+    }
+    #[test]
+    fn ghidra_subprocess_success_reads_output_tail() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output 'hydir stdout'; [Console]::Error.WriteLine('hydir stderr')",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "printf 'hydir stdout\\n'; printf 'hydir stderr\\n' >&2",
+            ]);
+            command
+        };
+        let cancel = AtomicBool::new(false);
+        let output = run_ghidra_command(&mut command, &cancel, Duration::from_secs(20)).unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hydir stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("hydir stderr"));
+    }
+
+    #[test]
+    fn ghidra_subprocess_cancels_during_execution() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while (-not (Test-Path $env:HYDIR_GHIDRA_CANCEL_FILE)) { Start-Sleep -Milliseconds 50 }",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "while [ ! -e \"$HYDIR_GHIDRA_CANCEL_FILE\" ]; do sleep 0.05; done",
+            ]);
+            command
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            signal.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = run_ghidra_command(&mut command, &cancel, Duration::from_secs(20));
+        trigger.join().unwrap();
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ghidra_subprocess_times_out_and_is_reaped() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 10",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 10"]);
+            command
+        };
+        let started = Instant::now();
+        let result = run_ghidra_command(
+            &mut command,
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(7));
+    }
+
+    #[test]
+    fn ghidra_setup_explains_ready_and_missing_runtimes() {
+        let mut status = GhidraRuntimeStatus {
+            mode: "local",
+            pinned_version: "12.1.4",
+            runtime_ready: false,
+            worker_image_cached: None,
+            detail: "missing local executable".to_owned(),
+        };
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("missing"));
+        assert!(action.contains("HYDIR_GHIDRA_HOME"));
+
+        status.runtime_ready = true;
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("found"));
+        assert!(action.contains("checks the version"));
+
+        status.mode = "docker";
+        status.runtime_ready = false;
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("unavailable"));
+        assert!(action.contains("Start Docker"));
+
+        status.runtime_ready = true;
+        status.worker_image_cached = Some(false);
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("image needed"));
+        assert!(action.contains("first use"));
+
+        status.worker_image_cached = Some(true);
+        let (headline, action) = ghidra_readiness_copy(&status);
+        assert!(headline.contains("image cached"));
+        assert!(action.contains("Ready"));
+    }
+
+    #[test]
+    fn ghidra_address_map_rebases_pie_navigation_and_keeps_trace_va() {
+        let bytes = include_bytes!("../../../tests/fixtures/ghidra_prototype.elf");
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prototype_high_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        let map = GhidraAddressMap::new(&snapshot, &spec).unwrap();
+        assert_eq!(map.ghidra_base, 0x100000);
+        assert_eq!(map.elf_base, 0);
+        assert_eq!(map.to_linked("ram", "0x101320"), Some(0x1320));
+        assert_eq!(map.to_linked("ram", "0x101323"), Some(0x1323));
+        assert_eq!(map.to_ghidra(0x1323), Some(0x101323));
+        let high = snapshot.selected_function.high_pcode.as_ref().unwrap();
+        assert_eq!(high.operations.len(), 17);
+        let layouts = ghidra_composite_evidence(&snapshot);
+        let node = layouts
+            .iter()
+            .find(|layout| layout.display_name == "Node")
+            .unwrap();
+        assert_eq!(node.fields.len(), 2);
+        assert_eq!(node.fields[0].offset_bytes, 0);
+        assert_eq!(node.fields[1].offset_bytes, 8);
+        assert_eq!(
+            high_pcode_varnode(high.operations[0].output.as_ref().unwrap()),
+            "?:bool#10"
+        );
+        assert_eq!(
+            selected_ghidra_trace_address(&snapshot, Some(&map), Some(0x1323)),
+            Some(0x101323)
+        );
+        assert_eq!(
+            ghidra_trace_start(&snapshot, "0x101323").unwrap().offset,
+            "0x101323"
+        );
+        assert_eq!(
+            selected_ghidra_trace_address(&snapshot, Some(&map), Some(0x1324)),
+            None
+        );
+        assert_eq!(map.to_linked("register", "0x101320"), None);
+        assert_eq!(map.to_linked("ram", "0xdeadbeef"), None);
+        assert_eq!(map.to_ghidra(0xdeadbeef), None);
+    }
+
+    #[test]
+    fn ghidra_address_map_keeps_exec_addresses() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prism_metadata_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        let map = GhidraAddressMap::new(&snapshot, &spec).unwrap();
+        assert_eq!(map.elf_base, map.ghidra_base);
+        assert_eq!(map.to_linked("ram", "0x20137c"), Some(0x20137c));
+        assert_eq!(map.to_ghidra(0x20137c), Some(0x20137c));
+    }
+
+    #[test]
+    fn ghidra_fixture_rows_keep_source_and_semantic_status() {
+        let snapshot: GhidraSnapshot = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/ghidra_prism_snapshot_v2.json"
+        ))
+        .unwrap();
+        let semantics = snapshot.pcode_function_ir().unwrap().lower_semantics();
+        let lines = pcode_display_lines(&snapshot, Some(&semantics));
+        assert!(
+            lines
+                .iter()
+                .any(|(_, line)| line.contains("ram:0x20137f #1:1"))
+        );
+        assert!(lines.iter().any(|(_, line)| line.contains("[exact ")));
+        assert!(lines.iter().any(|(_, line)| line.contains("[opaque:")));
+        let state_lines = pcode_state_lines(&semantics.lower_state());
+        assert!(
+            state_lines
+                .iter()
+                .any(|(address, line)| *address == Some(0x20137c)
+                    && line.contains("Read 0:register:"))
+        );
+        assert!(
+            state_lines
+                .iter()
+                .any(|(_, line)| line.contains("MayWrite"))
+        );
+        assert!(
+            semantics
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.operations)
+                .any(|operation| matches!(operation.effect, PcodeEffect::Opaque { .. }))
+        );
+    }
+
+    #[test]
+    fn ghidra_path_trace_rows_link_back_to_real_branch_instruction() {
+        let snapshot: GhidraSnapshot = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"
+        ))
+        .unwrap();
+        let mut seed: serde_json::Value =
+            serde_json::from_str(&ghidra_seed_template(&snapshot)).unwrap();
+        assert_eq!(seed["binary_sha256"], snapshot.binary_sha256);
+        assert_eq!(
+            seed["entry"],
+            serde_json::json!(snapshot.selected_function.entry)
+        );
+        seed["registers"] = serde_json::json!([{"offset": "0x206", "size": 1, "value": "0x1"}]);
+        let state = parse_pcode_seed(&serde_json::to_vec(&seed).unwrap(), &snapshot).unwrap();
+        let start = ghidra_trace_start(&snapshot, "0x2013d9").unwrap();
+        let trace = snapshot
+            .execute_concrete_path(&state, Some(&start), 8, 4)
+            .unwrap();
+        let lines = ghidra_trace_lines(&trace);
+        assert_eq!(lines[0].0, Some(0x2013d9));
+        assert!(lines[0].1.contains("0x2013e2"));
+    }
+
+    #[test]
+    fn gui_path_trace_reads_password_phrase_from_bound_elf() {
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let digest = "4ce1c25b8bf0e96350cb893d81511ef6ebee9509c76ef4e6cb28e869299e5288";
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json"),
+            digest,
+        )
+        .unwrap();
+        let mut seed: serde_json::Value =
+            serde_json::from_str(&ghidra_seed_template(&snapshot)).unwrap();
+        seed["registers"] = serde_json::json!([
+            {"offset": "0x38", "size": 8, "value": "0x210100"},
+            {"offset": "0x30", "size": 8, "value": "0xc"},
+            {"offset": "0x20", "size": 8, "value": "0x210000"},
+            {"offset": "0x0", "size": 8, "value": "0x0"},
+            {"offset": "0x8", "size": 8, "value": "0x0"}
+        ]);
+        seed["memory"] = serde_json::json!([
+            {"space": "ram", "byte_offset": "0x210000", "size": 8, "value": "0xdeadbeef"},
+            {"space": "ram", "byte_offset": "0x210100", "size": 8, "value": "0x43412d5249445948"},
+            {"space": "ram", "byte_offset": "0x210108", "size": 4, "value": "0x53534543"}
+        ]);
+        let json = seed.to_string();
+        let plain = trace_ghidra_path(&snapshot, &json, "0x2016d0", None).unwrap();
+        assert!(!matches!(plain.stop, PcodePathStop::Return { .. }));
+        let traced = trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary)).unwrap();
+        assert!(matches!(traced.stop, PcodePathStop::Return { .. }));
+        assert_eq!(
+            traced
+                .final_state
+                .read_varnode(&hydir_ir::pcode::PcodeVarnode {
+                    space: "register".to_owned(),
+                    offset: "0x0".to_owned(),
+                    size: 8,
+                })
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn gui_image_cfg_llvm_binds_the_selected_local_elf() {
+        let binary = include_bytes!("../../../tests/fixtures/hydir-password-gate-stripped.elf");
+        let digest = format!("{:x}", Sha256::digest(binary));
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_password_secure_equals_o1_v2.json"),
+            &digest,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("password.elf");
+        fs::write(&path, binary).unwrap();
+
+        let artifact = emit_ghidra_image_cfg_llvm(&snapshot, "0x2016d0", &path).unwrap();
+        assert_eq!(artifact.schema_version, 3);
+        assert_eq!(artifact.binary_sha256, digest);
+        assert_eq!(artifact.start, snapshot.selected_function.entry);
+        let image = artifact.read_only_image.as_ref().unwrap();
+        assert!(image.known_byte_count > 0);
+        assert!(image.byte_len <= PCODE_CFG_ELF_IMAGE_MAX_BYTES);
+        assert!(artifact.llvm_ir.contains("define "));
+
+        let mut changed = binary.to_vec();
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&path, changed).unwrap();
+        assert!(emit_ghidra_image_cfg_llvm(&snapshot, "0x2016d0", &path).is_err());
+    }
+
+    #[test]
+    fn ghidra_analysis_snapshot_is_saved_to_local_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        assert_eq!(pcode_line_target(&snapshot, 0), None);
+        assert_eq!(
+            pcode_line_target(&snapshot, 1).unwrap().instruction_index,
+            0
+        );
+        assert_eq!(pcode_line_target(&snapshot, 1).unwrap().operation_index, 0);
+        let first_instruction_rows = 1 + snapshot.selected_function.instructions[0].pcode.len();
+        assert_eq!(pcode_line_target(&snapshot, first_instruction_rows), None);
+
+        persist_ghidra_snapshot(&database, &binary, &spec.binary_sha256, &snapshot).unwrap();
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        let project = store.open_binary(Path::new(&binary), &spec).unwrap();
+        assert_eq!(
+            store
+                .load_ghidra_snapshot(&project, &snapshot.selected_function.entry)
+                .unwrap(),
+            Some(snapshot.clone())
+        );
+        let model = store.load_model(&project).unwrap().unwrap();
+        assert!(model.functions.iter().any(|function| {
+            function
+                .evidence
+                .iter()
+                .any(|evidence| evidence.source == hydir_model::ModelSource::GhidraAnalysis)
+        }));
+        let revision = project.revision;
+        persist_ghidra_snapshot(&database, &binary, &spec.binary_sha256, &snapshot).unwrap();
+        let reopened = store.open_binary(Path::new(&binary), &spec).unwrap();
+        assert_eq!(reopened.revision, revision);
+        assert!(
+            persist_ghidra_snapshot(&database, &binary, "wrong", &snapshot)
+                .unwrap_err()
+                .contains("changed")
+        );
+    }
+
+    #[test]
+    fn remote_model_edit_uses_model_revision_independently_of_project_revision() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let displayed = init_model(bytes).unwrap();
+        let access = super::RemoteAccess {
+            endpoint: "http://127.0.0.1:50051".to_owned(),
+            token: String::new(),
+            project_id: "fixture".to_owned(),
+            revision: displayed.revision + 7,
+            source_offer: String::new(),
+            named_pass_transform: false,
+            whole_rebuild: false,
+        };
+        let mut candidate = prepare_model_rename(
+            &displayed,
+            &ModelRenameTarget::Function(displayed.functions[0].entry),
+            "analyst_function",
+        )
+        .unwrap();
+        candidate.revision += 1;
+        assert!(
+            validate_remote_model_save(&access, &displayed.binary_sha256, &displayed, &candidate,)
+                .is_ok()
+        );
+        assert!(validate_remote_model_save(&access, "wrong", &displayed, &candidate).is_err());
+        candidate.revision += 1;
+        assert!(
+            validate_remote_model_save(&access, &displayed.binary_sha256, &displayed, &candidate,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_model_save_event_refreshes_selected_typed_model() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let spec = import_elf(bytes).unwrap();
+        let initial = init_model(bytes).unwrap();
+        let entry = initial.functions[0].entry;
+        let native = decompile_function_at(bytes, entry).unwrap();
+        let mut edited = prepare_model_rename(
+            &initial,
+            &ModelRenameTarget::Function(entry),
+            "analyst_function",
+        )
+        .unwrap();
+        edited.revision += 1;
+        let typed = super::typed_view_with_model(edited, &native).unwrap();
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        app.events = receiver;
+        app.spec = Some(spec.clone());
+        app.remote = true;
+        app.project_revision = Some(8);
+        app.native_decompilation = Some(native);
+        app.model_rename_target = Some(ModelRenameTarget::Function(entry));
+        sender
+            .send(Event::ModelRenamed {
+                binary_sha256: spec.binary_sha256,
+                entry,
+                revision: 9,
+                remote: true,
+                typed: Box::new(Ok(typed)),
+            })
+            .unwrap();
+        app.poll();
+        assert_eq!(app.project_revision, Some(9));
+        assert!(app.status.contains("remote revision 9"));
+        assert!(app.model_rename_target.is_none());
+        assert_eq!(
+            app.typed_native_view.as_ref().unwrap().model.functions[0].name,
+            "analyst_function"
+        );
+    }
+
+    #[test]
+    fn gui_model_renames_persist_evidence_and_reject_stale_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("analyst.sqlite");
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let mut store = LocalProjectStore::open(&database).unwrap();
+        let project = store.open_binary(&binary, &spec).unwrap();
+        let mut displayed = init_model(bytes).unwrap();
+        let entry = displayed.functions[0].entry;
+        let original_evidence = displayed.functions[0].evidence.clone();
+        let machine_evidence = ModelEvidence {
+            source: ModelSource::NativeAnalysis,
+            detail: "fixture machine observation".to_owned(),
+            site: None,
+        };
+        displayed.types.push(TypeDefinition {
+            id: "fixture_word".to_owned(),
+            name: "OldWord".to_owned(),
+            size_bytes: 8,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Alias {
+                target: TypeRef::Primitive {
+                    name: PrimitiveType::U64,
+                },
+            },
+            evidence: vec![machine_evidence.clone()],
+        });
+        displayed.conflicts.push(ModelConflict {
+            subject: "fixture_alias".to_owned(),
+            detail: "unresolved alias".to_owned(),
+            evidence: vec![machine_evidence.clone()],
+        });
+        for reserved in ["inline", "restrict", "_Atomic", "_Thread_local", "asm"] {
+            assert!(
+                persist_local_model_rename(
+                    &mut store,
+                    &project,
+                    bytes,
+                    project.revision,
+                    &displayed,
+                    &ModelRenameTarget::Function(entry),
+                    reserved,
+                    "invalid-rename",
+                )
+                .unwrap_err()
+                .contains("C identifier")
+            );
+        }
+
+        let (updated, saved) = persist_local_model_rename(
+            &mut store,
+            &project,
+            bytes,
+            project.revision,
+            &displayed,
+            &ModelRenameTarget::Function(entry),
+            "analyst_entry",
+            "rename-function",
+        )
+        .unwrap();
+        assert_eq!(updated.revision, project.revision + 1);
+        let function = saved
+            .functions
+            .iter()
+            .find(|row| row.entry == entry)
+            .unwrap();
+        assert_eq!(function.name, "analyst_entry");
+        assert!(
+            original_evidence
+                .iter()
+                .all(|fact| function.evidence.contains(fact))
+        );
+        assert!(
+            function
+                .evidence
+                .iter()
+                .any(|fact| fact.source == ModelSource::AnalystAssertion)
+        );
+        assert_eq!(saved.conflicts[0].detail, "unresolved alias");
+        assert!(
+            persist_local_model_rename(
+                &mut store,
+                &project,
+                bytes,
+                project.revision,
+                &displayed,
+                &ModelRenameTarget::Function(entry),
+                "stale_entry",
+                "stale-rename",
+            )
+            .unwrap_err()
+            .contains("Stale local project revision")
+        );
+
+        let (updated_again, saved_again) = persist_local_model_rename(
+            &mut store,
+            &updated,
+            bytes,
+            updated.revision,
+            &saved,
+            &ModelRenameTarget::Type("fixture_word".to_owned()),
+            "AnalystWord",
+            "rename-type",
+        )
+        .unwrap();
+        assert_eq!(updated_again.revision, updated.revision + 1);
+        let definition = saved_again
+            .types
+            .iter()
+            .find(|definition| definition.id == "fixture_word")
+            .unwrap();
+        assert_eq!(definition.name, "AnalystWord");
+        assert!(definition.evidence.contains(&machine_evidence));
+        assert!(
+            definition
+                .evidence
+                .iter()
+                .any(|fact| fact.source == ModelSource::AnalystAssertion)
+        );
+        assert_eq!(saved_again.conflicts, saved.conflicts);
+
+        let reopened = LocalProjectStore::open(&database).unwrap();
+        assert_eq!(
+            reopened.load_model(&updated_again).unwrap(),
+            Some(saved_again.clone())
+        );
+    }
+
+    #[test]
+    fn gui_field_editor_preserves_machine_evidence_and_rejects_invalid_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("analyst.sqlite")).unwrap();
+        let project = store.open_binary(&binary, &spec).unwrap();
+        let mut initial = init_model(bytes).unwrap();
+        let machine = ModelEvidence {
+            source: ModelSource::Dwarf,
+            detail: "fixture field at offset zero".to_owned(),
+            site: None,
+        };
+        initial.types.push(TypeDefinition {
+            id: "fixture_record".to_owned(),
+            name: "FixtureRecord".to_owned(),
+            size_bytes: 16,
+            size_is_lower_bound: false,
+            kind: TypeDefinitionKind::Struct {
+                fields: vec![
+                    ModelField {
+                        name: "old_field".to_owned(),
+                        offset_bytes: 0,
+                        ty: TypeRef::Primitive {
+                            name: PrimitiveType::U32,
+                        },
+                        evidence: vec![machine.clone()],
+                    },
+                    ModelField {
+                        name: "tail".to_owned(),
+                        offset_bytes: 12,
+                        ty: TypeRef::Primitive {
+                            name: PrimitiveType::U32,
+                        },
+                        evidence: vec![machine.clone()],
+                    },
+                ],
+            },
+            evidence: vec![machine.clone()],
+        });
+        let project = store.save_model(&project, &initial, "seed-fields").unwrap();
+        let displayed = store.load_model(&project).unwrap().unwrap();
+        let draft = super::model_edit_draft(
+            &displayed,
+            ModelEditTarget::Field {
+                type_id: "fixture_record".to_owned(),
+                field_index: 0,
+            },
+        )
+        .unwrap();
+        let ModelEditDraft::Field {
+            type_id,
+            field_index,
+            ..
+        } = draft
+        else {
+            panic!("expected field editor")
+        };
+        let edit = ModelEdit::Field {
+            type_id,
+            field_index,
+            name: "counter".to_owned(),
+            offset_bytes: 4,
+            ty: TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            },
+        };
+        let (updated, saved) = persist_local_model_edit(
+            &mut store,
+            &project,
+            bytes,
+            project.revision,
+            &displayed,
+            &edit,
+            "edit-field",
+        )
+        .unwrap();
+        assert_eq!(updated.revision, project.revision + 1);
+        let TypeDefinitionKind::Struct { fields } = &saved
+            .types
+            .iter()
+            .find(|ty| ty.id == "fixture_record")
+            .unwrap()
+            .kind
+        else {
+            panic!("expected struct")
+        };
+        assert_eq!(fields[0].name, "counter");
+        assert_eq!(fields[0].offset_bytes, 4);
+        assert_eq!(
+            fields[0].ty,
+            TypeRef::Primitive {
+                name: PrimitiveType::U64
+            }
+        );
+        assert!(fields[0].evidence.contains(&machine));
+        assert!(
+            fields[0]
+                .evidence
+                .iter()
+                .any(|item| item.source == ModelSource::AnalystAssertion)
+        );
+        assert!(
+            saved
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.subject == "type:fixture_record:field:0"
+                    && conflict.evidence.contains(&machine))
+        );
+        assert!(
+            persist_local_model_edit(
+                &mut store,
+                &project,
+                bytes,
+                project.revision,
+                &displayed,
+                &edit,
+                "stale-field",
+            )
+            .unwrap_err()
+            .contains("Stale local project revision")
+        );
+        let invalid = ModelEdit::Field {
+            type_id: "fixture_record".to_owned(),
+            field_index: 0,
+            name: "counter".to_owned(),
+            offset_bytes: 8,
+            ty: TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            },
+        };
+        assert!(
+            persist_local_model_edit(
+                &mut store,
+                &updated,
+                bytes,
+                updated.revision,
+                &saved,
+                &invalid,
+                "overlap-field",
+            )
+            .unwrap_err()
+            .contains("overlapping or out-of-bounds")
+        );
+        assert_eq!(store.load_model(&updated).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn gui_prototype_editor_revises_model_and_retains_prior_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("prism.elf");
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        fs::write(&binary, bytes).unwrap();
+        let spec = import_elf(bytes).unwrap();
+        let mut store = LocalProjectStore::open(&directory.path().join("analyst.sqlite")).unwrap();
+        let project = store.open_binary(&binary, &spec).unwrap();
+        let mut initial = init_model(bytes).unwrap();
+        let entry = initial.functions[0].entry;
+        let machine = ModelEvidence {
+            source: ModelSource::GhidraAnalysis,
+            detail: "fixture prior signature".to_owned(),
+            site: None,
+        };
+        initial.functions[0].evidence.push(machine.clone());
+        initial.functions[0].prototype = Some(ModelPrototype {
+            parameters: Vec::new(),
+            return_type: TypeRef::Primitive {
+                name: PrimitiveType::U64,
+            },
+            calling_convention: "sysv_amd64".to_owned(),
+            variadic: false,
+        });
+        let project = store
+            .save_model(&project, &initial, "seed-prototype")
+            .unwrap();
+        let displayed = store.load_model(&project).unwrap().unwrap();
+        let draft = super::model_edit_draft(&displayed, ModelEditTarget::Prototype(entry)).unwrap();
+        assert!(matches!(
+            parse_model_edit_draft(&draft).unwrap(),
+            ModelEdit::Prototype { .. }
+        ));
+        let replacement = ModelPrototype {
+            parameters: vec![ModelParameter {
+                name: "input".to_owned(),
+                ty: TypeRef::Pointer {
+                    to: Box::new(TypeRef::Primitive {
+                        name: PrimitiveType::U8,
+                    }),
+                },
+            }],
+            return_type: TypeRef::Primitive {
+                name: PrimitiveType::U32,
+            },
+            calling_convention: "sysv_amd64".to_owned(),
+            variadic: false,
+        };
+        let edit = ModelEdit::Prototype {
+            entry,
+            value: replacement.clone(),
+        };
+        let (updated, saved) = persist_local_model_edit(
+            &mut store,
+            &project,
+            bytes,
+            project.revision,
+            &displayed,
+            &edit,
+            "edit-prototype",
+        )
+        .unwrap();
+        let function = saved
+            .functions
+            .iter()
+            .find(|function| function.entry == entry)
+            .unwrap();
+        assert_eq!(function.prototype, Some(replacement));
+        assert!(function.evidence.contains(&machine));
+        assert!(
+            function
+                .evidence
+                .iter()
+                .any(|item| item.source == ModelSource::AnalystAssertion)
+        );
+        assert!(saved.conflicts.iter().any(|conflict| conflict.subject
+            == format!("function:0x{:x}:prototype", entry.value.0)
+            && conflict.evidence.contains(&machine)));
+        assert_eq!(store.load_model(&updated).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn first_ghidra_result_opens_artifacts_without_stealing_other_views() {
+        let bytes = include_bytes!("../../../demo/hydir-prism.elf");
+        let spec = import_elf(bytes).unwrap();
+        let snapshot = parse_ghidra_snapshot(
+            include_bytes!("../../../tests/fixtures/ghidra_prism_bit_prefix_v2.json"),
+            &spec.binary_sha256,
+        )
+        .unwrap();
+        let mut app = AnalystApp::new(&eframe::egui::Context::default());
+        let (sender, receiver) = mpsc::sync_channel(2);
+        app.events = receiver;
+        app.spec = Some(spec.clone());
+        sender
+            .send(Event::GhidraAnalyzed {
+                binary_sha256: spec.binary_sha256.clone(),
+                result: Ok((snapshot.clone(), Some("snapshot save failed".to_owned()))),
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::GhidraPcode));
+        assert_eq!(app.ghidra_snapshot.as_ref(), Some(&snapshot));
+        assert_eq!(
+            app.selected_address,
+            GhidraAddressMap::new(&snapshot, &spec).and_then(|map| {
+                map.to_linked(
+                    &snapshot.selected_function.entry.space,
+                    &snapshot.selected_function.entry.offset,
+                )
+            })
+        );
+        assert!(!app.ghidra_pcode_lines.is_empty());
+        assert!(!app.ghidra_state_lines.is_empty());
+        let llvm = app.ghidra_llvm_cfg.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(llvm.binary_sha256, spec.binary_sha256);
+        assert_eq!(llvm.start, snapshot.selected_function.entry);
+        assert!(!llvm.source_operations.is_empty());
+        assert!(llvm.llvm_ir.contains("define "));
+
+        let report = disassemble_elf(bytes).unwrap();
+        sender
+            .send(Event::Disassembled {
+                result: Ok(report),
+                automatic: true,
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::GhidraPcode));
+        assert!(app.disassembly_report.is_some());
+        assert_eq!(app.failure.as_deref(), Some("snapshot save failed"));
+
+        app.tab = Tab::Bytes;
+        sender
+            .send(Event::GhidraAnalyzed {
+                binary_sha256: spec.binary_sha256,
+                result: Ok((snapshot, None)),
+            })
+            .unwrap();
+        app.poll();
+        assert!(matches!(app.tab, Tab::Bytes));
+    }
+
+    #[test]
+    fn recipe_navigation_translates_only_verified_captured_pie_code() {
+        let stop = StopPoint {
+            runtime_pc: 0x7f00_1000,
+            elf_vaddr: Some(0x1000),
+            load_bias: Some(0x7f00_0000),
+            symbol: None,
+        };
+        assert_eq!(
+            captured_code_elf_address(&stop, 0x7f00_1000, 0x20, 0x7f00_101f),
+            Some(0x101f)
+        );
+        assert_eq!(
+            captured_code_elf_address(&stop, 0x7f00_1000, 0x20, 0x7f00_1020),
+            None
+        );
+        assert_eq!(
+            captured_code_elf_address(&stop, 0x7f00_1001, 0x20, 0x7f00_101f),
+            None
+        );
+        let wrong_bias = StopPoint {
+            load_bias: Some(0x7f00_0001),
+            ..stop
+        };
+        assert_eq!(
+            captured_code_elf_address(&wrong_bias, 0x7f00_1000, 0x20, 0x7f00_101f),
+            None
+        );
+    }
 
     #[test]
     fn graph_layout_leaves_label_space_and_routes_long_edges_around_nodes() {

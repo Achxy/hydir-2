@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+trap 'status=$?; printf "patch gate failed at line %s: %s (status %s)\n" "$LINENO" "$BASH_COMMAND" "$status" >&2' ERR
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
@@ -55,7 +56,7 @@ if "$client" patch "$run_dir/original" "$run_dir/patch.json" \
 fi
 grep -q 'refusing to overwrite' "$run_dir/overwrite.err"
 
-clang -O0 -no-pie tests/fixtures/add2.S tests/fixtures/add2_main.c \
+clang -O0 -no-pie tests/fixtures/tiny_add2.S tests/fixtures/add2_main.c \
   -o "$run_dir/add2-original"
 small_digest="$(sha256sum "$run_dir/add2-original" | awk '{print $1}')"
 printf '{"schema_version":1,"binary_sha256":"%s","function_symbol":"hydir_add2","prototype":"u64(u64,u64)","replacement":"return 18446744073709551615;"}\n' \
@@ -66,8 +67,29 @@ if "$client" patch "$run_dir/add2-original" "$run_dir/oversize.json" \
   echo 'oversize patch unexpectedly accepted' >&2
   exit 1
 fi
-grep -q 'replacement needs 11 bytes' "$run_dir/oversize.err"
+if ! grep -q 'replacement needs 11 bytes' "$run_dir/oversize.err"; then
+  cat "$run_dir/oversize.err" >&2
+  echo 'undersized patch refusal did not report the placement limit' >&2
+  exit 1
+fi
 test ! -e "$run_dir/oversize-patched"
+
+clang -O0 -no-pie tests/fixtures/add2.S tests/fixtures/add2_main.c \
+  -o "$run_dir/trampoline-original"
+trampoline_digest="$(sha256sum "$run_dir/trampoline-original" | awk '{print $1}')"
+printf '{"schema_version":1,"binary_sha256":"%s","function_symbol":"hydir_add2","prototype":"u64(u64,u64)","replacement":"return 18446744073709551615;"}\n' \
+  "$trampoline_digest" > "$run_dir/trampoline.json"
+"$client" patch "$run_dir/trampoline-original" "$run_dir/trampoline.json" \
+  --trusted-fixture --assume-u64x2 --assume-entry-only \
+  --output "$run_dir/trampoline-patched" > "$run_dir/trampoline-report.json"
+python3 - "$run_dir/trampoline-report.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["patch_bundle"]["placement_plan"]["strategy"] == "entry_trampoline", report
+PY
+test "$("$run_dir/trampoline-patched" 9 4)" = 18446744073709551615
 
 printf '{"schema_version":1,"binary_sha256":"%064d","function_symbol":"hydir_patch_target","prototype":"u64(u64,u64)","replacement":"return arg0 - arg1;"}\n' 0 > "$run_dir/wrong-hash.json"
 if "$client" patch "$run_dir/original" "$run_dir/wrong-hash.json" \

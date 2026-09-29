@@ -1,7 +1,7 @@
 <h1 align="center">HydIR</h1>
 
 <p align="center">
-  <strong>Native x86-64 ELF analysis and bounded decompilation.</strong><br>
+  <strong>Ghidra-backed binary lifting and reverse engineering in Rust.</strong><br>
   Desktop workbench, command-line tools, Python SDK, and authenticated service.
 </p>
 
@@ -20,11 +20,36 @@
 
 *The desktop workbench with a local ELF loaded: the overview presents the native analysis pipeline, program inventory, diagnostics, and inspector in one view.*
 
-HydIR opens little-endian x86-64 ELF files locally, shows a function's bytes and
-reachable branches, and turns supported semantics into inspectable LLVM IR and
-C. The desktop app, CLI, Python SDK, and authenticated service share the native
-core. The checked-in [`hydir_max2` walkthrough](https://hydir.wiki/articles/max2)
-shows the path on a 16-byte function.
+HydIR opens little-endian x86-64 ELF files, runs Ghidra analysis headlessly,
+and imports source-linked raw P-code into its Rust analysis core. Its desktop
+workbench shows functions, bytes, control flow, P-code effects, bounded LLVM,
+and the evidence behind type hints. A native ELF frontend remains available
+for independent analysis and comparison. The CLI, Python SDK, and authenticated
+service expose the same artifacts. The checked-in
+[`hydir_max2` walkthrough](https://hydir.wiki/articles/max2) shows the native
+path on a 16-byte function.
+
+The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
+GUI the entry point for automatic Ghidra analysis. Opening a local ELF now starts
+a headless worker and imports a bounded raw P-code snapshot with flow and call
+evidence into Hydir. The
+default worker provisions a pinned container image; developers can set
+`HYDIR_GHIDRA_HOME` to use a local Ghidra 12.1.4 installation. Hydir also exposes
+Rust semantic classification and LLVM for a narrow exact operation subset.
+Hydir caches the analyzed Ghidra project for later function selections. Its
+function state artifact is an ordered effect inventory; executable
+whole-function P-code lifting remains in progress.
+The v3 service and Python SDK can run the same managed worker on an uploaded
+ELF and return a validated snapshot, raw P-code, state effects, CFG LLVM, and
+bounded dependency slices.
+Revision-checked AnalysisModel edits are available through the v3 service and
+Python SDK; saved models feed subsequent typed C artifacts.
+
+The [Ubuntu container smoke test](https://github.com/Achxy/hydir-2/actions/runs/36262451695)
+exercises automatic CLI and v3 API analysis on a real ELF. A separate
+[Ghidra emulator comparison](integrations/ghidra/README.md) checks both PRISM
+branch outcomes from function entry against Hydir's Rust executor. These gates cover a declared
+subset; unresolved operations remain visible in coverage reports.
 
 ## Quick start
 
@@ -33,15 +58,60 @@ Open the checked-in PRISM ELF for a tour of the workbench. Use the smaller
 repository root with Rust 1.96:
 
 ```bash
+cargo run --locked --bin hydirctl -- doctor
 cargo run --locked --bin hydir -- --open-local demo/hydir-prism.elf hydir_stage_decision
 cargo run --locked --bin hydirctl -- discover fuzz/corpus/elf_import/max2.elf
 cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/max2.elf --function hydir_max2 --ir state
 cargo run --locked --bin hydirctl -- decompile fuzz/corpus/elf_import/max2.elf --function hydir_max2 --view unit
 ```
 
+To reproduce the Ghidra-backed path from the CLI, run the following commands.
+HydIR provisions its pinned container on the first analysis; no Ghidra project
+setup is required. The GUI starts the same analysis when you open the ELF.
+
+```bash
+cargo run --locked -p hydir-cli -- ghidra analyze demo/hydir-prism.elf --output target/prism-ghidra.json --function 0x20137c
+cargo run --locked -p hydir-cli -- ghidra-snapshot verify demo/hydir-prism.elf target/prism-ghidra.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf target/prism-ghidra.json
+cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
+cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
+cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c --max-functions 2
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
+cargo run --locked -p hydir-cli -- ghidra llvm-cfg-image tests/fixtures/hydir-password-gate-stripped.elf --function 0x2016d0 --output target/password-image-llvm.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
+```
+
+For a stripped ELF with no function names, open
+`tests/fixtures/hydir-password-gate-stripped.elf` in the GUI and select the
+recovered function at `0x2016d0`. The P-code view links its loop, `.rodata`
+load, and bounded trace to disassembly. On Linux, run
+`bash scripts/demo-ghidra-password-lift.sh` to reproduce a fresh automatic
+Ghidra export, coverage and CFG LLVM artifacts, and matching versus mismatching
+password traces. The script writes its artifacts under
+`target/demo-ghidra-password-lift/` and reports both return values. It uses the
+same pinned worker as the GUI; `HYDIR_GHIDRA_HOME` can select a local Ghidra
+12.1.4 installation for development. `llvm-cfg-image` emits a version 3 module
+with up to 64 KiB of validated read-only ELF bytes embedded beside a separate
+mutable guest-memory window. Unknown bytes and unsupported effects still stop
+explicitly; the existing version 2 LLVM path remains available.
+
 Replace the ELF path and function selector with your own. `discover` returns
 FunctionIndex IDs for entries without usable names. The GUI also opens an ELF
-through its local file control. [Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
+through its local file control. The call trace uses a concrete seed and stops
+explicitly at unsupported or unresolved call boundaries. In the GUI, open
+`hydir_stage_call_chain` and use the Call trace panel with the seed JSON.
+The indirect call command exercises bounded automatic export for a concrete
+callee. Unknown indirect targets stop without guessing a function.
+Automatic call tracing exports the function reached by the seed before spending
+its function budget on other static call targets.
+The indirect-jump command emits a bounded LLVM path module that dispatches a known
+indirect jump to an instruction in the selected function. The call LLVM
+commands emit one state machine over the loaded caller and callee snapshots.
+The automatic form collects functions reached by the seed; the snapshot form
+accepts saved exports. Both share register and RAM state, check return targets, and leave unsupported
+effects and missing callees as explicit stops. Its fidelity is still unknown
+until a path is compared with Rust, Ghidra, or native execution.
+[Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.
 

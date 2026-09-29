@@ -1,0 +1,26 @@
+# Hydir's Ghidra frontend. This image contains no Hydir lifting backend.
+# Build context contains this Dockerfile and HydIRSnapshot.java only.
+FROM eclipse-temurin:21.0.12_8-jdk-noble
+
+ARG GHIDRA_VERSION=12.1.4
+ARG GHIDRA_ARCHIVE=ghidra_12.1.4_PUBLIC_20260921.zip
+ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail --location --retry 3 \
+      "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ARCHIVE}" \
+      --output /tmp/ghidra.zip \
+    && echo "${GHIDRA_SHA256}  /tmp/ghidra.zip" | sha256sum --check --status \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
+    && rm /tmp/ghidra.zip \
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin hydir
+
+COPY HydIRSnapshot.java /opt/hydir/scripts/HydIRSnapshot.java
+
+USER 10001:10001
+WORKDIR /work
+ENV HOME=/work
+ENTRYPOINT ["/opt/ghidra/support/analyzeHeadless"]

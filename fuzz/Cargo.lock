@@ -513,7 +513,10 @@ name = "hydir-ir"
 version = "0.1.0"
 dependencies = [
  "hydir-core",
+ "object",
  "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

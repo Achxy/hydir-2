@@ -1,0 +1,20 @@
+[package]
+name = "hydir-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gimli.workspace = true
+hydir-core = { path = "../hydir-core" }
+hydir-loader = { path = "../hydir-loader" }
+hydir-ir = { path = "../hydir-ir" }
+object.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+hydir-decompile = { path = "../hydir-decompile" }
+tempfile = "3.23"
