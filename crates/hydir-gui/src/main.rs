@@ -36,8 +36,9 @@ use hydir_decompile::{
     emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
 };
 use hydir_execution::{
-    AnalysisRecipe, MAX_ANALYSIS_RECIPE_JSON_BYTES, StopPoint, parse_analysis_recipe,
-    validate_analysis_recipe,
+    AnalysisRecipe, DynamicTrace, MAX_ANALYSIS_RECIPE_JSON_BYTES, MAX_INPUT_SPEC_BYTES, StopPoint,
+    parse_analysis_recipe, parse_dynamic_trace, parse_input_spec, validate_analysis_recipe,
+    validate_dynamic_trace,
 };
 use hydir_ghidra_worker::{GhidraRuntimeStatus, runtime_status};
 use hydir_hlc::{
@@ -202,6 +203,14 @@ enum Task {
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
+    ObserveFrida {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: u64,
+        input_path: PathBuf,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
     EmitGhidraCallLlvm {
         binary: PathBuf,
         binary_sha256: String,
@@ -351,6 +360,12 @@ enum Event {
         function: String,
         seed_json: String,
         result: Result<PcodeFunctionAssessment, String>,
+    },
+    FridaObserved {
+        binary_sha256: String,
+        function: u64,
+        input_path: PathBuf,
+        result: Result<DynamicTrace, String>,
     },
     GhidraCallLlvmEmitted {
         binary_sha256: String,
@@ -2355,6 +2370,62 @@ fn run_ghidra_assessment(
     Ok(artifact)
 }
 
+fn run_frida_observation(
+    binary: &Path,
+    binary_sha256: &str,
+    function: u64,
+    input_path: &Path,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<DynamicTrace, String> {
+    if fs::metadata(input_path)
+        .map_err(|error| error.to_string())?
+        .len()
+        > MAX_INPUT_SPEC_BYTES as u64
+    {
+        return Err("Frida InputSpec exceeds 2 MiB".to_owned());
+    }
+    let input_bytes = fs::read(input_path).map_err(|error| error.to_string())?;
+    if input_bytes.is_empty() || input_bytes.len() > MAX_INPUT_SPEC_BYTES {
+        return Err("Frida InputSpec is empty or exceeds 2 MiB".to_owned());
+    }
+    let input = parse_input_spec(&input_bytes)?;
+    if input.binary_sha256 != binary_sha256 {
+        return Err("Frida InputSpec belongs to another ELF".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let artifact_path = scratch.path().join("observation.json");
+    let mut command = Command::new(hydirctl_path());
+    command
+        .args(["observe", "frida"])
+        .arg(binary)
+        .arg(input_path)
+        .arg("--function")
+        .arg(format!("0x{function:x}"))
+        .arg("--output")
+        .arg(&artifact_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Frida observation failed: {}",
+            String::from_utf8_lossy(detail).trim()
+        ));
+    }
+    let trace_bytes = fs::read(&artifact_path).map_err(|error| error.to_string())?;
+    let trace = parse_dynamic_trace(&trace_bytes)?;
+    if trace.selected_elf_vaddr != function || trace.binary_sha256 != binary_sha256 {
+        return Err("Frida trace belongs to another function or ELF".to_owned());
+    }
+    let elf = fs::read(binary).map_err(|error| error.to_string())?;
+    validate_dynamic_trace(&elf, &input, &trace)?;
+    Ok(trace)
+}
+
 fn run_ghidra_call_llvm(
     binary: &Path,
     binary_sha256: &str,
@@ -3143,6 +3214,30 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         binary_sha256,
                         function,
                         seed_json,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::ObserveFrida {
+                binary,
+                binary_sha256,
+                function,
+                input_path,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_frida_observation(
+                        &binary, &binary_sha256, function, &input_path, &cancel, timeout,
+                    );
+                    let _ = completion.send(Event::FridaObserved {
+                        binary_sha256,
+                        function,
+                        input_path,
                         result,
                     });
                     repaint.request_repaint();
@@ -4658,6 +4753,10 @@ struct AnalystApp {
     ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
     ghidra_assessment: Option<Result<PcodeFunctionAssessment, String>>,
+    frida_input_path: String,
+    frida_observation: Option<Result<DynamicTrace, String>>,
+    frida_busy: bool,
+    frida_task: Option<ActiveGhidraTask>,
     ghidra_call_lines: Vec<(Option<u64>, String)>,
     ghidra_call_busy: bool,
     ghidra_call_llvm: Option<Result<PcodeInterproceduralCfgLlvmArtifact, String>>,
@@ -4810,6 +4909,10 @@ impl AnalystApp {
             ghidra_path_lines: Vec::new(),
             ghidra_call_trace: None,
             ghidra_assessment: None,
+            frida_input_path: String::new(),
+            frida_observation: None,
+            frida_busy: false,
+            frida_task: None,
             ghidra_call_lines: Vec::new(),
             ghidra_call_busy: false,
             ghidra_call_llvm: None,
@@ -5152,6 +5255,9 @@ impl AnalystApp {
                     if let Some(task) = &self.ghidra_call_task {
                         task.cancel.store(true, Ordering::Release);
                     }
+                    if let Some(task) = &self.frida_task {
+                        task.cancel.store(true, Ordering::Release);
+                    }
                     self.status = format!("Opened {} functions", spec.functions.len());
                     self.history.push(format!("Opened {source}"));
                     self.current_local_path = if remote {
@@ -5209,6 +5315,7 @@ impl AnalystApp {
                     self.ghidra_call_trace = None;
                     self.ghidra_call_lines.clear();
                     self.ghidra_assessment = None;
+                    self.frida_observation = None;
                     self.ghidra_call_llvm = None;
                     if let Some(task) = &self.ghidra_call_llvm_task {
                         task.cancel.store(true, Ordering::Release);
@@ -5416,6 +5523,7 @@ impl AnalystApp {
                             self.ghidra_call_trace = None;
                             self.ghidra_call_lines.clear();
                             self.ghidra_assessment = None;
+                            self.frida_observation = None;
                             self.ghidra_call_llvm = None;
                             if let Some(task) = &self.ghidra_call_llvm_task {
                                 task.cancel.store(true, Ordering::Release);
@@ -5544,6 +5652,54 @@ impl AnalystApp {
                         Err(_) => "Ghidra assessment failed".to_owned(),
                     };
                     self.ghidra_assessment = Some(result);
+                }
+                Event::FridaObserved {
+                    binary_sha256,
+                    function,
+                    input_path,
+                    result,
+                } => {
+                    self.frida_busy = false;
+                    let cancelled = self
+                        .frida_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    let same_function = self
+                        .ghidra_snapshot
+                        .as_ref()
+                        .zip(self.spec.as_ref())
+                        .and_then(|(snapshot, spec)| {
+                            GhidraAddressMap::new(snapshot, spec).and_then(|map| {
+                                map.to_linked(
+                                    &snapshot.selected_function.entry.space,
+                                    &snapshot.selected_function.entry.offset,
+                                )
+                            })
+                        })
+                        == Some(function);
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || !same_function
+                        || self.frida_input_path.trim() != input_path.to_string_lossy().as_ref()
+                    {
+                        continue;
+                    }
+                    if cancelled {
+                        self.status = "Frida observation cancelled".to_owned();
+                        self.frida_observation = None;
+                        continue;
+                    }
+                    self.status = match &result {
+                        Ok(trace) => format!(
+                            "Frida observed {} events · {:?}",
+                            trace.events.len(),
+                            trace.status
+                        ),
+                        Err(_) => "Frida observation failed".to_owned(),
+                    };
+                    self.frida_observation = Some(result);
                 }
                 Event::GhidraCallLlvmEmitted {
                     binary_sha256,
@@ -8464,6 +8620,101 @@ impl AnalystApp {
                                 self.selected_address = linked;
                             }
                         }
+                    }
+                    Some(Err(error)) => { ui.label(RichText::new(error).size(11.0).color(BAD)); }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("Observe with Frida")
+            .id_salt("ghidra_frida_observation")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Run this ELF with one InputSpec. Observed blocks and calls are byte checked; paths outside this input remain unknown. A completed trace does not prove the process exit code.")
+                    .size(11.0).color(MUTED));
+                ui.horizontal(|ui| {
+                    ui.label("InputSpec JSON path");
+                    if ui.text_edit_singleline(&mut self.frida_input_path).changed() {
+                        self.frida_observation = None;
+                    }
+                });
+                let linked_entry = address_map.as_ref().and_then(|map|
+                    map.to_linked(&snapshot.selected_function.entry.space,
+                                  &snapshot.selected_function.entry.offset));
+                let can_observe = cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                    && self.current_local_path.is_some()
+                    && linked_entry.is_some()
+                    && !self.frida_input_path.trim().is_empty()
+                    && !self.frida_busy;
+                if ui.add_enabled(can_observe, egui::Button::new("Observe selected function")).clicked() {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let timeout = Duration::from_secs(30);
+                    let task = Task::ObserveFrida {
+                        binary: self.current_local_path.clone().expect("checked above"),
+                        binary_sha256: snapshot.binary_sha256.clone(),
+                        function: linked_entry.expect("checked above"),
+                        input_path: PathBuf::from(self.frida_input_path.trim()),
+                        cancel: Arc::clone(&cancel),
+                        timeout,
+                    };
+                    match self.tasks.try_send(task) {
+                        Ok(()) => {
+                            self.frida_busy = true;
+                            self.frida_task = Some(ActiveGhidraTask {
+                                cancel, started: Instant::now(), timeout,
+                            });
+                            self.frida_observation = None;
+                            self.status = "Observing selected ELF function…".to_owned();
+                        }
+                        Err(_) => self.frida_observation = Some(Err(
+                            "Analysis queue is full. Retry observation.".to_owned(),
+                        )),
+                    }
+                }
+                if self.frida_busy && let Some(task) = &self.frida_task {
+                    ghidra_progress(ui, task, "Observing ELF path");
+                    if ui.add_enabled(!task.cancel.load(Ordering::Acquire),
+                        egui::Button::new("Cancel observation")).clicked() {
+                        task.cancel.store(true, Ordering::Release);
+                    }
+                }
+                match &self.frida_observation {
+                    Some(Ok(trace)) => {
+                        ui.label(RichText::new(format!(
+                            "{:?} · {} events · {} lost · {} · process exit code unknown",
+                            trace.status, trace.events.len(), trace.lost_events,
+                            trace.observer,
+                        )).size(11.0).color(ACCENT));
+                        if ui.button("Copy observation JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(trace) {
+                                ui.ctx().copy_text(json);
+                            }
+                        egui::ScrollArea::vertical().id_salt("frida_observed_events")
+                            .max_height(240.0)
+                            .show_rows(ui, 18.0, trace.events.len(), |ui, range| {
+                                for index in range {
+                                    let event = &trace.events[index];
+                                    let source = event.source.elf_vaddr;
+                                    let target = event.target.as_ref()
+                                        .and_then(|witness| witness.elf_vaddr);
+                                    ui.horizontal(|ui| {
+                                        let line = format!("#{} {:?} {}{}",
+                                            event.sequence, event.kind,
+                                            source.map_or_else(|| "unknown".to_owned(),
+                                                |address| format!("0x{address:x}")),
+                                            target.map_or_else(String::new,
+                                                |address| format!(" → 0x{address:x}")));
+                                        if ui.selectable_label(
+                                            source.is_some() && self.selected_address == source,
+                                            RichText::new(line).monospace().size(11.0),
+                                        ).clicked() && source.is_some() {
+                                            self.selected_address = source;
+                                        }
+                                        if let Some(target) = target
+                                            && ui.small_button("Target").clicked() {
+                                                self.selected_address = Some(target);
+                                            }
+                                    });
+                                }
+                            });
                     }
                     Some(Err(error)) => { ui.label(RichText::new(error).size(11.0).color(BAD)); }
                     None => {}
