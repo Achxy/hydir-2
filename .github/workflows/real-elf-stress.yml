@@ -14,7 +14,7 @@ jobs:
         with:
           toolchain: 1.96.0
       - name: Install C compilers
-        run: sudo apt-get update && sudo apt-get install -y clang gcc
+        run: sudo apt-get update && sudo apt-get install -y clang gcc time
       - name: Decompile and compile every recovered function
         run: bash scripts/demo-real-elf-stress.sh
       - uses: actions/upload-artifact@v4
@@ -25,3 +25,4 @@ jobs:
             target/demo-real-elf-stress/*/coverage.json
             target/demo-real-elf-stress/*/manifest.json
             target/demo-real-elf-stress/*/summary.json
+            target/demo-real-elf-stress/*/determinism.json
