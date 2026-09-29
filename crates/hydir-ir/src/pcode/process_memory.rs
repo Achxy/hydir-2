@@ -1,19 +1,20 @@
 //! Versioned, binary-bound initial ELF process bytes and permissions.
 //!
 //! This is a bounded image of loaded PT_LOAD ranges, not a claim about a
-//! complete process. Dynamic relocation destinations are deliberately unknown
-//! until a loader contract can establish their runtime values.
+//! complete process. Only disjoint, explicit-addend x86-64 RELATIVE dynamic
+//! relocations are applied; other relocation destinations remain unknown.
 
 use super::{GhidraSnapshot, hex_u64, image::snapshot_layout_sha256, validate_ghidra_snapshot};
 use object::{
-    Architecture, BinaryFormat, Object, ObjectKind, ObjectSegment, RelocationFlags, SegmentFlags,
-    elf,
+    Architecture, BinaryFormat, Object, ObjectKind, ObjectSegment, RelocationFlags,
+    RelocationTarget, SegmentFlags, elf,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub const PCODE_ELF_PROCESS_MEMORY_VERSION: u32 = 1;
+pub const PCODE_ELF_PROCESS_MEMORY_VERSION: u32 = 2;
+const PCODE_ELF_PROCESS_MEMORY_V1_VERSION: u32 = 1;
 pub const PCODE_ELF_PROCESS_MEMORY_MAX_BYTES: usize = 1_048_576;
 pub const PCODE_PROCESS_ALLOCATIONS_VERSION: u32 = 1;
 pub const PCODE_PROCESS_ALLOCATION_MAX_BYTES: u64 = 1_048_576;
@@ -173,7 +174,7 @@ pub struct PcodeElfProcessMemory {
     mapped: Vec<u8>,
     /// `0xff` means the mapping permits a write.
     writable: Vec<u8>,
-    /// Number of destination bytes conservatively hidden by dynamic relocations.
+    /// Number of destination bytes still hidden by dynamic relocations.
     unresolved_relocation_bytes: usize,
     /// Deserialization alone cannot establish that these bytes came from the
     /// named binary. Only the constructor or canonical parser can bind them.
@@ -220,6 +221,26 @@ impl PcodeElfProcessMemory {
         snapshot: &GhidraSnapshot,
         max_bytes: usize,
     ) -> Result<Self, String> {
+        Self::from_elf_version(
+            binary,
+            snapshot,
+            max_bytes,
+            PCODE_ELF_PROCESS_MEMORY_VERSION,
+        )
+    }
+
+    fn from_elf_version(
+        binary: &[u8],
+        snapshot: &GhidraSnapshot,
+        max_bytes: usize,
+        schema_version: u32,
+    ) -> Result<Self, String> {
+        if !matches!(
+            schema_version,
+            PCODE_ELF_PROCESS_MEMORY_V1_VERSION | PCODE_ELF_PROCESS_MEMORY_VERSION
+        ) {
+            return Err("unsupported ELF process memory version".to_owned());
+        }
         if max_bytes == 0 || max_bytes > PCODE_ELF_PROCESS_MEMORY_MAX_BYTES {
             return Err("ELF process memory allocation limit is invalid".to_owned());
         }
@@ -371,6 +392,8 @@ impl PcodeElfProcessMemory {
             }
         }
         let mut relocated = BTreeSet::new();
+        let mut relocation_hits = vec![0u8; span];
+        let mut relative_candidates = Vec::new();
         if let Some(relocations) = file.dynamic_relocations() {
             let mut relocation_count = 0usize;
             for (address, relocation) in relocations {
@@ -408,6 +431,7 @@ impl PcodeElfProcessMemory {
                 }
                 let target = u64::try_from(i128::from(address) + load_bias)
                     .map_err(|_| "ELF relocation cannot map to Ghidra RAM")?;
+                let mut destination = Vec::with_capacity(width);
                 for byte in 0..width {
                     let Some(at) = target.checked_add(byte as u64) else {
                         return Err("ELF relocation address overflows".to_owned());
@@ -419,12 +443,35 @@ impl PcodeElfProcessMemory {
                     {
                         known[index] = 0;
                         relocated.insert(index);
+                        relocation_hits[index] = relocation_hits[index].saturating_add(1);
+                        destination.push(index);
+                    }
+                }
+                if schema_version == PCODE_ELF_PROCESS_MEMORY_VERSION
+                    && matches!(relocation.flags(), RelocationFlags::Elf { r_type } if r_type == elf::R_X86_64_RELATIVE)
+                    && width == 8
+                    && destination.len() == 8
+                    && !relocation.has_implicit_addend()
+                    && relocation.target() == RelocationTarget::Absolute
+                {
+                    if let Ok(value) = u64::try_from(load_bias + i128::from(relocation.addend())) {
+                        relative_candidates.push((destination, value.to_le_bytes()));
                     }
                 }
             }
         }
+        for (destination, value) in relative_candidates {
+            if destination.iter().all(|index| relocation_hits[*index] == 1) {
+                for (index, byte) in destination.into_iter().zip(value) {
+                    bytes[index] = byte;
+                    known[index] = 0xff;
+                }
+            }
+        }
+        let unresolved_relocation_bytes =
+            relocated.iter().filter(|index| known[**index] == 0).count();
         Ok(Self {
-            schema_version: PCODE_ELF_PROCESS_MEMORY_VERSION,
+            schema_version,
             binary_sha256: digest,
             snapshot_layout_sha256: snapshot_layout_sha256(snapshot)?,
             space: space.clone(),
@@ -433,7 +480,7 @@ impl PcodeElfProcessMemory {
             known,
             mapped,
             writable,
-            unresolved_relocation_bytes: relocated.len(),
+            unresolved_relocation_bytes,
             bound_to_binary: true,
         })
     }
@@ -452,7 +499,7 @@ impl PcodeElfProcessMemory {
         }
         let mut parsed: Self = serde_json::from_slice(json)
             .map_err(|error| format!("invalid ELF process memory JSON: {error}"))?;
-        let canonical = Self::from_elf(binary, snapshot, max_bytes)?;
+        let canonical = Self::from_elf_version(binary, snapshot, max_bytes, parsed.schema_version)?;
         parsed.bound_to_binary = true;
         if parsed != canonical {
             return Err("ELF process memory differs from binary and Ghidra layout".to_owned());
@@ -462,7 +509,10 @@ impl PcodeElfProcessMemory {
 
     pub fn validate_for_snapshot(&self, snapshot: &GhidraSnapshot) -> Result<(), String> {
         if !self.bound_to_binary
-            || self.schema_version != PCODE_ELF_PROCESS_MEMORY_VERSION
+            || !matches!(
+                self.schema_version,
+                PCODE_ELF_PROCESS_MEMORY_V1_VERSION | PCODE_ELF_PROCESS_MEMORY_VERSION
+            )
             || self.binary_sha256 != snapshot.binary_sha256
             || self.snapshot_layout_sha256 != snapshot_layout_sha256(snapshot)?
             || self.space != snapshot.program.image_base.space
@@ -584,6 +634,24 @@ mod tests {
             .is_err()
         );
         assert!(PcodeElfProcessMemory::from_elf(&binary, &snapshot, 1).is_err());
+    }
+
+    #[test]
+    fn v1_process_memory_remains_parseable_against_its_binary() {
+        let (binary, snapshot) = fixture();
+        let legacy = PcodeElfProcessMemory::from_elf_version(
+            &binary,
+            &snapshot,
+            64 * 1024,
+            PCODE_ELF_PROCESS_MEMORY_V1_VERSION,
+        )
+        .unwrap();
+        assert_eq!(legacy.schema_version, 1);
+        let json = serde_json::to_vec(&legacy).unwrap();
+        assert_eq!(
+            PcodeElfProcessMemory::parse_bound(&json, &binary, &snapshot, 64 * 1024).unwrap(),
+            legacy
+        );
     }
 
     #[test]

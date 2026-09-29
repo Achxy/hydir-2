@@ -21,6 +21,8 @@ on:
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-recursion.py
+      - scripts/check-ghidra-relative-reloc.py
+      - tests/fixtures/ghidra_relative_reloc.S
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
       - scripts/check-ghidra-frame-holdout.py
@@ -70,6 +72,8 @@ on:
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-recursion.py
+      - scripts/check-ghidra-relative-reloc.py
+      - tests/fixtures/ghidra_relative_reloc.S
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
       - scripts/check-ghidra-frame-holdout.py
@@ -207,6 +211,12 @@ jobs:
         run: |
           python3 scripts/check-ghidra-recursion.py \
             --output-dir "$RUNNER_TEMP/ghidra-recursion"
+      - name: Resolve a disjoint PIE RELATIVE relocation for Rust execution
+        env:
+          HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/check-ghidra-relative-reloc.py \
+            --output-dir "$RUNNER_TEMP/ghidra-relative-reloc"
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -380,6 +390,7 @@ jobs:
             ${{ runner.temp }}/hydir-password-llvm.json
             ${{ runner.temp }}/hydir-password-process-llvm.json
             ${{ runner.temp }}/ghidra-recursion/report.json
+            ${{ runner.temp }}/ghidra-relative-reloc/report.json
 
   differential-fixtures:
     runs-on: ubuntu-24.04
