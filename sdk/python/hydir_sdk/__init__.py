@@ -24,6 +24,7 @@ from .ghidra import LocalGhidra
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_PCODE_SEED_BYTES = 1024 * 1024
+MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES = 4096
 MAX_ANALYSIS_MODEL_BYTES = 16 * 1024 * 1024
 MAX_INPUT_SPEC_BYTES = 2 * 1024 * 1024
 FRIDA_TRACE_MEDIA_TYPE = "application/vnd.hydir.dynamic-trace+json;version=2"
@@ -270,6 +271,7 @@ class HydirClient:
         input_index: int | None = None,
         selected_function_entry: int | str | None = None,
         automatic: bool = False,
+        allocations: bytes | str | os.PathLike[str] | None = None,
     ) -> dict:
         """Analyze a Ghidra export bound to this project's uploaded binary.
 
@@ -288,14 +290,17 @@ class HydirClient:
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
             "llvm-cfg-image": ("application/vnd.hydir.pcode-cfg-llvm+json;version=3", 3),
             "llvm-cfg-process": ("application/vnd.hydir.pcode-cfg-llvm+json;version=4", 4),
+            "llvm-cfg-process-allocated": ("application/vnd.hydir.pcode-cfg-llvm+json;version=5", 5),
             "process-memory": ("application/vnd.hydir.pcode-process-memory+json;version=1", 1),
             "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
             "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
         if stage not in media_types:
             raise ValueError("Unsupported Ghidra snapshot artifact stage")
-        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-process", "llvm-cfg-simplified"}:
+        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-process", "llvm-cfg-process-allocated", "llvm-cfg-simplified"}:
             raise ValueError("Start address is supported only for CFG LLVM stages")
+        if (stage == "llvm-cfg-process-allocated") != (allocations is not None):
+            raise ValueError("Allocated process LLVM requires allocations; other stages must omit them")
         if stage == "slice":
             if instruction_index is None or operation_index is None:
                 raise ValueError("Slice requires instruction and operation indices")
@@ -341,6 +346,17 @@ class HydirClient:
             raise ValueError("Ghidra snapshot must be 1..=16 MiB")
         if automatic and content:
             raise ValueError("Automatic Ghidra analysis does not accept a caller snapshot")
+        allocation_json = b""
+        if allocations is not None:
+            if isinstance(allocations, bytes):
+                allocation_json = allocations
+            else:
+                path = Path(allocations)
+                if path.stat().st_size > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                    raise ValueError("Process allocation declaration exceeds 4 KiB")
+                allocation_json = path.read_bytes()
+            if not 1 <= len(allocation_json) <= MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                raise ValueError("Process allocation declaration must be 1..=4096 bytes")
         request = proto_v3.GhidraSnapshotArtifactRequest(
             project_id=project_id,
             expected_revision=revision,
@@ -349,6 +365,7 @@ class HydirClient:
             start_address=start_address or "",
             selected_function_entry=selected_function_entry or "",
             automatic=automatic,
+            allocation_json=allocation_json,
         )
         if stage == "slice":
             request.instruction_index = instruction_index
@@ -381,7 +398,7 @@ class HydirClient:
                        for character in image["contents_sha256"])
             ):
                 raise RuntimeError("Image-backed CFG LLVM lacks a valid ELF image binding")
-        if stage == "llvm-cfg-process":
+        if stage in {"llvm-cfg-process", "llvm-cfg-process-allocated"}:
             process = artifact.get("process_memory")
             if (
                 not isinstance(process, dict)
@@ -399,6 +416,27 @@ class HydirClient:
                 or any(c not in "0123456789abcdef" for c in process["contents_sha256"])
             ):
                 raise RuntimeError("Process-backed CFG LLVM lacks a valid ELF memory binding")
+        if stage == "llvm-cfg-process-allocated":
+            declared = artifact.get("allocations")
+            regions = declared.get("regions") if isinstance(declared, dict) else None
+            requested = json.loads(allocation_json)
+            if (
+                not isinstance(declared, dict)
+                or declared.get("schema_version") != 1
+                or declared.get("binary_sha256") != artifact.get("binary_sha256")
+                or not isinstance(declared.get("snapshot_layout_sha256"), str)
+                or len(declared["snapshot_layout_sha256"]) != 64
+                or not isinstance(regions, list)
+                or len(regions) > 2
+                or not isinstance(requested, dict)
+                or requested.get("schema_version") != 1
+                or not isinstance(requested.get("regions"), list)
+                or sorted(json.dumps(region, sort_keys=True) for region in regions)
+                   != sorted(json.dumps(region, sort_keys=True)
+                             for region in requested["regions"])
+                or not str(artifact.get("state_abi", "")).startswith("hydir-pcode-cfg-state-v5:")
+            ):
+                raise RuntimeError("Allocated process LLVM lacks a valid bound allocation contract")
         if stage == "process-memory":
             byte_values = artifact.get("bytes")
             masks = [artifact.get(key) for key in ("known", "mapped", "writable")]
@@ -496,6 +534,7 @@ class HydirClient:
         instruction_index: int | None = None,
         operation_index: int | None = None,
         input_index: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
     ) -> dict:
         """Analyze the project's uploaded ELF with managed headless Ghidra."""
         return self.analyze_ghidra_snapshot(
@@ -506,6 +545,7 @@ class HydirClient:
             operation_index=operation_index,
             input_index=input_index,
             automatic=True,
+            allocations=allocations,
         )
 
     def trace_ghidra_calls(

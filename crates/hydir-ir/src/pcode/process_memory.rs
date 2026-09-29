@@ -15,9 +15,146 @@ use std::collections::BTreeSet;
 
 pub const PCODE_ELF_PROCESS_MEMORY_VERSION: u32 = 1;
 pub const PCODE_ELF_PROCESS_MEMORY_MAX_BYTES: usize = 1_048_576;
+pub const PCODE_PROCESS_ALLOCATIONS_VERSION: u32 = 1;
+pub const PCODE_PROCESS_ALLOCATION_MAX_BYTES: u64 = 1_048_576;
+pub const MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES: usize = 4096;
 const MAX_LOAD_SEGMENTS: usize = 4096;
 const MAX_REGIONS: usize = 8192;
 const MAX_RELOCATIONS: usize = 65_536;
+
+/// A caller-declared allocation, not evidence that an operating system made
+/// the allocation. The half-open range starts at `base` and has `byte_len`
+/// bytes. Allocation alone never establishes the values of those bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PcodeProcessAllocationKind {
+    Stack,
+    Heap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeProcessAllocation {
+    pub kind: PcodeProcessAllocationKind,
+    pub space: String,
+    pub base: u64,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeProcessAllocations {
+    schema_version: u32,
+    binary_sha256: String,
+    snapshot_layout_sha256: String,
+    regions: Vec<PcodeProcessAllocation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredAllocations {
+    schema_version: u32,
+    regions: Vec<PcodeProcessAllocation>,
+}
+
+impl PcodeProcessAllocations {
+    /// Parse the caller's small declaration and bind it to the verified ELF
+    /// process image. Digest and layout identity are derived, not trusted from
+    /// caller JSON. Seed values are validated separately by strict execution.
+    pub fn parse_declared(
+        json: &[u8],
+        snapshot: &GhidraSnapshot,
+        process: &PcodeElfProcessMemory,
+    ) -> Result<Self, String> {
+        if json.is_empty() || json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+            return Err("process allocation declaration is empty or exceeds 4 KiB".into());
+        }
+        let declaration: DeclaredAllocations =
+            serde_json::from_slice(json).map_err(|error| error.to_string())?;
+        if declaration.schema_version != PCODE_PROCESS_ALLOCATIONS_VERSION {
+            return Err("unsupported process allocation declaration version".into());
+        }
+        Self::new(snapshot, process, declaration.regions)
+    }
+
+    pub fn new(
+        snapshot: &GhidraSnapshot,
+        process: &PcodeElfProcessMemory,
+        mut regions: Vec<PcodeProcessAllocation>,
+    ) -> Result<Self, String> {
+        process.validate_for_snapshot(snapshot)?;
+        regions.sort_by_key(|region| region.kind as u8);
+        let contract = Self {
+            schema_version: PCODE_PROCESS_ALLOCATIONS_VERSION,
+            binary_sha256: process.binary_sha256.clone(),
+            snapshot_layout_sha256: snapshot_layout_sha256(snapshot)?,
+            regions,
+        };
+        contract.validate_for(snapshot, process)?;
+        Ok(contract)
+    }
+
+    pub fn regions(&self) -> &[PcodeProcessAllocation] {
+        &self.regions
+    }
+
+    pub fn validate_for(
+        &self,
+        snapshot: &GhidraSnapshot,
+        process: &PcodeElfProcessMemory,
+    ) -> Result<(), String> {
+        process.validate_for_snapshot(snapshot)?;
+        if self.schema_version != PCODE_PROCESS_ALLOCATIONS_VERSION
+            || self.binary_sha256 != process.binary_sha256
+            || self.snapshot_layout_sha256 != snapshot_layout_sha256(snapshot)?
+            || self.regions.len() > 2
+        {
+            return Err("process allocations disagree with the ELF or Ghidra snapshot".into());
+        }
+        let process_end = process
+            .base
+            .checked_add(process.bytes.len() as u64)
+            .ok_or("ELF process span overflows")?;
+        let mut total = 0u64;
+        let mut seen = BTreeSet::new();
+        for region in &self.regions {
+            if !seen.insert(region.kind as u8)
+                || region.space != process.space
+                || region.byte_len == 0
+            {
+                return Err("process allocation kind, space, or size is invalid".into());
+            }
+            let end = region
+                .base
+                .checked_add(region.byte_len)
+                .ok_or("process allocation address overflows")?;
+            total = total
+                .checked_add(region.byte_len)
+                .ok_or("process allocation size overflows")?;
+            if total > PCODE_PROCESS_ALLOCATION_MAX_BYTES
+                || (region.base < process_end && process.base < end)
+            {
+                return Err("process allocation exceeds budget or overlaps the ELF span".into());
+            }
+        }
+        if self.regions.len() == 2 {
+            let a = &self.regions[0];
+            let b = &self.regions[1];
+            if a.base < b.base + b.byte_len && b.base < a.base + a.byte_len {
+                return Err("stack and heap allocations overlap".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, space: &str, address: u64) -> bool {
+        self.regions.iter().any(|region| {
+            region.space == space
+                && address >= region.base
+                && address - region.base < region.byte_len
+        })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -544,6 +681,138 @@ mod tests {
             snapshot
                 .execute_concrete_path_with_process_memory(&seed, &memory, None, 4, 4,)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn strict_stack_boundary_rejects_crossing_store_without_partial_write() {
+        let (binary, mut snapshot) = fixture();
+        let process = PcodeElfProcessMemory::from_elf(&binary, &snapshot, 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshot,
+            &process,
+            vec![
+                PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Stack,
+                    space: "ram".into(),
+                    base: 0x700000,
+                    byte_len: 16,
+                },
+                PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Heap,
+                    space: "ram".into(),
+                    base: 0x800000,
+                    byte_len: 16,
+                },
+            ],
+        )
+        .unwrap();
+        let instruction = &mut snapshot.selected_function.instructions[0];
+        instruction.pcode.truncate(1);
+        let operation = &mut instruction.pcode[0];
+        operation.opcode = 3;
+        operation.mnemonic = "STORE".into();
+        operation.inputs = vec![
+            node("const", "0x1b1", 4),
+            node("const", "0x70000f", 8),
+            node("const", "0xbeef", 2),
+        ];
+        operation.output = None;
+        let source = operation.source_address.clone();
+        let mut seed = PcodeConcreteState::default();
+        seed.write_memory("ram", 0x70000f, 1, 0xaa).unwrap();
+        let trace = snapshot
+            .execute_concrete_path_with_allocations(&seed, &process, &allocations, None, 1, 4)
+            .unwrap();
+        assert!(matches!(
+            trace.stop,
+            PcodePathStop::EffectBoundary {
+                boundary: PcodeExecutionStop::MemoryBoundary {
+                    source: ref stopped,
+                    reason: PcodeMemoryBoundaryKind::UnmappedWrite,
+                    ..
+                }
+            } if stopped.source_address == source
+        ));
+        assert_eq!(
+            trace.final_state.read_memory("ram", 0x70000f, 1).unwrap(),
+            Some(0xaa)
+        );
+        assert_eq!(
+            trace.final_state.read_memory("ram", 0x700010, 1).unwrap(),
+            None
+        );
+
+        snapshot.selected_function.instructions[0].pcode[0].inputs[1].offset = "0x70000e".into();
+        let trace = snapshot
+            .execute_concrete_path_with_allocations(&seed, &process, &allocations, None, 1, 4)
+            .unwrap();
+        assert_eq!(
+            trace.final_state.read_memory("ram", 0x70000e, 2).unwrap(),
+            Some(0xbeef)
+        );
+
+        seed.write_memory("ram", 0x900000, 1, 0xff).unwrap();
+        assert!(
+            snapshot
+                .execute_concrete_path_with_allocations(&seed, &process, &allocations, None, 1, 4)
+                .unwrap_err()
+                .contains("no declared allocation")
+        );
+    }
+
+    #[test]
+    fn declared_allocations_are_bounded_and_bound_to_the_process_layout() {
+        let (binary, snapshot) = fixture();
+        let process = PcodeElfProcessMemory::from_elf(&binary, &snapshot, 64 * 1024).unwrap();
+        let declaration = serde_json::json!({
+            "schema_version": 1,
+            "regions": [
+                {"kind":"stack", "space":"ram", "base":7340032, "byte_len":16},
+                {"kind":"heap", "space":"ram", "base":8388608, "byte_len":16}
+            ]
+        });
+        let parsed = PcodeProcessAllocations::parse_declared(
+            &serde_json::to_vec(&declaration).unwrap(),
+            &snapshot,
+            &process,
+        )
+        .unwrap();
+        assert!(parsed.validate_for(&snapshot, &process).is_ok());
+        assert!(parsed.contains("ram", 0x70000f));
+        assert!(!parsed.contains("ram", 0x700010));
+        let mut invalid = declaration.clone();
+        invalid["regions"][1]["base"] = serde_json::json!(0x700008);
+        assert!(
+            PcodeProcessAllocations::parse_declared(
+                &serde_json::to_vec(&invalid).unwrap(),
+                &snapshot,
+                &process,
+            )
+            .unwrap_err()
+            .contains("overlap")
+        );
+        invalid = declaration.clone();
+        invalid["regions"][0]["base"] = serde_json::json!(process.base());
+        assert!(
+            PcodeProcessAllocations::parse_declared(
+                &serde_json::to_vec(&invalid).unwrap(),
+                &snapshot,
+                &process,
+            )
+            .unwrap_err()
+            .contains("ELF span")
+        );
+        invalid = declaration;
+        invalid["regions"][0]["byte_len"] =
+            serde_json::json!(PCODE_PROCESS_ALLOCATION_MAX_BYTES + 1);
+        assert!(
+            PcodeProcessAllocations::parse_declared(
+                &serde_json::to_vec(&invalid).unwrap(),
+                &snapshot,
+                &process,
+            )
+            .is_err()
         );
     }
 }

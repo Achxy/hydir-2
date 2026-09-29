@@ -33,9 +33,10 @@ use hydir_decompile::{
     PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, PcodeObservedPathComparison,
     PcodeSimplifiedCfgLlvmArtifact, PcodeStandalonePrefixArtifact, compare_pcode_observed_path,
     decompile_function_at, decompile_symbol, discover_functions, emit_pcode_cfg_llvm,
-    emit_pcode_cfg_llvm_with_image, emit_pcode_cfg_llvm_with_process_memory,
-    emit_pcode_exact_operation_llvm, emit_pcode_simplified_cfg_llvm,
-    emit_pcode_standalone_prefix_llvm, frida_entry_pcode_seed, measure_native_coverage,
+    emit_pcode_cfg_llvm_with_allocations, emit_pcode_cfg_llvm_with_image,
+    emit_pcode_cfg_llvm_with_process_memory, emit_pcode_exact_operation_llvm,
+    emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, frida_entry_pcode_seed,
+    measure_native_coverage,
 };
 use hydir_execution::{
     AnalysisRecipe, DynamicTrace, MAX_ANALYSIS_RECIPE_JSON_BYTES, MAX_INPUT_SPEC_BYTES, StopPoint,
@@ -51,12 +52,12 @@ use hydir_hlc::{
 };
 use hydir_ir::pcode::{
     GhidraDataTypeEvidence, GhidraDataTypeKind, GhidraHighVarnodeEvidence, GhidraSnapshot,
-    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
-    PcodeAddress, PcodeBackwardSlice, PcodeCapabilityReport, PcodeCoverageReport, PcodeEffect,
-    PcodeElfProcessMemory, PcodeInterproceduralTrace, PcodePathDestination, PcodePathEvent,
-    PcodePathStop, PcodePathTrace, PcodeReadOnlyElfImage, PcodeSemanticFunctionIr,
-    PcodeSimplificationArtifact, PcodeSliceTarget, PcodeStateFunctionIr, PcodeVarnode,
-    parse_ghidra_snapshot, parse_pcode_seed,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES, MAX_PCODE_SEED_BYTES,
+    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeAddress, PcodeBackwardSlice, PcodeCapabilityReport,
+    PcodeCoverageReport, PcodeEffect, PcodeElfProcessMemory, PcodeInterproceduralTrace,
+    PcodePathDestination, PcodePathEvent, PcodePathStop, PcodePathTrace, PcodeProcessAllocations,
+    PcodeReadOnlyElfImage, PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeSliceTarget,
+    PcodeStateFunctionIr, PcodeVarnode, parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_ir::{
     Cir, FunctionEvidenceState, FunctionIndex, FunctionIr, IndexedFunction, MachineFunctionIr,
@@ -192,6 +193,7 @@ enum Task {
         seed_json: String,
         start_text: String,
         memory_mode: String,
+        allocation_json: String,
     },
     TraceGhidraCalls {
         binary: PathBuf,
@@ -2711,10 +2713,32 @@ fn trace_ghidra_path(
     start_text: &str,
     binary: Option<&[u8]>,
     memory_mode: &str,
+    allocation_json: &str,
 ) -> Result<PcodePathTrace, String> {
     let initial = parse_pcode_seed(seed_json.as_bytes(), snapshot)?;
     let start = ghidra_trace_start(snapshot, start_text)?;
     match memory_mode {
+        "allocated" => {
+            let binary = binary.ok_or("declared process allocations need the local ELF bytes")?;
+            let memory = PcodeElfProcessMemory::from_elf(
+                binary,
+                snapshot,
+                PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+            )?;
+            let allocations = PcodeProcessAllocations::parse_declared(
+                allocation_json.as_bytes(),
+                snapshot,
+                &memory,
+            )?;
+            snapshot.execute_concrete_path_with_allocations(
+                &initial,
+                &memory,
+                &allocations,
+                Some(&start),
+                4096,
+                1024,
+            )
+        }
         "process" => {
             let binary = binary.ok_or("process memory needs the local ELF bytes")?;
             let memory = PcodeElfProcessMemory::from_elf(
@@ -2773,6 +2797,21 @@ fn emit_ghidra_process_cfg_llvm(
     let memory =
         PcodeElfProcessMemory::from_elf(&binary, snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
     emit_pcode_cfg_llvm_with_process_memory(snapshot, Some(&start), &memory)
+}
+
+fn emit_ghidra_allocated_cfg_llvm(
+    snapshot: &GhidraSnapshot,
+    start_text: &str,
+    binary_path: &Path,
+    allocation_json: &str,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    let start = ghidra_trace_start(snapshot, start_text)?;
+    let binary = bounded_read(binary_path)?;
+    let memory =
+        PcodeElfProcessMemory::from_elf(&binary, snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let allocations =
+        PcodeProcessAllocations::parse_declared(allocation_json.as_bytes(), snapshot, &memory)?;
+    emit_pcode_cfg_llvm_with_allocations(snapshot, Some(&start), &memory, &allocations)
 }
 
 /// Translate Ghidra's imported RAM image back to linked ELF virtual addresses.
@@ -3275,12 +3314,15 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 seed_json,
                 start_text,
                 memory_mode,
+                allocation_json,
             } => {
                 let binary = match &source {
                     Source::Local(bytes) => Some(bytes.as_slice()),
                     _ => None,
                 };
-                let result = trace_ghidra_path(&snapshot, &seed_json, &start_text, binary, &memory_mode);
+                let result = trace_ghidra_path(
+                    &snapshot, &seed_json, &start_text, binary, &memory_mode, &allocation_json,
+                );
                 Event::GhidraPathTraced {
                     binary_sha256: snapshot.binary_sha256.clone(),
                     function: snapshot.selected_function.entry.clone(),
@@ -4907,6 +4949,7 @@ struct AnalystApp {
     ghidra_trace_seed_json: String,
     ghidra_trace_start: String,
     ghidra_trace_memory_mode: String,
+    ghidra_allocation_json: String,
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
     ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
@@ -5069,6 +5112,7 @@ impl AnalystApp {
             ghidra_trace_seed_json: String::new(),
             ghidra_trace_start: String::new(),
             ghidra_trace_memory_mode: "readonly".to_owned(),
+            ghidra_allocation_json: "{\"schema_version\":1,\"regions\":[]}".to_owned(),
             ghidra_path_trace: None,
             ghidra_path_lines: Vec::new(),
             ghidra_call_trace: None,
@@ -8629,12 +8673,30 @@ impl AnalystApp {
                         ui.selectable_value(&mut self.ghidra_trace_memory_mode,
                             "process".to_owned(), "ELF writable data + .bss + seed");
                         ui.selectable_value(&mut self.ghidra_trace_memory_mode,
+                            "allocated".to_owned(), "ELF + declared stack/heap");
+                        ui.selectable_value(&mut self.ghidra_trace_memory_mode,
                             "seed".to_owned(), "Seed only");
                     });
                 if self.ghidra_trace_memory_mode != prior_memory_mode {
                     self.ghidra_path_trace = None;
                     self.ghidra_path_lines.clear();
                     self.frida_path_comparison = None;
+                    self.ghidra_llvm_image_cfg = None;
+                }
+                if self.ghidra_trace_memory_mode == "allocated" {
+                    ui.label(RichText::new("Allocation declaration v1 · at most one stack and one heap range. Seed bytes give initial values; declaring a range alone does not make bytes known.")
+                        .size(11.0).color(MUTED));
+                    if ui.add(egui::TextEdit::multiline(&mut self.ghidra_allocation_json)
+                        .code_editor().desired_rows(4).desired_width(f32::INFINITY)).changed() {
+                        self.ghidra_path_trace = None;
+                        self.ghidra_path_lines.clear();
+                        self.frida_path_comparison = None;
+                        self.ghidra_llvm_image_cfg = None;
+                    }
+                    if self.ghidra_allocation_json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+                        ui.label(RichText::new("Allocation JSON exceeds the 4 KiB limit.")
+                            .size(11.0).color(BAD));
+                    }
                 }
                 if ui.add_enabled(!self.busy && !self.ghidra_busy, egui::Button::new("Trace path")).clicked() {
                     self.ghidra_path_trace = None;
@@ -8645,6 +8707,7 @@ impl AnalystApp {
                         seed_json: self.ghidra_trace_seed_json.clone(),
                         start_text: self.ghidra_trace_start.clone(),
                         memory_mode: self.ghidra_trace_memory_mode.clone(),
+                        allocation_json: self.ghidra_allocation_json.clone(),
                     });
                 }
                 match &self.ghidra_path_trace {
@@ -9495,6 +9558,14 @@ impl AnalystApp {
                             path,
                         ));
                     }
+                    if ui.button("Generate allocated CFG LLVM").clicked() {
+                        self.ghidra_llvm_image_cfg = Some(emit_ghidra_allocated_cfg_llvm(
+                            snapshot,
+                            &self.ghidra_trace_start,
+                            path,
+                            &self.ghidra_allocation_json,
+                        ));
+                    }
                     match &self.ghidra_llvm_image_cfg {
                         Some(Ok(artifact)) => {
                             ui.label(RichText::new(format!(
@@ -9522,6 +9593,18 @@ impl AnalystApp {
                                     memory.unresolved_relocation_bytes,
                                     memory.contents_sha256,
                                 )).monospace().size(11.0).color(MUTED));
+                            }
+                            if let Some(allocations) = &artifact.allocations {
+                                ui.label(RichText::new(format!(
+                                    "Declared allocations: {} ranges; initial bytes stay unknown until seeded",
+                                    allocations.regions().len(),
+                                )).monospace().size(11.0).color(MUTED));
+                                for region in allocations.regions() {
+                                    ui.label(RichText::new(format!(
+                                        "{:?}: {} 0x{:x} + {} bytes",
+                                        region.kind, region.space, region.base, region.byte_len,
+                                    )).monospace().size(11.0).color(MUTED));
+                                }
                             }
                             egui::ScrollArea::vertical().id_salt("ghidra_llvm_image_cfg_stops")
                                 .max_height(130.0)
@@ -14064,6 +14147,7 @@ fn probe_ghidra_demo(binary: &Path, selector: Option<&str>) -> Result<String, St
             seed_json: seed_json.clone(),
             start_text: start_text.clone(),
             memory_mode: "readonly".to_owned(),
+            allocation_json: String::new(),
         };
         app.ghidra_trace_seed_json = seed_json;
         app.ghidra_trace_start = start_text;
@@ -14855,15 +14939,16 @@ mod tests {
         AnalystApp, COutputSource, Event, GhidraAddressMap, GraphNodeAction, GraphNodeTone,
         ModelEdit, ModelEditDraft, ModelEditTarget, ModelRenameTarget, NativeViewMode, Tab,
         WorkbenchGraphEdge, WorkbenchGraphNode, captured_code_elf_address,
-        emit_ghidra_image_cfg_llvm, emit_ghidra_process_cfg_llvm, ghidra_composite_evidence,
-        ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines, ghidra_trace_start,
-        high_pcode_varnode, indexed_function_action, ir_slice, local_region_artifacts,
-        native_function_excerpt, native_instruction_count, native_opaque_instruction_count,
-        parse_model_edit_draft, pcode_display_lines, pcode_line_target, pcode_state_lines,
-        persist_ghidra_snapshot, persist_local_model_edit, persist_local_model_rename,
-        prepare_model_rename, preview_patch_local, resized_console_height, run_ghidra_command,
-        save_render_smoke_png, selected_ghidra_trace_address, trace_ghidra_path,
-        valid_bearer_token, validate_endpoint, validate_remote_model_save, workbench_graph_layout,
+        emit_ghidra_allocated_cfg_llvm, emit_ghidra_image_cfg_llvm, emit_ghidra_process_cfg_llvm,
+        ghidra_composite_evidence, ghidra_readiness_copy, ghidra_seed_template, ghidra_trace_lines,
+        ghidra_trace_start, high_pcode_varnode, indexed_function_action, ir_slice,
+        local_region_artifacts, native_function_excerpt, native_instruction_count,
+        native_opaque_instruction_count, parse_model_edit_draft, pcode_display_lines,
+        pcode_line_target, pcode_state_lines, persist_ghidra_snapshot, persist_local_model_edit,
+        persist_local_model_rename, prepare_model_rename, preview_patch_local,
+        resized_console_height, run_ghidra_command, save_render_smoke_png,
+        selected_ghidra_trace_address, trace_ghidra_path, valid_bearer_token, validate_endpoint,
+        validate_remote_model_save, workbench_graph_layout,
     };
     use egui_graph::NodeId;
     use hydir_backend::{disassemble_elf, import_elf, lift_symbol};
@@ -15184,12 +15269,12 @@ mod tests {
             {"space": "ram", "byte_offset": "0x210108", "size": 4, "value": "0x53534543"}
         ]);
         let json = seed.to_string();
-        let plain = trace_ghidra_path(&snapshot, &json, "0x2016d0", None, "readonly").unwrap();
+        let plain = trace_ghidra_path(&snapshot, &json, "0x2016d0", None, "readonly", "").unwrap();
         assert!(!matches!(plain.stop, PcodePathStop::Return { .. }));
         let traced =
-            trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "readonly").unwrap();
+            trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "readonly", "").unwrap();
         let process =
-            trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "process").unwrap();
+            trace_ghidra_path(&snapshot, &json, "0x2016d0", Some(binary), "process", "").unwrap();
         assert!(matches!(traced.stop, PcodePathStop::Return { .. }));
         assert_eq!(process.final_state, traced.final_state);
         assert_eq!(
@@ -15237,11 +15322,20 @@ mod tests {
         assert!(memory.byte_len <= PCODE_ELF_PROCESS_MEMORY_MAX_BYTES);
         assert!(process.llvm_ir.contains("define "));
 
+        let declaration = r#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}"#;
+        let allocated =
+            emit_ghidra_allocated_cfg_llvm(&snapshot, "0x2016d0", &path, declaration).unwrap();
+        assert_eq!(allocated.schema_version, 5);
+        assert_eq!(allocated.binary_sha256, digest);
+        assert_eq!(allocated.allocations.as_ref().unwrap().regions().len(), 1);
+        assert!(allocated.llvm_ir.contains("define "));
+
         let mut changed = binary.to_vec();
         *changed.last_mut().unwrap() ^= 1;
         fs::write(&path, changed).unwrap();
         assert!(emit_ghidra_image_cfg_llvm(&snapshot, "0x2016d0", &path).is_err());
         assert!(emit_ghidra_process_cfg_llvm(&snapshot, "0x2016d0", &path).is_err());
+        assert!(emit_ghidra_allocated_cfg_llvm(&snapshot, "0x2016d0", &path, declaration).is_err());
     }
 
     #[test]

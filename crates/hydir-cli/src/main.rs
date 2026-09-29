@@ -31,9 +31,10 @@ use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES,
-    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfProcessMemory, PcodeReadOnlyElfImage,
-    PcodeSliceTarget, parse_ghidra_snapshot, parse_pcode_seed,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+    MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfProcessMemory,
+    PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget, parse_ghidra_snapshot,
+    parse_pcode_seed,
 };
 use hydir_model::{
     import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
@@ -78,6 +79,7 @@ Usage:
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
   hydirctl ghidra llvm-cfg-image <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra llvm-cfg-process <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-process.json>]
+  hydirctl ghidra llvm-cfg-allocated <binary> --allocations <allocations.json> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-allocated.json>]
   hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
   hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra assess <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
@@ -95,8 +97,9 @@ Usage:
   hydirctl ghidra-snapshot process-memory <binary> <snapshot.json> [--output <memory.json>]
   hydirctl ghidra-snapshot rediscover-calls <binary> <snapshot.json> <input.json> <trace.json> [--output <plan.json>]
   hydirctl ghidra-snapshot rediscover-apply <binary> <snapshot.json> <input.json> <trace.json> [--output <snapshot.json>]
-  hydirctl ghidra-snapshot compare-observed-path <binary> <snapshot.json> <input.json> <trace.json> <seed.json> [--memory readonly|process|seed] [--output <comparison.json>]
+  hydirctl ghidra-snapshot compare-observed-path <binary> <snapshot.json> <input.json> <trace.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--output <comparison.json>]
   hydirctl ghidra-snapshot llvm-cfg-process <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-process.json>]
+  hydirctl ghidra-snapshot llvm-cfg-allocated <binary> <snapshot.json> --allocations <allocations.json> [--start <0xaddress>] [--output <cfg-llvm-allocated.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
@@ -105,7 +108,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
-  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--memory readonly|process|seed] [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot assess <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
@@ -359,13 +362,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut output_path = None;
             let mut memory_mode = "readonly";
             let mut memory_option_seen = false;
+            let mut allocations_path = None;
             let mut options = args[7..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     "--memory"
                         if !memory_option_seen
-                            && matches!(pair[1].as_str(), "readonly" | "process" | "seed") =>
+                            && matches!(
+                                pair[1].as_str(),
+                                "readonly" | "process" | "allocated" | "seed"
+                            ) =>
                     {
                         memory_mode = pair[1].as_str();
                         memory_option_seen = true;
@@ -375,6 +385,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
+            }
+            if (memory_mode == "allocated") != allocations_path.is_some() {
+                return Err("allocated memory requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let digest = format!("{:x}", sha2::Sha256::digest(&binary));
@@ -395,6 +408,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &snapshot,
             )?;
             let path = match memory_mode {
+                "allocated" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    let allocations = PcodeProcessAllocations::parse_declared(
+                        &read_bounded_json(
+                            allocations_path.unwrap(),
+                            MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                        )?,
+                        &snapshot,
+                        &memory,
+                    )?;
+                    snapshot.execute_concrete_path_with_allocations(
+                        &seed,
+                        &memory,
+                        &allocations,
+                        None,
+                        4096,
+                        1024,
+                    )?
+                }
                 "process" => {
                     let memory = PcodeElfProcessMemory::from_elf(
                         &binary,
@@ -456,11 +492,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             if args.len() >= 4
                 && matches!(
                     args[1].as_str(),
-                    "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-process" | "llvm-cfg-simplified"
+                    "llvm-cfg"
+                        | "llvm-cfg-image"
+                        | "llvm-cfg-process"
+                        | "llvm-cfg-allocated"
+                        | "llvm-cfg-simplified"
                 ) =>
         {
             let mut start_address = None;
             let mut output_path = None;
+            let mut allocations_path = None;
             let mut options = args[4..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -468,11 +509,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                         start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
+            }
+            if (args[1] == "llvm-cfg-allocated") != allocations_path.is_some() {
+                return Err("allocated LLVM requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let digest = format!("{:x}", sha2::Sha256::digest(&binary));
@@ -509,6 +556,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                             &snapshot,
                             start.as_ref(),
                             &memory,
+                        )?,
+                    )?
+                }
+                "llvm-cfg-allocated" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    let allocations = PcodeProcessAllocations::parse_declared(
+                        &read_bounded_json(
+                            allocations_path.unwrap(),
+                            MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                        )?,
+                        &snapshot,
+                        &memory,
+                    )?;
+                    serde_json::to_vec_pretty(
+                        &hydir_decompile::emit_pcode_cfg_llvm_with_allocations(
+                            &snapshot,
+                            start.as_ref(),
+                            &memory,
+                            &allocations,
                         )?,
                     )?
                 }
@@ -624,6 +694,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut output_path = None;
             let mut memory_mode = "readonly";
             let mut memory_option_seen = false;
+            let mut allocations_path = None;
             let mut options = args[5..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -645,9 +716,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     "--memory"
                         if !memory_option_seen
-                            && matches!(pair[1].as_str(), "readonly" | "process" | "seed") =>
+                            && matches!(
+                                pair[1].as_str(),
+                                "readonly" | "process" | "allocated" | "seed"
+                            ) =>
                     {
                         memory_mode = pair[1].as_str();
                         memory_option_seen = true;
@@ -657,6 +734,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
+            }
+            if (memory_mode == "allocated") != allocations_path.is_some() {
+                return Err("allocated memory requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let digest = format!("{:x}", sha2::Sha256::digest(&binary));
@@ -673,6 +753,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                 offset: format!("0x{address:x}"),
             });
             let trace = match memory_mode {
+                "allocated" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    let allocations = PcodeProcessAllocations::parse_declared(
+                        &read_bounded_json(
+                            allocations_path.unwrap(),
+                            MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                        )?,
+                        &snapshot,
+                        &memory,
+                    )?;
+                    snapshot.execute_concrete_path_with_allocations(
+                        &initial,
+                        &memory,
+                        &allocations,
+                        start.as_ref(),
+                        max_operations,
+                        max_visits,
+                    )?
+                }
                 "process" => {
                     let memory = PcodeElfProcessMemory::from_elf(
                         &binary,
@@ -877,11 +980,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra")
             if args.len() >= 3
-                && matches!(args[1].as_str(), "llvm-cfg-image" | "llvm-cfg-process") =>
+                && matches!(
+                    args[1].as_str(),
+                    "llvm-cfg-image" | "llvm-cfg-process" | "llvm-cfg-allocated"
+                ) =>
         {
             let mut selected = None;
             let mut start_address = None;
             let mut output_path = None;
+            let mut allocations_path = None;
             let mut options = args[3..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -894,11 +1001,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "--output" if output_path.is_none() && !pair[1].is_empty() => {
                         output_path = Some(pair[1].as_str());
                     }
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     _ => return Err("invalid automatic Ghidra image LLVM option".into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err("Ghidra image LLVM options require values".into());
+            }
+            if (args[1] == "llvm-cfg-allocated") != allocations_path.is_some() {
+                return Err("allocated LLVM requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let scratch = tempfile::tempdir()?;
@@ -911,7 +1024,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let artifact = if args[1] == "llvm-cfg-process" {
+            let artifact = if args[1] == "llvm-cfg-allocated" {
+                let memory = PcodeElfProcessMemory::from_elf(
+                    &binary,
+                    &snapshot,
+                    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                )?;
+                let allocations = PcodeProcessAllocations::parse_declared(
+                    &read_bounded_json(
+                        allocations_path.unwrap(),
+                        MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                    )?,
+                    &snapshot,
+                    &memory,
+                )?;
+                hydir_decompile::emit_pcode_cfg_llvm_with_allocations(
+                    &snapshot,
+                    start.as_ref(),
+                    &memory,
+                    &allocations,
+                )?
+            } else if args[1] == "llvm-cfg-process" {
                 let memory = PcodeElfProcessMemory::from_elf(
                     &binary,
                     &snapshot,

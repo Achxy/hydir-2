@@ -264,6 +264,37 @@ jobs:
           PY
           clang -x ir -c "$RUNNER_TEMP/hydir-password-process.ll" \
             -o "$RUNNER_TEMP/hydir-password-process.o"
+          printf '%s\n' '{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}' \
+            > "$RUNNER_TEMP/hydir-allocations.json"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-allocated \
+            tests/fixtures/hydir-password-gate-stripped.elf \
+            "$RUNNER_TEMP/hydir-password-snapshot.json" \
+            --allocations "$RUNNER_TEMP/hydir-allocations.json" \
+            --output "$RUNNER_TEMP/hydir-password-allocated-llvm.json"
+          python3 - "$RUNNER_TEMP/hydir-password-allocated-llvm.json" \
+            "$RUNNER_TEMP/hydir-password-allocated.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert artifact['schema_version'] == 5
+          assert artifact['allocations']['regions'] == [
+              {'kind': 'stack', 'space': 'ram', 'base': 7340032, 'byte_len': 4096}
+          ]
+          assert artifact['state_abi'].startswith('hydir-pcode-cfg-state-v5:')
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/hydir-password-allocated.ll" \
+            -o "$RUNNER_TEMP/hydir-password-allocated.o"
+      - name: Require Rust and compiled LLVM v5 allocation parity
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm
+          command -v opt
+          command -v lli
+          cargo test --locked -p hydir-decompile --lib \
+            allocated_process_v5_stack_boundary_matches_rust_without_partial_write -- --nocapture
       - name: Probe the Hydir desktop import path with the container worker
         env:
           HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-demo.sqlite

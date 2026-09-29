@@ -189,10 +189,13 @@ class LocalGhidra:
         seed: str | os.PathLike[str],
         *,
         memory: str = "readonly",
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Execute a bounded P-code path from a seed and compare observations."""
-        if memory not in {"readonly", "process", "seed"}:
-            raise ValueError("memory must be readonly, process, or seed")
+        if memory not in {"readonly", "process", "allocated", "seed"}:
+            raise ValueError("memory must be readonly, process, allocated, or seed")
+        if (memory == "allocated") != (allocations is not None):
+            raise ValueError("allocated memory requires an allocations file")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         input_path = Path(input_spec).resolve(strict=True)
@@ -200,11 +203,14 @@ class LocalGhidra:
         seed_path = Path(seed).resolve(strict=True)
         digest = self._digest(binary_path)
         self._snapshot(snapshot_path, digest)
-        data = json.loads(self._run(
+        args = [
             "ghidra-snapshot", "compare-observed-path", str(binary_path),
             str(snapshot_path), str(input_path), str(trace_path), str(seed_path),
             "--memory", memory,
-        ))
+        ]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
+        data = json.loads(self._run(*args))
         if (
             not isinstance(data, dict)
             or data.get("schema_version") != 1
@@ -257,6 +263,7 @@ class LocalGhidra:
         simplified: bool = False,
         image: bool = False,
         process: bool = False,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Emit bounded CFG-aware LLVM with explicit stop status and provenance.
 
@@ -266,17 +273,20 @@ class LocalGhidra:
         """
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("start must be a 64-bit address")
-        if sum((image, process, simplified)) > 1:
+        if sum((image, process, simplified, allocations is not None)) > 1:
             raise ValueError("LLVM modes cannot be combined")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         digest = self._digest(binary_path)
         self._snapshot(snapshot_path, digest)
         stage = (
+            "llvm-cfg-allocated" if allocations is not None else
             "llvm-cfg-process" if process else "llvm-cfg-image" if image
             else "llvm-cfg-simplified" if simplified else "llvm-cfg"
         )
         args = ["ghidra-snapshot", stage, str(binary_path), str(snapshot_path)]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
         if start is not None:
             args.extend(["--start", hex(start)])
         data = json.loads(self._run(*args))
@@ -289,6 +299,12 @@ class LocalGhidra:
             or not isinstance(data.get("process_memory"), dict)
         ):
             raise RuntimeError("Hydir process-backed CFG LLVM artifact has the wrong version")
+        if allocations is not None and (
+            data.get("schema_version") != 5
+            or not isinstance(data.get("process_memory"), dict)
+            or not isinstance(data.get("allocations"), dict)
+        ):
+            raise RuntimeError("Hydir allocated CFG LLVM artifact has the wrong version")
         return data
 
     def llvm_cfg_calls(
@@ -439,14 +455,17 @@ class LocalGhidra:
         max_operations: int = 4096,
         max_visits: int = 1024,
         memory: str = "readonly",
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Follow one bounded concrete path through selected Ghidra instructions."""
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("P-code start must be a 64-bit address")
         if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
             raise ValueError("P-code path budgets must be 0..262144")
-        if memory not in {"readonly", "process", "seed"}:
-            raise ValueError("P-code memory mode must be readonly, process, or seed")
+        if memory not in {"readonly", "process", "allocated", "seed"}:
+            raise ValueError("P-code memory mode must be readonly, process, allocated, or seed")
+        if (memory == "allocated") != (allocations is not None):
+            raise ValueError("allocated memory requires an allocations file")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
@@ -458,6 +477,8 @@ class LocalGhidra:
         ]
         if memory != "readonly":
             args.extend(["--memory", memory])
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
         if start is not None:
             args.extend(["--start", hex(start)])
         data = json.loads(self._run(*args))

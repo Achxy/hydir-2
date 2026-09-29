@@ -31,9 +31,9 @@ use hydir_core::{
 use hydir_decompile::{
     PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, assess_pcode_function,
     compare_pcode_observed_path, decompile_function_unit_at, decompile_indexed_function,
-    discover_functions, emit_pcode_interprocedural_cfg_llvm, export_function_ir_llvm,
-    lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
-    measure_native_coverage,
+    discover_functions, emit_pcode_cfg_llvm_with_allocations, emit_pcode_interprocedural_cfg_llvm,
+    export_function_ir_llvm, lift_machine_function_at, lower_cir, lower_function_ir,
+    lower_state_ir, measure_native_coverage,
 };
 use hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES;
 use hydir_execution::{
@@ -42,10 +42,11 @@ use hydir_execution::{
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
-    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
-    PcodeAddress, PcodeElfProcessMemory, PcodeInterproceduralTrace, PcodeReadOnlyElfImage,
-    PcodeSliceTarget, execute_concrete_call_path, execute_concrete_call_path_with_image,
-    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES, MAX_PCODE_SEED_BYTES,
+    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeAddress, PcodeElfProcessMemory,
+    PcodeInterproceduralTrace, PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget,
+    execute_concrete_call_path, execute_concrete_call_path_with_image, parse_ghidra_snapshot,
+    parse_pcode_seed, unloaded_call_target,
 };
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
@@ -110,6 +111,8 @@ const GHIDRA_CALL_IMAGE_MAGIC: &[u8; 4] = b"HCIM";
 const MAX_CALL_TRACE_IMAGE_INPUT: usize = MAX_CALL_TRACE_INPUT + MAX_BINARY_BYTES + 12;
 const GHIDRA_SNAPSHOT_IMAGE_MAGIC: &[u8; 4] = b"HSIM";
 const MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT: usize = MAX_GHIDRA_SNAPSHOT_BYTES + MAX_BINARY_BYTES + 12;
+const MAX_GHIDRA_ALLOCATED_PROCESS_INPUT: usize =
+    MAX_GHIDRA_SNAPSHOT_BYTES + MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES + MAX_BINARY_BYTES + 12;
 const MAX_GHIDRA_OBSERVATION_INPUT: usize = MAX_GHIDRA_SNAPSHOT_BYTES
     + MAX_INPUT_SPEC_BYTES
     + MAX_DYNAMIC_TRACE_JSON_BYTES
@@ -1871,6 +1874,7 @@ fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
         "native-artifact"
             | "ghidra-snapshot-artifact"
             | "ghidra-snapshot-image-artifact"
+            | "ghidra-allocated-process-artifact"
             | "ghidra-observation-artifact"
             | "ghidra-call-trace"
             | "ghidra-call-cfg-llvm"
@@ -2437,6 +2441,104 @@ fn unpack_ghidra_snapshot_image_input(bytes: &[u8]) -> Result<(&[u8], &[u8]), St
     Ok((snapshot, binary))
 }
 
+fn pack_ghidra_allocated_process_input(
+    snapshot: &[u8],
+    allocation: &[u8],
+    binary: &[u8],
+) -> Result<Vec<u8>, String> {
+    if snapshot.is_empty()
+        || snapshot.len() > MAX_GHIDRA_SNAPSHOT_BYTES
+        || allocation.is_empty()
+        || allocation.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES
+        || binary.is_empty()
+        || binary.len() > MAX_BINARY_BYTES
+    {
+        return Err("allocated process input is empty or exceeds its limit".to_owned());
+    }
+    let size = 12usize
+        .checked_add(snapshot.len())
+        .and_then(|size| size.checked_add(allocation.len()))
+        .and_then(|size| size.checked_add(binary.len()))
+        .ok_or("allocated process input length overflow")?;
+    if size > MAX_GHIDRA_ALLOCATED_PROCESS_INPUT {
+        return Err("allocated process input exceeds service limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(size);
+    for part in [snapshot, allocation, binary] {
+        bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    }
+    for part in [snapshot, allocation, binary] {
+        bytes.extend_from_slice(part);
+    }
+    Ok(bytes)
+}
+
+fn unpack_ghidra_allocated_process_input(bytes: &[u8]) -> Result<[&[u8]; 3], String> {
+    if bytes.len() < 12 || bytes.len() > MAX_GHIDRA_ALLOCATED_PROCESS_INPUT {
+        return Err("allocated process envelope exceeds service limit".to_owned());
+    }
+    let limits = [
+        MAX_GHIDRA_SNAPSHOT_BYTES,
+        MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+        MAX_BINARY_BYTES,
+    ];
+    let mut parts = [&[][..]; 3];
+    let mut cursor = 12usize;
+    for (index, part) in parts.iter_mut().enumerate() {
+        let offset = index * 4;
+        let size = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .map_err(|_| "invalid allocated process part size")?,
+        ) as usize;
+        if size == 0 || size > limits[index] {
+            return Err("allocated process part is empty or exceeds its limit".to_owned());
+        }
+        let end = cursor
+            .checked_add(size)
+            .ok_or("allocated process length overflow")?;
+        *part = bytes
+            .get(cursor..end)
+            .ok_or("allocated process part is truncated")?;
+        cursor = end;
+    }
+    if cursor != bytes.len() {
+        return Err("allocated process envelope has trailing bytes".to_owned());
+    }
+    Ok(parts)
+}
+
+fn ghidra_allocated_process_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraSnapshotArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid allocated process selector: {error}"))?;
+    if selector.stage != "llvm-cfg-process-allocated" {
+        return Err("allocated process worker requires LLVM v5 stage".to_owned());
+    }
+    validate_ghidra_start_address(&selector.stage, &selector.start_address)?;
+    validate_ghidra_slice_target(
+        &selector.stage,
+        selector.instruction_index,
+        selector.operation_index,
+        selector.input_index,
+    )?;
+    let [snapshot_bytes, allocation_bytes, binary] = unpack_ghidra_allocated_process_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("allocated process binary digest disagrees with selector".to_owned());
+    }
+    let snapshot = parse_ghidra_snapshot(snapshot_bytes, &selector.binary_sha256)?;
+    let process =
+        PcodeElfProcessMemory::from_elf(binary, &snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let allocations =
+        PcodeProcessAllocations::parse_declared(allocation_bytes, &snapshot, &process)?;
+    let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
+        space: snapshot.selected_function.entry.space.clone(),
+        offset: selector.start_address,
+    });
+    let artifact =
+        emit_pcode_cfg_llvm_with_allocations(&snapshot, start.as_ref(), &process, &allocations)?;
+    serde_json::to_vec(&artifact).map_err(|error| error.to_string())
+}
+
 fn pack_ghidra_observation_input(parts: [&[u8]; 5]) -> Result<Vec<u8>, String> {
     let limits = [
         MAX_GHIDRA_SNAPSHOT_BYTES,
@@ -2725,6 +2827,7 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
         "llvm-cfg-image" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=3"),
         "llvm-cfg-process" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=4"),
+        "llvm-cfg-process-allocated" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=5"),
         "process-memory" => Some("application/vnd.hydir.pcode-process-memory+json;version=1"),
         "llvm-cfg-simplified" => {
             Some("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1")
@@ -2763,7 +2866,11 @@ fn validate_ghidra_start_address(stage: &str, address: &str) -> Result<(), Strin
     }
     if !matches!(
         stage,
-        "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-process" | "llvm-cfg-simplified"
+        "llvm-cfg"
+            | "llvm-cfg-image"
+            | "llvm-cfg-process"
+            | "llvm-cfg-process-allocated"
+            | "llvm-cfg-simplified"
     ) {
         return Err("start address is supported only for CFG LLVM stages".to_owned());
     }
@@ -3550,6 +3657,9 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("ghidra-snapshot-image-artifact", Some(selector)) => {
             ghidra_snapshot_image_artifact(bytes, selector)
         }
+        ("ghidra-allocated-process-artifact", Some(selector)) => {
+            ghidra_allocated_process_artifact(bytes, selector)
+        }
         ("ghidra-observation-artifact", Some(selector)) => {
             ghidra_observation_artifact(bytes, selector)
         }
@@ -3806,6 +3916,7 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
         Some("ghidra-call-assessment") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-snapshot-image-artifact") => MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT,
+        Some("ghidra-allocated-process-artifact") => MAX_GHIDRA_ALLOCATED_PROCESS_INPUT,
         Some("ghidra-observation-artifact") => MAX_GHIDRA_OBSERVATION_INPUT,
         _ => MAX_BINARY_BYTES,
     };
@@ -5457,6 +5568,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             ghidra_function_assessment: true,
             frida_observation_jobs: cfg!(all(target_os = "linux", target_arch = "x86_64")),
             ghidra_observation_artifacts: true,
+            ghidra_process_allocations: true,
         }))
     }
 
@@ -5911,6 +6023,17 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             input.stage.as_str(),
             "llvm-cfg-image" | "llvm-cfg-process" | "process-memory"
         );
+        let allocated_stage = input.stage == "llvm-cfg-process-allocated";
+        if allocated_stage != !input.allocation_json.is_empty() {
+            return Err(Status::invalid_argument(
+                "allocated process LLVM requires allocation_json; other stages must omit it",
+            ));
+        }
+        if input.allocation_json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+            return Err(Status::resource_exhausted(
+                "process allocation declaration exceeds 4 KiB",
+            ));
+        }
         let automatic = input.automatic;
         if automatic && !input.snapshot_json.is_empty() {
             return Err(Status::invalid_argument(
@@ -5982,7 +6105,18 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         } else {
             input.snapshot_json
         };
-        let (action, worker_input) = if image_stage {
+        let (action, worker_input) = if allocated_stage {
+            let binary = self
+                .current_binary(&principal, &input.project_id, input.expected_revision)
+                .await?;
+            let envelope = pack_ghidra_allocated_process_input(
+                &snapshot_json,
+                &input.allocation_json,
+                &binary,
+            )
+            .map_err(Status::resource_exhausted)?;
+            ("ghidra-allocated-process-artifact", envelope)
+        } else if image_stage {
             let binary = self
                 .current_binary(&principal, &input.project_id, input.expected_revision)
                 .await?;
@@ -7263,6 +7397,7 @@ mod tests {
             input_index: None,
             selected_function_entry: "0x101320".to_owned(),
             automatic: true,
+            allocation_json: Vec::new(),
         };
         let result = HydirV3::analyze_ghidra_snapshot(&store, authorized(request.clone(), &token))
             .await
@@ -8242,6 +8377,7 @@ mod tests {
             input_index: None,
             selected_function_entry: String::new(),
             automatic: false,
+            allocation_json: Vec::new(),
         };
         let worker_key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, None);
         {
@@ -8832,6 +8968,7 @@ mod tests {
                 String::new()
             },
             automatic,
+            allocation_json: Vec::new(),
         };
 
         let v2 = HydirV3::analyze_ghidra_snapshot(
@@ -8944,6 +9081,82 @@ mod tests {
                     .contains("@hydir_process_initial_bytes")
             );
         }
+
+        let declared = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "regions": [
+                {"kind": "stack", "space": "ram", "base": 7340032, "byte_len": 16},
+                {"kind": "heap", "space": "ram", "base": 8388608, "byte_len": 16}
+            ]
+        }))
+        .unwrap();
+        let mut allocated = request("llvm-cfg-process-allocated", false);
+        allocated.allocation_json = declared.clone();
+        let v5 = HydirV3::analyze_ghidra_snapshot(&store, authorized(allocated.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            v5.media_type,
+            "application/vnd.hydir.pcode-cfg-llvm+json;version=5"
+        );
+        assert_eq!(v5.sha256, sha256(&v5.content));
+        let v5_json: serde_json::Value = serde_json::from_slice(&v5.content).unwrap();
+        assert_eq!(v5_json["schema_version"], 5);
+        assert_eq!(
+            v5_json["allocations"]["binary_sha256"],
+            uploaded.binary_sha256
+        );
+        assert_eq!(v5_json["allocations"]["regions"][0]["kind"], "stack");
+        assert!(
+            v5_json["state_abi"]
+                .as_str()
+                .unwrap()
+                .starts_with("hydir-pcode-cfg-state-v5:")
+        );
+        let stored = store
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: v5.sha256,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stored.content, v5.content);
+        let mut invalid = allocated.clone();
+        invalid.allocation_json = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "regions": [{"kind":"stack","space":"ram","base":2097152,"byte_len":16}]
+        }))
+        .unwrap();
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(invalid, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut wrong_stage = allocated.clone();
+        wrong_stage.stage = "llvm-cfg-process".into();
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(wrong_stage, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut stale_allocated = allocated;
+        stale_allocated.expected_revision = 0;
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(stale_allocated, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
 
         let mut stale = request("llvm-cfg-image", false);
         stale.expected_revision = 0;

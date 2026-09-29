@@ -18,8 +18,8 @@ use super::semantics::lower_operation;
 use super::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PCODE_SEMANTIC_IR_VERSION, PcodeAddress,
     PcodeEffect, PcodeElfProcessMemory, PcodeFunctionIr, PcodeOpaqueClass, PcodeOperation,
-    PcodeReadOnlyElfImage, PcodeSemanticFunctionIr, PcodeSemanticOperation, PcodeVarnode, hex_u64,
-    validate_ghidra_snapshot,
+    PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSemanticFunctionIr,
+    PcodeSemanticOperation, PcodeVarnode, hex_u64, validate_ghidra_snapshot,
 };
 use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -32,11 +32,60 @@ trait PcodeInitialMemory {
     fn byte(&self, space: &str, address: u64) -> Option<u8>;
     fn mapped(&self, space: &str, address: u64) -> bool;
     fn writable(&self, space: &str, address: u64) -> bool;
+    fn reject_unmapped_writes(&self) -> bool {
+        false
+    }
     fn validate_for(
         &self,
         snapshot: &GhidraSnapshot,
         state: &PcodeConcreteState,
     ) -> Result<(), String>;
+}
+
+struct PcodeAllocatedProcessMemory<'a> {
+    process: &'a PcodeElfProcessMemory,
+    allocations: &'a PcodeProcessAllocations,
+}
+
+impl PcodeInitialMemory for PcodeAllocatedProcessMemory<'_> {
+    fn byte(&self, space: &str, address: u64) -> Option<u8> {
+        self.process.initial_byte(space, address)
+    }
+
+    fn mapped(&self, space: &str, address: u64) -> bool {
+        self.process.is_mapped(space, address) || self.allocations.contains(space, address)
+    }
+
+    fn writable(&self, space: &str, address: u64) -> bool {
+        self.process.is_writable(space, address) || self.allocations.contains(space, address)
+    }
+
+    fn reject_unmapped_writes(&self) -> bool {
+        true
+    }
+
+    fn validate_for(
+        &self,
+        snapshot: &GhidraSnapshot,
+        state: &PcodeConcreteState,
+    ) -> Result<(), String> {
+        self.allocations.validate_for(snapshot, self.process)?;
+        for (space, bytes) in &state.memory_bytes {
+            for (&address, &value) in bytes {
+                if !self.mapped(space, address) {
+                    return Err(format!(
+                        "seed byte at {space}:0x{address:x} has no declared allocation or ELF mapping"
+                    ));
+                }
+                if !self.writable(space, address) && self.byte(space, address) != Some(value) {
+                    return Err(format!(
+                        "seed byte at {space}:0x{address:x} conflicts with read-only ELF memory"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PcodeInitialMemory for PcodeReadOnlyElfImage {
@@ -370,6 +419,7 @@ pub enum PcodeMemoryBoundaryKind {
     AddressOverflow,
     StateLimit,
     ReadOnlyImageWrite,
+    UnmappedWrite,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -951,6 +1001,19 @@ impl PcodeSemanticFunctionIr {
                         "STORE targets a byte in a binary read-only mapping",
                     ));
                 }
+                if image.is_some_and(|image| {
+                    image.reject_unmapped_writes()
+                        && (0..width)
+                            .any(|index| !image.mapped(&space.name, byte_offset + u64::from(index)))
+                }) {
+                    return Err(memory_boundary(
+                        source,
+                        Some(&space.name),
+                        Some(pointer_offset),
+                        PcodeMemoryBoundaryKind::UnmappedWrite,
+                        "STORE crosses an unmapped ELF, stack, or heap address",
+                    ));
+                }
                 let data = &source.inputs[2];
                 match state.read_varnode(data) {
                     Ok(Some(value)) => {
@@ -1207,6 +1270,30 @@ impl GhidraSnapshot {
         self.execute_concrete_path_inner(
             initial_state,
             Some(memory),
+            start,
+            max_operations,
+            max_instruction_visits,
+        )
+    }
+
+    /// Strict process execution with explicit, bounded stack and heap
+    /// allocations. Seed bytes outside ELF mappings and these ranges are
+    /// rejected; a STORE crossing any range boundary stops before writing.
+    pub fn execute_concrete_path_with_allocations(
+        &self,
+        initial_state: &PcodeConcreteState,
+        process: &PcodeElfProcessMemory,
+        allocations: &PcodeProcessAllocations,
+        start: Option<&PcodeAddress>,
+        max_operations: usize,
+        max_instruction_visits: usize,
+    ) -> Result<PcodePathTrace, String> {
+        self.execute_concrete_path_inner(
+            initial_state,
+            Some(&PcodeAllocatedProcessMemory {
+                process,
+                allocations,
+            }),
             start,
             max_operations,
             max_instruction_visits,

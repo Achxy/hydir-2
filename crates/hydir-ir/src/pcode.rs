@@ -40,7 +40,10 @@ pub use interprocedural::{
     unloaded_call_target,
 };
 pub use process_memory::{
-    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PCODE_ELF_PROCESS_MEMORY_VERSION, PcodeElfProcessMemory,
+    MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+    PCODE_ELF_PROCESS_MEMORY_VERSION, PCODE_PROCESS_ALLOCATION_MAX_BYTES,
+    PCODE_PROCESS_ALLOCATIONS_VERSION, PcodeElfProcessMemory, PcodeProcessAllocation,
+    PcodeProcessAllocationKind, PcodeProcessAllocations,
 };
 pub use seed::{MAX_PCODE_SEED_BYTES, PCODE_SEED_VERSION, parse_pcode_seed};
 pub use semantics::{

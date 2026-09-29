@@ -946,3 +946,52 @@ fn stripped_secure_equals_cli_emits_versioned_binary_bound_image_llvm() {
         .unwrap();
     assert!(!wrong_binary.status.success());
 }
+
+#[test]
+fn allocated_cfg_llvm_cli_binds_declaration_to_verified_elf() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/hydir-password-gate-stripped.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+    let allocations = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        allocations.path(),
+        br#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}"#,
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-allocated"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .arg("--allocations")
+        .arg(allocations.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(artifact["schema_version"], 5);
+    assert_eq!(
+        artifact["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()))
+    );
+    assert_eq!(artifact["allocations"]["regions"][0]["kind"], "stack");
+    assert_eq!(artifact["allocations"]["regions"][0]["base"], 7340032);
+    assert!(artifact["llvm_ir"].as_str().unwrap().contains("define i32"));
+
+    let changed = tempfile::NamedTempFile::new().unwrap();
+    let mut tampered = fs::read(&binary).unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    fs::write(changed.path(), tampered).unwrap();
+    let wrong_binary = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-allocated"])
+        .arg(changed.path())
+        .arg(&snapshot)
+        .arg("--allocations")
+        .arg(allocations.path())
+        .output()
+        .unwrap();
+    assert!(!wrong_binary.status.success());
+}

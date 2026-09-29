@@ -408,6 +408,78 @@ class ClientBoundaryTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 client.analyze_ghidra_snapshot("project", 4, snapshot.read_bytes(), "llvm-cfg")
 
+    def test_v3_allocated_process_llvm_requires_declared_ranges_and_v5_binding(self):
+        snapshot = b'{"schema_version":2}'
+        declaration = b'{"schema_version":1,"regions":[]}'
+        artifact = json.dumps({
+            "schema_version": 5, "binary_sha256": "a" * 64,
+            "process_memory": {
+                "space": "ram", "base": 0x200000, "byte_len": 2,
+                "known_byte_count": 2, "mapped_byte_count": 2,
+                "writable_byte_count": 1, "contents_sha256": "b" * 64,
+            },
+            "allocations": {
+                "schema_version": 1, "binary_sha256": "a" * 64,
+                "snapshot_layout_sha256": "c" * 64, "regions": [],
+            },
+            "state_abi": "hydir-pcode-cfg-state-v5: test",
+        }).encode()
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def call(method, request):
+                self.assertIs(method, client._stub_v3.AnalyzeGhidraSnapshot)
+                requests.append(request)
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(artifact).hexdigest(), content=artifact,
+                    media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=5",
+                    project_revision=4,
+                )
+
+            client._call = call
+            result = client.analyze_ghidra_snapshot(
+                "project", 4, snapshot, "llvm-cfg-process-allocated",
+                start_address=0x20137C, allocations=declaration,
+            )
+            self.assertEqual(result["allocations"]["schema_version"], 1)
+            self.assertEqual(requests[-1].allocation_json, declaration)
+            self.assertEqual(requests[-1].start_address, "0x20137c")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated"
+                )
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process", allocations=declaration
+                )
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated", allocations=b"x" * 4097
+                )
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(artifact).hexdigest(), content=artifact,
+                media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=4",
+                project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated", allocations=declaration
+                )
+            wrong = json.loads(artifact)
+            wrong["allocations"]["regions"] = [
+                {"kind": "stack", "space": "ram", "base": 7340032, "byte_len": 16}
+            ]
+            wrong_bytes = json.dumps(wrong).encode()
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(wrong_bytes).hexdigest(), content=wrong_bytes,
+                media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=5",
+                project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated", allocations=declaration
+                )
+
     def test_v3_observation_artifacts_are_revision_and_claim_checked(self):
         snapshot = b'{"schema_version":2}'
         input_spec = b'{"schema_version":1}'

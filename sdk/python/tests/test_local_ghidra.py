@@ -141,6 +141,18 @@ class LocalGhidraTests(unittest.TestCase):
         with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()):
             with self.assertRaises(RuntimeError):
                 self.client.llvm_cfg(self.binary, self.snapshot, process=True)
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated_artifact = {
+            **artifact, "schema_version": 5,
+            "process_memory": {"space": "ram"}, "allocations": {"regions": []},
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated_artifact).encode()) as run:
+            self.client.llvm_cfg(self.binary, self.snapshot, allocations=allocations)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-allocated"))
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        with self.assertRaises(ValueError):
+            self.client.llvm_cfg(self.binary, self.snapshot, process=True, allocations=allocations)
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, image=True, simplified=True)
         with self.assertRaises(ValueError):
@@ -199,6 +211,17 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[-2:], ("--memory", "readonly"))
         with self.assertRaises(ValueError):
             self.client.compare_observed_path(self.binary, self.snapshot, *paths, memory="unknown")
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        with patch.object(self.client, "_run", return_value=json.dumps(comparison).encode()) as run:
+            self.client.compare_observed_path(
+                self.binary, self.snapshot, *paths, memory="allocated", allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        with self.assertRaises(ValueError):
+            self.client.compare_observed_path(
+                self.binary, self.snapshot, *paths, memory="allocated",
+            )
         with patch.object(self.client, "_run", return_value=b"{}"):
             with self.assertRaises(RuntimeError):
                 self.client.compare_observed_path(self.binary, self.snapshot, *paths)
@@ -316,6 +339,17 @@ class LocalGhidraTests(unittest.TestCase):
         }).encode()) as run:
             self.client.trace_path(self.binary, self.snapshot, seed, memory="process")
         self.assertEqual(run.call_args.args[-2:], ("--memory", "process"))
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "events": [],
+        }).encode()) as run:
+            self.client.trace_path(
+                self.binary, self.snapshot, seed, memory="allocated", allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        with self.assertRaises(ValueError):
+            self.client.trace_path(self.binary, self.snapshot, seed, memory="allocated")
         with self.assertRaises(ValueError):
             self.client.trace_path(self.binary, self.snapshot, seed, memory="invented")
         with patch.object(self.client, "_run", return_value=json.dumps({

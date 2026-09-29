@@ -39,6 +39,20 @@ execution oracle.
 `LocalGhidra.llvm_cfg(binary, snapshot, process=True)` emits LLVM v4 with
 checked ELF process bytes, zero-filled tails, and writable globals. Its
 mapping and known-byte masks keep unresolved relocations explicit.
+For explicit stack or heap ranges, supply a small declaration file:
+
+```json
+{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}
+```
+
+`LocalGhidra.llvm_cfg(binary, snapshot, allocations="allocations.json")`
+emits LLVM v5. `trace_path(..., memory="allocated",
+allocations="allocations.json")` uses the same bounds in the Rust executor.
+Declaring a range does not initialize its bytes; put known input bytes in the
+seed. An access outside the ELF mappings and declared ranges stops explicitly.
+The service exposes the same v5 artifact through
+`analyze_ghidra_binary(project_id, revision, "llvm-cfg-process-allocated",
+allocations="allocations.json")`.
 `LocalGhidra.rediscover_calls(binary, snapshot, input_spec, trace)` returns
 bounded, byte-verified candidate targets from one observed input while
 retaining unresolved static call edges. Pass `apply=True` to reanalyze an
@@ -83,7 +97,8 @@ exported Ghidra snapshot as bytes or a file path to the v3 service. The
 project must already contain the same binary. The server checks the snapshot
 digest against that binary and runs a bounded worker. Supported stages are
 `snapshot`, `pcode`, `simplify`, `semantics`, `state`, `cfg`, `coverage`,
-`process-memory`, `llvm-cfg`, `llvm-cfg-image`, `llvm-cfg-process`, and `slice`. The
+`process-memory`, `llvm-cfg`, `llvm-cfg-image`, `llvm-cfg-process`,
+`llvm-cfg-process-allocated`, and `slice`. The
 `simplify` stage returns original and rewritten raw P-code with per-operation
 preconditions; its local bitvector identities do not claim native equivalence. For
 `llvm-cfg`, pass `start_address=0x...` to select a CFG entry. For `slice`, pass

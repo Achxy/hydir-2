@@ -416,16 +416,19 @@ pub fn runtime_status() -> GhidraRuntimeStatus {
         } else {
             "analyzeHeadless"
         });
-        let ready = executable.is_file();
+        let project_path = project_root("doctor");
+        let ready = executable.is_file() && project_path.is_ok();
         return GhidraRuntimeStatus {
             mode: "local",
             pinned_version: GHIDRA_VERSION,
             runtime_ready: ready,
             worker_image_cached: None,
-            detail: if ready {
-                "Ghidra executable found; version and output are checked during analysis".to_owned()
-            } else {
+            detail: if !executable.is_file() {
                 format!("HYDIR_GHIDRA_HOME lacks {}", executable.display())
+            } else if let Err(error) = project_path {
+                error
+            } else {
+                "Ghidra executable found; version and output are checked during analysis".to_owned()
             },
         };
     }

@@ -30,13 +30,15 @@ mod pcode_cfg_llvm;
 mod pcode_llvm;
 mod pcode_standalone;
 pub use pcode_cfg_llvm::{
-    PCODE_CFG_ELF_IMAGE_MAX_BYTES, PCODE_CFG_GUEST_RAM_MAX_BYTES, PCODE_CFG_IMAGE_LLVM_VERSION,
-    PCODE_CFG_LLVM_VERSION, PCODE_CFG_PROCESS_LLVM_VERSION, PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
+    PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION, PCODE_CFG_ELF_IMAGE_MAX_BYTES,
+    PCODE_CFG_GUEST_RAM_MAX_BYTES, PCODE_CFG_IMAGE_LLVM_VERSION, PCODE_CFG_LLVM_VERSION,
+    PCODE_CFG_PROCESS_LLVM_VERSION, PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
     PCODE_SIMPLIFIED_CFG_LLVM_VERSION, PcodeCfgLlvmArtifact, PcodeCfgLlvmImageBinding,
     PcodeCfgLlvmProcessBinding, PcodeCfgLlvmSourceOperation, PcodeCfgLlvmStatus,
     PcodeCfgLlvmStopSite, PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
-    emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_image, emit_pcode_cfg_llvm_with_process_memory,
-    emit_pcode_interprocedural_cfg_llvm, emit_pcode_simplified_cfg_llvm,
+    emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_allocations, emit_pcode_cfg_llvm_with_image,
+    emit_pcode_cfg_llvm_with_process_memory, emit_pcode_interprocedural_cfg_llvm,
+    emit_pcode_simplified_cfg_llvm,
 };
 pub use pcode_llvm::{
     PcodeLlvmPrefixArtifact, PcodeLlvmSourceOperation, emit_pcode_exact_operation_llvm,
