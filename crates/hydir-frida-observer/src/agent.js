@@ -1,11 +1,17 @@
 // Runs only in the staged target. Rust owns identity checks and artifact validation.
 const moduleBase = Process.mainModule.base;
 const selected = moduleBase.add(__OFFSET__);
+const traceFile = new File('/work/.hydir-agent-events', 'wb');
 const cap = __CAP__;
 let count = 0;
 let lost = 0;
 let depth = 0;
 let activeThread = 0;
+
+function record(value) {
+  traceFile.write(JSON.stringify(value) + '\n');
+  traceFile.flush();
+}
 
 function emit(payload) {
   emitBatch([payload]);
@@ -19,7 +25,7 @@ function emitBatch(payloads) {
     count++;
   }
   if (accepted.length !== 0)
-    console.log('HYDIR_BATCH:' + JSON.stringify(accepted));
+    record({ type: 'batch', events: accepted });
 }
 function witness(address) {
   const p = ptr(address);
@@ -30,7 +36,7 @@ function witness(address) {
   } catch (_) {}
   return { address: p.toString(), bytes: bytes };
 }
-console.log('HYDIR_META:' + JSON.stringify({ base: moduleBase.toString() }));
+record({ type: 'meta', base: moduleBase.toString() });
 Interceptor.attach(selected, {
   onEnter() {
     if (depth++ !== 0) return;
@@ -56,6 +62,6 @@ Interceptor.attach(selected, {
     Stalker.unfollow(activeThread);
     Stalker.flush();
     emit({ kind: 'exit', source: witness(selected), target: null });
-    console.log('HYDIR_DONE:' + JSON.stringify({ lost: lost }));
+    record({ type: 'done', lost: lost });
   }
 });

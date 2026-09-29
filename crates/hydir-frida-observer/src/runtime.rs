@@ -1,7 +1,4 @@
-use frida::{
-    DeviceManager, Frida, Message, ScriptHandler, ScriptOption, ScriptRuntime, SpawnOptions,
-    SpawnStdio,
-};
+use frida::{DeviceManager, Frida, ScriptOption, ScriptRuntime, SpawnOptions, SpawnStdio};
 use hydir_execution::{
     DYNAMIC_TRACE_VERSION, DynamicTrace, InputSpec, TraceBudget, TraceEvent, TraceEventKind,
     TraceStatus, TraceWitness, decode_hex, input_sha256, validate_dynamic_trace,
@@ -18,7 +15,6 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -50,66 +46,58 @@ struct RawEvent {
     target: Option<RawWitness>,
 }
 
-struct Handler(Arc<Mutex<Collector>>);
-
-impl ScriptHandler for Handler {
-    fn on_message(&mut self, message: Message, _data: Option<Vec<u8>>) {
-        let mut state = self.0.lock().expect("Frida collector lock poisoned");
-        match message {
-            Message::Log(log) => {
-                if let Some(json) = log.payload.strip_prefix("HYDIR_BATCH:") {
-                    match serde_json::from_str::<Vec<RawEvent>>(json) {
-                        Ok(batch) if batch.len() <= MAX_EVENTS => {
-                            for event in batch {
-                                if state.events.len() < MAX_EVENTS {
-                                    state.events.push(event);
-                                } else {
-                                    state.lost += 1;
-                                }
-                            }
-                        }
-                        _ => state
-                            .errors
-                            .push("invalid or oversized Frida event batch".into()),
-                    }
-                } else if let Some(json) = log.payload.strip_prefix("HYDIR_META:") {
-                    #[derive(Deserialize)]
-                    struct Meta {
-                        base: String,
-                    }
-                    match serde_json::from_str::<Meta>(json)
-                        .ok()
-                        .and_then(|m| parse_address(&m.base).ok())
-                    {
-                        Some(base) => state.base = Some(base),
-                        None => state.errors.push("invalid agent module base".into()),
-                    }
-                } else if let Some(json) = log.payload.strip_prefix("HYDIR_DONE:") {
-                    #[derive(Deserialize)]
-                    struct Done {
-                        lost: u64,
-                    }
-                    match serde_json::from_str::<Done>(json) {
-                        Ok(done) => {
-                            state.done = true;
-                            state.lost += done.lost;
-                        }
-                        Err(error) => state
-                            .errors
-                            .push(format!("invalid agent completion: {error}")),
+fn read_agent_events(path: &str) -> Result<Collector, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("Frida agent evidence missing: {error}"))?;
+    if metadata.len() > hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES as u64 {
+        return Err("Frida agent evidence exceeds 16 MiB".into());
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let content = std::str::from_utf8(&bytes).map_err(|_| "Frida agent evidence is not UTF-8")?;
+    let mut state = Collector::default();
+    for line in content.lines() {
+        if line.len() > 1024 * 1024 {
+            return Err("Frida agent event line exceeds 1 MiB".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|error| error.to_string())?;
+        match value.get("type").and_then(|value| value.as_str()) {
+            Some("meta") => {
+                state.base = value
+                    .get("base")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| parse_address(value).ok());
+            }
+            Some("batch") => {
+                let batch: Vec<RawEvent> = serde_json::from_value(
+                    value
+                        .get("events")
+                        .cloned()
+                        .ok_or("missing Frida event batch")?,
+                )
+                .map_err(|error| error.to_string())?;
+                if batch.len() > MAX_EVENTS {
+                    return Err("Frida event batch exceeds cap".into());
+                }
+                for event in batch {
+                    if state.events.len() < MAX_EVENTS {
+                        state.events.push(event);
+                    } else {
+                        state.lost += 1;
                     }
                 }
             }
-            Message::Error(error) => state
-                .errors
-                .push(format!("Frida agent: {}", error.description)),
-            Message::Other(value) => state
-                .errors
-                .push(format!("unexpected Frida message: {value}")),
-            Message::Send(_) => state.errors.push("unexpected Frida send message".into()),
+            Some("done") => {
+                state.done = true;
+                state.lost += value
+                    .get("lost")
+                    .and_then(|value| value.as_u64())
+                    .ok_or("invalid Frida loss count")?;
+            }
+            _ => return Err("unknown Frida agent record".into()),
         }
-        state.errors.truncate(16);
     }
+    Ok(state)
 }
 
 /// Observe a selected ELF address using a helper and target in the same
@@ -371,18 +359,11 @@ pub fn inside(args: &[String]) -> Result<(), String> {
     let result = (|| {
         let session = device.attach(pid).map_err(|error| error.to_string())?;
         stage(&stage_path, "target attached");
-        let mut script_options = ScriptOption::new()
-            .set_name("hydir-observer")
-            .set_runtime(ScriptRuntime::QJS);
-        let mut script = session
+        let mut script_options = ScriptOption::new().set_runtime(ScriptRuntime::QJS);
+        let script = session
             .create_script(&source, &mut script_options)
             .map_err(|error| error.to_string())?;
         stage(&stage_path, "script created");
-        let collector = Arc::new(Mutex::new(Collector::default()));
-        script
-            .handle_message(Handler(collector.clone()))
-            .map_err(|error| error.to_string())?;
-        stage(&stage_path, "message handler installed");
         script.load().map_err(|error| error.to_string())?;
         stage(&stage_path, "script loaded");
         device.resume(pid).map_err(|error| error.to_string())?;
@@ -394,7 +375,7 @@ pub fn inside(args: &[String]) -> Result<(), String> {
         let timed_out = !session.is_detached();
         stage(&stage_path, "target detached or timed out");
         thread::sleep(Duration::from_millis(50));
-        let state = collector.lock().map_err(|_| "collector lock poisoned")?;
+        let state = read_agent_events("/work/.hydir-agent-events")?;
         let base = state.base.ok_or("Frida agent did not report module base")?;
         let bias = base
             .checked_sub(image_base)
