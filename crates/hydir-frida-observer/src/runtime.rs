@@ -3,7 +3,7 @@ use frida::{
     SpawnStdio,
 };
 use hydir_execution::{
-    DYNAMIC_TRACE_VERSION, DynamicTrace, InputSpec, TraceBudget, TraceEvent, TraceEventKind,
+    DYNAMIC_TRACE_V2_VERSION, DynamicTrace, InputSpec, TraceBudget, TraceEvent, TraceEventKind,
     TraceStatus, TraceWitness, decode_hex, input_sha256, validate_dynamic_trace,
     validate_input_spec,
 };
@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     os::unix::{
@@ -132,6 +133,7 @@ struct RawEvent {
     thread_id: u32,
     source: RawWitness,
     target: Option<RawWitness>,
+    registers: Option<BTreeMap<String, String>>,
 }
 
 fn apply_agent_record(state: &mut Collector, value: Value) -> Result<(), String> {
@@ -534,6 +536,16 @@ pub fn inside(args: &[String]) -> Result<(), String> {
                     .as_ref()
                     .map(|value| normalize(&file, &elf, bias, value))
                     .transpose()?,
+                registers: raw
+                    .registers
+                    .as_ref()
+                    .map(|registers| {
+                        registers
+                            .iter()
+                            .map(|(name, value)| Ok((name.clone(), parse_register_value(value)?)))
+                            .collect::<Result<BTreeMap<_, _>, String>>()
+                    })
+                    .transpose()?,
             });
         }
         let mut diagnostics = state.errors.clone();
@@ -552,12 +564,12 @@ pub fn inside(args: &[String]) -> Result<(), String> {
             TraceStatus::Detached
         };
         let trace = DynamicTrace {
-            schema_version: DYNAMIC_TRACE_VERSION,
+            schema_version: DYNAMIC_TRACE_V2_VERSION,
             binary_sha256: format!("{:x}", Sha256::digest(&elf)),
             input_sha256: input_digest.clone(),
             selected_elf_vaddr: selected,
             ghidra_snapshot_sha256: None,
-            observer: "bubblewrap-frida-rust-message-v3".into(),
+            observer: "bubblewrap-frida-rust-message-v4".into(),
             frida_version: Frida::version().into(),
             agent_sha256: format!("{:x}", Sha256::digest(AGENT.as_bytes())),
             runtime_module_base: Some(base),
@@ -586,6 +598,16 @@ pub fn inside(args: &[String]) -> Result<(), String> {
 fn parse_address(value: &str) -> Result<u64, String> {
     u64::from_str_radix(value.trim_start_matches("0x"), 16)
         .map_err(|_| "invalid hex address".into())
+}
+
+fn parse_register_value(value: &str) -> Result<u64, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .ok_or("Frida register value lacks 0x prefix")?;
+    if digits.is_empty() || digits.len() > 16 {
+        return Err("Frida register value exceeds 64 bits".into());
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| "invalid Frida register value".into())
 }
 
 fn stage(label: &str) {

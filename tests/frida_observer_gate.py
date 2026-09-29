@@ -47,7 +47,7 @@ def run_one(binary, symbols, value, scratch):
     if observed.returncode != 0:
         raise AssertionError(f"isolated Frida observation failed: {observed.stderr}")
     trace = json.loads(observed.stdout)
-    if trace["observer"] != "bubblewrap-frida-rust-message-v3":
+    if trace["schema_version"] != 2 or trace["observer"] != "bubblewrap-frida-rust-message-v4":
         raise AssertionError("observer did not use the isolated Frida result pipe")
     if trace["status"] != "completed":
         raise AssertionError(f"trace incomplete: {trace['status']} {trace['diagnostics']}")
@@ -58,6 +58,12 @@ def run_one(binary, symbols, value, scratch):
     if bytes.fromhex(trace["stderr_hex"]) != native.stderr:
         raise AssertionError("observed stderr differs from uninstrumented native run")
     events = trace["events"]
+    entries = [event for event in events if event["kind"] == "entry"]
+    if not entries or any(
+        event.get("registers", {}).get("RIP") != event["source"]["runtime_address"]
+        or "RSP" not in event.get("registers", {}) for event in entries
+    ):
+        raise AssertionError("Frida did not capture a bound entry register context")
     if not any(event["kind"] == "entry" and
                event["source"]["elf_vaddr"] == symbols["hydir_select"] for event in events):
         raise AssertionError("selected entry was not normalized")

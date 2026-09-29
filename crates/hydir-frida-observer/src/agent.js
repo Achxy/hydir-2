@@ -34,6 +34,15 @@ function witness(address) {
   } catch (_) {}
   return { address: p.toString(), bytes: bytes };
 }
+function entryRegisters(context) {
+  const registers = { RIP: context.pc.toString(), RSP: context.sp.toString() };
+  for (const name of ['rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp',
+                      'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15']) {
+    if (context[name] !== undefined)
+      registers[name.toUpperCase()] = context[name].toString();
+  }
+  return registers;
+}
 // Interceptor replaces the entry bytes; attest them before installing it.
 const selectedWitness = witness(selected);
 record({ type: 'meta', base: moduleBase.toString() });
@@ -41,7 +50,8 @@ Interceptor.attach(selected, {
   onEnter() {
     if (depth++ !== 0) return;
     activeThread = this.threadId;
-    emit({ kind: 'entry', source: selectedWitness, target: null });
+    emit({ kind: 'entry', source: selectedWitness, target: null,
+           registers: entryRegisters(this.context) });
     Stalker.follow(activeThread, {
       events: { call: true, ret: false, block: true, exec: false, compile: false },
       onReceive(raw) {

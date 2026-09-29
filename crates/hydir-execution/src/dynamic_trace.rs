@@ -3,8 +3,10 @@
 use crate::{InputSpec, decode_hex, input_sha256, validate_input_spec};
 use object::{Object, ObjectSegment, SegmentFlags};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const DYNAMIC_TRACE_VERSION: u32 = 1;
+pub const DYNAMIC_TRACE_V2_VERSION: u32 = 2;
 pub const MAX_DYNAMIC_TRACE_JSON_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TRACE_EVENTS: usize = 100_000;
 
@@ -53,6 +55,9 @@ pub struct TraceEvent {
     pub kind: TraceEventKind,
     pub source: TraceWitness,
     pub target: Option<TraceWitness>,
+    /// v2 entry-only CPU context, read before the selected function runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registers: Option<BTreeMap<String, u64>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,8 +96,10 @@ pub fn validate_dynamic_trace(
     trace: &DynamicTrace,
 ) -> Result<(), String> {
     validate_input_spec(elf, input)?;
-    if trace.schema_version != DYNAMIC_TRACE_VERSION
-        || trace.binary_sha256 != input.binary_sha256
+    if !matches!(
+        trace.schema_version,
+        DYNAMIC_TRACE_VERSION | DYNAMIC_TRACE_V2_VERSION
+    ) || trace.binary_sha256 != input.binary_sha256
         || trace.input_sha256 != input_sha256(input)?
     {
         return Err("DynamicTrace version or input binding is invalid".into());
@@ -162,6 +169,18 @@ pub fn validate_dynamic_trace(
                 return Err("entry does not match selected ELF address".into());
             }
         }
+        match (&event.kind, &event.registers, trace.schema_version) {
+            (TraceEventKind::Entry, Some(registers), DYNAMIC_TRACE_V2_VERSION) => {
+                validate_entry_registers(registers, event.source.runtime_address)?;
+            }
+            (TraceEventKind::Entry, None, DYNAMIC_TRACE_V2_VERSION) => {
+                return Err("v2 entry lacks captured register context".into());
+            }
+            (_, Some(_), _) => {
+                return Err("register context is only allowed on v2 entry events".into());
+            }
+            _ => {}
+        }
         if matches!(event.kind, TraceEventKind::Exit) {
             exits += 1;
         }
@@ -179,6 +198,24 @@ pub fn validate_dynamic_trace(
         && trace.lost_events == 0
     {
         return Err("truncated trace has not reached its event cap".into());
+    }
+    Ok(())
+}
+
+fn validate_entry_registers(
+    registers: &BTreeMap<String, u64>,
+    runtime_entry: u64,
+) -> Result<(), String> {
+    const NAMES: &[&str] = &[
+        "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12",
+        "R13", "R14", "R15", "RIP",
+    ];
+    if registers.len() > NAMES.len()
+        || registers.keys().any(|name| !NAMES.contains(&name.as_str()))
+        || registers.get("RIP") != Some(&runtime_entry)
+        || !registers.contains_key("RSP")
+    {
+        return Err("v2 entry register layout or runtime RIP is invalid".into());
     }
     Ok(())
 }
@@ -311,6 +348,7 @@ mod tests {
                     kind: TraceEventKind::Entry,
                     source: witness.clone(),
                     target: None,
+                    registers: None,
                 },
                 TraceEvent {
                     sequence: 1,
@@ -318,6 +356,7 @@ mod tests {
                     kind: TraceEventKind::Exit,
                     source: witness,
                     target: None,
+                    registers: None,
                 },
             ],
         };
@@ -332,5 +371,25 @@ mod tests {
         assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
         trace.lost_events = 1;
         validate_dynamic_trace(elf, &input, &trace).unwrap();
+        let legacy = serde_json::to_vec(&trace).unwrap();
+        assert!(
+            parse_dynamic_trace(&legacy).unwrap().events[0]
+                .registers
+                .is_none()
+        );
+        trace.schema_version = DYNAMIC_TRACE_V2_VERSION;
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
+        trace.events[0].registers = Some(BTreeMap::from([
+            ("RIP".into(), address),
+            ("RSP".into(), 0x700000),
+            ("RDI".into(), 5),
+        ]));
+        validate_dynamic_trace(elf, &input, &trace).unwrap();
+        trace.events[0]
+            .registers
+            .as_mut()
+            .unwrap()
+            .insert("RIP".into(), address + 1);
+        assert!(validate_dynamic_trace(elf, &input, &trace).is_err());
     }
 }
