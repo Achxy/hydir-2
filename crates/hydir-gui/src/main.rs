@@ -8716,7 +8716,11 @@ impl AnalystApp {
                                 let binary_path = self.current_local_path.as_ref()
                                     .ok_or("No local ELF is open")?;
                                 let binary = bounded_read(binary_path)?;
-                                let input_bytes = fs::read(self.frida_input_path.trim())
+                                let mut input_bytes = Vec::new();
+                                fs::File::open(self.frida_input_path.trim())
+                                    .map_err(|error| error.to_string())?
+                                    .take((MAX_INPUT_SPEC_BYTES + 1) as u64)
+                                    .read_to_end(&mut input_bytes)
                                     .map_err(|error| error.to_string())?;
                                 if input_bytes.len() > MAX_INPUT_SPEC_BYTES {
                                     return Err("InputSpec exceeds size limit".into());
