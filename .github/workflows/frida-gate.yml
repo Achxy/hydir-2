@@ -44,7 +44,7 @@ jobs:
             -o "$RUNNER_TEMP/frida-devkit.tar.xz"
           echo "e98803f6cad21c41a1b67eaa495963955afab6ed7ae95a18dc485ab2188bb021  $RUNNER_TEMP/frida-devkit.tar.xz" | sha256sum --check
           tar -xf "$RUNNER_TEMP/frida-devkit.tar.xz" -C "$RUNNER_TEMP/frida-devkit"
-      - name: Build optional Rust observer and run real execution gate
+      - name: Test patched Frida callback
         env:
           HYDIR_FRIDA_OBSERVER: target/debug/hydir-frida-observer
         run: |
@@ -52,5 +52,12 @@ jobs:
           export CPATH="$RUNNER_TEMP/frida-devkit"
           export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
           cargo test --locked -p frida ordinary_send_dispatches_to_registered_handler
+      - name: Build optional Rust observer and run real execution gate
+        env:
+          HYDIR_FRIDA_OBSERVER: target/debug/hydir-frida-observer
+        run: |
+          set -euo pipefail
+          export CPATH="$RUNNER_TEMP/frida-devkit"
+          export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
           cargo build --locked -p hydir-frida-observer --features frida-runtime --bin hydir-frida-observer
           python3 tests/frida_observer_gate.py

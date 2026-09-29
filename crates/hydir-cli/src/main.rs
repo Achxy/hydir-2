@@ -39,6 +39,7 @@ use hydir_model::{
 };
 use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod frida;
 mod ghidra_calls;
 mod local;
 mod passes;
@@ -62,6 +63,7 @@ const HELP: &str = "Hydir: Ghidra-backed binary lifting and reverse engineering
 
 Usage:
   hydirctl doctor
+  hydirctl observe frida <elf> <input.json> --function <0xelf-vaddr> [--snapshot <snapshot.json>] [--output <trace.json>]
   hydirctl inspect <elf>
   hydirctl disassemble <elf>
   hydirctl discover <elf>
@@ -232,6 +234,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("observe") => frida::run(&args)?,
         Some("ghidra-project") if args.len() == 4 && args[1] == "save" => {
             let binary = read_binary(&args[2])?;
             let spec = import_elf(&binary)?;
@@ -1541,6 +1544,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Some("doctor") if args.len() == 1 => {
+            let frida_helper = frida::helper_path()?;
             let gdb_version = Command::new("gdb")
                 .arg("--version")
                 .output()
@@ -1649,6 +1653,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_replay_v1": replay_ready,
                     "native_replay_scope": "local Linux x86-64 Bubblewrap replay with private network namespace, bounded argv/stdin/files, exact exit/output goals and explicit setup/timeout/output-limit failures; Ubuntu 24.04 smoke gate passed",
                     "bubblewrap_installed": bwrap_version.is_some(),
+                    "frida_observer_helper": frida_helper.display().to_string(),
+                    "frida_observation_ready": cfg!(all(target_os = "linux", target_arch = "x86_64")) && bubblewrap_isolation_ready && frida_helper.is_file(),
+                    "frida_observation_scope": "InputSpec-bound Linux x86-64 ELF paths with byte-checked block/call witnesses; no process exit-code claim or static CFG-completeness claim",
                     "bubblewrap_isolation_ready": bubblewrap_isolation_ready,
                     "bubblewrap_version": bwrap_version,
                     "gdb_installed": gdb_version.is_some(),
