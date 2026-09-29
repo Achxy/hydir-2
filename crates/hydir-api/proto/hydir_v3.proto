@@ -16,6 +16,7 @@ service HydirV3 {
   rpc AnalyzeGhidraSnapshot (GhidraSnapshotArtifactRequest) returns (ArtifactReply);
   rpc TraceGhidraCalls (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc BuildGhidraCallCfgLlvm (GhidraCallTraceRequest) returns (ArtifactReply);
+  rpc AssessGhidraFunction (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
 
@@ -37,6 +38,7 @@ message DiscoverReply {
   bool revisioned_analysis_model_edits = 14;
   bool ghidra_call_tracing = 15;
   bool ghidra_call_cfg_llvm = 16;
+  bool ghidra_function_assessment = 17;
 }
 
 // Returns the newest saved model for the current binary, or an inferred v1

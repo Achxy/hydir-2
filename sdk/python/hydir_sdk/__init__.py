@@ -442,6 +442,27 @@ class HydirClient:
             max_visits=max_visits, max_depth=max_depth, timeout=timeout,
         )
 
+    def assess_ghidra_function(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Assess one seed against loaded Ghidra functions and LLVM emission."""
+        return self._ghidra_call_artifact(
+            project_id, revision, seed, function_entry=function_entry,
+            llvm=False, assessment=True, max_functions=max_functions,
+            max_operations=max_operations, max_visits=max_visits,
+            max_depth=max_depth, timeout=timeout,
+        )
+
     def _ghidra_call_artifact(
         self,
         project_id: str,
@@ -450,6 +471,7 @@ class HydirClient:
         *,
         function_entry: int | str,
         llvm: bool,
+        assessment: bool = False,
         max_functions: int | None = None,
         max_operations: int | None = None,
         max_visits: int | None = None,
@@ -520,7 +542,9 @@ class HydirClient:
             if value is not None:
                 setattr(request, name, value)
         reply = self._call(
-            self._stub_v3.BuildGhidraCallCfgLlvm if llvm else self._stub_v3.TraceGhidraCalls,
+            (self._stub_v3.BuildGhidraCallCfgLlvm if llvm
+             else self._stub_v3.AssessGhidraFunction if assessment
+             else self._stub_v3.TraceGhidraCalls),
             request,
             timeout=max(self._timeout, 180.0) if timeout is None else timeout,
         )
@@ -528,9 +552,10 @@ class HydirClient:
             reply, revision=revision,
             media_type=(
                 "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
-                if llvm else "application/vnd.hydir.pcode-call-trace+json;version=2"
+                if llvm else "application/vnd.hydir.pcode-function-assessment+json;version=1"
+                if assessment else "application/vnd.hydir.pcode-call-trace+json;version=2"
             ),
-            schema_version=1 if llvm else 2,
+            schema_version=1 if llvm or assessment else 2,
         )
         if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
             raise RuntimeError("Ghidra call artifact belongs to another binary")
@@ -548,6 +573,16 @@ class HydirClient:
                 or not isinstance(module.get("llvm_ir"), str)
             ):
                 raise RuntimeError("Ghidra call LLVM artifact differs from the requested binary or function")
+        elif assessment:
+            if (
+                artifact.get("entry") != seed_json["entry"]
+                or artifact.get("seed_sha256") != hashlib.sha256(content).hexdigest()
+                or not isinstance(artifact.get("static_capability"), dict)
+                or not isinstance(artifact.get("trace"), dict)
+                or artifact["trace"].get("root_entry") != seed_json["entry"]
+                or artifact.get("verification") != "not_run"
+            ):
+                raise RuntimeError("Ghidra assessment differs from the requested seed or function")
         elif artifact.get("root_entry", {}).get("offset") != function_hex:
             raise RuntimeError("Ghidra call trace differs from the requested function")
         return artifact

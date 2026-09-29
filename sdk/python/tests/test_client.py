@@ -454,6 +454,40 @@ class ClientBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual(len(requests), 2)
 
+    def test_v3_function_assessment_is_seed_bound_and_unverified(self):
+        digest = "a" * 64
+        entry = {"space": "ram", "offset": "0x2013a9"}
+        seed = json.dumps({
+            "schema_version": 1, "binary_sha256": digest,
+            "entry": entry, "registers": [], "memory": [],
+        }).encode()
+        artifact = {
+            "schema_version": 1, "binary_sha256": digest,
+            "seed_sha256": hashlib.sha256(seed).hexdigest(),
+            "entry": entry, "static_capability": {},
+            "trace": {"root_entry": entry}, "verification": "not_run",
+        }
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request, **kwargs):
+                self.assertIs(method, client._stub_v3.AssessGhidraFunction)
+                requests.append(request)
+                content = json.dumps(artifact).encode()
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-function-assessment+json;version=1",
+                    content=content, project_revision=4,
+                )
+            client._call = call
+            self.assertEqual(
+                client.assess_ghidra_function("project", 4, seed, function_entry=0x2013a9)["entry"],
+                entry,
+            )
+            self.assertEqual(requests[0].seed_json, seed)
+            artifact["verification"] = "passed"
+            with self.assertRaises(RuntimeError):
+                client.assess_ghidra_function("project", 4, seed, function_entry=0x2013a9)
+
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             with self.assertRaises(ValueError):

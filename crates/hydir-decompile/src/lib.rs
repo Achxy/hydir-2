@@ -7,6 +7,11 @@
 
 mod expression;
 pub use expression::lower_expression_ir;
+mod pcode_assessment;
+pub use pcode_assessment::{
+    PCODE_FUNCTION_ASSESSMENT_VERSION, PcodeAssessedCall, PcodeFunctionAssessment,
+    PcodeLlvmAssessment, PcodeMemoryWitness, assess_pcode_function,
+};
 mod pcode_cfg_llvm;
 mod pcode_llvm;
 mod pcode_standalone;

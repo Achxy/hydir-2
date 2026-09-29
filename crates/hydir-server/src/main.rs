@@ -28,10 +28,10 @@ use hydir_core::{
     parse_annotation_address, parse_program_spec_json, validate_analyst_annotation,
 };
 use hydir_decompile::{
-    PcodeInterproceduralCfgLlvmArtifact, decompile_function_unit_at, decompile_indexed_function,
-    discover_functions, emit_pcode_interprocedural_cfg_llvm, export_function_ir_llvm,
-    lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
-    measure_native_coverage,
+    PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, assess_pcode_function,
+    decompile_function_unit_at, decompile_indexed_function, discover_functions,
+    emit_pcode_interprocedural_cfg_llvm, export_function_ir_llvm, lift_machine_function_at,
+    lower_cir, lower_function_ir, lower_state_ir, measure_native_coverage,
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
@@ -1821,6 +1821,7 @@ fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
             | "ghidra-snapshot-image-artifact"
             | "ghidra-call-trace"
             | "ghidra-call-cfg-llvm"
+            | "ghidra-call-assessment"
     ) {
         if argument.is_empty() || argument.len() > 1024 || argument.chars().any(char::is_control) {
             return Err(Status::invalid_argument(
@@ -2133,6 +2134,8 @@ struct GhidraCallTraceSelector {
 const GHIDRA_CALL_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.pcode-call-trace+json;version=2";
 const GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1";
+const GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-function-assessment+json;version=1";
 
 fn pack_ghidra_call_trace_input(seed: &[u8], snapshots: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     if seed.is_empty() || seed.len() > MAX_PCODE_SEED_BYTES {
@@ -2444,6 +2447,45 @@ fn ghidra_call_trace_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u
             .push(LEGACY_CALL_IMAGE_DIAGNOSTIC.to_owned());
     }
     serde_json::to_vec(&trace).map_err(|error| error.to_string())
+}
+
+fn ghidra_call_assessment_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra assessment selector: {error}"))?;
+    if selector.max_operations > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_visits > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_depth > 16
+    {
+        return Err("Ghidra assessment budget exceeds service limit".to_owned());
+    }
+    let (binary, seed_bytes, raw_snapshots) = unpack_ghidra_call_image_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("Ghidra assessment ELF digest disagrees with selector".to_owned());
+    }
+    let snapshots = raw_snapshots
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, &selector.binary_sha256))
+        .collect::<Result<Vec<_>, _>>()?;
+    let image = if snapshots[0].memory_blocks.is_empty() {
+        None
+    } else {
+        Some(PcodeReadOnlyElfImage::from_elf(binary, &snapshots[0])?)
+    };
+    let mut assessment = assess_pcode_function(
+        &snapshots,
+        seed_bytes,
+        image.as_ref(),
+        selector.max_operations,
+        selector.max_visits,
+        selector.max_depth,
+    )?;
+    if image.is_none() {
+        assessment
+            .trace
+            .snapshot_diagnostics
+            .push(LEGACY_CALL_IMAGE_DIAGNOSTIC.to_owned());
+    }
+    serde_json::to_vec(&assessment).map_err(|error| error.to_string())
 }
 
 fn ghidra_call_cfg_llvm_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
@@ -3173,6 +3215,9 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
             ghidra_snapshot_image_artifact(bytes, selector)
         }
         ("ghidra-call-trace", Some(selector)) => ghidra_call_trace_artifact(bytes, selector),
+        ("ghidra-call-assessment", Some(selector)) => {
+            ghidra_call_assessment_artifact(bytes, selector)
+        }
         ("ghidra-call-cfg-llvm", Some(selector)) => ghidra_call_cfg_llvm_artifact(bytes, selector),
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
@@ -3420,6 +3465,7 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("native-artifact-model") => MAX_BINARY_BYTES + MAX_MODEL_BYTES + 4,
         Some("ghidra-call-trace") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
+        Some("ghidra-call-assessment") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-snapshot-image-artifact") => MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT,
         _ => MAX_BINARY_BYTES,
     };
@@ -4617,10 +4663,17 @@ fn require_native_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
     Ok(v3_job_reply(job))
 }
 
+#[derive(Clone, Copy)]
+enum GhidraCallArtifactKind {
+    Trace,
+    Llvm,
+    Assessment,
+}
+
 async fn ghidra_call_artifact(
     store: &Store,
     request: Request<api_v3::GhidraCallTraceRequest>,
-    llvm: bool,
+    kind: GhidraCallArtifactKind,
 ) -> Result<Response<api_v3::ArtifactReply>, Status> {
     let principal = store.principal(&request)?;
     let input = request.into_inner();
@@ -4785,7 +4838,7 @@ async fn ghidra_call_artifact(
         snapshots.push(bytes);
         parsed.push(snapshot);
     };
-    let (content, media_type) = if llvm {
+    let (content, media_type) = if matches!(kind, GhidraCallArtifactKind::Llvm) {
         let envelope = pack_ghidra_call_trace_input(&input.seed_json, &snapshots)
             .map_err(Status::resource_exhausted)?;
         let raw = run_worker("ghidra-call-cfg-llvm", Some(&selector), envelope).await?;
@@ -4826,6 +4879,38 @@ async fn ghidra_call_artifact(
             serde_json::to_vec(&artifact)
                 .map_err(|_| Status::internal("Ghidra call LLVM serialization failed"))?,
             GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE,
+        )
+    } else if matches!(kind, GhidraCallArtifactKind::Assessment) {
+        let envelope = pack_ghidra_call_image_input(&binary, &input.seed_json, &snapshots)
+            .map_err(Status::resource_exhausted)?;
+        let raw = run_worker("ghidra-call-assessment", Some(&selector), envelope).await?;
+        let mut artifact: PcodeFunctionAssessment = serde_json::from_slice(&raw)
+            .map_err(|_| Status::internal("Ghidra assessment worker returned invalid artifact"))?;
+        let expected_snapshots = parsed
+            .iter()
+            .map(|snapshot| {
+                serde_json::to_vec(snapshot)
+                    .map(|content| sha256(&content))
+                    .map_err(|_| Status::internal("Ghidra snapshot serialization failed"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if artifact.schema_version != 1
+            || artifact.binary_sha256 != project.binary_sha256
+            || artifact.entry != parsed[0].selected_function.entry
+            || artifact.seed_sha256 != sha256(&input.seed_json)
+            || artifact.snapshot_sha256 != expected_snapshots
+            || artifact.static_capability.binary_sha256 != project.binary_sha256
+            || artifact.trace.binary_sha256 != project.binary_sha256
+        {
+            return Err(Status::internal(
+                "Ghidra assessment worker returned mismatched identity",
+            ));
+        }
+        artifact.trace.snapshot_diagnostics.extend(diagnostics);
+        (
+            serde_json::to_vec(&artifact)
+                .map_err(|_| Status::internal("Ghidra assessment serialization failed"))?,
+            GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE,
         )
     } else {
         trace.snapshot_diagnostics.extend(diagnostics);
@@ -4900,6 +4985,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             revisioned_analysis_model_edits: true,
             ghidra_call_tracing: true,
             ghidra_call_cfg_llvm: true,
+            ghidra_function_assessment: true,
         }))
     }
 
@@ -5476,14 +5562,21 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         &self,
         request: Request<api_v3::GhidraCallTraceRequest>,
     ) -> Result<Response<api_v3::ArtifactReply>, Status> {
-        ghidra_call_artifact(self, request, false).await
+        ghidra_call_artifact(self, request, GhidraCallArtifactKind::Trace).await
     }
 
     async fn build_ghidra_call_cfg_llvm(
         &self,
         request: Request<api_v3::GhidraCallTraceRequest>,
     ) -> Result<Response<api_v3::ArtifactReply>, Status> {
-        ghidra_call_artifact(self, request, true).await
+        ghidra_call_artifact(self, request, GhidraCallArtifactKind::Llvm).await
+    }
+
+    async fn assess_ghidra_function(
+        &self,
+        request: Request<api_v3::GhidraCallTraceRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        ghidra_call_artifact(self, request, GhidraCallArtifactKind::Assessment).await
     }
 
     async fn update_analyst_fact(
@@ -7495,6 +7588,30 @@ mod tests {
                 })
                 .unwrap(),
             Some(12)
+        );
+
+        let assessed = HydirV3::assess_ghidra_function(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(assessed.media_type, GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE);
+        assert_eq!(assessed.sha256, sha256(&assessed.content));
+        let assessment: PcodeFunctionAssessment =
+            serde_json::from_slice(&assessed.content).unwrap();
+        assert_eq!(assessment.binary_sha256, uploaded.binary_sha256);
+        assert_eq!(assessment.seed_sha256, sha256(seed));
+        assert_eq!(assessment.snapshot_sha256.len(), 2);
+        assert!(
+            assessment
+                .calls
+                .iter()
+                .any(|call| call.snapshot_loaded && call.reached)
+        );
+        assert!(!assessment.memory_witnesses.is_empty());
+        assert!(assessment.llvm.emitted);
+        assert_eq!(
+            assessment.verification,
+            hydir_ir::VerificationStatus::NotRun
         );
 
         let llvm_reply =

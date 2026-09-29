@@ -125,6 +125,65 @@ fn real_prism_call_trace_uses_two_binary_bound_snapshots() {
 }
 
 #[test]
+fn seeded_capability_assessment_distinguishes_loaded_callee_and_reached_memory() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("demo/hydir-prism.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_prism_calls_flow_v2.json");
+    let seed = root.join("tests/fixtures/ghidra_prism_call_seed_v1.json");
+    let callee = root.join("tests/fixtures/ghidra_prism_leaf_add_v2.json");
+    let command = |include_callee: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hydirctl"));
+        command.args(["ghidra-snapshot", "assess"]);
+        command.arg(&binary).arg(&snapshot).arg(&seed);
+        if include_callee {
+            command.arg("--callee").arg(&callee);
+        }
+        command.output().unwrap()
+    };
+    let loaded = command(true);
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&loaded.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["static_capability"]["schema_version"], 1);
+    assert_eq!(
+        report["seed_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&seed).unwrap()))
+    );
+    assert_eq!(report["snapshot_sha256"].as_array().unwrap().len(), 2);
+    assert_eq!(report["trace"]["stop"]["kind"], "return");
+    assert_eq!(report["llvm"]["emitted"], true);
+    assert_eq!(report["verification"], "not_run");
+    assert!(
+        report["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|call| { call["snapshot_loaded"] == true && call["reached"] == true })
+    );
+    assert!(!report["memory_witnesses"].as_array().unwrap().is_empty());
+
+    let missing = command(false);
+    assert!(
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(report["trace"]["stop"]["kind"], "call_boundary");
+    assert!(
+        report["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|call| { call["snapshot_loaded"] == false && call["reached"] == false })
+    );
+}
+
+#[test]
 fn real_prism_call_snapshots_emit_one_binary_bound_llvm_module() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let binary = root.join("demo/hydir-prism.elf");

@@ -30,7 +30,7 @@ use hydir_core::{
 };
 use hydir_decompile::{
     NativeCoverageReport, NativeDecompilation, PCODE_CFG_ELF_IMAGE_MAX_BYTES, PcodeCfgLlvmArtifact,
-    PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
+    PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, PcodeSimplifiedCfgLlvmArtifact,
     PcodeStandalonePrefixArtifact, decompile_function_at, decompile_symbol, discover_functions,
     emit_pcode_cfg_llvm, emit_pcode_cfg_llvm_with_image, emit_pcode_exact_operation_llvm,
     emit_pcode_simplified_cfg_llvm, emit_pcode_standalone_prefix_llvm, measure_native_coverage,
@@ -194,6 +194,14 @@ enum Task {
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
+    AssessGhidra {
+        binary: PathBuf,
+        binary_sha256: String,
+        function: String,
+        seed_json: String,
+        cancel: Arc<AtomicBool>,
+        timeout: Duration,
+    },
     EmitGhidraCallLlvm {
         binary: PathBuf,
         binary_sha256: String,
@@ -337,6 +345,12 @@ enum Event {
         binary_sha256: String,
         function: String,
         result: Result<PcodeInterproceduralTrace, String>,
+    },
+    GhidraAssessed {
+        binary_sha256: String,
+        function: String,
+        seed_json: String,
+        result: Result<PcodeFunctionAssessment, String>,
     },
     GhidraCallLlvmEmitted {
         binary_sha256: String,
@@ -2279,6 +2293,68 @@ fn run_ghidra_call_trace(
     Ok(trace)
 }
 
+fn run_ghidra_assessment(
+    binary: &Path,
+    binary_sha256: &str,
+    function: &str,
+    seed_json: &str,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<PcodeFunctionAssessment, String> {
+    if seed_json.is_empty() || seed_json.len() > MAX_PCODE_SEED_BYTES {
+        return Err("Ghidra assessment seed exceeds the JSON input limit".to_owned());
+    }
+    let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let seed_path = scratch.path().join("seed.json");
+    let artifact_path = scratch.path().join("assessment.json");
+    fs::write(&seed_path, seed_json).map_err(|error| error.to_string())?;
+    let mut command = Command::new(hydirctl_path());
+    command
+        .args(["ghidra", "assess"])
+        .arg(binary)
+        .arg(&seed_path)
+        .arg("--function")
+        .arg(function)
+        .arg("--max-functions")
+        .arg("8")
+        .arg("--output")
+        .arg(&artifact_path);
+    let output = run_ghidra_command(&mut command, cancel, timeout)
+        .map_err(|error| format!("Could not start Ghidra assessment: {error}"))?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Ghidra assessment failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(detail)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+                .trim()
+        ));
+    }
+    let bytes = fs::read(&artifact_path)
+        .map_err(|error| format!("Ghidra assessment produced no artifact: {error}"))?;
+    if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
+        return Err("Ghidra assessment exceeds the GUI artifact limit".to_owned());
+    }
+    let artifact: PcodeFunctionAssessment = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid Ghidra assessment: {error}"))?;
+    if artifact.schema_version != 1
+        || artifact.binary_sha256 != binary_sha256
+        || artifact.entry.offset != function
+        || artifact.seed_sha256 != format!("{:x}", Sha256::digest(seed_json.as_bytes()))
+        || artifact.verification != hydir_ir::VerificationStatus::NotRun
+    {
+        return Err("Ghidra assessment differs from the opened binary or seed".to_owned());
+    }
+    Ok(artifact)
+}
+
 fn run_ghidra_call_llvm(
     binary: &Path,
     binary_sha256: &str,
@@ -3038,6 +3114,35 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                     let _ = completion.send(Event::GhidraCallsTraced {
                         binary_sha256,
                         function,
+                        result,
+                    });
+                    repaint.request_repaint();
+                });
+                continue;
+            },
+            Task::AssessGhidra {
+                binary,
+                binary_sha256,
+                function,
+                seed_json,
+                cancel,
+                timeout,
+            } => {
+                let completion = events.clone();
+                let repaint = ctx.clone();
+                thread::spawn(move || {
+                    let result = run_ghidra_assessment(
+                        &binary,
+                        &binary_sha256,
+                        &function,
+                        &seed_json,
+                        &cancel,
+                        timeout,
+                    );
+                    let _ = completion.send(Event::GhidraAssessed {
+                        binary_sha256,
+                        function,
+                        seed_json,
                         result,
                     });
                     repaint.request_repaint();
@@ -4552,6 +4657,7 @@ struct AnalystApp {
     ghidra_path_trace: Option<Result<PcodePathTrace, String>>,
     ghidra_path_lines: Vec<(Option<u64>, String)>,
     ghidra_call_trace: Option<Result<PcodeInterproceduralTrace, String>>,
+    ghidra_assessment: Option<Result<PcodeFunctionAssessment, String>>,
     ghidra_call_lines: Vec<(Option<u64>, String)>,
     ghidra_call_busy: bool,
     ghidra_call_llvm: Option<Result<PcodeInterproceduralCfgLlvmArtifact, String>>,
@@ -4703,6 +4809,7 @@ impl AnalystApp {
             ghidra_path_trace: None,
             ghidra_path_lines: Vec::new(),
             ghidra_call_trace: None,
+            ghidra_assessment: None,
             ghidra_call_lines: Vec::new(),
             ghidra_call_busy: false,
             ghidra_call_llvm: None,
@@ -5101,6 +5208,7 @@ impl AnalystApp {
                     self.ghidra_path_lines.clear();
                     self.ghidra_call_trace = None;
                     self.ghidra_call_lines.clear();
+                    self.ghidra_assessment = None;
                     self.ghidra_call_llvm = None;
                     if let Some(task) = &self.ghidra_call_llvm_task {
                         task.cancel.store(true, Ordering::Release);
@@ -5307,6 +5415,7 @@ impl AnalystApp {
                             self.ghidra_path_lines.clear();
                             self.ghidra_call_trace = None;
                             self.ghidra_call_lines.clear();
+                            self.ghidra_assessment = None;
                             self.ghidra_call_llvm = None;
                             if let Some(task) = &self.ghidra_call_llvm_task {
                                 task.cancel.store(true, Ordering::Release);
@@ -5398,6 +5507,43 @@ impl AnalystApp {
                         Err(_) => "Ghidra call tracing failed".to_owned(),
                     };
                     self.ghidra_call_trace = Some(result);
+                }
+                Event::GhidraAssessed {
+                    binary_sha256,
+                    function,
+                    seed_json,
+                    result,
+                } => {
+                    self.ghidra_call_busy = false;
+                    let cancelled = self
+                        .ghidra_call_task
+                        .take()
+                        .is_some_and(|task| task.cancel.load(Ordering::Acquire));
+                    if self
+                        .spec
+                        .as_ref()
+                        .is_none_or(|spec| spec.binary_sha256 != binary_sha256)
+                        || self.ghidra_snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.selected_function.entry.offset != function
+                        })
+                        || self.ghidra_trace_seed_json != seed_json
+                    {
+                        continue;
+                    }
+                    if cancelled {
+                        self.status = "Ghidra assessment cancelled".to_owned();
+                        self.ghidra_assessment = None;
+                        continue;
+                    }
+                    self.status = match &result {
+                        Ok(assessment) => format!(
+                            "Assessed {} call sites and {} reached memory effects",
+                            assessment.calls.len(),
+                            assessment.memory_witnesses.len() + assessment.omitted_memory_witnesses
+                        ),
+                        Err(_) => "Ghidra assessment failed".to_owned(),
+                    };
+                    self.ghidra_assessment = Some(result);
                 }
                 Event::GhidraCallLlvmEmitted {
                     binary_sha256,
@@ -8061,6 +8207,7 @@ impl AnalystApp {
                         self.ghidra_path_lines.clear();
                         self.ghidra_call_trace = None;
                         self.ghidra_call_lines.clear();
+                        self.ghidra_assessment = None;
                         self.ghidra_call_llvm = None;
                         if let Some(task) = &self.ghidra_call_llvm_task {
                             task.cancel.store(true, Ordering::Release);
@@ -8221,6 +8368,104 @@ impl AnalystApp {
                     Some(Err(error)) => {
                         ui.label(RichText::new(error).size(11.0).color(BAD));
                     }
+                    None => {}
+                }
+            });
+        egui::CollapsingHeader::new("Seeded lift assessment")
+            .id_salt("ghidra_function_assessment")
+            .show(ui, |ui| {
+                ui.label(RichText::new("Checks the supplied seed against reached memory effects and available callees. LLVM emission is reported separately; equivalence has not been verified.")
+                    .size(11.0).color(MUTED));
+                let can_assess = !self.ghidra_busy
+                    && !self.ghidra_call_busy
+                    && !self.ghidra_call_llvm_busy
+                    && self.current_local_path.is_some();
+                if ui.add_enabled(can_assess, egui::Button::new("Assess seeded lift")).clicked() {
+                    match parse_pcode_seed(self.ghidra_trace_seed_json.as_bytes(), snapshot) {
+                        Err(error) => self.ghidra_assessment = Some(Err(error)),
+                        Ok(_) => {
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            let timeout = ghidra_task_timeout(
+                                self.ghidra_runtime_status.as_ref().map(|status| status.mode),
+                                true,
+                            );
+                            let task = Task::AssessGhidra {
+                                binary: self.current_local_path.clone().expect("checked above"),
+                                binary_sha256: snapshot.binary_sha256.clone(),
+                                function: snapshot.selected_function.entry.offset.clone(),
+                                seed_json: self.ghidra_trace_seed_json.clone(),
+                                cancel: Arc::clone(&cancel),
+                                timeout,
+                            };
+                            match self.tasks.try_send(task) {
+                                Ok(()) => {
+                                    self.ghidra_call_busy = true;
+                                    self.ghidra_call_task = Some(ActiveGhidraTask {
+                                        cancel,
+                                        started: Instant::now(),
+                                        timeout,
+                                    });
+                                    self.ghidra_assessment = None;
+                                    self.status = "Assessing seeded Ghidra lift…".to_owned();
+                                }
+                                Err(_) => self.ghidra_assessment = Some(Err(
+                                    "Analysis queue is full. Retry the assessment.".to_owned(),
+                                )),
+                            }
+                        }
+                    }
+                }
+                match &self.ghidra_assessment {
+                    Some(Ok(assessment)) => {
+                        let stop = serde_json::to_value(&assessment.trace.stop).unwrap_or_default();
+                        let kind = stop.get("kind").and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        ui.label(RichText::new(format!(
+                            "{} reached calls · {} reached memory effects · stop: {kind}",
+                            assessment.calls.iter().filter(|call| call.reached).count(),
+                            assessment.memory_witnesses.len() + assessment.omitted_memory_witnesses,
+                        )).size(11.0).color(ACCENT));
+                        ui.label(RichText::new(if assessment.llvm.emitted {
+                            "LLVM module emitted; execution and equivalence unverified".to_owned()
+                        } else {
+                            format!("LLVM emission stopped: {}",
+                                assessment.llvm.error.as_deref().unwrap_or("unknown reason"))
+                        }).size(11.0).color(MUTED));
+                        if ui.button("Copy assessment JSON").clicked()
+                            && let Ok(json) = serde_json::to_string_pretty(assessment) {
+                                ui.ctx().copy_text(json);
+                            }
+                        for call in assessment.calls.iter().take(32) {
+                            let linked = parse_ghidra_offset(&call.call_site.offset)
+                                .and_then(|address| address_map.as_ref()
+                                    .and_then(|map| map.to_linked_raw(address)));
+                            let label = format!("{} → {} · {}{}",
+                                call.call_site.offset,
+                                call.target.as_ref().map_or("unknown", |target| target.offset.as_str()),
+                                if call.snapshot_loaded { "callee loaded" } else { "callee missing" },
+                                if call.reached { " · reached" } else { "" });
+                            if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                RichText::new(label).monospace().size(11.0)).clicked()
+                                && linked.is_some() {
+                                self.selected_address = linked;
+                            }
+                        }
+                        for witness in assessment.memory_witnesses.iter().take(32) {
+                            let linked = parse_ghidra_offset(&witness.source.offset)
+                                .and_then(|address| address_map.as_ref()
+                                    .and_then(|map| map.to_linked_raw(address)));
+                            let label = format!("{} · {:?} {}:0x{:x} ({} bytes)",
+                                witness.source.offset, witness.access.kind,
+                                witness.access.space, witness.access.byte_offset,
+                                witness.access.width_bytes);
+                            if ui.selectable_label(linked.is_some() && self.selected_address == linked,
+                                RichText::new(label).monospace().size(11.0)).clicked()
+                                && linked.is_some() {
+                                self.selected_address = linked;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => { ui.label(RichText::new(error).size(11.0).color(BAD)); }
                     None => {}
                 }
             });

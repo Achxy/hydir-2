@@ -72,6 +72,7 @@ Usage:
   hydirctl ghidra llvm-cfg-image <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
   hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra assess <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
@@ -93,6 +94,7 @@ Usage:
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot assess <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
@@ -430,11 +432,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("ghidra") if args.len() >= 6 && args[1] == "trace-calls" => {
             ghidra_calls::run_automatic(&args[2..])?;
         }
+        Some("ghidra") if args.len() >= 6 && args[1] == "assess" => {
+            ghidra_calls::run_assessment_automatic(&args[2..])?;
+        }
         Some("ghidra") if args.len() >= 6 && args[1] == "llvm-cfg-calls" => {
             ghidra_calls::run_automatic_llvm(&args[2..])?;
         }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-calls" => {
             ghidra_calls::run_snapshots(&args[2..])?;
+        }
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "assess" => {
+            ghidra_calls::run_assessment_snapshots(&args[2..])?;
         }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-path" => {
             let mut max_operations = 4096usize;

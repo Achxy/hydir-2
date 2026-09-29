@@ -414,3 +414,40 @@ class LocalGhidra:
         if not isinstance(data, dict) or data.get("binary_sha256") != digest:
             raise RuntimeError("Hydir call trace belongs to another binary")
         return data
+
+    def assess(
+        self,
+        binary: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        function: int,
+        max_functions: int = 8,
+        max_operations: int = 4096,
+        max_visits: int = 1024,
+        max_depth: int = 8,
+    ) -> dict[str, Any]:
+        """Assess a seeded Ghidra lift with the managed worker."""
+        if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("function entry must be a 64-bit address")
+        if not 1 <= max_functions <= 32 or not 0 <= max_depth <= 16:
+            raise ValueError("assessment function or depth limit is invalid")
+        if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
+            raise ValueError("assessment operation or visit budget is invalid")
+        binary_path = Path(binary).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        seed_digest = hashlib.sha256(seed_path.read_bytes()).hexdigest()
+        data = json.loads(self._run(
+            "ghidra", "assess", str(binary_path), str(seed_path),
+            "--function", hex(function), "--max-functions", str(max_functions),
+            "--max-ops", str(max_operations), "--max-visits", str(max_visits),
+            "--max-depth", str(max_depth),
+        ))
+        if (
+            not isinstance(data, dict) or data.get("binary_sha256") != digest
+            or data.get("seed_sha256") != seed_digest
+            or data.get("entry", {}).get("offset") != hex(function)
+            or data.get("verification") != "not_run"
+        ):
+            raise RuntimeError("Hydir assessment belongs to another binary, seed, or function")
+        return data

@@ -103,6 +103,60 @@ fn emit(
     Ok(())
 }
 
+fn emit_assessment(
+    snapshots: &[GhidraSnapshot],
+    binary: &[u8],
+    seed_path: &str,
+    options: &Options<'_>,
+    diagnostics: Vec<String>,
+) -> Result<(), Box<dyn Error>> {
+    let seed_json = read_bounded_json(seed_path, MAX_PCODE_SEED_BYTES)?;
+    let image = super::pcode_image_or_legacy(binary, &snapshots[0])?;
+    let mut assessment = hydir_decompile::assess_pcode_function(
+        snapshots,
+        &seed_json,
+        image.as_ref(),
+        options.max_operations,
+        options.max_visits,
+        options.max_depth,
+    )?;
+    assessment.trace.snapshot_diagnostics = diagnostics;
+    let bytes = serde_json::to_vec_pretty(&assessment)?;
+    if let Some(path) = options.output {
+        write_new_or_identical(path, &bytes)?;
+    } else {
+        println!("{}", String::from_utf8(bytes)?);
+    }
+    Ok(())
+}
+
+pub fn run_assessment_snapshots(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let [binary, root, seed, options @ ..] = args else {
+        return Err("assess needs binary, root snapshot, and seed".into());
+    };
+    let options = parse_options(options, false)?;
+    let binary_bytes = read_binary(binary)?;
+    let digest = format!("{:x}", Sha256::digest(&binary_bytes));
+    let mut snapshots = Vec::with_capacity(options.callees.len() + 1);
+    for path in std::iter::once(root.as_str()).chain(options.callees.iter().copied()) {
+        snapshots.push(parse_ghidra_snapshot(
+            &read_bounded_json(path, MAX_GHIDRA_SNAPSHOT_BYTES)?,
+            &digest,
+        )?);
+    }
+    emit_assessment(&snapshots, &binary_bytes, seed, &options, Vec::new())
+}
+
+pub fn run_assessment_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let [binary, seed, options @ ..] = args else {
+        return Err("assess needs binary and seed".into());
+    };
+    let options = parse_options(options, true)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let binary_bytes = read_binary(binary)?;
+    emit_assessment(&snapshots, &binary_bytes, seed, &options, diagnostics)
+}
+
 pub fn run_snapshots(args: &[String]) -> Result<(), Box<dyn Error>> {
     let [binary, root, seed, options @ ..] = args else {
         return Err("trace-calls needs binary, root snapshot, and seed".into());
