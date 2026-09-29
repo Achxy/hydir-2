@@ -86,9 +86,11 @@ wall time before collection begins.
   PIE normalization uses ELF load segments, not a guessed subtraction from a
   displayed module base. Changed runtime code is marked separately.
 - Observations: ordered, per-thread block ranges and call/return events with
-  source and target where Frida supplies them; selected entry/exit registers
-  and bounded memory windows. Unknown values stay unknown. A compiled block
-  is not counted as executed.
+  source and target where Frida supplies them. The entry/exit state field is
+  optional in F1 and carries an explicit `not_requested`, `captured`, or
+  `unavailable` status; F2 adds validated registers and bounded memory
+  windows. Unknown values stay unknown. A compiled block is not counted as
+  executed.
 - Status: completed, budget truncation, process fault, timeout, injection
   error, unsupported threads/target, or detached. Record observed event
   counts and any collector loss/gap indication. Even `completed` means only
@@ -100,7 +102,9 @@ Default collection follows one thread while the selected function is active.
 Nested calls are recorded; recursion requires a depth counter so the observer
 does not stop at an inner return. Other threads, a fork, a missing return, or
 an unreadable page produce an explicit partial result. The collector batches
-events rather than sending a message per instruction.
+events rather than sending a message per instruction. Observation-specific
+limits cap block/call events, transferred bytes, and instrumentation time;
+they are recorded separately from `InputSpec`'s native replay budget.
 
 ## Autonomous implementation sequence
 
@@ -117,6 +121,8 @@ Measure event count, runtime overhead, and whether any events are lost.
 extra privilege; entry and call addresses normalize through checked ELF
 mappings. If it fails, record the exact Frida error and runner configuration,
 then prove a narrowly isolated alternative before production integration.
+The spike produces a short go/no-go record with the tested Frida/devkit pair,
+runner invocation, fixture inputs, and observed event counts.
 
 ### F1 — Ship an observed-path artifact
 
@@ -160,7 +166,10 @@ bytes before it can be offered for targeted Ghidra reanalysis. Store the
 original event and input as evidence. Reanalysis may add a candidate edge or
 function, but a single run never closes the CFG. Runtime-modified bytes go to
 a separately identified runtime-image analysis path; never apply file-backed
-P-code to different bytes.
+P-code to different bytes. A direct Stalker call event may supply its target;
+consecutive block visits alone are only a candidate transition. Do not turn
+block adjacency into an edge across a call, return, missing event, or
+uninstrumented range.
 
 **Gate:** indirect jump/call fixtures reveal the observed target, improve a
 subsequent bounded analysis, and still leave unobserved targets unresolved.
