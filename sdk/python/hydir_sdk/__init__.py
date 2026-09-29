@@ -25,6 +25,8 @@ MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_PCODE_SEED_BYTES = 1024 * 1024
 MAX_ANALYSIS_MODEL_BYTES = 16 * 1024 * 1024
+MAX_INPUT_SPEC_BYTES = 2 * 1024 * 1024
+FRIDA_TRACE_MEDIA_TYPE = "application/vnd.hydir.dynamic-trace+json;version=2"
 
 
 class HydirClient:
@@ -598,6 +600,85 @@ class HydirClient:
                 idempotency_key=idempotency_key or str(uuid4()),
             ),
         )
+
+    def start_frida_observation(
+        self, project_id: str, revision: int, input_spec: dict | bytes,
+        selected_elf_vaddr: int, *, snapshot_json: bytes | None = None,
+        idempotency_key: str | None = None,
+    ):
+        """Queue a bounded Linux x86-64 observation of the uploaded ELF."""
+        if not 0 < selected_elf_vaddr < 1 << 64:
+            raise ValueError("Selected ELF address must be a nonzero 64-bit integer")
+        content = (
+            json.dumps(input_spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if isinstance(input_spec, dict) else input_spec
+        )
+        if not isinstance(content, bytes) or not 0 < len(content) <= MAX_INPUT_SPEC_BYTES:
+            raise ValueError("InputSpec must be bounded JSON bytes or a dictionary")
+        try:
+            spec = json.loads(content)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("InputSpec is not valid JSON") from error
+        digest = spec.get("binary_sha256") if isinstance(spec, dict) else None
+        if (
+            spec.get("schema_version") != 1
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("InputSpec version or binary digest is invalid")
+        snapshot = snapshot_json or b""
+        if not isinstance(snapshot, bytes) or len(snapshot) > MAX_GHIDRA_SNAPSHOT_BYTES:
+            raise ValueError("Ghidra snapshot must be at most 16 MiB JSON bytes")
+        key = idempotency_key or str(uuid4())
+        if not 1 <= len(key) <= 128 or any(ord(character) < 32 for character in key):
+            raise ValueError("Idempotency key must be 1..=128 non-control characters")
+        reply = self._call(
+            self._stub_v3.StartFridaObservation,
+            proto_v3.StartFridaObservationRequest(
+                project_id=project_id, expected_revision=revision,
+                idempotency_key=key, input_spec_json=content,
+                selected_elf_vaddr=selected_elf_vaddr, snapshot_json=snapshot,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.project_revision != revision
+            or reply.kind != "frida-observation"
+            or not reply.job_id
+        ):
+            raise RuntimeError("Frida job identity differs from request")
+        return reply
+
+    def get_frida_observation(
+        self, project_id: str, job_id: str, *, revision: int,
+        artifact_sha256: str, binary_sha256: str, selected_elf_vaddr: int,
+    ) -> dict:
+        """Fetch a completed DynamicTrace v2 with its job and binary identity."""
+        if not job_id or revision < 0 or not 0 < selected_elf_vaddr < 1 << 64:
+            raise ValueError("Frida job identity is invalid")
+        for digest in (artifact_sha256, binary_sha256):
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError("Frida artifact and binary digests must be lowercase SHA-256")
+        reply = self._call(
+            self._stub_v3.GetFridaObservation,
+            proto_v3.FridaObservationArtifactRequest(project_id=project_id, job_id=job_id),
+        )
+        content = self._checked_artifact(
+            reply, expected_sha256=artifact_sha256, revision=revision,
+        )
+        if reply.media_type != FRIDA_TRACE_MEDIA_TYPE:
+            raise RuntimeError("Frida artifact media type differs from DynamicTrace v2")
+        trace = json.loads(content)
+        if (
+            not isinstance(trace, dict)
+            or trace.get("schema_version") != 2
+            or trace.get("binary_sha256") != binary_sha256
+            or trace.get("selected_elf_vaddr") != selected_elf_vaddr
+            or "exit_code" in trace
+        ):
+            raise RuntimeError("Frida trace identity or exit-code claim is invalid")
+        return trace
 
     def get_analysis_job(self, project_id: str, job_id: str):
         return self._call(

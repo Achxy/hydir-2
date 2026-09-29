@@ -17,6 +17,8 @@ service HydirV3 {
   rpc TraceGhidraCalls (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc BuildGhidraCallCfgLlvm (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc AssessGhidraFunction (GhidraCallTraceRequest) returns (ArtifactReply);
+  rpc StartFridaObservation (StartFridaObservationRequest) returns (JobReply);
+  rpc GetFridaObservation (FridaObservationArtifactRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
 
@@ -39,6 +41,7 @@ message DiscoverReply {
   bool ghidra_call_tracing = 15;
   bool ghidra_call_cfg_llvm = 16;
   bool ghidra_function_assessment = 17;
+  bool frida_observation_jobs = 18;
 }
 
 // Returns the newest saved model for the current binary, or an inferred v1
@@ -150,6 +153,23 @@ message GhidraCallTraceRequest {
   optional uint32 max_operations = 6;
   optional uint32 max_visits = 7;
   optional uint32 max_depth = 8;
+}
+
+// Runs the separately bundled Linux x86-64 observer on the project's ELF.
+// InputSpec and optional Ghidra snapshot are validated against that binary.
+// The job stores a DynamicTrace v2 artifact; it does not claim an exit code.
+message StartFridaObservationRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+  bytes input_spec_json = 4;
+  uint64 selected_elf_vaddr = 5;
+  bytes snapshot_json = 6;
+}
+
+message FridaObservationArtifactRequest {
+  string project_id = 1;
+  string job_id = 2;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.

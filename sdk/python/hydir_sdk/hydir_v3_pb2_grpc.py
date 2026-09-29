@@ -97,6 +97,16 @@ class HydirV3Stub:
                 request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
                 response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.StartFridaObservation = channel.unary_unary(
+                '/hydir.v3.HydirV3/StartFridaObservation',
+                request_serializer=hydir__v3__pb2.StartFridaObservationRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.JobReply.FromString,
+                _registered_method=True)
+        self.GetFridaObservation = channel.unary_unary(
+                '/hydir.v3.HydirV3/GetFridaObservation',
+                request_serializer=hydir__v3__pb2.FridaObservationArtifactRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
         self.UpdateAnalystFact = channel.unary_unary(
                 '/hydir.v3.HydirV3/UpdateAnalystFact',
                 request_serializer=hydir__v3__pb2.AnalystFactRequest.SerializeToString,
@@ -182,6 +192,18 @@ class HydirV3Servicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StartFridaObservation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetFridaObservation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def UpdateAnalystFact(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -249,6 +271,16 @@ def add_HydirV3Servicer_to_server(servicer, server):
             'AssessGhidraFunction': grpc.unary_unary_rpc_method_handler(
                     servicer.AssessGhidraFunction,
                     request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'StartFridaObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartFridaObservation,
+                    request_deserializer=hydir__v3__pb2.StartFridaObservationRequest.FromString,
+                    response_serializer=hydir__v3__pb2.JobReply.SerializeToString,
+            ),
+            'GetFridaObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetFridaObservation,
+                    request_deserializer=hydir__v3__pb2.FridaObservationArtifactRequest.FromString,
                     response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
             ),
             'UpdateAnalystFact': grpc.unary_unary_rpc_method_handler(
@@ -583,6 +615,60 @@ class HydirV3:
             target,
             '/hydir.v3.HydirV3/AssessGhidraFunction',
             hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartFridaObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/StartFridaObservation',
+            hydir__v3__pb2.StartFridaObservationRequest.SerializeToString,
+            hydir__v3__pb2.JobReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetFridaObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/GetFridaObservation',
+            hydir__v3__pb2.FridaObservationArtifactRequest.SerializeToString,
             hydir__v3__pb2.ArtifactReply.FromString,
             options,
             channel_credentials,

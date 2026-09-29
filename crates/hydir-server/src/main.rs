@@ -1,4 +1,5 @@
-//! Authenticated local-or-TLS HydIR RPC slice. No sample execution endpoint.
+//! Authenticated local-or-TLS HydIR RPC slice. Runtime observation is an
+//! explicit operator job using the separately bundled Linux Frida helper.
 
 mod interchange;
 
@@ -32,6 +33,12 @@ use hydir_decompile::{
     decompile_function_unit_at, decompile_indexed_function, discover_functions,
     emit_pcode_interprocedural_cfg_llvm, export_function_ir_llvm, lift_machine_function_at,
     lower_cir, lower_function_ir, lower_state_ir, measure_native_coverage,
+};
+#[cfg(not(test))]
+use hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES;
+use hydir_execution::{
+    DYNAMIC_TRACE_V2_VERSION, InputSpec, MAX_INPUT_SPEC_BYTES, parse_dynamic_trace,
+    parse_input_spec, validate_dynamic_trace, validate_input_spec,
 };
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
@@ -93,6 +100,7 @@ use uuid::Uuid;
 include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
 
 const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
+const FRIDA_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.dynamic-trace+json;version=2";
 const MAX_CALL_TRACE_FUNCTIONS: usize = 8;
 const MAX_CALL_TRACE_INPUT: usize =
     MAX_CALL_TRACE_FUNCTIONS * (MAX_GHIDRA_SNAPSHOT_BYTES + 4) + MAX_PCODE_SEED_BYTES + 8;
@@ -1612,11 +1620,13 @@ impl Store {
         }
     }
 
-    async fn finish_native_analysis_job(
+    async fn finish_analysis_job(
         &self,
         job_id: &str,
         project_id: &str,
         revision: u64,
+        media_type: &str,
+        ready_message: &str,
         result: Result<Vec<u8>, Status>,
     ) -> Result<(), Status> {
         let prepared = match result {
@@ -1638,25 +1648,13 @@ impl Store {
         match prepared {
             Ok(staged) => {
                 let digest = staged.digest.clone();
-                insert_artifact(
-                    &tx,
-                    project_id,
-                    revision as i64,
-                    "application/vnd.hydir.native-analysis+json;version=1",
-                    &staged,
-                )?;
+                insert_artifact(&tx, project_id, revision as i64, media_type, &staged)?;
                 tx.execute(
                     "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
                     params![digest, job_id],
                 )
                 .map_err(internal)?;
-                insert_event(
-                    &tx,
-                    job_id,
-                    "succeeded",
-                    "native program analysis artifact ready",
-                    &digest,
-                )?;
+                insert_event(&tx, job_id, "succeeded", ready_message, &digest)?;
             }
             Err(diagnostic) => {
                 tx.execute(
@@ -1688,10 +1686,54 @@ impl Store {
         }
         let result = run_worker("native-analysis", None, bytes).await;
         if let Err(error) = self
-            .finish_native_analysis_job(&job_id, &project_id, revision, result)
+            .finish_analysis_job(
+                &job_id,
+                &project_id,
+                revision,
+                "application/vnd.hydir.native-analysis+json;version=1",
+                "native program analysis artifact ready",
+                result,
+            )
             .await
         {
             eprintln!("hydird native job completion failed: {error}");
+        }
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.remove(&job_id);
+        }
+    }
+
+    async fn execute_frida_observation_job(
+        self,
+        job_id: String,
+        project_id: String,
+        revision: u64,
+        elf: Vec<u8>,
+        input_json: Vec<u8>,
+        snapshot_json: Vec<u8>,
+        selected: u64,
+    ) {
+        match self.transition_job(&job_id, "queued", "running", "Frida observer started") {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("hydird Frida job transition failed: {error}");
+                return;
+            }
+        }
+        let result = run_frida_observer(elf, input_json, snapshot_json, selected).await;
+        if let Err(error) = self
+            .finish_analysis_job(
+                &job_id,
+                &project_id,
+                revision,
+                FRIDA_TRACE_MEDIA_TYPE,
+                "DynamicTrace v2 artifact ready",
+                result,
+            )
+            .await
+        {
+            eprintln!("hydird Frida job completion failed: {error}");
         }
         if let Ok(mut workers) = self.workers.lock() {
             workers.remove(&job_id);
@@ -2616,6 +2658,132 @@ async fn automatic_ghidra_snapshot(
     .map_err(|error| {
         Status::failed_precondition(format!("automatic Ghidra analysis failed: {error}"))
     })
+}
+
+#[cfg(not(test))]
+async fn run_frida_observer(
+    elf: Vec<u8>,
+    input_json: Vec<u8>,
+    snapshot_json: Vec<u8>,
+    selected: u64,
+) -> Result<Vec<u8>, Status> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(Status::failed_precondition(
+            "Frida observation requires Linux x86-64",
+        ));
+    }
+    let (input, expected_snapshot) =
+        validate_frida_request(&elf, &input_json, &snapshot_json, selected)
+            .map_err(Status::invalid_argument)?;
+    let helper = env::var_os("HYDIR_FRIDA_OBSERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env::current_exe()
+                .unwrap_or_default()
+                .with_file_name("hydir-frida-observer")
+        });
+    if !helper.is_file() {
+        return Err(Status::failed_precondition(
+            "Frida observer is unavailable; install the Linux observer bundle",
+        ));
+    }
+    let scratch =
+        tempfile::tempdir().map_err(|_| Status::internal("cannot create Frida input scratch"))?;
+    let binary_path = scratch.path().join("binary.elf");
+    let input_path = scratch.path().join("input.json");
+    stage_frida_elf(&binary_path, &elf).map_err(Status::internal)?;
+    std::fs::write(&input_path, &input_json)
+        .map_err(|_| Status::internal("cannot stage Frida InputSpec"))?;
+    let mut command = Command::new(&helper);
+    command
+        .arg(&binary_path)
+        .arg(&input_path)
+        .arg(format!("{selected:x}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpgid is async-signal-safe between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| Status::failed_precondition("Frida observer could not start"))?;
+    #[cfg(target_os = "linux")]
+    let mut process_group = WorkerProcessGroup {
+        pid: i32::try_from(
+            child
+                .id()
+                .ok_or_else(|| Status::internal("observer PID unavailable"))?,
+        )
+        .map_err(|_| Status::internal("observer PID overflow"))?,
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Status::internal("observer stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Status::internal("observer stderr unavailable"))?;
+    let stdout_reader = async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take((MAX_DYNAMIC_TRACE_JSON_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let stderr_reader = async move {
+        let mut bytes = Vec::new();
+        stderr.take(8193).read_to_end(&mut bytes).await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let deadline = Duration::from_millis(input.budget.timeout_ms.saturating_add(8_000));
+    let (stdout, stderr, exit) = tokio::time::timeout(deadline, async {
+        tokio::try_join!(stdout_reader, stderr_reader, child.wait())
+    })
+    .await
+    .map_err(|_| Status::deadline_exceeded("Frida observer exceeded InputSpec timeout"))?
+    .map_err(|_| Status::internal("Frida observer output failed"))?;
+    #[cfg(target_os = "linux")]
+    process_group.disarm();
+    if stdout.len() > MAX_DYNAMIC_TRACE_JSON_BYTES || stderr.len() > 8192 {
+        return Err(Status::resource_exhausted(
+            "Frida observer output exceeds limit",
+        ));
+    }
+    if !exit.success() {
+        return Err(Status::failed_precondition(format!(
+            "Frida observer failed: {}",
+            String::from_utf8_lossy(&stderr)
+                .trim()
+                .chars()
+                .take(4096)
+                .collect::<String>()
+        )));
+    }
+    checked_frida_trace(&elf, &input, selected, expected_snapshot, &stdout)
+        .map_err(Status::data_loss)
+}
+
+#[cfg(test)]
+async fn run_frida_observer(
+    _elf: Vec<u8>,
+    _input_json: Vec<u8>,
+    _snapshot_json: Vec<u8>,
+    _selected: u64,
+) -> Result<Vec<u8>, Status> {
+    Err(Status::failed_precondition(
+        "Frida observer is not started in unit tests",
+    ))
 }
 
 async fn collect_ghidra_call_root_snapshot(
@@ -4663,6 +4831,135 @@ fn require_native_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
     Ok(v3_job_reply(job))
 }
 
+fn require_frida_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
+    if job.kind != "frida-observation" {
+        return Err(Status::not_found("Frida observation job not found"));
+    }
+    Ok(v3_job_reply(job))
+}
+
+fn require_v3_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
+    if !matches!(job.kind.as_str(), "native-analysis" | "frida-observation") {
+        return Err(Status::not_found("analysis job not found"));
+    }
+    Ok(v3_job_reply(job))
+}
+
+fn frida_request_fingerprint(input: &api_v3::StartFridaObservationRequest) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"hydir-frida-observation-v1\0");
+    hash.update(input.selected_elf_vaddr.to_le_bytes());
+    for part in [&input.input_spec_json, &input.snapshot_json] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn stage_frida_elf(path: &Path, elf: &[u8]) -> Result<(), String> {
+    std::fs::write(path, elf).map_err(|error| format!("cannot stage Frida ELF: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot mark Frida ELF executable: {error}"))?;
+    }
+    Ok(())
+}
+
+fn frida_snapshot_digest(
+    elf: &[u8],
+    input: &InputSpec,
+    snapshot_json: &[u8],
+    selected: u64,
+) -> Result<Option<String>, String> {
+    if snapshot_json.is_empty() {
+        return Ok(None);
+    }
+    let snapshot = parse_ghidra_snapshot(snapshot_json, &input.binary_sha256)?;
+    let parse_address = |value: &str| -> Result<u64, String> {
+        let digits = value
+            .strip_prefix("0x")
+            .ok_or("Ghidra address is not 0x-prefixed")?;
+        u64::from_str_radix(digits, 16).map_err(|_| "Ghidra address is invalid".to_owned())
+    };
+    let elf_base = import_elf(elf)
+        .map_err(|error| error.to_string())?
+        .mapped_segments
+        .iter()
+        .filter(|segment| segment.address_space == 0 && segment.memory_size > 0)
+        .map(|segment| segment.virtual_address.0)
+        .min()
+        .ok_or("ELF has no mapped RAM segment")?;
+    let snapshot_base = parse_address(&snapshot.program.image_base.offset)?;
+    let entry = parse_address(&snapshot.selected_function.entry.offset)?;
+    let linked = entry
+        .checked_sub(snapshot_base)
+        .and_then(|offset| elf_base.checked_add(offset))
+        .ok_or("Ghidra function entry cannot be normalized to ELF")?;
+    if snapshot.selected_function.entry.space != "ram"
+        || snapshot.program.image_base.space != "ram"
+        || linked != selected
+    {
+        return Err("Ghidra snapshot entry differs from observed ELF address".to_owned());
+    }
+    Ok(Some(sha256(
+        &serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?,
+    )))
+}
+
+fn validate_frida_request(
+    elf: &[u8],
+    input_json: &[u8],
+    snapshot_json: &[u8],
+    selected: u64,
+) -> Result<(InputSpec, Option<String>), String> {
+    if selected == 0 || input_json.is_empty() || input_json.len() > MAX_INPUT_SPEC_BYTES {
+        return Err("Frida observation requires a selected address and bounded InputSpec".into());
+    }
+    if snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+        return Err("Ghidra snapshot exceeds 16 MiB".into());
+    }
+    let input = parse_input_spec(input_json)?;
+    validate_input_spec(elf, &input)?;
+    if !input.stdin_hex.is_empty() || input.budget.memory_bytes < 1024 * 1024 * 1024 {
+        return Err(
+            "Frida observation currently requires argv/files and a 1 GiB memory budget".into(),
+        );
+    }
+    let program = import_elf(elf).map_err(|error| error.to_string())?;
+    if !program.mapped_segments.iter().any(|segment| {
+        segment.address_space == 0
+            && segment.executable
+            && selected >= segment.virtual_address.0
+            && selected - segment.virtual_address.0 < segment.file_size
+    }) {
+        return Err("selected Frida address is outside file-backed executable ELF code".into());
+    }
+    let expected_snapshot = frida_snapshot_digest(elf, &input, snapshot_json, selected)?;
+    Ok((input, expected_snapshot))
+}
+
+fn checked_frida_trace(
+    elf: &[u8],
+    input: &InputSpec,
+    selected: u64,
+    expected_snapshot: Option<String>,
+    content: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut trace = parse_dynamic_trace(content)?;
+    if trace.schema_version != DYNAMIC_TRACE_V2_VERSION
+        || trace.selected_elf_vaddr != selected
+        || trace.ghidra_snapshot_sha256.is_some()
+    {
+        return Err("Frida observer returned a mismatched trace".into());
+    }
+    validate_dynamic_trace(elf, input, &trace)?;
+    trace.ghidra_snapshot_sha256 = expected_snapshot;
+    validate_dynamic_trace(elf, input, &trace)?;
+    serde_json::to_vec(&trace).map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Copy)]
 enum GhidraCallArtifactKind {
     Trace,
@@ -4986,6 +5283,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             ghidra_call_tracing: true,
             ghidra_call_cfg_llvm: true,
             ghidra_function_assessment: true,
+            frida_observation_jobs: cfg!(all(target_os = "linux", target_arch = "x86_64")),
         }))
     }
 
@@ -5127,7 +5425,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
     ) -> Result<Response<api_v3::JobReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
-        Ok(Response::new(require_native_job(self.job(
+        Ok(Response::new(require_v3_job(self.job(
             &principal,
             &input.project_id,
             &input.job_id,
@@ -5146,7 +5444,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         });
         *legacy.metadata_mut() = metadata;
         let principal = self.principal(&legacy)?;
-        require_native_job(self.job(
+        require_v3_job(self.job(
             &principal,
             &legacy.get_ref().project_id,
             &legacy.get_ref().job_id,
@@ -5154,7 +5452,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         let job = <Store as Hydir>::cancel_job(self, legacy)
             .await?
             .into_inner();
-        Ok(Response::new(require_native_job(job)?))
+        Ok(Response::new(require_v3_job(job)?))
     }
 
     type StreamAnalysisEventsStream = ReceiverStream<Result<api_v3::JobEvent, Status>>;
@@ -5172,7 +5470,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         });
         *legacy.metadata_mut() = metadata;
         let principal = self.principal(&legacy)?;
-        require_native_job(self.job(
+        require_v3_job(self.job(
             &principal,
             &legacy.get_ref().project_id,
             &legacy.get_ref().job_id,
@@ -5577,6 +5875,209 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         request: Request<api_v3::GhidraCallTraceRequest>,
     ) -> Result<Response<api_v3::ArtifactReply>, Status> {
         ghidra_call_artifact(self, request, GhidraCallArtifactKind::Assessment).await
+    }
+
+    async fn start_frida_observation(
+        &self,
+        request: Request<api_v3::StartFridaObservationRequest>,
+    ) -> Result<Response<api_v3::JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
+        if !cfg!(all(target_os = "linux", target_arch = "x86_64")) && !cfg!(test) {
+            return Err(Status::failed_precondition(
+                "Frida observation requires Linux x86-64",
+            ));
+        }
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "job idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        if input.selected_elf_vaddr == 0
+            || input.input_spec_json.is_empty()
+            || input.input_spec_json.len() > MAX_INPUT_SPEC_BYTES
+            || input.snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES
+        {
+            return Err(Status::invalid_argument(
+                "Frida request exceeds its input bounds",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        let fingerprint = frida_request_fingerprint(&input);
+        self.project(&principal, &input.project_id)?;
+        let prior: Option<(String, i64, String, String)> = self.connection()?.query_row(
+            "SELECT id,revision,kind,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+            params![input.project_id, input.idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(internal)?;
+        if let Some((id, revision, kind, symbol)) = prior {
+            if revision != expected || kind != "frida-observation" || symbol != fingerprint {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to another request",
+                ));
+            }
+            return Ok(Response::new(require_frida_job(self.job(
+                &principal,
+                &input.project_id,
+                &id,
+            )?)?));
+        }
+        let elf = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        validate_frida_request(
+            &elf,
+            &input.input_spec_json,
+            &input.snapshot_json,
+            input.selected_elf_vaddr,
+        )
+        .map_err(Status::invalid_argument)?;
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
+            let retry: Option<(String, i64, String, String)> = tx.query_row(
+                "SELECT id,revision,kind,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+                params![input.project_id, input.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional().map_err(internal)?;
+            if let Some((existing, revision, kind, symbol)) = retry {
+                drop(tx);
+                drop(conn);
+                if revision != expected || kind != "frida-observation" || symbol != fingerprint {
+                    return Err(Status::already_exists(
+                        "idempotency key belongs to another request",
+                    ));
+                }
+                return Ok(Response::new(require_frida_job(self.job(
+                    &principal,
+                    &input.project_id,
+                    &existing,
+                )?)?));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE requested_by=?1 AND state IN ('queued','running')",
+                [principal.as_str()], |row| row.get(0),
+            ).map_err(internal)?;
+            if active >= MAX_ACTIVE_JOBS_PER_IDENTITY {
+                return Err(Status::resource_exhausted("identity has two active jobs"));
+            }
+            tx.execute(
+                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state,requested_by) \
+                 VALUES(?1,?2,?3,'frida-observation',?4,?5,'queued',?6)",
+                params![id, input.project_id, expected, fingerprint, input.idempotency_key, principal],
+            ).map_err(internal)?;
+            insert_event(&tx, &id, "queued", "Frida observation queued", "")?;
+            tx.commit().map_err(internal)?;
+        }
+        let (start_sender, start_receiver) = oneshot::channel();
+        let runner = self.clone();
+        let runner_id = id.clone();
+        let project_id = input.project_id.clone();
+        let handle = tokio::spawn(async move {
+            if start_receiver.await.is_ok() {
+                runner
+                    .execute_frida_observation_job(
+                        runner_id,
+                        project_id,
+                        input.expected_revision,
+                        elf,
+                        input.input_spec_json,
+                        input.snapshot_json,
+                        input.selected_elf_vaddr,
+                    )
+                    .await;
+            }
+        });
+        self.workers
+            .lock()
+            .map_err(|_| Status::internal("worker registry lock poisoned"))?
+            .insert(id.clone(), handle);
+        let _ = start_sender.send(());
+        Ok(Response::new(require_frida_job(self.job(
+            &principal,
+            &input.project_id,
+            &id,
+        )?)?))
+    }
+
+    async fn get_frida_observation(
+        &self,
+        request: Request<api_v3::FridaObservationArtifactRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        let job = self.job(&principal, &input.project_id, &input.job_id)?;
+        require_frida_job(job.clone())?;
+        if job.state != "succeeded" || job.artifact_sha256.is_empty() {
+            return Err(Status::failed_precondition(
+                "Frida observation artifact is not ready",
+            ));
+        }
+        let record: Option<(String, Vec<u8>, String, String, i64)> = self
+            .connection()?
+            .query_row(
+                "SELECT media_type,content,storage_kind,storage_key,content_size FROM artifacts \
+             WHERE project_id=?1 AND revision=?2 AND sha256=?3",
+                params![
+                    input.project_id,
+                    job.project_revision as i64,
+                    job.artifact_sha256
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?;
+        let (media_type, inline, storage_kind, storage_key, content_size) =
+            record.ok_or_else(|| Status::data_loss("Frida artifact record is missing"))?;
+        if media_type != FRIDA_TRACE_MEDIA_TYPE {
+            return Err(Status::data_loss(
+                "Frida artifact media type differs from job",
+            ));
+        }
+        let content = self
+            .content_storage
+            .load(
+                &job.artifact_sha256,
+                inline,
+                &storage_kind,
+                &storage_key,
+                content_size,
+            )
+            .await?;
+        if sha256(&content) != job.artifact_sha256 {
+            return Err(Status::data_loss("Frida artifact digest differs from job"));
+        }
+        Ok(Response::new(api_v3::ArtifactReply {
+            sha256: job.artifact_sha256,
+            media_type,
+            content,
+            project_revision: job.project_revision,
+        }))
     }
 
     async fn update_analyst_fact(
@@ -6158,6 +6659,301 @@ async fn async_main(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frida_test_input(elf: &[u8]) -> InputSpec {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "binary_sha256": sha256(elf),
+            "argv_hex": ["30"],
+            "stdin_hex": "",
+            "files": [],
+            "origins": [],
+            "goal": {"exit_code": 0},
+            "budget": {"timeout_ms": 10000, "memory_bytes": 1073741824, "output_bytes": 4096}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn frida_elf_staging_preserves_bytes_and_is_executable_on_unix() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("binary.elf");
+        let elf = include_bytes!("../../../demo/hydir-prism.elf");
+        stage_frida_elf(&path, elf).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), elf);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn frida_trace_requires_bound_v2_evidence_and_preserves_unknown_exit_code() {
+        use hydir_execution::{
+            DynamicTrace, TraceBudget, TraceEvent, TraceEventKind, TraceStatus, TraceWitness,
+            input_sha256,
+        };
+        let elf = include_bytes!("../../../demo/hydir-prism.elf");
+        let address = 0x201388;
+        let input = frida_test_input(elf);
+        let program = import_elf(elf).unwrap();
+        let segment = program
+            .mapped_segments
+            .iter()
+            .find(|segment| {
+                segment.executable
+                    && segment.address_space == 0
+                    && address >= segment.virtual_address.0
+                    && address - segment.virtual_address.0 < segment.file_size
+            })
+            .unwrap();
+        let byte_offset = (segment.file_offset.0 + address - segment.virtual_address.0) as usize;
+        let witness = TraceWitness {
+            runtime_address: address,
+            elf_vaddr: Some(address),
+            original_bytes_hex: Some(format!("{:02x}", elf[byte_offset])),
+        };
+        let image_base = program
+            .mapped_segments
+            .iter()
+            .filter(|segment| segment.file_offset.0 == 0)
+            .map(|segment| segment.virtual_address.0 & !4095)
+            .min()
+            .unwrap();
+        let trace = DynamicTrace {
+            schema_version: 2,
+            binary_sha256: sha256(elf),
+            input_sha256: input_sha256(&input).unwrap(),
+            selected_elf_vaddr: address,
+            ghidra_snapshot_sha256: None,
+            observer: "test-frida".into(),
+            frida_version: "17.9.5".into(),
+            agent_sha256: sha256(b"test-agent"),
+            runtime_module_base: Some(image_base),
+            elf_load_bias: Some(0),
+            budget: TraceBudget {
+                max_events: 8,
+                timeout_ms: 1000,
+            },
+            status: TraceStatus::Completed,
+            lost_events: 0,
+            stdout_hex: String::new(),
+            stderr_hex: String::new(),
+            diagnostics: vec![],
+            events: vec![
+                TraceEvent {
+                    sequence: 0,
+                    thread_id: 1,
+                    kind: TraceEventKind::Entry,
+                    source: witness.clone(),
+                    target: None,
+                    registers: Some(std::collections::BTreeMap::from([
+                        ("RIP".into(), address),
+                        ("RSP".into(), 0x700000),
+                    ])),
+                },
+                TraceEvent {
+                    sequence: 1,
+                    thread_id: 1,
+                    kind: TraceEventKind::Exit,
+                    source: witness,
+                    target: None,
+                    registers: None,
+                },
+            ],
+        };
+        let content = serde_json::to_vec(&trace).unwrap();
+        let checked =
+            checked_frida_trace(elf, &input, address, Some("b".repeat(64)), &content).unwrap();
+        let checked: serde_json::Value = serde_json::from_slice(&checked).unwrap();
+        assert_eq!(checked["ghidra_snapshot_sha256"], "b".repeat(64));
+        assert!(checked.get("exit_code").is_none());
+        let mut forged = checked;
+        forged["exit_code"] = json!(0);
+        assert!(
+            checked_frida_trace(
+                elf,
+                &input,
+                address,
+                None,
+                &serde_json::to_vec(&forged).unwrap()
+            )
+            .is_err()
+        );
+        assert!(checked_frida_trace(elf, &input, address + 1, None, &content).is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_frida_job_checks_revision_replay_and_artifact_readiness() {
+        use api_v3::hydir_v3_server::HydirV3;
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("frida-operator").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Frida job".into(),
+                    idempotency_key: "frida-project".into(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../demo/hydir-prism.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let input_json = serde_json::to_vec(&frida_test_input(&binary)).unwrap();
+        let request = api_v3::StartFridaObservationRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: "frida-once".into(),
+            input_spec_json: input_json,
+            selected_elf_vaddr: 0x201388,
+            snapshot_json: vec![],
+        };
+        let job = HydirV3::start_frida_observation(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(job.kind, "frida-observation");
+        assert_eq!(job.project_revision, uploaded.revision);
+        let replay = HydirV3::start_frida_observation(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.job_id, job.job_id);
+        let mut collision = request.clone();
+        collision.selected_elf_vaddr += 1;
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(collision, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::AlreadyExists
+        );
+        let mut stale = request.clone();
+        stale.expected_revision = 0;
+        stale.idempotency_key = "frida-stale".into();
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let mut wrong_binary = request.clone();
+        wrong_binary.idempotency_key = "frida-wrong".into();
+        let mut bad: serde_json::Value =
+            serde_json::from_slice(&wrong_binary.input_spec_json).unwrap();
+        bad["binary_sha256"] = json!("0".repeat(64));
+        wrong_binary.input_spec_json = serde_json::to_vec(&bad).unwrap();
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(wrong_binary, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut outside = request.clone();
+        outside.idempotency_key = "frida-outside".into();
+        outside.selected_elf_vaddr = 1;
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(outside, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            HydirV3::get_frida_observation(
+                &store,
+                authorized(
+                    api_v3::FridaObservationArtifactRequest {
+                        project_id: project.project_id.clone(),
+                        job_id: job.job_id.clone(),
+                    },
+                    &token,
+                )
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = HydirV3::get_analysis_job(
+                    &store,
+                    authorized(
+                        api_v3::JobRequest {
+                            project_id: project.project_id.clone(),
+                            job_id: job.job_id.clone(),
+                        },
+                        &token,
+                    ),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                if current.state == "failed" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Seed storage directly to exercise exact job-revision artifact lookup.
+        let content = b"retrieval-fixture";
+        let staged = store.content_storage.stage(content).await.unwrap();
+        let conn = store.connection().unwrap();
+        insert_artifact(
+            &conn,
+            &project.project_id,
+            uploaded.revision as i64,
+            FRIDA_TRACE_MEDIA_TYPE,
+            &staged,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
+            params![staged.digest, job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+        let artifact = HydirV3::get_frida_observation(
+            &store,
+            authorized(
+                api_v3::FridaObservationArtifactRequest {
+                    project_id: project.project_id,
+                    job_id: job.job_id,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(artifact.project_revision, uploaded.revision);
+        assert_eq!(artifact.media_type, FRIDA_TRACE_MEDIA_TYPE);
+        assert_eq!(artifact.sha256, sha256(content));
+        assert_eq!(artifact.content, content);
+    }
 
     #[tokio::test]
     #[ignore = "requires HYDIR_GHIDRA_HOME pointing to Ghidra 12.1.4 or Docker"]

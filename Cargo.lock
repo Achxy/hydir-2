@@ -2529,6 +2529,7 @@ dependencies = [
  "hydir-c",
  "hydir-core",
  "hydir-decompile",
+ "hydir-execution",
  "hydir-ghidra-worker",
  "hydir-hlc",
  "hydir-interchange",

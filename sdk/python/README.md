@@ -135,9 +135,17 @@ sandbox.
 for trusted static ELFs. It requires `--trusted-fixture`, a JSON list of
 hex-encoded stdin cases, and a new report path. It compares stdout, stderr,
 and exit status under no-network, read-only, CPU/memory/process/time controls.
-This does not establish hostile-input isolation or general equivalence. The
-remote service still has no execution endpoint. A ready case list is
+This does not establish hostile-input isolation or general equivalence. A ready case list is
 `../../tests/fixtures/whole_choice_cases.json`.
+
+On a Linux x86-64 server with the separately bundled Frida observer,
+`start_frida_observation(project_id, revision, input_spec, selected_elf_vaddr)`
+queues an explicit operator-only job for the uploaded ELF. Use
+`get_analysis_job` or `analysis_events` to follow it, then pass the completed
+job's revision and artifact digest, the InputSpec binary digest, and the
+selected address to `get_frida_observation`. The SDK checks the artifact hash,
+revision, schema, binary, and address. DynamicTrace v2 records bounded path
+events and output; process exit code remains unknown.
 
 Install Python 3.10+ in a private virtual environment:
 

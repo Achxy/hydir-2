@@ -144,6 +144,75 @@ class ClientBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(artifact["schema_version"], 3)
 
+    def test_v3_frida_observation_job_and_artifact_are_revision_checked(self):
+        binary_sha = "a" * 64
+        spec = {"schema_version": 1, "binary_sha256": binary_sha}
+        selected = 0x401000
+        trace = {
+            "schema_version": 2, "binary_sha256": binary_sha,
+            "selected_elf_vaddr": selected, "observer": "hydir-frida-observer",
+            "status": "completed", "events": [],
+        }
+        content = json.dumps(trace).encode()
+        digest = hashlib.sha256(content).hexdigest()
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def start_call(method, request):
+                self.assertIs(method, client._stub_v3.StartFridaObservation)
+                requests.append(request)
+                return proto_v3.JobReply(
+                    project_id="project", job_id="job", project_revision=4,
+                    kind="frida-observation", state="queued",
+                )
+
+            client._call = start_call
+            job = client.start_frida_observation(
+                "project", 4, spec, selected, idempotency_key="frida-1",
+            )
+            self.assertEqual(job.job_id, "job")
+            self.assertEqual(requests[0].expected_revision, 4)
+            self.assertEqual(requests[0].selected_elf_vaddr, selected)
+            self.assertEqual(json.loads(requests[0].input_spec_json), spec)
+            with self.assertRaises(ValueError):
+                client.start_frida_observation("project", 4, spec, 0)
+            with self.assertRaises(ValueError):
+                client.start_frida_observation("project", 4, spec, selected,
+                                               idempotency_key="bad\nkey")
+
+            def artifact_call(method, request):
+                self.assertIs(method, client._stub_v3.GetFridaObservation)
+                self.assertEqual(request.job_id, "job")
+                return proto_v3.ArtifactReply(
+                    sha256=digest,
+                    media_type="application/vnd.hydir.dynamic-trace+json;version=2",
+                    content=content, project_revision=4,
+                )
+
+            client._call = artifact_call
+            self.assertEqual(client.get_frida_observation(
+                "project", "job", revision=4, artifact_sha256=digest,
+                binary_sha256=binary_sha, selected_elf_vaddr=selected,
+            ), trace)
+            with self.assertRaises(RuntimeError):
+                client.get_frida_observation(
+                    "project", "job", revision=5, artifact_sha256=digest,
+                    binary_sha256=binary_sha, selected_elf_vaddr=selected,
+                )
+            changed = dict(trace, exit_code=0)
+            changed_content = json.dumps(changed).encode()
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(changed_content).hexdigest(),
+                media_type="application/vnd.hydir.dynamic-trace+json;version=2",
+                content=changed_content, project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.get_frida_observation(
+                    "project", "job", revision=4,
+                    artifact_sha256=hashlib.sha256(changed_content).hexdigest(),
+                    binary_sha256=binary_sha, selected_elf_vaddr=selected,
+                )
+
     def test_v3_analysis_model_read_and_revisioned_save(self):
         model = {"schema_version": 1, "binary_sha256": "a" * 64, "revision": 2}
         content = json.dumps(model).encode("utf-8")
