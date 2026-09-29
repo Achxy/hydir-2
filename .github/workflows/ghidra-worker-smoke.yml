@@ -185,6 +185,7 @@ jobs:
           test -x "$HYDIR_GHIDRA_HOME/support/analyzeHeadless"
           test -x "$HYDIRCTL_BIN"
           python3 -m unittest -v tests/ghidra_oracle_test.py
+          chmod +x tests/fixtures/ghidra_add_zero.elf
           python3 tests/ghidra_four_engine_gate.py
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
