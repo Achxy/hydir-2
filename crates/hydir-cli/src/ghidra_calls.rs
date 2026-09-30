@@ -7,7 +7,8 @@ use hydir_ir::pcode::{
     MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfProcessMemory,
     PcodeProcessAllocations, execute_concrete_call_path,
     execute_concrete_call_path_with_allocations, execute_concrete_call_path_with_image,
-    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
+    execute_concrete_call_path_with_imports, parse_ghidra_snapshot, parse_pcode_seed,
+    unloaded_call_target,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, error::Error, path::Path};
@@ -92,7 +93,11 @@ fn emit(
     seed_path: &str,
     options: &Options<'_>,
     diagnostics: Vec<String>,
+    with_imports: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if with_imports && options.allocations.is_none() {
+        return Err("checked import calls require --allocations".into());
+    }
     let seed = parse_pcode_seed(
         &read_bounded_json(seed_path, MAX_PCODE_SEED_BYTES)?,
         &snapshots[0],
@@ -104,15 +109,28 @@ fn emit(
     };
     let mut trace = if let Some(path) = options.allocations {
         let (process, allocations) = strict_allocations(snapshots, binary, path)?;
-        execute_concrete_call_path_with_allocations(
-            snapshots,
-            &seed,
-            &process,
-            &allocations,
-            options.max_operations,
-            options.max_visits,
-            options.max_depth,
-        )?
+        if with_imports {
+            execute_concrete_call_path_with_imports(
+                snapshots,
+                &seed,
+                binary,
+                &process,
+                &allocations,
+                options.max_operations,
+                options.max_visits,
+                options.max_depth,
+            )?
+        } else {
+            execute_concrete_call_path_with_allocations(
+                snapshots,
+                &seed,
+                &process,
+                &allocations,
+                options.max_operations,
+                options.max_visits,
+                options.max_depth,
+            )?
+        }
     } else if let Some(image) = &image {
         execute_concrete_call_path_with_image(
             snapshots,
@@ -212,7 +230,24 @@ pub fn run_snapshots(args: &[String]) -> Result<(), Box<dyn Error>> {
             &digest,
         )?);
     }
-    emit(&snapshots, &binary_bytes, seed, &options, Vec::new())
+    emit(&snapshots, &binary_bytes, seed, &options, Vec::new(), false)
+}
+
+pub fn run_snapshots_imports(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let [binary, root, seed, options @ ..] = args else {
+        return Err("trace-calls-imports needs binary, root snapshot, and seed".into());
+    };
+    let options = parse_options(options, false)?;
+    let binary_bytes = read_binary(binary)?;
+    let digest = format!("{:x}", Sha256::digest(&binary_bytes));
+    let mut snapshots = Vec::with_capacity(options.callees.len() + 1);
+    for path in std::iter::once(root.as_str()).chain(options.callees.iter().copied()) {
+        snapshots.push(parse_ghidra_snapshot(
+            &read_bounded_json(path, MAX_GHIDRA_SNAPSHOT_BYTES)?,
+            &digest,
+        )?);
+    }
+    emit(&snapshots, &binary_bytes, seed, &options, Vec::new(), true)
 }
 
 pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -222,7 +257,24 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(options, true)?;
     let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
     let binary_bytes = read_binary(binary)?;
-    emit(&snapshots, &binary_bytes, seed, &options, diagnostics)
+    emit(
+        &snapshots,
+        &binary_bytes,
+        seed,
+        &options,
+        diagnostics,
+        false,
+    )
+}
+
+pub fn run_automatic_imports(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let [binary, seed, options @ ..] = args else {
+        return Err("trace-calls-imports needs binary and seed".into());
+    };
+    let options = parse_options(options, true)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let binary_bytes = read_binary(binary)?;
+    emit(&snapshots, &binary_bytes, seed, &options, diagnostics, true)
 }
 
 pub fn run_automatic_llvm(args: &[String]) -> Result<(), Box<dyn Error>> {

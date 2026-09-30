@@ -297,6 +297,17 @@ impl PcodeConcreteState {
         self.unique_bytes.clear();
     }
 
+    /// An external SysV call may change every register except the supplied
+    /// callee-saved ranges. Unknown bytes stay unknown after the call.
+    pub(super) fn retain_register_ranges(&mut self, ranges: &[(u64, u32)]) {
+        self.register_bytes.retain(|address, _| {
+            ranges
+                .iter()
+                .any(|(start, size)| *address >= *start && *address - *start < u64::from(*size))
+        });
+        self.clear_unique();
+    }
+
     /// Seed or update fully known bytes in a named memory space. Execution
     /// checks the space ID and layout against the Ghidra artifact before use.
     pub fn write_memory(

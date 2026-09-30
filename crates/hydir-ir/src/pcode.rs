@@ -39,10 +39,12 @@ pub use imports::{
     PCODE_ELF_IMPORT_INDEX_VERSION, PcodeElfImport, PcodeElfImportCall, PcodeElfImportIndex,
 };
 pub use interprocedural::{
-    PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION, PCODE_CALL_PATH_VERSION, PcodeCallPathSegment,
-    PcodeCallPathStop, PcodeCallProcessBinding, PcodeCallTransition, PcodeInterproceduralTrace,
+    PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION, PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION,
+    PCODE_CALL_PATH_VERSION, PcodeCallPathSegment, PcodeCallPathStop, PcodeCallProcessBinding,
+    PcodeCallTransition, PcodeContractedImportCall, PcodeInterproceduralTrace,
     execute_concrete_call_path, execute_concrete_call_path_with_allocations,
-    execute_concrete_call_path_with_image, unloaded_call_target,
+    execute_concrete_call_path_with_image, execute_concrete_call_path_with_imports,
+    unloaded_call_target,
 };
 pub use process_memory::{
     MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,

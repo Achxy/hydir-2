@@ -261,6 +261,13 @@ class LocalGhidraTests(unittest.TestCase):
         with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
             self.client.trace_calls(self.binary, seed, function=0x401000, allocations=allocations)
         self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        contracted = {**artifact, "schema_version": 4, "contracted_imports": []}
+        with patch.object(self.client, "_run", return_value=json.dumps(contracted).encode()) as run:
+            self.client.trace_calls(self.binary, seed, function=0x401000,
+                                    allocations=allocations, imports=True)
+        self.assertEqual(run.call_args.args[:2], ("ghidra", "trace-calls-imports"))
+        with self.assertRaises(ValueError):
+            self.client.trace_calls(self.binary, seed, function=0x401000, imports=True)
         with self.assertRaises(ValueError):
             self.client.trace_calls(self.binary, seed, function=0x401000, max_depth=17)
         with patch.object(self.client, "_run", return_value=b'{"binary_sha256":"wrong"}'):

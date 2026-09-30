@@ -546,6 +546,7 @@ class LocalGhidra:
         max_visits: int = 1024,
         max_depth: int = 8,
         allocations: str | os.PathLike[str] | None = None,
+        imports: bool = False,
     ) -> dict[str, Any]:
         """Ask Hydir's managed Ghidra worker for direct callees and trace one path."""
         if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
@@ -554,11 +555,14 @@ class LocalGhidra:
             raise ValueError("call-path function or depth limit is invalid")
         if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
             raise ValueError("call-path operation or visit budget is invalid")
+        if imports and allocations is None:
+            raise ValueError("checked import calls require allocations")
         binary_path = Path(binary).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
         digest = self._digest(binary_path)
         args = [
-            "ghidra", "trace-calls", str(binary_path), str(seed_path),
+            "ghidra", "trace-calls-imports" if imports else "trace-calls",
+            str(binary_path), str(seed_path),
             "--function", hex(function), "--max-functions", str(max_functions),
             "--max-ops", str(max_operations), "--max-visits", str(max_visits),
             "--max-depth", str(max_depth),
@@ -568,7 +572,10 @@ class LocalGhidra:
         data = json.loads(self._run(*args))
         if not isinstance(data, dict) or data.get("binary_sha256") != digest:
             raise RuntimeError("Hydir call trace belongs to another binary")
-        if allocations is not None and data.get("schema_version") != 3:
+        if imports and (data.get("schema_version") != 4
+                        or not isinstance(data.get("contracted_imports", []), list)):
+            raise RuntimeError("Hydir checked import trace has the wrong version")
+        if allocations is not None and not imports and data.get("schema_version") != 3:
             raise RuntimeError("Hydir allocated call trace has the wrong version")
         return data
 
