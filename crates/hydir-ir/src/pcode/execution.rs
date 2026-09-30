@@ -175,18 +175,6 @@ impl PcodeConcreteState {
         Ok(())
     }
 
-    fn read_memory_with_image(
-        &self,
-        space: &str,
-        byte_offset: u64,
-        size: u32,
-        image: Option<&dyn PcodeInitialMemory>,
-    ) -> Result<Option<u64>, String> {
-        checked_memory_range(byte_offset, size)?;
-        self.read_memory_with_image_wide(space, byte_offset, size, image)
-            .map(|value| value.map(|value| value as u64))
-    }
-
     fn read_memory_with_image_wide(
         &self,
         space: &str,
@@ -335,6 +323,31 @@ impl PcodeConcreteState {
         Ok(())
     }
 
+    fn write_memory_wide(
+        &mut self,
+        space: &str,
+        byte_offset: u64,
+        size: u32,
+        value: u128,
+    ) -> Result<(), String> {
+        checked_memory_range_wide(byte_offset, size)?;
+        if space.is_empty() || space.len() > 128 || space.chars().any(char::is_control) {
+            return Err("concrete memory space name is invalid".to_owned());
+        }
+        let current_bytes = self.known_byte_count();
+        let bytes = self.memory_bytes.entry(space.to_owned()).or_default();
+        let missing = (0..size)
+            .filter(|index| !bytes.contains_key(&(byte_offset + u64::from(*index))))
+            .count();
+        if current_bytes.saturating_add(missing) > MAX_KNOWN_STATE_BYTES {
+            return Err("concrete P-code state exceeds byte limit".to_owned());
+        }
+        for index in 0..size {
+            bytes.insert(byte_offset + u64::from(index), (value >> (index * 8)) as u8);
+        }
+        Ok(())
+    }
+
     /// Read a complete little-endian memory value. Unknown bytes produce
     /// `None`; no default zero-filled memory is assumed.
     pub fn read_memory(
@@ -417,6 +430,8 @@ pub struct PcodeConcreteMemoryAccess {
     pub pointer_offset: u64,
     pub byte_offset: u64,
     pub width_bytes: u32,
+    /// Low 64 bits for legacy readers. For wider accesses the full value is
+    /// in PcodeExecutedOperation input_values (STORE) or output_value (LOAD).
     pub value: u64,
 }
 
@@ -922,7 +937,7 @@ impl PcodeSemanticFunctionIr {
                 data.size
             }
         };
-        if !(1..=8).contains(&width) || space.addressable_unit_size == 0 {
+        if !(1..=16).contains(&width) || space.addressable_unit_size == 0 {
             return Err(memory_boundary(
                 source,
                 Some(&space.name),
@@ -963,7 +978,7 @@ impl PcodeSemanticFunctionIr {
                     "pointer scaling overflows the supported byte offset",
                 )
             })?;
-        checked_memory_range(byte_offset, width).map_err(|reason| {
+        checked_memory_range_wide(byte_offset, width).map_err(|reason| {
             memory_boundary(
                 source,
                 Some(&space.name),
@@ -975,7 +990,7 @@ impl PcodeSemanticFunctionIr {
         let mut input_values = vec![u128::from(id), u128::from(pointer_offset)];
         let value = match kind {
             PcodeMemoryAccessKind::Load => {
-                match state.read_memory_with_image(&space.name, byte_offset, width, image) {
+                match state.read_memory_with_image_wide(&space.name, byte_offset, width, image) {
                     Ok(Some(value)) => value,
                     Ok(None) => {
                         return Err(memory_boundary(
@@ -1026,9 +1041,9 @@ impl PcodeSemanticFunctionIr {
                     ));
                 }
                 let data = &source.inputs[2];
-                match state.read_varnode(data) {
+                match state.read_varnode_wide(data) {
                     Ok(Some(value)) => {
-                        input_values.push(u128::from(value));
+                        input_values.push(value);
                         value
                     }
                     Ok(None) => {
@@ -1053,7 +1068,7 @@ impl PcodeSemanticFunctionIr {
         match kind {
             PcodeMemoryAccessKind::Load => {
                 let output = source.output.as_ref().expect("validated LOAD output");
-                state.write_varnode(output, value).map_err(|reason| {
+                state.write_varnode_wide(output, value).map_err(|reason| {
                     memory_boundary(
                         source,
                         Some(&space.name),
@@ -1065,7 +1080,7 @@ impl PcodeSemanticFunctionIr {
             }
             PcodeMemoryAccessKind::Store => {
                 state
-                    .write_memory(&space.name, byte_offset, width, value)
+                    .write_memory_wide(&space.name, byte_offset, width, value)
                     .map_err(|reason| {
                         memory_boundary(
                             source,
@@ -1080,7 +1095,7 @@ impl PcodeSemanticFunctionIr {
         Ok(PcodeExecutedOperation {
             source: source.clone(),
             input_values,
-            output_value: (kind == PcodeMemoryAccessKind::Load).then_some(u128::from(value)),
+            output_value: (kind == PcodeMemoryAccessKind::Load).then_some(value),
             memory_access: Some(PcodeConcreteMemoryAccess {
                 kind,
                 space: space.name.clone(),
@@ -1088,7 +1103,7 @@ impl PcodeSemanticFunctionIr {
                 pointer_offset,
                 byte_offset,
                 width_bytes: width,
-                value,
+                value: value as u64,
             }),
         })
     }
@@ -2834,5 +2849,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn sixteen_byte_store_and_load_preserve_every_byte() {
+        let mut f = function(vec![
+            operation(
+                3,
+                "STORE",
+                0,
+                None,
+                vec![
+                    node("const", "0x1", 4),
+                    node("register", "0x20", 8),
+                    node("register", "0x100", 16),
+                ],
+            ),
+            operation(
+                2,
+                "LOAD",
+                1,
+                Some(node("register", "0x200", 16)),
+                vec![node("const", "0x1", 4), node("register", "0x20", 8)],
+            ),
+        ]);
+        f.address_spaces = vec![GhidraAddressSpace {
+            name: "ram".to_owned(),
+            id: 1,
+            space_type: 1,
+            addressable_unit_size: 1,
+            pointer_size: 8,
+        }];
+        let original = 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00_u128;
+        let mut state = PcodeConcreteState::default();
+        state
+            .write_varnode(&node("register", "0x20", 8), 0x700000)
+            .unwrap();
+        state
+            .write_varnode_wide(&node("register", "0x100", 16), original)
+            .unwrap();
+        let trace = f.execute_exact_prefix(&state, 4).unwrap();
+        assert_eq!(trace.executed.len(), 2);
+        assert_eq!(trace.executed[0].input_values[2], original);
+        assert_eq!(trace.executed[1].output_value, Some(original));
+        assert_eq!(
+            trace.executed[1]
+                .memory_access
+                .as_ref()
+                .unwrap()
+                .width_bytes,
+            16
+        );
+        assert_eq!(
+            trace
+                .final_state
+                .read_varnode_wide(&node("register", "0x200", 16))
+                .unwrap(),
+            Some(original)
+        );
     }
 }

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import resource
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ROOT / "tests/holdout/musl"
-HYDIRCTL = Path(os.environ.get("HYDIRCTL", ROOT / "target/debug/hydirctl")).resolve()
+HYDIRCTL = Path(os.environ.get("HYDIRCTL") or shutil.which("hydirctl") or
+                ROOT / "target/debug/hydirctl").resolve()
 STACK_BASE = 0x6FFE00
 STACK_LENGTH = 0x208
 STACK_POINTER = 0x700000
@@ -86,6 +88,29 @@ def write_seed(case, binary, snapshot, addresses, directory):
                           "size": 8, "value": hex(value)})
     registers.append({"offset": layout["RSP"]["storage"]["offset"],
                       "size": 8, "value": hex(STACK_POINTER)})
+    # A native caller supplies concrete callee-saved registers. Use a stated
+    # synthetic value for bytes that an O0 prologue saves before overwriting.
+    for name in ("RBP", "RBX", "R12", "R13", "R14", "R15"):
+        if name in layout:
+            registers.append({"offset": layout[name]["storage"]["offset"],
+                              "size": 8, "value": "0x0"})
+    seeded = {(int(row["offset"], 16) + byte)
+              for row in registers for byte in range(row["size"])}
+    for instruction in snapshot["selected_function"]["instructions"]:
+        for operation in instruction["pcode"]:
+            inputs = operation["inputs"]
+            if (operation["mnemonic"] != "INT_XOR" or len(inputs) != 2
+                    or inputs[0] != inputs[1] or inputs[0]["space"] != "register"
+                    or inputs[0]["size"] > 16):
+                continue
+            start = int(inputs[0]["offset"], 16)
+            for part in range(0, inputs[0]["size"], 8):
+                size = min(8, inputs[0]["size"] - part)
+                if any(start + part + byte in seeded for byte in range(size)):
+                    continue
+                registers.append({"offset": hex(start + part), "size": size,
+                                  "value": "0x0"})
+                seeded.update(start + part + byte for byte in range(size))
     seed = {"schema_version": 1, "binary_sha256": sha(binary),
             "entry": snapshot["selected_function"]["entry"],
             "registers": registers,
@@ -189,9 +214,10 @@ def llvm_result(artifact, seed, snapshot, directory):
 
 
 def observe(binary, entry, native_stdout, directory):
-    observer = os.environ.get("HYDIR_FRIDA_OBSERVER")
-    if not observer:
-        raise RuntimeError("HYDIR_FRIDA_OBSERVER is required for the full demo")
+    observer = Path(os.environ.get("HYDIR_FRIDA_OBSERVER") or
+                    HYDIRCTL.parent / "hydir-frida-observer")
+    if not observer.is_file():
+        raise RuntimeError(f"bundled Frida observer is unavailable: {observer}")
     spec = {"schema_version": 1, "binary_sha256": sha(binary),
             "argv_hex": [], "stdin_hex": "", "files": [], "origins": [],
             "goal": {"exit_code": 0, "stdout_contains_hex": None,
@@ -237,6 +263,9 @@ def run_case(case, directory, full):
             or int(snapshot["selected_function"]["entry"]["offset"], 16) != entry):
         raise RuntimeError("Ghidra snapshot has a different binary or entry")
     result["snapshot_sha256"] = sha(snapshot_path)
+    result["seed_assumption"] = (
+        "callee-saved entry registers and self-XOR source registers are zero "
+        "for this bounded input")
     seed_path = write_seed(case, binary, snapshot, addresses, directory)
     allocation_path = directory / "allocations.json"
     allocation_path.write_text(json.dumps({"schema_version": 1, "regions": [

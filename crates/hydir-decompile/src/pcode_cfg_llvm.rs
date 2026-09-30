@@ -984,7 +984,7 @@ fn memory_layout<'a>(
     };
     if !matches!(value.space.as_str(), "register" | "unique" | "const")
         || kind == MemoryKind::Load && value.space == "const"
-        || !(1..=8).contains(&value.size)
+        || !(1..=16).contains(&value.size)
         || space.addressable_unit_size == 0
     {
         return Err(invalid("memory value width or state space is unsupported"));
@@ -1358,7 +1358,7 @@ fn emit_process_memory_value(
         body.push_str(&format!("process_store_{id}:\n"));
         let value = if data.space == "const" {
             let bits = data.size * 8;
-            let mask = if bits == 64 {
+            let mask = if bits >= 64 {
                 u64::MAX
             } else {
                 (1u64 << bits) - 1
@@ -1366,15 +1366,16 @@ fn emit_process_memory_value(
             format!("{}", offset(&data.offset)? & mask)
         } else {
             body.push_str(&format!(
-                "  %process_store_value_{id} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                "  %process_store_value_{id} = call i{load_bits} @{}(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                if load_bits == 128 { "hydir_read_varnode_wide" } else { "hydir_read_varnode" },
                 pcode_space_id(&data.space)?, pcode_offset(data)?, data.size
             ));
             format!("%process_store_value_{id}")
         };
         for byte in 0..layout.width {
             body.push_str(&format!(
-                "  %process_shifted_{id}_{byte} = lshr i64 {value}, {}\n\
-                 %process_store_byte_{id}_{byte} = trunc i64 %process_shifted_{id}_{byte} to i8\n\
+                "  %process_shifted_{id}_{byte} = lshr i{load_bits} {value}, {}\n\
+                 %process_store_byte_{id}_{byte} = trunc i{load_bits} %process_shifted_{id}_{byte} to i8\n\
                  %process_byte_ptr_{id}_{byte} = getelementptr i8, ptr %process_bytes, i64 %process_index_{id}_{byte}\n\
                  store i8 %process_store_byte_{id}_{byte}, ptr %process_byte_ptr_{id}_{byte}\n\
                  store i8 -1, ptr %process_known_ptr_{id}_{byte}\n",
@@ -1648,26 +1649,32 @@ fn emit_memory_operation(
                 body.push_str(&format!("  br label %memory_store_{id}\n"));
             }
             body.push_str(&format!("memory_store_{id}:\n"));
-            let value =
-                if data.space == "const" {
-                    let bits = data.size * 8;
-                    let mask = if bits == 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << bits) - 1
-                    };
-                    format!("{}", offset(&data.offset)? & mask)
+            let value = if data.space == "const" {
+                let bits = data.size * 8;
+                let mask = if bits >= 64 {
+                    u64::MAX
                 } else {
-                    let name = format!("%store_value_{id}");
-                    body.push_str(&format!(
-                    "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
-                    pcode_space_id(&data.space)?, pcode_offset(data)?, data.size
-                ));
-                    name
+                    (1u64 << bits) - 1
                 };
+                format!("{}", offset(&data.offset)? & mask)
+            } else {
+                let name = format!("%store_value_{id}");
+                body.push_str(&format!(
+                    "  {name} = call i{load_bits} @{}(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                    if load_bits == 128 {
+                        "hydir_read_varnode_wide"
+                    } else {
+                        "hydir_read_varnode"
+                    },
+                    pcode_space_id(&data.space)?,
+                    pcode_offset(data)?,
+                    data.size
+                ));
+                name
+            };
             for byte in 0..layout.width {
                 body.push_str(&format!(
-                    "  %store_shifted_{id}_{byte} = lshr i64 {value}, {}\n  %store_byte_{id}_{byte} = trunc i64 %store_shifted_{id}_{byte} to i8\n  %store_relative_{id}_{byte} = add i64 {guest_relative}, {byte}\n  %store_guest_ptr_{id}_{byte} = getelementptr i8, ptr {guest_ram}, i64 %store_relative_{id}_{byte}\n  store i8 %store_byte_{id}_{byte}, ptr %store_guest_ptr_{id}_{byte}\n  %store_known_ptr_{id}_{byte} = getelementptr i8, ptr {guest_known}, i64 %store_relative_{id}_{byte}\n  store i8 -1, ptr %store_known_ptr_{id}_{byte}\n",
+                    "  %store_shifted_{id}_{byte} = lshr i{load_bits} {value}, {}\n  %store_byte_{id}_{byte} = trunc i{load_bits} %store_shifted_{id}_{byte} to i8\n  %store_relative_{id}_{byte} = add i64 {guest_relative}, {byte}\n  %store_guest_ptr_{id}_{byte} = getelementptr i8, ptr {guest_ram}, i64 %store_relative_{id}_{byte}\n  store i8 %store_byte_{id}_{byte}, ptr %store_guest_ptr_{id}_{byte}\n  %store_known_ptr_{id}_{byte} = getelementptr i8, ptr {guest_known}, i64 %store_relative_{id}_{byte}\n  store i8 -1, ptr %store_known_ptr_{id}_{byte}\n",
                     byte * 8
                 ));
             }
