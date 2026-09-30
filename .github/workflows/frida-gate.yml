@@ -8,6 +8,7 @@ on:
       - crates/hydir-cli/**
       - crates/hydir-execution/**
       - crates/hydir-decompile/**
+      - crates/hydir-ghidra-worker/**
       - crates/hydir-ir/**
       - crates/hydir-frida-observer/**
       - vendor/frida-rust-0.17.2/**
@@ -26,6 +27,7 @@ on:
       - crates/hydir-cli/**
       - crates/hydir-execution/**
       - crates/hydir-decompile/**
+      - crates/hydir-ghidra-worker/**
       - crates/hydir-ir/**
       - crates/hydir-frida-observer/**
       - vendor/frida-rust-0.17.2/**

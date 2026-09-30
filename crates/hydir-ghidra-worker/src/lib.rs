@@ -620,6 +620,26 @@ fn validate_output(
     Ok(snapshot)
 }
 
+/// Ghidra names a Docker import `/input/binary`, while local headless import
+/// uses the ELF filename. Keep automatic snapshot bytes independent of that
+/// transport detail; expert project imports retain their own program names.
+fn canonical_automatic_snapshot(
+    mut snapshot: GhidraSnapshot,
+    binary: &Path,
+) -> Result<(GhidraSnapshot, Vec<u8>), String> {
+    snapshot.program.name = binary
+        .file_name()
+        .ok_or("automatic Ghidra input has no filename")?
+        .to_string_lossy()
+        .into_owned();
+    let bytes = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| format!("cannot encode canonical Ghidra snapshot: {error}"))?;
+    if bytes.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+        return Err("canonical Ghidra snapshot exceeds the artifact byte limit".into());
+    }
+    Ok((snapshot, bytes))
+}
+
 /// Recheck a persisted worker snapshot before using it as analysis input.
 /// This includes the pinned Ghidra version and requested function selector.
 pub fn validate_cached_snapshot(
@@ -632,7 +652,7 @@ pub fn validate_cached_snapshot(
 
 fn cache_key(binary_digest: &str, selected_entry: Option<u64>, mode: &str) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"hydir-ghidra-worker-v1\0");
+    hash.update(b"hydir-ghidra-worker-v2-canonical-name\0");
     hash.update(GHIDRA_VERSION.as_bytes());
     hash.update(b"\0raw-pcode-flow-overrides\0");
     hash.update(binary_digest.as_bytes());
@@ -1289,6 +1309,7 @@ pub fn analyze(
             log_tail(&scratch.path().join("analysis.log"))
         )
     })?;
+    let (snapshot, bytes) = canonical_automatic_snapshot(snapshot, &binary)?;
     if let Some(fresh_project) = fresh_project {
         if !fresh_project.path().join("HydirAuto.gpr").is_file() {
             return Err("Ghidra exported a snapshot but did not save its managed project".into());
@@ -1994,6 +2015,25 @@ mod tests {
             cache_key(&"a".repeat(64), None, "docker"),
             cache_key(&"a".repeat(64), None, "local")
         );
+    }
+
+    #[test]
+    fn automatic_snapshot_name_is_stable_across_frontend_modes() {
+        let fixture: GhidraSnapshot = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/ghidra_add_zero_v2.json"
+        ))
+        .unwrap();
+        let mut docker = fixture.clone();
+        docker.program.name = "binary".to_owned();
+        let mut local = fixture;
+        local.program.name = "span.elf".to_owned();
+        let (docker, docker_bytes) =
+            canonical_automatic_snapshot(docker, Path::new("span.elf")).unwrap();
+        let (local, local_bytes) =
+            canonical_automatic_snapshot(local, Path::new("span.elf")).unwrap();
+        assert_eq!(docker.program.name, "span.elf");
+        assert_eq!(local.program.name, "span.elf");
+        assert_eq!(docker_bytes, local_bytes);
     }
 
     #[test]
