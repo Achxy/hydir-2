@@ -14,7 +14,7 @@
   <header class="site-header">
     <a class="brand" href="/">HydIR</a>
     <nav class="site-nav" aria-label="Main navigation">
-      <a href="/" aria-current="page">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a><a href="/blogs">Blogs</a>
+      <a href="/" aria-current="page">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture">Architecture</a><a href="/blogs">Articles</a>
     </nav>
   </header>
   <main class="site-main" id="content">
@@ -22,7 +22,7 @@
       <p class="eyebrow">Binary analysis and transformation</p>
       <h1>From executable bytes to analyzable program representations.</h1>
       <p class="lead">HydIR connects executable bytes to structured program representations and reproducible analysis artifacts. Examine disassembly and control flow, inspect LLVM IR and C output, explore symbolic behavior with Triton, and evaluate transformations against observed execution.</p>
-      <div class="actions"><a href="/start">Documentation</a><a href="/blogs">Technical articles</a><a href="https://github.com/Achxy/hydir-2">Source code</a></div>
+      <div class="actions"><a href="/start">Get started</a><a href="/guides">Explore guides</a><a href="https://github.com/Achxy/hydir-2">Source code</a></div>
     </div>
     <figure class="hero-image">
       <a href="/assets/studio-lift.png"><img src="/assets/studio-lift.png" width="2800" height="1764" alt="HydIR egui workbench with a selected ELF function, lifted LLVM IR, function inspector, diagnostics, and console"></a>
@@ -36,6 +36,18 @@
         <section><h3>Semantic analysis</h3><p>Examine lifted LLVM IR and C output. Use Triton expressions and path conditions to analyze relationships between inputs and results.</p></section>
         <section><h3>Transformation and evaluation</h3><p>Generate patch and rebuild artifacts, compare their behavior with the original, and retain the associated reports.</p></section>
       </div>
+      <hr class="section-rule">
+      <h2>Documentation paths</h2>
+      <p>Choose a route based on what you want to inspect. The guides explain the interfaces and artifact contracts; the articles work through specific functions and algorithms.</p>
+      <div class="docs-card-grid">
+        <section class="docs-card"><p class="eyebrow">First run</p><h3><a href="/start">Open the PRISM ELF</a></h3><p>Launch the desktop app, inspect a branch, and save function-scoped IR from the CLI.</p></section>
+        <section class="docs-card"><p class="eyebrow">Reference</p><h3><a href="/guides">Find your workflow</a></h3><p>Map the workbench, CLI, Ghidra snapshots, native IR stages, and result claims.</p></section>
+        <section class="docs-card"><p class="eyebrow">System design</p><h3><a href="/architecture">Trace the architecture</a></h3><p>See how input bytes become source-linked analysis and versioned artifacts.</p></section>
+      </div>
+      <h2>What a result means</h2>
+      <p>HydIR records uncertainty beside its output. A recovered CFG can remain partial, an instruction can have a conservative effect, and a C view can preserve an opaque operation. Structural recovery, semantic modeling, execution comparison, and rewrite readiness are reported as separate claims. Read the <a href="/guides#read-the-result">guide to result status</a> before treating an artifact as a proof.</p>
+      <h2>Observe one path with Frida</h2>
+      <p>The desktop has a top-level <strong>Frida observation</strong> tab that opens the <strong>Observe with Frida</strong> panel. On Linux x86-64 with the optional observer bundle, it can run a selected local ELF function against an InputSpec and record byte-checked blocks and calls for that input. See <a href="/start#frida-gui">where to find the panel</a> and <a href="/guides#frida-observation">how to read the observation</a>.</p>
       <hr class="section-rule">
       <h2>Technical articles</h2>
       <div class="story-grid">
@@ -58,8 +70,8 @@
       <p class="more-link"><a href="/blogs">View all articles →</a></p>
       <hr class="section-rule">
       <h2>Interfaces</h2>
-      <p>The desktop workbench supports interactive analysis. The CLI produces artifacts for scripted workflows. An authenticated service and Python SDK provide revisioned project operations. See the <a href="/architecture">architecture guide</a> for the relationship between these components.</p>
-      <p><a href="/start">Read the quick start →</a></p>
+      <p>The desktop workbench supports interactive analysis of a local ELF. The CLI produces artifacts for scripted workflows and controlled comparisons. A Python SDK offers local Ghidra operations; the authenticated service and SDK also expose revisioned project operations. Start with the <a href="/guides">workflow guide</a> or follow the components through the <a href="/architecture">architecture guide</a>.</p>
+      <p><a href="/start">Run the quick start →</a></p>
     </div>
   </main>
   <footer class="site-footer"><p>HydIR is open source under <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a>. <a href="https://github.com/Achxy/hydir-2">Explore the source</a>.</p></footer>

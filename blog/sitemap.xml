@@ -2,6 +2,7 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://hydir.wiki/</loc></url>
   <url><loc>https://hydir.wiki/start</loc></url>
+  <url><loc>https://hydir.wiki/guides</loc></url>
   <url><loc>https://hydir.wiki/architecture</loc></url>
   <url><loc>https://hydir.wiki/blogs</loc></url>
   <url><loc>https://hydir.wiki/articles/ghidra-pcode-explained</loc></url>

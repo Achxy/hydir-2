@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="A project-wide map of HydIR: automatic Ghidra P-code, Rust lifting and execution, native IR, C output, evidence, and user interfaces.">
+  <meta name="description" content="A project-wide map of HydIR: automatic Ghidra P-code, native IR, C output, optional Frida observation, and source-linked evidence.">
   <link rel="canonical" href="https://hydir.wiki/architecture">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
   <link rel="stylesheet" href="/styles.css">
@@ -11,22 +11,27 @@
 </head>
 <body class="latex-dark-auto">
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/architecture" aria-current="page">Architecture</a><a href="/blogs">Blogs</a></nav></header>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture" aria-current="page">Architecture</a><a href="/blogs">Articles</a></nav></header>
   <main class="site-main prose" id="content">
     <p class="eyebrow">From bytes to artifacts</p>
     <h1>Follow the bytes through HydIR</h1>
-    <p class="lead">Open an ELF in HydIR and two complementary paths can examine it: an automatic Ghidra worker exports raw P-code, while HydIR's native frontend builds its own intermediate representations. Both paths keep results tied to the original bytes and addresses.</p>
+    <p class="lead">Open an ELF in HydIR and two static paths can examine it: an automatic Ghidra worker exports raw P-code, while HydIR's native frontend builds its own intermediate representations. For a selected function and bounded input, a separate Linux Frida observer can record one runtime path. Each result stays tied to the original bytes and addresses.</p>
 
     <h2>The whole project on one map</h2>
+    <p>Follow the ELF into either static lane. The third lane runs the original executable with a declared <code>InputSpec</code>; it records observed behavior for that input and can guide a later Ghidra reanalysis. It does not close unknown control-flow edges in the static result.</p>
     <figure class="architecture-map">
       <div class="architecture-map-frame" tabindex="0" aria-label="Scrollable HydIR architecture diagram">
-        <img src="/assets/hydir-architecture.svg" width="1175" height="1042" alt="HydIR's GUI, CLI, API, and Python SDK open an ELF. The ELF enters an automatic Ghidra P-code lane and an independent native IR lane. Rust execution, LLVM, low-level C, typed C, model facts, and checks produce versioned artifacts.">
+        <img src="/assets/hydir-architecture.svg" width="1200" height="996" alt="HydIR architecture diagram rendered from LaTeX. One ELF feeds separate Ghidra P-code and native Rust analysis lanes, which produce source-linked static artifacts. An optional Frida observer records one input-specific path and can guide later P-code analysis.">
       </div>
-      <figcaption>HydIR's major paths, from one ELF to source-linked artifacts. <a href="/assets/hydir-architecture.mmd">Read the Mermaid source</a> or <a href="/assets/hydir-architecture.svg">open the full-size diagram</a>.</figcaption>
+      <figcaption>The dotted route marks optional Frida observation. The diagram is drawn in <a href="/assets/hydir-architecture.tex">LaTeX/TikZ</a>. <a href="/assets/hydir-architecture.svg">Open the full-size diagram</a>.</figcaption>
     </figure>
     <p>Think of the ELF as a book written in CPU instructions. Ghidra translates each instruction into smaller P-code effects; HydIR imports those effects and uses Rust to classify them, run supported paths, and emit bounded LLVM. The native frontend independently reads the ELF and builds <code>MachineIR</code>, <code>StateIR</code>, and <code>FunctionIR</code> before generating C. These are two routes through the same file, not one long chain where Ghidra's decompiler produces HydIR's C.</p>
-    <p>The boxes at the bottom are the results you inspect in the workbench or retrieve through the CLI, API, and SDK. A diagram arrow means a stage can provide input to another stage; it does not promise every ELF reaches the end. Each artifact records its scope and source addresses. If an operation, memory byte, or call effect is unknown, the relevant path stops with a reason instead of filling in a plausible answer.</p>
-    <p>Triton exploration and the restricted patch and rebuild routes sit off to the side because they have separate requirements and checks. The comparison box covers supported, bounded runs; it is not a claim that HydIR has proved an arbitrary executable equivalent to its lift.</p>
+    <p>The yellow box summarizes the static results you inspect in the workbench or retrieve through the CLI, API, and SDK. A diagram arrow means a stage can provide input to another stage; it does not promise every ELF reaches the end. Each artifact records its scope and source addresses. If an operation, memory byte, or call effect is unknown, the relevant path stops with a reason instead of filling in a plausible answer.</p>
+    <p>Triton exploration and the restricted patch and rebuild routes have separate requirements and checks. Supported, bounded comparisons are not a claim that HydIR has proved an arbitrary executable equivalent to its lift.</p>
+
+    <h2>Where runtime observation fits</h2>
+    <p>In the desktop workbench, open a local ELF, select a function, then choose the top-level <strong>Frida observation</strong> tab. It opens the existing <strong>Observe with Frida</strong> panel, which is also available in Ghidra P-code. Provide the path to a binary-bound <code>InputSpec</code> JSON file and choose <strong>Observe selected function</strong>. The control is enabled on Linux x86-64 when the selected Ghidra function maps to the local ELF. The Linux observer helper must also be installed; <code>hydirctl doctor</code> reports its readiness.</p>
+    <p>The observer returns a byte-checked <code>DynamicTrace</code> of blocks, calls, computed jumps, and captured entry registers for that one input. The GUI can use those registers as a P-code seed or plan observed indirect calls and jumps for isolated Ghidra reanalysis. A trace does not prove that unobserved paths are absent, that the static CFG is complete, or that the process exit code is known.</p>
 
     <h2>The native path in four steps</h2>
 

@@ -4198,6 +4198,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
 enum Tab {
     Overview,
     GhidraPcode,
+    Frida,
     Investigation,
     RegionStudio,
     Native,
@@ -5046,6 +5047,7 @@ struct AnalystApp {
     frida_rediscovery_task: Option<ActiveGhidraTask>,
     frida_busy: bool,
     frida_task: Option<ActiveGhidraTask>,
+    frida_scroll_pending: bool,
     ghidra_call_lines: Vec<(Option<u64>, String)>,
     ghidra_call_busy: bool,
     ghidra_call_llvm: Option<Result<PcodeInterproceduralCfgLlvmArtifact, String>>,
@@ -5211,6 +5213,7 @@ impl AnalystApp {
             frida_rediscovery_task: None,
             frida_busy: false,
             frida_task: None,
+            frida_scroll_pending: false,
             ghidra_call_lines: Vec::new(),
             ghidra_call_busy: false,
             ghidra_call_llvm: None,
@@ -8264,6 +8267,7 @@ impl AnalystApp {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
                 (Tab::GhidraPcode, "Ghidra P-code"),
+                (Tab::Frida, "Frida observation"),
                 (Tab::Investigation, "Investigation"),
                 (Tab::RegionStudio, "Region Studio"),
                 (Tab::Native, "Native decompiler"),
@@ -8279,6 +8283,9 @@ impl AnalystApp {
                 let response = ui.add(egui::Button::selectable(self.tab == tab, label));
                 if response.clicked() {
                     self.tab = tab;
+                    if tab == Tab::Frida {
+                        self.frida_scroll_pending = true;
+                    }
                 }
             }
         });
@@ -8288,6 +8295,11 @@ impl AnalystApp {
             Tab::GhidraPcode => {
                 egui::ScrollArea::vertical()
                     .id_salt("ghidra_workbench_scroll")
+                    .show(ui, |ui| self.ghidra_pcode_view(ui));
+            }
+            Tab::Frida => {
+                egui::ScrollArea::vertical()
+                    .id_salt("frida_workbench_scroll")
                     .show(ui, |ui| self.ghidra_pcode_view(ui));
             }
             Tab::Investigation => self.investigation_view(ui),
@@ -8305,12 +8317,36 @@ impl AnalystApp {
     }
 
     fn ghidra_pcode_view(&mut self, ui: &mut egui::Ui) {
+        if self.tab == Tab::Frida {
+            ui.heading(RichText::new("Frida observation").color(ACCENT));
+            ui.label(RichText::new(
+                "Observe the selected function in the open local ELF with a bounded InputSpec. Requires Linux x86-64, the bundled Frida observer and a Ghidra snapshot. This executes the ELF in an isolated run."
+            ).size(11.0).color(MUTED));
+            if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                ui.label(
+                    RichText::new(
+                        "Observation is unavailable on this host; use the Linux x86-64 release.",
+                    )
+                    .color(BAD),
+                );
+            }
+            ui.separator();
+        }
         ui.heading(RichText::new("Ghidra function index and raw P-code").color(ACCENT));
         let Some(snapshot) = &self.ghidra_snapshot else {
-            ui.label(
-                RichText::new("Open a local ELF to run automatic Ghidra analysis, or retry from the Program pane.")
-                    .color(MUTED),
-            );
+            if self.tab == Tab::Frida {
+                ui.heading(RichText::new("Before you observe").size(16.0));
+                ui.label("1. Open a local Linux x86-64 ELF in the Program pane.");
+                ui.label("2. Wait for Ghidra analysis and select a function.");
+                ui.label("3. Create an InputSpec with `hydirctl replay init <elf>` and edit its argv/files.");
+                ui.label("4. On Linux x86-64, select the InputSpec JSON and run the bundled Frida observer here.");
+                ui.label(RichText::new("Ghidra snapshot is not available yet. Check the Program pane for analysis status or retry.").color(MUTED));
+            } else {
+                ui.label(
+                    RichText::new("Open a local ELF to run automatic Ghidra analysis, or retry from the Program pane.")
+                        .color(MUTED),
+                );
+            }
             return;
         };
         let address_map = self
@@ -9071,10 +9107,17 @@ impl AnalystApp {
                     None => {}
                 }
             });
-        egui::CollapsingHeader::new("Observe with Frida")
-            .id_salt("ghidra_frida_observation")
-            .show(ui, |ui| {
+        let frida_header =
+            egui::CollapsingHeader::new("Observe with Frida").id_salt("ghidra_frida_observation");
+        let frida_header = if self.tab == Tab::Frida {
+            frida_header.open(Some(true))
+        } else {
+            frida_header
+        };
+        let frida_response = frida_header.show(ui, |ui| {
                 ui.label(RichText::new("Run this ELF with one InputSpec. Observed blocks and calls are byte checked; paths outside this input remain unknown. A completed trace does not prove the process exit code.")
+                    .size(11.0).color(MUTED));
+                ui.label(RichText::new("Create an InputSpec with `hydirctl replay init <elf>`, edit its argv/files, then select the JSON file below. The selected function must have a linked ELF address. The Linux x86-64 release needs its bundled Frida observer.")
                     .size(11.0).color(MUTED));
                 ui.horizontal(|ui| {
                     ui.label("InputSpec JSON path");
@@ -9097,6 +9140,15 @@ impl AnalystApp {
                     && linked_entry.is_some()
                     && !self.frida_input_path.trim().is_empty()
                     && !self.frida_busy;
+                if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                    ui.label(RichText::new("Observation requires Linux x86-64.").size(11.0).color(BAD));
+                } else if self.current_local_path.is_none() {
+                    ui.label(RichText::new("Open a local ELF to observe it.").size(11.0).color(MUTED));
+                } else if linked_entry.is_none() {
+                    ui.label(RichText::new("Select a function with a linked ELF address.").size(11.0).color(MUTED));
+                } else if self.frida_input_path.trim().is_empty() {
+                    ui.label(RichText::new("Select an InputSpec JSON file to enable observation.").size(11.0).color(MUTED));
+                }
                 if ui.add_enabled(can_observe, egui::Button::new("Observe selected function")).clicked() {
                     let cancel = Arc::new(AtomicBool::new(false));
                     let timeout = Duration::from_secs(30);
@@ -9515,6 +9567,12 @@ impl AnalystApp {
                     None => {}
                 }
             });
+        if self.frida_scroll_pending && self.tab == Tab::Frida {
+            frida_response
+                .header_response
+                .scroll_to_me(Some(egui::Align::TOP));
+            self.frida_scroll_pending = false;
+        }
         egui::CollapsingHeader::new("LLVM across analyzed calls")
             .id_salt("ghidra_call_llvm")
             .show(ui, |ui| {

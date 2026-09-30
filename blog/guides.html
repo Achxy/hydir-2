@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HydIR documentation for the desktop workbench, CLI, Ghidra P-code, Frida observation, native IR artifacts, and verification boundaries.">
+  <link rel="canonical" href="https://hydir.wiki/guides">
+  <link rel="stylesheet" href="/vendor/latex.css/style.css">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Guides and reference — HydIR</title>
+</head>
+<body class="latex-dark-auto">
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/guides" aria-current="page">Guides</a><a href="/architecture">Architecture</a><a href="/blogs">Articles</a></nav></header>
+  <main class="site-main prose" id="content">
+    <nav class="site-nav" aria-label="On this page">
+      <a href="#choose-a-path">Choose a path</a>
+      <a href="#desktop-workbench">Desktop workbench</a>
+      <a href="#frida-observation">Frida observation</a>
+      <a href="#command-line">Command line</a>
+      <a href="#artifact-reference">Artifact reference</a>
+      <a href="#read-the-result">Read the result</a>
+      <a href="#next-steps">Next steps</a>
+    </nav>
+    <div>
+      <p class="eyebrow">Documentation / Guide map</p>
+      <h1>Choose a workflow, then follow its evidence</h1>
+      <p class="lead">HydIR connects an ELF to source-linked program facts, intermediate representations, and generated artifacts. This guide maps the major workflows and explains what a result establishes.</p>
+      <div class="story-grid" id="choose-a-path">
+        <article><p class="eyebrow">01 / First run</p><h3><a href="/start">Open a local ELF</a></h3><p>Build the app, open the PRISM showcase, select a function, and find disassembly, CFG, P-code, and output views.</p></article>
+        <article><p class="eyebrow">02 / System map</p><h3><a href="/architecture">Understand the pipeline</a></h3><p>Follow the automatic Ghidra lane and native Rust lane through artifacts, consumers, and verification boundaries.</p></article>
+        <article><p class="eyebrow">03 / Deep dives</p><h3><a href="/blogs">Read technical articles</a></h3><p>Study Ghidra P-code, bitvector behavior, and the compiler theory behind HydIR's IRs.</p></article>
+      </div>
+
+      <h2 id="desktop-workbench">Desktop workbench</h2>
+      <p>Open a local little-endian x86-64 ELF in the <code>hydir</code> app. The overview shows the program inventory and analysis status. Select a function to connect its machine address and bytes to disassembly, control flow, P-code effects, and generated views. The Ghidra worker starts automatically for local ELF analysis and its project is cached for later selections.</p>
+      <ol>
+        <li><strong>Pick a function.</strong> The checked-in <code>demo/hydir-prism.elf</code> includes named entry points. <code>hydir_stage_decision</code> shows branching control flow; <code>hydir_stage_call_chain</code> shows a direct call.</li>
+        <li><strong>Inspect the evidence.</strong> Read the instruction and CFG views before interpreting a generated representation. A recovered function boundary or edge carries evidence and may still have unresolved targets.</li>
+        <li><strong>Compare outputs.</strong> Open the available IR and C views and read diagnostics alongside them. A C rendering can preserve unknown effects explicitly without proving that it can be safely rewritten.</li>
+      </ol>
+      <p>The <a href="/articles/ghidra-pcode-explained">Ghidra P-code article</a> explains the imported operations behind one x86 instruction. For the native pipeline's control flow and SSA, see <a href="/articles/graphs-to-code">From Graphs to Code</a>.</p>
+
+      <h2 id="frida-observation">Observe a selected function with Frida</h2>
+      <p>In the desktop app, open an ELF and select a function, then choose the top-level <strong>Frida observation</strong> tab. Its <strong>Observe with Frida</strong> panel opens automatically. Enter an <code>InputSpec</code> JSON path and choose <strong>Observe selected function</strong>. The same panel is available in <strong>Ghidra P-code</strong>. This runs that ELF with the specified input and records observed blocks and calls for the selected function. The panel can copy the observation JSON, use captured entry registers as a P-code seed, and plan observed indirect calls.</p>
+      <aside class="note" aria-label="Frida availability"><strong>Availability:</strong> the observation action requires Linux x86-64, a local ELF, a Ghidra snapshot with a mapped selected function, a nonempty InputSpec path, and the optional Linux Frida observer bundle. It is disabled when those conditions are not met. Ordinary Windows builds can still inspect the ELF and its static analysis.</aside>
+      <p>Frida evidence is tied to that binary and input. Observed blocks and calls are byte checked; unobserved paths remain unknown. A completed trace does not prove the process exit code or whole-program equivalence.</p>
+
+      <h2 id="command-line">Command line</h2>
+      <p><code>hydirctl</code> makes the same analysis useful in scripts. Start with <code>doctor</code> to check the local toolchain, use <code>discover</code> to enumerate function candidates, and request a specific stage with <code>lift</code> or a C view with <code>decompile</code>. Ghidra commands can save a binary-bound snapshot for later verification and coverage inspection.</p>
+      <pre><code>cargo run --locked --bin hydirctl -- doctor
+cargo run --locked --bin hydirctl -- discover demo/hydir-prism.elf
+cargo run --locked --bin hydirctl -- lift demo/hydir-prism.elf --function hydir_stage_decision --ir state
+cargo run --locked --bin hydirctl -- decompile demo/hydir-prism.elf --function hydir_stage_decision --view unit</code></pre>
+      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/docs/NATIVE_DECOMPILER.md">native decompiler reference</a> lists stage contracts, limits, supported instruction families, and reproduction commands. The <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Python SDK reference</a> covers local Ghidra operations and authenticated service workflows.</p>
+
+      <h2 id="artifact-reference">Artifact reference</h2>
+      <div class="table-scroll" tabindex="0" aria-label="Scrollable HydIR artifact reference">
+        <table><thead><tr><th>Artifact</th><th>Question it answers</th><th>Important boundary</th></tr></thead><tbody>
+          <tr><td>ProgramSpec and FunctionIndex</td><td>What bytes, sections, symbols, and candidate functions were found?</td><td>A candidate extent is evidence, not proof that every byte belongs to one function.</td></tr>
+          <tr><td>MachineIR</td><td>Which instructions, effects, and control edges were decoded?</td><td>Unknown instructions and targets remain explicit.</td></tr>
+          <tr><td>StateIR</td><td>How do registers, flags, control, and memory regions change?</td><td>Unsupported effects are carried conservatively.</td></tr>
+          <tr><td>FunctionIR and CIR</td><td>What calls, objects, operations, and control structure can be represented?</td><td>Types and prototypes are labeled by their evidence.</td></tr>
+          <tr><td>DecompilationUnit</td><td>Which C views, provenance, diagnostics, and claims belong together?</td><td>Readable C and rewrite readiness are separate claims.</td></tr>
+          <tr><td>Ghidra snapshot</td><td>What headless Ghidra analysis and raw P-code were imported?</td><td>Function state is an ordered effect inventory; whole-function executable P-code lifting is still in progress.</td></tr>
+        </tbody></table>
+      </div>
+
+      <h2 id="read-the-result">Read the result</h2>
+      <p>Look for separate structural, semantic, verification, and rewrite-readiness claims. <code>partial</code> control-flow recovery means some edges remain unresolved. <code>unknown</code> or <code>conservative</code> semantics mean the representation retains uncertainty. <code>not_run</code> verification means no execution comparison has been made. Exactness is relative to the recorded machine and environment model.</p>
+      <aside class="note" aria-label="Reading stopped stages"><strong>When a stage stops:</strong> keep the diagnostic and the source location with the artifact. An explicit refusal or opaque effect identifies the unmodeled boundary; it does not invalidate earlier, independently recovered facts.</aside>
+      <p>For the distinction between native C generation and the restricted scalar LLVM path, read the <a href="/architecture">architecture guide</a>. The <a href="/articles/graphs-to-code">compiler-theory article</a> explains why control-flow joins, memory effects, and SSA matter to both paths.</p>
+
+      <h2 id="next-steps">Next steps</h2>
+      <div class="story-grid">
+        <article><h3><a href="/articles/ghidra-pcode-explained">Ghidra P-code</a></h3><p>See how one instruction expands into typed varnode operations and explicit effects.</p></article>
+        <article><h3><a href="/articles/graphs-to-code">Control flow and SSA</a></h3><p>Follow dataflow, memory effects, and joins toward C output.</p></article>
+        <article><h3><a href="/articles/bitvectors-to-behavior">Instruction semantics</a></h3><p>Work through modular arithmetic, flags, signed comparison, and proof obligations.</p></article>
+      </div>
+    </div>
+  </main>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="/start">Quick start</a> · <a href="https://github.com/Achxy/hydir-2">Source</a></p></footer>
+</body>
+</html>

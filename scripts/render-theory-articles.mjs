@@ -112,8 +112,8 @@ function head(post, redirect = false) {
 
 const nav = '  <a class="skip" href="#article">Skip to article</a>\n' +
   '  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation">' +
-  '<a href="/">Home</a><a href="/start">Start</a><a href="/architecture">Architecture</a>' +
-  '<a href="/blogs" aria-current="page">Blogs</a></nav></header>\n';
+  '<a href="/">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture">Architecture</a>' +
+  '<a href="/blogs" aria-current="page">Articles</a></nav></header>\n';
 const footer = '  <footer class="site-footer"><p><a href="/">HydIR</a> · ' +
   '<a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/start">Start locally</a></p></footer>\n';
 
