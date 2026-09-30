@@ -403,6 +403,7 @@ jobs:
             ${{ runner.temp }}/hydir-password-process-llvm.json
             ${{ runner.temp }}/ghidra-recursion/report.json
             ${{ runner.temp }}/ghidra-relative-reloc/report.json
+            ${{ runner.temp }}/ghidra-import-index/
 
   differential-fixtures:
     runs-on: ubuntu-24.04

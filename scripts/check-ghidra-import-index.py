@@ -171,9 +171,14 @@ def main():
         expected_events = []
         for segment_index, segment in enumerate(strlen_trace["segments"]):
             for event in segment["path"]["events"]:
-                operation = event.get("operation", {}).get("source") if event["kind"] == "effect" else event.get("source")
-                if operation is None:
+                if event["kind"] == "fallthrough":
                     continue
+                if event["kind"] == "effect":
+                    operation = event["operation"]["source"]
+                elif event["kind"] == "branch":
+                    operation = event["source"]
+                else:
+                    raise AssertionError(f"unexpected Rust event: {event['kind']}")
                 key = (operation["source_address"]["space"],
                        operation["source_address"]["offset"],
                        operation["sequence_index"])
