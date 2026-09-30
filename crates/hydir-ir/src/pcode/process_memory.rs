@@ -5,9 +5,10 @@
 //! relocations are applied; other relocation destinations remain unknown.
 
 use super::{GhidraSnapshot, hex_u64, image::snapshot_layout_sha256, validate_ghidra_snapshot};
+use goblin::{elf::Elf, options::ParseOptions};
 use object::{
-    Architecture, BinaryFormat, Object, ObjectKind, ObjectSegment, RelocationFlags,
-    RelocationTarget, SegmentFlags, elf,
+    Architecture, BinaryFormat, Object, ObjectKind, ObjectSegment, RelocationFlags, SegmentFlags,
+    elf,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -188,6 +189,227 @@ struct Region {
     end: u64,
     file_offset: Option<usize>,
     writable: bool,
+}
+
+#[derive(Debug)]
+struct DynamicRelocation {
+    address: u64,
+    width: usize,
+    relative_addend: Option<i64>,
+}
+
+fn checked_dynamic_table(
+    binary: &[u8],
+    headers: &[goblin::elf::ProgramHeader],
+    address: Option<u64>,
+    size: Option<u64>,
+    entry_size: u64,
+    parsed_count: usize,
+) -> Result<(), String> {
+    let size = size.unwrap_or(0);
+    if size == 0 {
+        if parsed_count != 0 {
+            return Err("ELF dynamic relocation table has no declared size".to_owned());
+        }
+        return Ok(());
+    }
+    let address = address.ok_or("ELF dynamic relocation table has no address")?;
+    if size % entry_size != 0
+        || usize::try_from(size / entry_size).ok() != Some(parsed_count)
+        || parsed_count > MAX_RELOCATIONS
+    {
+        return Err("ELF dynamic relocation table size disagrees with entries".to_owned());
+    }
+    let end = address
+        .checked_add(size)
+        .ok_or("ELF dynamic relocation table address overflows")?;
+    let in_file_backed_load = headers.iter().any(|header| {
+        header.p_type == goblin::elf::program_header::PT_LOAD
+            && address >= header.p_vaddr
+            && header
+                .p_vaddr
+                .checked_add(header.p_filesz)
+                .is_some_and(|segment_end| end <= segment_end)
+            && header
+                .p_offset
+                .checked_add(address - header.p_vaddr)
+                .and_then(|offset| offset.checked_add(size))
+                .and_then(|file_end| usize::try_from(file_end).ok())
+                .is_some_and(|file_end| file_end <= binary.len())
+    });
+    if !in_file_backed_load {
+        return Err("ELF dynamic relocation table is outside file-backed PT_LOAD".to_owned());
+    }
+    Ok(())
+}
+
+fn dynamic_relocations(
+    binary: &[u8],
+    file: &object::File<'_>,
+    schema_version: u32,
+) -> Result<Vec<DynamicRelocation>, String> {
+    let mut result = Vec::new();
+    if schema_version == PCODE_ELF_PROCESS_MEMORY_V1_VERSION {
+        // Reconstruct old artifacts exactly. v2 uses PT_DYNAMIC, since section
+        // headers can be removed from an otherwise executable ELF.
+        if let Some(relocations) = file.dynamic_relocations() {
+            for (address, relocation) in relocations {
+                if result.len() >= MAX_RELOCATIONS {
+                    return Err("ELF dynamic relocation count limit exceeded".to_owned());
+                }
+                let width = if relocation.size() == 0 {
+                    match relocation.flags() {
+                        RelocationFlags::Elf { r_type }
+                            if matches!(
+                                r_type,
+                                elf::R_X86_64_RELATIVE
+                                    | elf::R_X86_64_GLOB_DAT
+                                    | elf::R_X86_64_JUMP_SLOT
+                                    | elf::R_X86_64_IRELATIVE
+                                    | elf::R_X86_64_64
+                            ) =>
+                        {
+                            8
+                        }
+                        RelocationFlags::Elf { r_type } if r_type == elf::R_X86_64_TLSDESC => 16,
+                        _ => {
+                            return Err("ELF dynamic relocation has unknown write width".to_owned());
+                        }
+                    }
+                } else {
+                    usize::from(relocation.size()).div_ceil(8)
+                };
+                result.push(DynamicRelocation {
+                    address,
+                    width,
+                    relative_addend: None,
+                });
+            }
+        }
+        return Ok(result);
+    }
+
+    let parsed = Elf::parse_with_opts(binary, &ParseOptions::strict())
+        .map_err(|error| format!("invalid ELF dynamic metadata: {error}"))?;
+    if !parsed.is_64
+        || !parsed.little_endian
+        || parsed.header.e_machine != goblin::elf::header::EM_X86_64
+    {
+        return Err("process memory requires executable x86-64 ELF".to_owned());
+    }
+    if let Some(dynamic) = &parsed.dynamic {
+        // Goblin does not expand packed relocation formats. Until Hydir has a
+        // bounded decoder, treating their destination bytes as known is unsafe.
+        const UNSUPPORTED_PACKED_TAGS: [u64; 11] = [
+            35,
+            36,
+            37,          // DT_RELRSZ, DT_RELR, DT_RELRENT
+            0x4000_0026, // DT_CREL
+            0x6000_000f,
+            0x6000_0010,
+            0x6000_0011,
+            0x6000_0012,
+            0x6fff_e000,
+            0x6fff_e001,
+            0x6fff_e003,
+        ];
+        if dynamic
+            .dyns
+            .iter()
+            .any(|entry| UNSUPPORTED_PACKED_TAGS.contains(&entry.d_tag))
+        {
+            return Err(
+                "packed ELF dynamic relocations need an explicit loader contract".to_owned(),
+            );
+        }
+        let tag = |wanted| -> Result<Option<u64>, String> {
+            let mut values = dynamic
+                .dyns
+                .iter()
+                .filter(|entry| entry.d_tag == wanted)
+                .map(|entry| entry.d_val);
+            let value = values.next();
+            if values.next().is_some() {
+                return Err("duplicate ELF dynamic relocation table tag".to_owned());
+            }
+            Ok(value)
+        };
+        let rela_size = tag(goblin::elf::dynamic::DT_RELASZ)?;
+        let rel_size = tag(goblin::elf::dynamic::DT_RELSZ)?;
+        let plt_size = tag(goblin::elf::dynamic::DT_PLTRELSZ)?;
+        if tag(goblin::elf::dynamic::DT_RELAENT)?.is_some_and(|size| size != 24)
+            || tag(goblin::elf::dynamic::DT_RELENT)?.is_some_and(|size| size != 16)
+        {
+            return Err("ELF dynamic relocation entry size is unsupported".to_owned());
+        }
+        checked_dynamic_table(
+            binary,
+            &parsed.program_headers,
+            tag(goblin::elf::dynamic::DT_RELA)?,
+            rela_size,
+            24,
+            parsed.dynrelas.len(),
+        )?;
+        checked_dynamic_table(
+            binary,
+            &parsed.program_headers,
+            tag(goblin::elf::dynamic::DT_REL)?,
+            rel_size,
+            16,
+            parsed.dynrels.len(),
+        )?;
+        let plt_entry_size = match tag(goblin::elf::dynamic::DT_PLTREL)? {
+            Some(goblin::elf::dynamic::DT_RELA) => 24,
+            Some(goblin::elf::dynamic::DT_REL) => 16,
+            None if plt_size.unwrap_or(0) == 0 => 24,
+            _ => return Err("ELF PLT relocation format is unsupported".to_owned()),
+        };
+        checked_dynamic_table(
+            binary,
+            &parsed.program_headers,
+            tag(goblin::elf::dynamic::DT_JMPREL)?,
+            plt_size,
+            plt_entry_size,
+            parsed.pltrelocs.len(),
+        )?;
+    }
+    for relocation in parsed
+        .dynrelas
+        .iter()
+        .chain(parsed.dynrels.iter())
+        .chain(parsed.pltrelocs.iter())
+    {
+        if result.len() >= MAX_RELOCATIONS {
+            return Err("ELF dynamic relocation count limit exceeded".to_owned());
+        }
+        let width = match relocation.r_type {
+            elf::R_X86_64_NONE => continue,
+            elf::R_X86_64_RELATIVE
+            | elf::R_X86_64_GLOB_DAT
+            | elf::R_X86_64_JUMP_SLOT
+            | elf::R_X86_64_IRELATIVE
+            | elf::R_X86_64_64
+            | elf::R_X86_64_DTPMOD64
+            | elf::R_X86_64_DTPOFF64
+            | elf::R_X86_64_TPOFF64 => 8,
+            elf::R_X86_64_TLSDESC => 16,
+            elf::R_X86_64_32 | elf::R_X86_64_32S | elf::R_X86_64_PC32 => 4,
+            _ => {
+                return Err(format!(
+                    "ELF dynamic relocation type {} has unknown write width",
+                    relocation.r_type
+                ));
+            }
+        };
+        result.push(DynamicRelocation {
+            address: relocation.r_offset,
+            width,
+            relative_addend: (relocation.r_type == elf::R_X86_64_RELATIVE && relocation.r_sym == 0)
+                .then_some(relocation.r_addend)
+                .flatten(),
+        });
+    }
+    Ok(result)
 }
 
 impl PcodeElfProcessMemory {
@@ -394,69 +616,36 @@ impl PcodeElfProcessMemory {
         let mut relocated = BTreeSet::new();
         let mut relocation_hits = vec![0u8; span];
         let mut relative_candidates = Vec::new();
-        if let Some(relocations) = file.dynamic_relocations() {
-            let mut relocation_count = 0usize;
-            for (address, relocation) in relocations {
-                relocation_count += 1;
-                if relocation_count > MAX_RELOCATIONS {
-                    return Err("ELF dynamic relocation count limit exceeded".to_owned());
-                }
-                // Some ELF relocation records report no generic bit width.
-                // Only known x86-64 write widths can be safely masked; COPY
-                // and unknown records require a loader contract before use.
-                let width = if relocation.size() == 0 {
-                    match relocation.flags() {
-                        RelocationFlags::Elf { r_type }
-                            if matches!(
-                                r_type,
-                                elf::R_X86_64_RELATIVE
-                                    | elf::R_X86_64_GLOB_DAT
-                                    | elf::R_X86_64_JUMP_SLOT
-                                    | elf::R_X86_64_IRELATIVE
-                                    | elf::R_X86_64_64
-                            ) =>
-                        {
-                            8
-                        }
-                        RelocationFlags::Elf { r_type } if r_type == elf::R_X86_64_TLSDESC => 16,
-                        _ => {
-                            return Err("ELF dynamic relocation has unknown write width".to_owned());
-                        }
-                    }
-                } else {
-                    usize::from(relocation.size()).div_ceil(8)
+        for relocation in dynamic_relocations(binary, &file, schema_version)? {
+            let width = relocation.width;
+            if width == 0 || width > 16 {
+                return Err("unsupported ELF dynamic relocation width".to_owned());
+            }
+            let target = u64::try_from(i128::from(relocation.address) + load_bias)
+                .map_err(|_| "ELF relocation cannot map to Ghidra RAM")?;
+            let mut destination = Vec::with_capacity(width);
+            for byte in 0..width {
+                let Some(at) = target.checked_add(byte as u64) else {
+                    return Err("ELF relocation address overflows".to_owned());
                 };
-                if width == 0 || width > 16 {
-                    return Err("unsupported ELF dynamic relocation width".to_owned());
-                }
-                let target = u64::try_from(i128::from(address) + load_bias)
-                    .map_err(|_| "ELF relocation cannot map to Ghidra RAM")?;
-                let mut destination = Vec::with_capacity(width);
-                for byte in 0..width {
-                    let Some(at) = target.checked_add(byte as u64) else {
-                        return Err("ELF relocation address overflows".to_owned());
-                    };
-                    if let Some(index) = at
-                        .checked_sub(base)
-                        .and_then(|index| usize::try_from(index).ok())
-                        .filter(|index| *index < span && mapped[*index] == 0xff)
-                    {
-                        known[index] = 0;
-                        relocated.insert(index);
-                        relocation_hits[index] = relocation_hits[index].saturating_add(1);
-                        destination.push(index);
-                    }
-                }
-                if schema_version == PCODE_ELF_PROCESS_MEMORY_VERSION
-                    && matches!(relocation.flags(), RelocationFlags::Elf { r_type } if r_type == elf::R_X86_64_RELATIVE)
-                    && width == 8
-                    && destination.len() == 8
-                    && !relocation.has_implicit_addend()
-                    && relocation.target() == RelocationTarget::Absolute
+                if let Some(index) = at
+                    .checked_sub(base)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .filter(|index| *index < span && mapped[*index] == 0xff)
                 {
-                    if let Ok(value) = u64::try_from(load_bias + i128::from(relocation.addend())) {
-                        relative_candidates.push((destination, value.to_le_bytes()));
-                    }
+                    known[index] = 0;
+                    relocated.insert(index);
+                    relocation_hits[index] = relocation_hits[index].saturating_add(1);
+                    destination.push(index);
+                }
+            }
+            if let Some(addend) = relocation.relative_addend
+                && schema_version == PCODE_ELF_PROCESS_MEMORY_VERSION
+                && width == 8
+                && destination.len() == 8
+            {
+                if let Ok(value) = u64::try_from(load_bias + i128::from(addend)) {
+                    relative_candidates.push((destination, value.to_le_bytes()));
                 }
             }
         }
@@ -651,6 +840,54 @@ mod tests {
         assert_eq!(
             PcodeElfProcessMemory::parse_bound(&json, &binary, &snapshot, 64 * 1024).unwrap(),
             legacy
+        );
+    }
+
+    #[test]
+    fn sectionless_pie_relocations_come_from_dynamic_tags() {
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_relative_reloc_sectionless.elf"
+        ));
+        let file = object::File::parse(binary.as_slice()).unwrap();
+        assert_eq!(file.sections().count(), 0);
+        assert_eq!(
+            dynamic_relocations(binary, &file, PCODE_ELF_PROCESS_MEMORY_V1_VERSION)
+                .unwrap()
+                .len(),
+            0
+        );
+        let relocations =
+            dynamic_relocations(binary, &file, PCODE_ELF_PROCESS_MEMORY_VERSION).unwrap();
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].address, 0x3388);
+        assert_eq!(relocations[0].width, 8);
+        assert_eq!(relocations[0].relative_addend, Some(0x3390));
+
+        // DT_RELR cannot silently leave its destinations marked as known.
+        let mut packed = binary.to_vec();
+        let dynamic = Elf::parse(&packed).unwrap();
+        let debug = dynamic
+            .dynamic
+            .as_ref()
+            .unwrap()
+            .dyns
+            .iter()
+            .position(|entry| entry.d_tag == goblin::elf::dynamic::DT_DEBUG)
+            .unwrap();
+        let dynamic_offset = dynamic
+            .program_headers
+            .iter()
+            .find(|header| header.p_type == goblin::elf::program_header::PT_DYNAMIC)
+            .unwrap()
+            .p_offset as usize;
+        packed[dynamic_offset + debug * 16..dynamic_offset + debug * 16 + 8]
+            .copy_from_slice(&36u64.to_le_bytes());
+        let packed_file = object::File::parse(packed.as_slice()).unwrap();
+        assert!(
+            dynamic_relocations(&packed, &packed_file, PCODE_ELF_PROCESS_MEMORY_VERSION)
+                .unwrap_err()
+                .contains("packed ELF dynamic relocations")
         );
     }
 

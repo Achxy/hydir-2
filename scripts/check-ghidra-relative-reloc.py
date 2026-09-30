@@ -44,7 +44,7 @@ def main():
         binary = directory / "relative.elf"
         run("clang", "-nostdlib", "-pie",
             "-Wl,--build-id=none", "-Wl,-e,_start", SOURCE, "-o", binary)
-        if "R_X86_64_RELATIVE" not in run("readelf", "--relocs", binary):
+        if "R_X86_64_RELATIVE" not in run("readelf", "--relocs", "--wide", binary):
             raise AssertionError("PIE fixture lacks R_X86_64_RELATIVE")
         symbols = run("nm", binary)
         entry = symbol_address(symbols, "hydir_read_target")
