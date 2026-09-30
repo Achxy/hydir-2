@@ -10,6 +10,7 @@ pub mod cfg;
 pub mod coverage;
 pub mod execution;
 pub mod image;
+pub mod imports;
 pub mod interprocedural;
 pub mod process_memory;
 pub mod seed;
@@ -34,6 +35,9 @@ pub use execution::{
     PcodePathEvent, PcodePathStop, PcodePathTrace,
 };
 pub use image::{PcodeReadOnlyElfImage, PcodeReadOnlyElfWindow};
+pub use imports::{
+    PCODE_ELF_IMPORT_INDEX_VERSION, PcodeElfImport, PcodeElfImportCall, PcodeElfImportIndex,
+};
 pub use interprocedural::{
     PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION, PCODE_CALL_PATH_VERSION, PcodeCallPathSegment,
     PcodeCallPathStop, PcodeCallProcessBinding, PcodeCallTransition, PcodeInterproceduralTrace,

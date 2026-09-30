@@ -198,7 +198,7 @@ struct DynamicRelocation {
     relative_addend: Option<i64>,
 }
 
-fn checked_dynamic_table(
+pub(super) fn checked_dynamic_table(
     binary: &[u8],
     headers: &[goblin::elf::ProgramHeader],
     address: Option<u64>,

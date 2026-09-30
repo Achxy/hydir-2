@@ -32,9 +32,9 @@ use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
     GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
-    MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfProcessMemory,
-    PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget, parse_ghidra_snapshot,
-    parse_pcode_seed,
+    MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfImportIndex,
+    PcodeElfProcessMemory, PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_model::{
     import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
@@ -95,6 +95,7 @@ Usage:
   hydirctl ghidra-snapshot coverage <binary> <snapshot.json> [--output <coverage.json>]
   hydirctl ghidra-snapshot capability <binary> <snapshot.json> [--output <capability.json>]
   hydirctl ghidra-snapshot process-memory <binary> <snapshot.json> [--output <memory.json>]
+  hydirctl ghidra-snapshot imports <binary> <snapshot.json> [--output <imports.json>]
   hydirctl ghidra-snapshot rediscover-calls <binary> <snapshot.json> <input.json> <trace.json> [--output <plan.json>]
   hydirctl ghidra-snapshot rediscover-jumps <binary> <snapshot.json> <input.json> <trace-v3.json> [--output <plan.json>]
   hydirctl ghidra-snapshot rediscover-apply <binary> <snapshot.json> <input.json> <trace.json> [--output <snapshot.json>]
@@ -332,6 +333,24 @@ fn run() -> Result<(), Box<dyn Error>> {
                 PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
             )?;
             let bytes = serde_json::to_vec_pretty(&memory)?;
+            if args.len() == 6 {
+                write_new_or_identical(&args[5], &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
+                && args[1] == "imports" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let imports = PcodeElfImportIndex::from_elf(&binary, &snapshot)?;
+            let bytes = serde_json::to_vec_pretty(&imports)?;
             if args.len() == 6 {
                 write_new_or_identical(&args[5], &bytes)?;
             } else {

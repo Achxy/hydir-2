@@ -22,7 +22,9 @@ on:
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-recursion.py
       - scripts/check-ghidra-relative-reloc.py
+      - scripts/check-ghidra-import-index.py
       - tests/fixtures/ghidra_relative_reloc.S
+      - 'tests/fixtures/ghidra_import_calls*'
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
       - scripts/check-ghidra-frame-holdout.py
@@ -73,7 +75,9 @@ on:
       - scripts/check-ghidra-call-loop.py
       - scripts/check-ghidra-recursion.py
       - scripts/check-ghidra-relative-reloc.py
+      - scripts/check-ghidra-import-index.py
       - tests/fixtures/ghidra_relative_reloc.S
+      - 'tests/fixtures/ghidra_import_calls*'
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
       - scripts/check-ghidra-frame-holdout.py
@@ -218,6 +222,13 @@ jobs:
         run: |
           python3 scripts/check-ghidra-relative-reloc.py \
             --output-dir "$RUNNER_TEMP/ghidra-relative-reloc"
+      - name: Bind ELF JUMP_SLOT imports to Ghidra calls
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/check-ghidra-import-index.py \
+            --output-dir "$RUNNER_TEMP/ghidra-import-index"
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
