@@ -1,0 +1,36 @@
+flowchart TB
+    UI["HydIR GUI · CLI · API · Python SDK"] --> ELF["Linux x86-64 ELF"]
+
+    subgraph GH["Automatic Ghidra-backed lane"]
+        G["Headless Ghidra worker"] --> PC["Raw P-code<br/>with bytes and addresses"]
+        PC --> SEM["Rust semantics<br/>and coverage"]
+        SEM --> GL["Bounded execution<br/>and LLVM IR"]
+    end
+
+    subgraph NA["Independent native lane"]
+        N["ELF loader<br/>and function discovery"] --> IR["MachineIR → StateIR<br/>→ FunctionIR"]
+        IR --> C["CIR → low-level / structured C"]
+        IR --> MODEL["AnalysisModel<br/>DWARF + analyst edits"]
+        IR --> HLC["HighLevelCIR → typed C"]
+        MODEL --> HLC
+    end
+
+    ELF --> G
+    ELF --> N
+    GL --> CHECK["Source-linked checks<br/>and stop reasons"]
+    PC --> ART["Versioned artifacts<br/>for every interface"]
+    CHECK --> ART
+    C --> ART
+    HLC --> ART
+    MODEL --> ART
+
+    classDef entry fill:#e3f2f4,stroke:#155d70,color:#123943
+    classDef ghidra fill:#f1e9f6,stroke:#76538a,color:#382746
+    classDef native fill:#e7f0e6,stroke:#4b704c,color:#233b24
+    classDef evidence fill:#fff2da,stroke:#9b6a18,color:#51330b
+    class UI,ELF,ART entry
+    class G,PC,SEM,GL ghidra
+    class N,IR,C,HLC,MODEL native
+    class CHECK evidence
+    style GH fill:#faf7fc,stroke:#76538a
+    style NA fill:#f4f8f3,stroke:#4b704c

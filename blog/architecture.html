@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="How HydIR turns an ELF inventory into scoped CFG, LLVM IR, scalar C, and separately checked rebuild artifacts.">
+  <meta name="description" content="A project-wide map of HydIR: automatic Ghidra P-code, Rust lifting and execution, native IR, C output, evidence, and user interfaces.">
   <link rel="canonical" href="https://hydir.wiki/architecture">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
   <link rel="stylesheet" href="/styles.css">
@@ -15,24 +15,37 @@
   <main class="site-main prose" id="content">
     <p class="eyebrow">From bytes to artifacts</p>
     <h1>Follow the bytes through HydIR</h1>
-    <p class="lead">When you open an ELF, HydIR first records what is in the file. It then follows control flow for a selected function, lifts the instructions it understands, and checks generated output with trusted fixtures. A stop at one step does not undo what an earlier step found.</p>
+    <p class="lead">Open an ELF in HydIR and two complementary paths can examine it: an automatic Ghidra worker exports raw P-code, while HydIR's native frontend builds its own intermediate representations. Both paths keep results tied to the original bytes and addresses.</p>
 
-    <h2>1. Inventory the ELF</h2>
+    <h2>The whole project on one map</h2>
+    <figure class="architecture-map">
+      <div class="architecture-map-frame" tabindex="0" aria-label="Scrollable HydIR architecture diagram">
+        <img src="/assets/hydir-architecture.svg" width="1175" height="1042" alt="HydIR's GUI, CLI, API, and Python SDK open an ELF. The ELF enters an automatic Ghidra P-code lane and an independent native IR lane. Rust execution, LLVM, low-level C, typed C, model facts, and checks produce versioned artifacts.">
+      </div>
+      <figcaption>HydIR's major paths, from one ELF to source-linked artifacts. <a href="/assets/hydir-architecture.mmd">Read the Mermaid source</a> or <a href="/assets/hydir-architecture.svg">open the full-size diagram</a>.</figcaption>
+    </figure>
+    <p>Think of the ELF as a book written in CPU instructions. Ghidra translates each instruction into smaller P-code effects; HydIR imports those effects and uses Rust to classify them, run supported paths, and emit bounded LLVM. The native frontend independently reads the ELF and builds <code>MachineIR</code>, <code>StateIR</code>, and <code>FunctionIR</code> before generating C. These are two routes through the same file, not one long chain where Ghidra's decompiler produces HydIR's C.</p>
+    <p>The boxes at the bottom are the results you inspect in the workbench or retrieve through the CLI, API, and SDK. A diagram arrow means a stage can provide input to another stage; it does not promise every ELF reaches the end. Each artifact records its scope and source addresses. If an operation, memory byte, or call effect is unknown, the relevant path stops with a reason instead of filling in a plausible answer.</p>
+    <p>Triton exploration and the restricted patch and rebuild routes sit off to the side because they have separate requirements and checks. The comparison box covers supported, bounded runs; it is not a claim that HydIR has proved an arbitrary executable equivalent to its lift.</p>
+
+    <h2>The native path in four steps</h2>
+
+    <h3>1. Inventory the ELF</h3>
     <p>The native importer reads a little-endian x86-64 ELF and records file-derived sections, load mappings, symbols, imports, and relocations. Ordinary inspection does not pretend that an empty call or reference list proves there are none; recovery state is explicit. The desktop's broader disassembly scan marks uncertain uncovered regions.</p>
 
-    <h2>2. Recover a bounded CFG</h2>
+    <h3>2. Recover a bounded CFG</h3>
     <p>For a selected function symbol or analyst-supplied entry and byte extent, <code>iced-x86</code> decodes reachable instructions and follows direct branches. Recovery rejects overlapping instructions and edges outside the declared extent. The CFG retains instruction addresses, original bytes, edge kinds, and scope provenance.</p>
 
-    <h2>3. Lift supported machine state</h2>
-    <p>The scalar lift accepts an explicit SysV AMD64 <code>u64(u64,u64)</code> assertion. It tracks the supported registers and flags across CFG blocks, rejects reads that may be uninitialized, and emits LLVM IR with explicit joins. Wrapping arithmetic does not acquire LLVM no-overflow promises that the machine operation did not provide.</p>
+    <h3>3. Lift supported machine state</h3>
+    <p><code>MachineIR</code> keeps decoded instructions and their source bytes. <code>StateIR</code> tracks how registers, flags, and memory change across branches. <code>FunctionIR</code> adds calls, parameters, stack objects, and evidence for pointers. The separate scalar LLVM route accepts an explicit SysV AMD64 <code>u64(u64,u64)</code> assertion, rejects reads that may be uninitialized, and emits explicit joins. Wrapping machine arithmetic does not acquire an LLVM no-overflow promise.</p>
 
-    <h2>4. Emit and test scoped outputs</h2>
-    <p>The first-party C path consumes only HydIR's supported raw scalar IR grammar. It may produce labels, gotos, and SSA edge copies; a simple recognized branch can become structured C. Demo scripts verify generated IR where LLVM tools are available and compare compiled outputs with trusted originals on finite input sets. Validation executes those originals, so it is restricted to trusted fixtures.</p>
+    <h3>4. Emit and test scoped outputs</h3>
+    <p>The native C path turns supported <code>FunctionIR</code> into <code>CIR</code> and then low-level or structured C. Recovered DWARF facts and analyst edits in <code>AnalysisModel</code> can feed a typed C view. Unresolved flow may keep labels and gotos, while unsupported effects remain visible. Demo scripts verify generated LLVM where tools are available and compare selected outputs with trusted originals on finite input sets. Those checks execute the originals, so they use trusted fixtures.</p>
 
     <p class="note"><strong>Another path:</strong> whole-executable rebuilding is not a consequence of a successful scalar function lift. It requires complete supported text coverage in a static freestanding program, bounded mapped data, and checked read/write/exit syscall behavior. It emits a new executable and a separate report.</p>
 
     <h2>Interfaces and ownership</h2>
-    <p>The egui workbench and <code>hydirctl</code> use the native analysis path. <code>hydird</code> exposes authenticated loopback projects with immutable revisions and artifacts; the Python SDK covers the implemented remote subset. Local ELF opening stays local until a separate upload action. Local analyst facts live in a private on-device ledger; remote project facts live in the service ledger and do not automatically sync.</p>
+    <p>The egui workbench and <code>hydirctl</code> expose native analysis and can start the automatic Ghidra worker for a local ELF. <code>hydird</code> exposes authenticated projects with immutable revisions and artifacts; the Python SDK covers the implemented remote subset. Local ELF opening stays local until a separate upload action. Local analyst facts live in a private on-device ledger; remote project facts live in the service ledger and do not automatically sync.</p>
     <p>Read the <a href="/articles/graphs-to-code">compiler theory article</a> in the blogs, or inspect the <a href="https://github.com/Achxy/hydir-2">source tree</a> and <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">SDK reference</a>.</p>
   </main>
   <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs">Blogs</a></p></footer>
