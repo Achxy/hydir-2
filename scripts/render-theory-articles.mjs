@@ -6,7 +6,7 @@ import MarkdownIt from 'markdown-it';
 
 const site = fileURLToPath(new URL('../blog/', import.meta.url));
 const require = createRequire(import.meta.url);
-// Use the exact same renderer and fonts as the existing mathematics article.
+// Use one renderer and the same fonts for all Markdown-authored articles.
 const katex = require('../blog/vendor/katex/katex.min.js');
 const checking = process.argv.includes('--check');
 const posts = JSON.parse(fs.readFileSync(path.join(site, 'posts.json'), 'utf8'));
@@ -132,7 +132,8 @@ for (const post of posts) {
     '      <p class="eyebrow"><a href="/blogs">Blogs</a> / ' + escape(post.category) + '</p>\n' +
     '      <h1>' + escape(post.title + ': ' + post.subtitle) + '</h1>\n' +
     '      <p class="lead">' + escape(post.lead) + '</p>\n' + content +
-    '<p class="small muted"><a href="/content/' + post.slug + '.md">Download the Markdown and LaTeX source</a></p>\n' +
+    '<p class="small muted"><a href="/content/' + post.slug + '.md">' +
+      escape(post.source_label || 'Download the Markdown and LaTeX source') + '</a></p>\n' +
     '    </article>\n  </main>\n' + footer +
     '  <script type="module" src="/assets/theory.js"></script>\n</body>\n</html>\n';
   output('articles/' + post.slug + '.html', html);
@@ -143,4 +144,5 @@ for (const post of posts) {
     footer + '</body>\n</html>\n');
   console.log(post.slug + ': ' + env.equations + ' display equations, ' + env.inlineMath + ' inline expressions');
 }
-console.log((checking ? 'Checked' : 'Rendered') + ' two articles using the shared HydIR layout and vendored KaTeX.');
+console.log((checking ? 'Checked ' : 'Rendered ') + posts.length +
+  ' articles using the shared HydIR layout and vendored KaTeX.');

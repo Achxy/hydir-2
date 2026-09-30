@@ -18,5 +18,16 @@
     "description": "A detailed walk through bounded CFG recovery, fixed-point dataflow analysis, explicit SSA, parallel phi copies, and conservative effect summaries.",
     "lead": "The hard part of lifting is deciding what every value means on every incoming edge. Control-flow graphs and fixed points make that question precise.",
     "date": "2026-09-21"
+  },
+  {
+    "slug": "ghidra-pcode-explained",
+    "number": "03",
+    "category": "Binary lifting",
+    "title": "Ghidra P-code, Explained",
+    "subtitle": "Varnodes, State, and the Decompiler",
+    "description": "A deep guide to Ghidra P-code: address spaces, varnodes, widths, memory, branches, raw versus high P-code, and a real x86-64 example.",
+    "lead": "One x86 instruction can create many smaller effects. Learn to read the varnodes and operations between machine code and Ghidra's C view.",
+    "source_label": "Download the Markdown source",
+    "date": "2026-09-30"
   }
 ]

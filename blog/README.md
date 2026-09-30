@@ -1,8 +1,8 @@
 # HydIR blog
 
-The site is static. The article index is `/blogs` and both posts live under `/articles/`. The mathematics and compiler-theory articles use the same LaTeX.css fonts, shared styles, navigation, footer, light/dark themes, and reading width.
+The site is static. The article index is `/blogs` and all three posts live under `/articles/`. The P-code guide and the mathematics and compiler-theory articles use the same LaTeX.css fonts, shared styles, navigation, footer, light/dark themes, and reading width.
 
-The two theory articles are authored in `content/` as Markdown with inline `$...$` and display `$$...$$` LaTeX. Display blocks can have a stable anchor, for example `$$ {#signed-comparison}`. `posts.json` holds their metadata. The renderer owns only those two article pages and their draft-URL redirects; it never replaces the shared blog index.
+The articles are authored in `content/` as Markdown. The two theory articles also use inline `$...$` and display `$$...$$` LaTeX; display blocks can have a stable anchor, for example `$$ {#signed-comparison}`. `posts.json` holds metadata. The renderer owns these article pages and their draft-URL redirects; it never replaces the shared blog index.
 
 ~~~sh
 # From the repository root:
@@ -18,7 +18,7 @@ The renderer uses the existing vendored KaTeX 0.16.25 to produce HTML and MathML
 
 Generated pages are checked in alongside their Markdown sources. `npm run check:blog` rejects stale generated output or malformed mathematics, validates HTML, and checks site links and fragment targets. The Python checker verifies canonical routes, the sitemap, and local assets. The existing Pages build packages the full site, including clean article routes.
 
-Implementation claims were checked against revision `b00835d7568801738a2ee01e42f6bd11ae537e81`, and repository citations are pinned to it. The articles distinguish the native compiler pipeline from the scalar LLVM compatibility path, and mathematical derivations from implementation evidence and proof obligations.
+The mathematics and compiler-theory articles checked implementation claims against revision `b00835d7568801738a2ee01e42f6bd11ae537e81`. The P-code guide checks its concrete example and brief HydIR section against revision `34dbb5b11d71e43feb10e8e83e87f307b92012eb`. Source citations are pinned to those revisions. The articles distinguish implementation evidence from proof obligations.
 
 `examples/signed-branch.smt2` is a standalone bitvector identity check. `examples/arithmetic-identities.smt2` contains six additional checks of carry, overflow, borrow, signed comparison, and sign-bit biasing. Z3 4.16.0 returned `unsat` for all seven queries. These queries do not execute or certify HydIR.
 
