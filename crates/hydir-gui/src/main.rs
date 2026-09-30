@@ -239,6 +239,7 @@ enum Task {
         function: String,
         seed_json: String,
         allocation_json: Option<String>,
+        assume_import_contracts: bool,
         cancel: Arc<AtomicBool>,
         timeout: Duration,
     },
@@ -2551,9 +2552,13 @@ fn run_ghidra_call_llvm(
     function: &str,
     seed_json: &str,
     allocation_json: Option<&str>,
+    assume_import_contracts: bool,
     cancel: &AtomicBool,
     timeout: Duration,
 ) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    if assume_import_contracts && allocation_json.is_none() {
+        return Err("Import LLVM contracts require declared allocations".to_owned());
+    }
     if seed_json.len() > MAX_PCODE_SEED_BYTES {
         return Err("Ghidra call seed exceeds the JSON input limit".to_owned());
     }
@@ -2573,7 +2578,14 @@ fn run_ghidra_call_llvm(
     };
     let mut command = Command::new(hydirctl_path());
     command
-        .args(["ghidra", "llvm-cfg-calls"])
+        .args([
+            "ghidra",
+            if assume_import_contracts {
+                "llvm-cfg-calls-imports"
+            } else {
+                "llvm-cfg-calls"
+            },
+        ])
         .arg(binary)
         .arg(&seed_path)
         .arg("--function")
@@ -2612,8 +2624,20 @@ fn run_ghidra_call_llvm(
     let artifact: PcodeInterproceduralCfgLlvmArtifact =
         serde_json::from_slice(&fs::read(&artifact_path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("Invalid Ghidra call LLVM artifact: {error}"))?;
-    let expected_version = if allocation_json.is_some() { 2 } else { 1 };
-    let expected_llvm_version = if allocation_json.is_some() { 5 } else { 2 };
+    let expected_version = if assume_import_contracts {
+        3
+    } else if allocation_json.is_some() {
+        2
+    } else {
+        1
+    };
+    let expected_llvm_version = if assume_import_contracts {
+        6
+    } else if allocation_json.is_some() {
+        5
+    } else {
+        2
+    };
     if artifact.schema_version != expected_version
         || artifact.llvm.schema_version != expected_llvm_version
         || artifact.llvm.allocations.is_some() != allocation_json.is_some()
@@ -3502,6 +3526,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                 function,
                 seed_json,
                 allocation_json,
+                assume_import_contracts,
                 cancel,
                 timeout,
             } => {
@@ -3514,6 +3539,7 @@ fn worker(tasks: Receiver<Task>, events: SyncSender<Event>, ctx: egui::Context) 
                         &function,
                         &seed_json,
                         allocation_json.as_deref(),
+                        assume_import_contracts,
                         &cancel,
                         timeout,
                     );
@@ -9498,7 +9524,12 @@ impl AnalystApp {
                     && !self.ghidra_call_busy
                     && !self.ghidra_call_llvm_busy
                     && self.current_local_path.is_some();
-                if ui.add_enabled(can_generate, egui::Button::new("Generate call CFG LLVM")).clicked() {
+                let generate = ui.add_enabled(can_generate, egui::Button::new("Generate call CFG LLVM")).clicked();
+                let generate_imports = ui.add_enabled(
+                    can_generate && self.ghidra_trace_memory_mode == "allocated",
+                    egui::Button::new("Generate LLVM with import contracts"),
+                ).clicked();
+                if generate || generate_imports {
                     match parse_pcode_seed(self.ghidra_trace_seed_json.as_bytes(), snapshot) {
                         Err(error) => self.ghidra_call_llvm = Some(Err(error)),
                         Ok(_) => {
@@ -9514,6 +9545,7 @@ impl AnalystApp {
                                 seed_json: self.ghidra_trace_seed_json.clone(),
                                 allocation_json: (self.ghidra_trace_memory_mode == "allocated")
                                     .then(|| self.ghidra_allocation_json.clone()),
+                                assume_import_contracts: generate_imports,
                                 cancel: Arc::clone(&cancel),
                                 timeout,
                             };
@@ -9564,6 +9596,21 @@ impl AnalystApp {
                                 "Shared ELF process and {} declared allocations",
                                 allocations.regions().len(),
                             )).size(11.0).color(MUTED));
+                        }
+                        if artifact.schema_version == 3 {
+                            ui.label(RichText::new("ELF JUMP_SLOT names assume a conforming runtime binding; this LLVM module is not an equivalence proof.")
+                                .size(11.0).color(MUTED));
+                            for call in &artifact.import_calls {
+                                let address = address_map.as_ref().and_then(|map|
+                                    map.to_linked(&call.call_site.space, &call.call_site.offset));
+                                if ui.selectable_label(
+                                    address.is_some() && self.selected_address == address,
+                                    RichText::new(format!("{} → {} (assumed binding)",
+                                        call.call_site.offset, call.name)).monospace().size(11.0),
+                                ).clicked() && address.is_some() {
+                                    self.selected_address = address;
+                                }
+                            }
                         }
                         ui.label(RichText::new("Runnable path module; execution can stop at the listed boundaries. The generated code has not been verified against the binary.")
                             .size(11.0).color(MUTED));

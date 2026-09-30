@@ -178,7 +178,8 @@ message GhidraCallTraceRequest {
   // Optional v1 stack/heap declaration. Trace and LLVM use strict ELF process
   // memory when supplied; assessment requires this field to be empty.
   bytes allocation_json = 9;
-  // TraceGhidraCalls only: opt into v4 SysV import contracts. A checked PLT
+  // TraceGhidraCalls or BuildGhidraCallCfgLlvm: opt into SysV import contracts.
+  // Requires allocation_json. A checked PLT
   // name is an explicit assumption about the dynamic linker's final binding.
   bool assume_import_contracts = 10;
 }

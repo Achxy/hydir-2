@@ -278,20 +278,41 @@ pub fn run_automatic_imports(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 pub fn run_automatic_llvm(args: &[String]) -> Result<(), Box<dyn Error>> {
+    run_automatic_llvm_inner(args, false)
+}
+
+pub fn run_automatic_llvm_imports(args: &[String]) -> Result<(), Box<dyn Error>> {
+    run_automatic_llvm_inner(args, true)
+}
+
+fn run_automatic_llvm_inner(args: &[String], with_imports: bool) -> Result<(), Box<dyn Error>> {
     let [binary, seed, options @ ..] = args else {
         return Err("llvm-cfg-calls needs binary and seed".into());
     };
     let options = parse_options(options, true)?;
+    if with_imports && options.allocations.is_none() {
+        return Err("import LLVM contracts require --allocations".into());
+    }
     let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
     let mut artifact = if let Some(path) = options.allocations {
         let binary_bytes = read_binary(binary)?;
         let (process, allocations) = strict_allocations(&snapshots, &binary_bytes, path)?;
-        hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
-            &snapshots,
-            options.max_depth,
-            &process,
-            &allocations,
-        )?
+        if with_imports {
+            hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_imports(
+                &snapshots,
+                &binary_bytes,
+                options.max_depth,
+                &process,
+                &allocations,
+            )?
+        } else {
+            hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
+                &snapshots,
+                options.max_depth,
+                &process,
+                &allocations,
+            )?
+        }
     } else {
         hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, options.max_depth)?
     };

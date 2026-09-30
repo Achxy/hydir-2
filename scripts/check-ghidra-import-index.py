@@ -92,9 +92,9 @@ def main():
                 selected_snapshot, seed_path, "--allocations", allocation_path,
                 "--max-ops", "256", "--max-visits", "64", "--max-depth", "4",
                 "--output", trace_path)
-            return json.loads(trace_path.read_text(encoding="utf-8"))
+            return json.loads(trace_path.read_text(encoding="utf-8")), seed_path
 
-        strlen_trace = contract_trace("strlen", snapshot_path)
+        strlen_trace, strlen_seed_path = contract_trace("strlen", snapshot_path)
         if (strlen_trace["schema_version"] != 4
                 or strlen_trace["stop"]["kind"] != "return"
                 or len(strlen_trace["contracted_imports"]) != 1
@@ -107,6 +107,91 @@ def main():
         if native() != 5:
             raise AssertionError("native strlen fixture did not return 5")
 
+        llvm_path = directory / "strlen-llvm.json"
+        run(CLIENT, "ghidra-snapshot", "llvm-cfg-calls-imports", BINARY,
+            snapshot_path, "--allocations", allocation_path,
+            "--max-depth", "4", "--output", llvm_path)
+        llvm_artifact = json.loads(llvm_path.read_text(encoding="utf-8"))
+        if (llvm_artifact["schema_version"] != 3
+                or llvm_artifact["llvm"]["schema_version"] != 6
+                or [call["name"] for call in llvm_artifact["import_calls"]] != ["strlen"]):
+            raise AssertionError("import LLVM artifact lacks the checked call")
+        source = directory / "strlen.ll"
+        source.write_text(llvm_artifact["llvm"]["llvm_ir"], encoding="utf-8")
+        library = directory / "strlen-lifted.so"
+        run("clang", "-shared", "-fPIC", source, "-o", library)
+        lifted = ctypes.CDLL(str(library.resolve())).hydir_pcode_cfg
+        u8p = ctypes.POINTER(ctypes.c_uint8)
+        lifted.argtypes = [u8p, u8p, ctypes.c_int32,
+                           u8p, u8p, ctypes.c_uint64, ctypes.c_uint64,
+                           u8p, u8p, ctypes.c_uint64, ctypes.c_uint64,
+                           ctypes.POINTER(ctypes.c_uint32),
+                           ctypes.POINTER(ctypes.c_uint32), ctypes.c_int32, ctypes.c_int32]
+        lifted.restype = ctypes.c_int32
+        llvm = llvm_artifact["llvm"]
+        byte_map = {(row["space"], int(row["offset"], 16)): row["index"]
+                    for row in llvm["byte_map"]}
+        state = (ctypes.c_uint8 * llvm["state_bytes"])()
+        known = (ctypes.c_uint8 * llvm["state_bytes"])()
+        seed = json.loads(strlen_seed_path.read_text(encoding="utf-8"))
+        for register in seed["registers"]:
+            start = int(register["offset"], 16)
+            value = int(register["value"], 16)
+            for byte in range(register["size"]):
+                key = ("register", start + byte)
+                if key in byte_map:
+                    state[byte_map[key]] = (value >> (byte * 8)) & 0xff
+                    known[byte_map[key]] = 0xff
+        stack_base = 0x6ffff8
+        stack = (ctypes.c_uint8 * 16)()
+        stack_known = (ctypes.c_uint8 * 16)()
+        for region in seed["memory"]:
+            start = int(region["byte_offset"], 16) - stack_base
+            value = int(region["value"], 16).to_bytes(region["size"], "little")
+            if start < 0 or start + len(value) > 16:
+                raise AssertionError("seed memory is outside declared stack")
+            for index, byte in enumerate(value):
+                stack[start + index] = byte
+                stack_known[start + index] = 0xff
+        heap = (ctypes.c_uint8 * 1)()
+        heap_known = (ctypes.c_uint8 * 1)()
+        events = (ctypes.c_uint32 * 256)()
+        event_count = ctypes.c_uint32()
+        status = lifted(state, known, 433, stack, stack_known, stack_base, 16,
+                        heap, heap_known, 0, 0, events, ctypes.byref(event_count),
+                        256, 256)
+        rax = int(layout["RAX"]["storage"]["offset"], 16)
+        result = sum(state[byte_map[("register", rax + byte)]] << (byte * 8)
+                     for byte in range(8))
+        if status != 1 or result != 5:
+            raise AssertionError(f"compiled LLVM strlen differs: status={status}, rax={result}")
+        sources = {(row["instruction_address"]["space"], row["instruction_address"]["offset"],
+                    row["operation_index"]): index
+                   for index, row in enumerate(llvm["source_operations"])}
+        expected_events = []
+        for segment_index, segment in enumerate(strlen_trace["segments"]):
+            for event in segment["path"]["events"]:
+                operation = event.get("operation", {}).get("source") if event["kind"] == "effect" else event.get("source")
+                if operation is None:
+                    continue
+                key = (operation["source_address"]["space"],
+                       operation["source_address"]["offset"],
+                       operation["sequence_index"])
+                expected_events.append(sources[key])
+            if segment_index + 1 < len(strlen_trace["segments"]):
+                operation = segment["path"]["stop"]["source"]
+                key = (operation["source_address"]["space"],
+                       operation["source_address"]["offset"],
+                       operation["sequence_index"])
+                expected_events.append(sources[key])
+        actual_events = list(events[:event_count.value])
+        if actual_events != expected_events:
+            first = next((index for index, (actual, wanted) in
+                          enumerate(zip(actual_events, expected_events))
+                          if actual != wanted), min(len(actual_events), len(expected_events)))
+            raise AssertionError(f"LLVM/Rust strlen events differ at {first}: "
+                                 f"{actual_events[first:first + 3]} != {expected_events[first:first + 3]}")
+
         memcmp = [item for item in catalog["functions"]
                   if item["name"] == "hydir_import_memcmp"]
         if len(memcmp) != 1:
@@ -114,13 +199,15 @@ def main():
         memcmp_snapshot = directory / "memcmp.json"
         run(CLIENT, "ghidra", "analyze", BINARY, "--function",
             memcmp[0]["entry"]["offset"], "--output", memcmp_snapshot)
-        memcmp_trace = contract_trace("memcmp", memcmp_snapshot)
+        memcmp_trace, _ = contract_trace("memcmp", memcmp_snapshot)
         if (memcmp_trace["stop"]["kind"] != "call_boundary"
                 or "no checked SysV call contract" not in memcmp_trace["stop"]["reason"]
                 or memcmp_trace.get("contracted_imports")):
             raise AssertionError("unsupported memcmp was silently treated as exact")
         print(json.dumps({"binary_sha256": digest, "imports": sorted(names),
                           "linked_call": linked[0], "strlen_result": 5,
+                          "llvm_strlen_status": status,
+                          "llvm_strlen_events": len(actual_events),
                           "memcmp_stop": memcmp_trace["stop"]["kind"]}, sort_keys=True))
 
 

@@ -85,6 +85,7 @@ Usage:
   hydirctl ghidra trace-calls-imports <binary> <seed.json> --function <0xentry> --allocations <allocations.json> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
   hydirctl ghidra assess <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--allocations <allocations.json>] [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra llvm-cfg-calls-imports <binary> <seed.json> --function <0xentry> --allocations <allocations.json> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
@@ -110,6 +111,7 @@ Usage:
   hydirctl ghidra-snapshot llvm-cfg-image <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
   hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--allocations <allocations.json>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-calls-imports <binary> <root-snapshot.json> --allocations <allocations.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
   hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
@@ -636,7 +638,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!("{}", String::from_utf8(bytes)?);
             }
         }
-        Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg-calls" => {
+        Some("ghidra-snapshot")
+            if args.len() >= 4
+                && matches!(
+                    args[1].as_str(),
+                    "llvm-cfg-calls" | "llvm-cfg-calls-imports"
+                ) =>
+        {
+            let with_imports = args[1] == "llvm-cfg-calls-imports";
             let mut callee_paths = Vec::new();
             let mut max_depth = 4usize;
             let mut depth_seen = false;
@@ -659,6 +668,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
+            }
+            if with_imports && allocations_path.is_none() {
+                return Err("import LLVM contracts require --allocations".into());
             }
             let binary = read_binary(&args[2])?;
             let digest = format!("{:x}", sha2::Sha256::digest(&binary));
@@ -683,12 +695,22 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &snapshots[0],
                     &process,
                 )?;
-                hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
-                    &snapshots,
-                    max_depth,
-                    &process,
-                    &allocations,
-                )?
+                if with_imports {
+                    hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_imports(
+                        &snapshots,
+                        &binary,
+                        max_depth,
+                        &process,
+                        &allocations,
+                    )?
+                } else {
+                    hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
+                        &snapshots,
+                        max_depth,
+                        &process,
+                        &allocations,
+                    )?
+                }
             } else {
                 hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?
             };
@@ -749,6 +771,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("ghidra") if args.len() >= 6 && args[1] == "llvm-cfg-calls" => {
             ghidra_calls::run_automatic_llvm(&args[2..])?;
+        }
+        Some("ghidra") if args.len() >= 8 && args[1] == "llvm-cfg-calls-imports" => {
+            ghidra_calls::run_automatic_llvm_imports(&args[2..])?;
         }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-calls" => {
             ghidra_calls::run_snapshots(&args[2..])?;

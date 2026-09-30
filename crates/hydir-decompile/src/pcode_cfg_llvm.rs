@@ -6,8 +6,8 @@ use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_spa
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
 use hydir_ir::pcode::{
     GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect,
-    PcodeElfProcessMemory, PcodeExactOp, PcodeOpaqueClass, PcodeOperation,
-    PcodeProcessAllocationKind, PcodeProcessAllocations, PcodeReadOnlyElfWindow,
+    PcodeElfImportCall, PcodeElfImportIndex, PcodeElfProcessMemory, PcodeExactOp, PcodeOpaqueClass,
+    PcodeOperation, PcodeProcessAllocationKind, PcodeProcessAllocations, PcodeReadOnlyElfWindow,
     PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode, validate_ghidra_snapshot,
 };
 use hydir_ir::{SemanticFidelity, VerificationStatus};
@@ -20,10 +20,12 @@ pub const PCODE_CFG_LLVM_VERSION: u32 = 2;
 pub const PCODE_CFG_IMAGE_LLVM_VERSION: u32 = 3;
 pub const PCODE_CFG_PROCESS_LLVM_VERSION: u32 = 4;
 pub const PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION: u32 = 5;
+pub const PCODE_CFG_IMPORT_CONTRACT_LLVM_VERSION: u32 = 6;
 pub const PCODE_CFG_ELF_IMAGE_MAX_BYTES: usize = 65_536;
 pub const PCODE_SIMPLIFIED_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION: u32 = 2;
+pub const PCODE_INTERPROCEDURAL_IMPORT_CONTRACT_CFG_LLVM_VERSION: u32 = 3;
 pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
 const MAX_CFG_INSTRUCTIONS: usize = 4096;
 const MAX_CFG_OPERATIONS: usize = 4096;
@@ -162,6 +164,10 @@ pub struct PcodeInterproceduralCfgLlvmArtifact {
     /// an explicit stop in the LLVM module.
     pub snapshot_diagnostics: Vec<String>,
     pub max_call_depth: usize,
+    /// Byte-verified direct PLT calls eligible for an opt-in import contract.
+    /// The ELF name assumes, but cannot prove, the final runtime binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_calls: Vec<PcodeElfImportCall>,
     pub llvm: PcodeCfgLlvmArtifact,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
@@ -172,6 +178,8 @@ struct CallLlvmContext<'a> {
     owners: Vec<usize>,
     max_call_depth: usize,
     process: Option<&'a PcodeElfProcessMemory>,
+    allocations: Option<&'a PcodeProcessAllocations>,
+    imports: Option<Vec<PcodeElfImportIndex>>,
 }
 
 fn internal_process_call_target(
@@ -354,6 +362,169 @@ fn emit_known_guard(
     ));
 }
 
+fn import_abi_register(snapshot: &GhidraSnapshot, name: &str) -> Result<PcodeVarnode, String> {
+    let layout = snapshot
+        .register_layout
+        .iter()
+        .find(|register| register.name == name)
+        .ok_or_else(|| format!("SysV import contract requires Ghidra {name} layout"))?;
+    if layout.size_bytes != 8 || layout.storage.space != "register" {
+        return Err(format!(
+            "SysV import contract has invalid Ghidra {name} layout"
+        ));
+    }
+    Ok(PcodeVarnode {
+        space: "register".to_owned(),
+        offset: layout.storage.offset.clone(),
+        size: 8,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_interprocedural_import_call(
+    context: &CallLlvmContext<'_>,
+    snapshot: &GhidraSnapshot,
+    import: &PcodeElfImportCall,
+    source: &PcodeOperation,
+    operation_index: usize,
+    id: usize,
+    return_index: usize,
+    continuation: u64,
+    byte_map: &[PcodeStateByte],
+    body: &mut String,
+    sites: &mut Vec<PcodeCfgLlvmStopSite>,
+) -> Result<(), String> {
+    if import.name != "strlen" {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            format!("import {} has no checked SysV call contract", import.name),
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    }
+    let registers = (|| -> Result<_, String> {
+        let rax = import_abi_register(snapshot, "RAX")?;
+        let rdi = import_abi_register(snapshot, "RDI")?;
+        let rsp = import_abi_register(snapshot, "RSP")?;
+        let mut occupied = Vec::<u64>::new();
+        let mut preserved = Vec::<u64>::new();
+        for node in [&rax, &rdi, &rsp] {
+            let start = offset(&node.offset)?;
+            if occupied
+                .iter()
+                .any(|other| start < *other + 8 && *other < start + 8)
+            {
+                return Err("SysV import register layout overlaps".to_owned());
+            }
+            occupied.push(start);
+        }
+        preserved.push(offset(&rsp.offset)?);
+        for name in ["RBX", "RBP", "R12", "R13", "R14", "R15"] {
+            if snapshot
+                .register_layout
+                .iter()
+                .any(|register| register.name == name)
+            {
+                let node = import_abi_register(snapshot, name)?;
+                let start = offset(&node.offset)?;
+                if occupied
+                    .iter()
+                    .any(|other| start < *other + 8 && *other < start + 8)
+                {
+                    return Err("SysV import register layout overlaps".to_owned());
+                }
+                occupied.push(start);
+                preserved.push(start);
+            }
+        }
+        Ok((rax, rdi, rsp, preserved))
+    })();
+    let (rax, rdi, rsp, preserved) = match registers {
+        Ok(registers) => registers,
+        Err(reason) => {
+            stop_site(
+                sites,
+                &source.source_address,
+                Some(operation_index),
+                PcodeCfgLlvmStatus::Call,
+                reason,
+            );
+            body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+            return Ok(());
+        }
+    };
+    if context.process.is_none() || context.allocations.is_none() {
+        return Err("import LLVM contract requires process and allocations".to_owned());
+    }
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(operation_index),
+        PcodeCfgLlvmStatus::CallDepth,
+        "call depth budget exhausted",
+    );
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(operation_index),
+        PcodeCfgLlvmStatus::Call,
+        "strlen requires known SysV arguments, a matching declared return slot, and a mapped known NUL-terminated string of at most 4096 bytes",
+    );
+    body.push_str(&format!(
+        "  %import_depth_{id} = load i32, ptr %call_depth\n\
+         %import_full_{id} = icmp uge i32 %import_depth_{id}, {}\n\
+         br i1 %import_full_{id}, label %stop_call_depth, label %import_run_{id}\n\
+         import_run_{id}:\n\
+         %import_result_{id} = call {{ i64, i1 }} @hydir_import_strlen(ptr %state, ptr %known, ptr %process_bytes, ptr %process_known, ptr %guest_ram, ptr %guest_known, i64 %guest_base, i64 %guest_len, ptr %heap_ram, ptr %heap_known, i64 %heap_base, i64 %heap_len, i64 {}, i64 {}, i64 {continuation})\n\
+         %import_length_{id} = extractvalue {{ i64, i1 }} %import_result_{id}, 0\n\
+         %import_ok_{id} = extractvalue {{ i64, i1 }} %import_result_{id}, 1\n\
+         br i1 %import_ok_{id}, label %import_apply_{id}, label %stop_call\n\
+         import_apply_{id}:\n\
+         %import_rsp_{id} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 8)\n\
+         %import_rsp_next_{id} = add i64 %import_rsp_{id}, 8\n",
+        context.max_call_depth,
+        offset(&rdi.offset)?,
+        offset(&rsp.offset)?,
+        pcode_space_id("register")?,
+        offset(&rsp.offset)?,
+    ));
+    for byte in byte_map.iter().filter(|byte| byte.space == "register") {
+        let address = offset(&byte.offset)?;
+        if preserved
+            .iter()
+            .any(|start| address >= *start && address - *start < 8)
+        {
+            continue;
+        }
+        body.push_str(&format!(
+            "  %import_unknown_ptr_{id}_{} = getelementptr i8, ptr %known, i64 {}\n\
+             store i8 0, ptr %import_unknown_ptr_{id}_{}\n",
+            byte.index, byte.index, byte.index,
+        ));
+    }
+    let register_space = pcode_space_id("register")?;
+    body.push_str(&format!(
+        "  call void @hydir_write_varnode(ptr %state, i32 {register_space}, i64 {}, i32 8, i64 %import_length_{id})\n\
+         call void @hydir_write_varnode(ptr %known, i32 {register_space}, i64 {}, i32 8, i64 -1)\n\
+         call void @hydir_write_varnode(ptr %state, i32 {register_space}, i64 {}, i32 8, i64 %import_rsp_next_{id})\n\
+         call void @hydir_write_varnode(ptr %known, i32 {register_space}, i64 {}, i32 8, i64 -1)\n",
+        offset(&rax.offset)?,
+        offset(&rax.offset)?,
+        offset(&rsp.offset)?,
+        offset(&rsp.offset)?,
+    ));
+    body.push_str(&log_event(
+        id,
+        &format!("%count_{id}"),
+        "import",
+        &format!("ins_{return_index}"),
+    ));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_interprocedural_call(
     context: &CallLlvmContext<'_>,
@@ -364,6 +535,7 @@ fn emit_interprocedural_call(
     id: usize,
     index: &BTreeMap<(String, u64), usize>,
     caller_index: &BTreeMap<(String, u64), usize>,
+    byte_map: &[PcodeStateByte],
     body: &mut String,
     sites: &mut Vec<PcodeCfgLlvmStopSite>,
 ) -> Result<(), String> {
@@ -491,6 +663,34 @@ fn emit_interprocedural_call(
         );
         body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
         return Ok(());
+    }
+    if !indirect
+        && let Some(import) = context
+            .imports
+            .as_ref()
+            .and_then(|indices| indices.get(owner))
+            .and_then(|index| {
+                index.calls.iter().find(|call| {
+                    call.call_site == *site
+                        && offset(&call.plt_target.offset).ok().is_some_and(|address| {
+                            Some((call.plt_target.space.clone(), address)) == target_key
+                        })
+                })
+            })
+    {
+        return emit_interprocedural_import_call(
+            context,
+            snapshot,
+            import,
+            source,
+            operation_index,
+            id,
+            return_index,
+            continuation_key.1,
+            byte_map,
+            body,
+            sites,
+        );
     }
     if let (Some(process), Some((space, address))) = (context.process, target_key.as_ref())
         && !internal_process_call_target(snapshot, process, space, *address)
@@ -967,6 +1167,115 @@ fn process_globals(process: &PcodeElfProcessMemory) -> String {
         encode_llvm_bytes(process.mapped()),
         encode_llvm_bytes(process.writable()),
     )
+}
+
+/// The result is valid only when every argument, return-slot, and string byte
+/// is known in the same sparse process contract used by Rust execution.
+fn import_strlen_helper(process: &PcodeElfProcessMemory) -> String {
+    r#"
+define { i64, i1 } @hydir_import_strlen(ptr %state, ptr %known, ptr %process_bytes, ptr %process_known, ptr %stack_ram, ptr %stack_known, i64 %stack_base, i64 %stack_len, ptr %heap_ram, ptr %heap_known, i64 %heap_base, i64 %heap_len, i64 %rdi_offset, i64 %rsp_offset, i64 %continuation) {
+entry:
+  %rdi_mask = call i64 @hydir_read_varnode(ptr %known, i32 1, i64 %rdi_offset, i32 8)
+  %rsp_mask = call i64 @hydir_read_varnode(ptr %known, i32 1, i64 %rsp_offset, i32 8)
+  %rdi_known = icmp eq i64 %rdi_mask, -1
+  %rsp_known = icmp eq i64 %rsp_mask, -1
+  %arguments_known = and i1 %rdi_known, %rsp_known
+  br i1 %arguments_known, label %return_slot, label %fail
+return_slot:
+  %pointer = call i64 @hydir_read_varnode(ptr %state, i32 1, i64 %rdi_offset, i32 8)
+  %rsp = call i64 @hydir_read_varnode(ptr %state, i32 1, i64 %rsp_offset, i32 8)
+  %rsp_above = icmp uge i64 %rsp, %stack_base
+  %rsp_relative = sub i64 %rsp, %stack_base
+  %stack_has_slot = icmp uge i64 %stack_len, 8
+  %slot_last = sub i64 %stack_len, 8
+  %slot_inside = icmp ule i64 %rsp_relative, %slot_last
+  %slot_ge = and i1 %rsp_above, %stack_has_slot
+  %slot_valid = and i1 %slot_ge, %slot_inside
+  br i1 %slot_valid, label %read_return, label %fail
+read_return:
+  %return_known_ptr = getelementptr i8, ptr %stack_known, i64 %rsp_relative
+  %return_known = load i64, ptr %return_known_ptr, align 1
+  %return_known_ok = icmp eq i64 %return_known, -1
+  %return_ptr = getelementptr i8, ptr %stack_ram, i64 %rsp_relative
+  %return_value = load i64, ptr %return_ptr, align 1
+  %return_matches = icmp eq i64 %return_value, %continuation
+  %return_ok = and i1 %return_known_ok, %return_matches
+  br i1 %return_ok, label %scan, label %fail
+scan:
+  %index = phi i64 [ 0, %read_return ], [ %next, %advance ]
+  %within_budget = icmp ult i64 %index, 4096
+  br i1 %within_budget, label %address_step, label %fail
+address_step:
+  %addition = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %pointer, i64 %index)
+  %address = extractvalue { i64, i1 } %addition, 0
+  %overflow = extractvalue { i64, i1 } %addition, 1
+  br i1 %overflow, label %fail, label %select_memory
+select_memory:
+  %process_above = icmp uge i64 %address, __PROCESS_BASE__
+  %process_relative = sub i64 %address, __PROCESS_BASE__
+  %process_inside = icmp ult i64 %process_relative, __PROCESS_LEN__
+  %in_process = and i1 %process_above, %process_inside
+  br i1 %in_process, label %check_process, label %check_stack
+check_process:
+  %mapped_ptr = getelementptr [__PROCESS_LEN__ x i8], ptr @hydir_process_mapped, i64 0, i64 %process_relative
+  %mapped = load i8, ptr %mapped_ptr
+  %process_known_ptr = getelementptr i8, ptr %process_known, i64 %process_relative
+  %process_known_byte = load i8, ptr %process_known_ptr
+  %mapped_ok = icmp eq i8 %mapped, -1
+  %process_known_ok = icmp eq i8 %process_known_byte, -1
+  %process_ok = and i1 %mapped_ok, %process_known_ok
+  br i1 %process_ok, label %read_process, label %fail
+read_process:
+  %process_ptr = getelementptr i8, ptr %process_bytes, i64 %process_relative
+  %process_byte = load i8, ptr %process_ptr
+  br label %check_zero
+check_stack:
+  %stack_above = icmp uge i64 %address, %stack_base
+  %stack_relative = sub i64 %address, %stack_base
+  %stack_inside = icmp ult i64 %stack_relative, %stack_len
+  %in_stack = and i1 %stack_above, %stack_inside
+  br i1 %in_stack, label %check_stack_known, label %check_heap
+check_stack_known:
+  %stack_known_ptr = getelementptr i8, ptr %stack_known, i64 %stack_relative
+  %stack_known_byte = load i8, ptr %stack_known_ptr
+  %stack_ok = icmp eq i8 %stack_known_byte, -1
+  br i1 %stack_ok, label %read_stack, label %fail
+read_stack:
+  %stack_ptr = getelementptr i8, ptr %stack_ram, i64 %stack_relative
+  %stack_byte = load i8, ptr %stack_ptr
+  br label %check_zero
+check_heap:
+  %heap_above = icmp uge i64 %address, %heap_base
+  %heap_relative = sub i64 %address, %heap_base
+  %heap_inside = icmp ult i64 %heap_relative, %heap_len
+  %in_heap = and i1 %heap_above, %heap_inside
+  br i1 %in_heap, label %check_heap_known, label %fail
+check_heap_known:
+  %heap_known_ptr = getelementptr i8, ptr %heap_known, i64 %heap_relative
+  %heap_known_byte = load i8, ptr %heap_known_ptr
+  %heap_ok = icmp eq i8 %heap_known_byte, -1
+  br i1 %heap_ok, label %read_heap, label %fail
+read_heap:
+  %heap_ptr = getelementptr i8, ptr %heap_ram, i64 %heap_relative
+  %heap_byte = load i8, ptr %heap_ptr
+  br label %check_zero
+check_zero:
+  %byte = phi i8 [ %process_byte, %read_process ], [ %stack_byte, %read_stack ], [ %heap_byte, %read_heap ]
+  %terminal = icmp eq i8 %byte, 0
+  br i1 %terminal, label %success, label %advance
+advance:
+  %next = add i64 %index, 1
+  br label %scan
+success:
+  %result_length = insertvalue { i64, i1 } undef, i64 %index, 0
+  %result_ok = insertvalue { i64, i1 } %result_length, i1 true, 1
+  ret { i64, i1 } %result_ok
+fail:
+  ret { i64, i1 } { i64 0, i1 false }
+}
+"#
+    .replace("__PROCESS_BASE__", &process.base().to_string())
+    .replace("__PROCESS_LEN__", &process.bytes().len().to_string())
 }
 
 fn emit_process_memory_value(
@@ -1498,7 +1807,7 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
     snapshots: &[GhidraSnapshot],
     max_call_depth: usize,
 ) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
-    emit_pcode_interprocedural_cfg_llvm_inner(snapshots, max_call_depth, None)
+    emit_pcode_interprocedural_cfg_llvm_inner(snapshots, max_call_depth, None, None)
 }
 
 /// Emit an opt-in v5 interprocedural module with one shared ELF process and
@@ -1514,6 +1823,25 @@ pub fn emit_pcode_interprocedural_cfg_llvm_with_allocations(
         snapshots,
         max_call_depth,
         Some((process, allocations)),
+        None,
+    )
+}
+
+/// Opt in to ELF JUMP_SLOT import contracts. Only exact PLT bytes linked to
+/// Ghidra's direct CALL evidence qualify; the named dynamic binding remains
+/// an explicit assumption rather than a proven property of the binary.
+pub fn emit_pcode_interprocedural_cfg_llvm_with_imports(
+    snapshots: &[GhidraSnapshot],
+    binary: &[u8],
+    max_call_depth: usize,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    emit_pcode_interprocedural_cfg_llvm_inner(
+        snapshots,
+        max_call_depth,
+        Some((process, allocations)),
+        Some(binary),
     )
 }
 
@@ -1521,6 +1849,7 @@ fn emit_pcode_interprocedural_cfg_llvm_inner(
     snapshots: &[GhidraSnapshot],
     max_call_depth: usize,
     allocated: Option<(&PcodeElfProcessMemory, &PcodeProcessAllocations)>,
+    import_binary: Option<&[u8]>,
 ) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
     let root = snapshots
         .first()
@@ -1528,15 +1857,22 @@ fn emit_pcode_interprocedural_cfg_llvm_inner(
     if snapshots.len() > 128 || max_call_depth > 16 {
         return Err("interprocedural LLVM snapshot or call-depth limit exceeded".into());
     }
+    if import_binary.is_some() && allocated.is_none() {
+        return Err("import contracts require declared process allocations".into());
+    }
     let mut owners = Vec::new();
     let mut semantic = root.pcode_function_ir()?.lower_semantics();
     semantic.instructions.clear();
     let mut entries = BTreeSet::new();
     let mut digests = Vec::new();
+    let mut import_indices = Vec::new();
     for (owner, snapshot) in snapshots.iter().enumerate() {
         validate_ghidra_snapshot(snapshot, &root.binary_sha256)?;
         if let Some((process, allocations)) = allocated {
             allocations.validate_for(snapshot, process)?;
+        }
+        if let Some(binary) = import_binary {
+            import_indices.push(PcodeElfImportIndex::from_elf(binary, snapshot)?);
         }
         snapshot.pcode_cfg_ir()?;
         if snapshot.program != root.program
@@ -1563,6 +1899,8 @@ fn emit_pcode_interprocedural_cfg_llvm_inner(
         owners,
         max_call_depth,
         process: allocated.map(|(process, _)| process),
+        allocations: allocated.map(|(_, allocations)| allocations),
+        imports: import_binary.map(|_| import_indices),
     };
     let mut llvm = emit_pcode_cfg_llvm_semantic(
         root,
@@ -1573,13 +1911,17 @@ fn emit_pcode_interprocedural_cfg_llvm_inner(
         allocated.map(|(process, _)| process),
         allocated.map(|(_, allocations)| allocations),
     )?;
-    llvm.state_abi.push_str(if allocated.is_some() {
+    llvm.state_abi.push_str(if import_binary.is_some() {
+        "; checked direct PLT calls may execute bounded SysV import contracts under the explicit ELF JUMP_SLOT final-binding assumption; unsupported imports and unknown bytes stop at the call"
+    } else if allocated.is_some() {
         "; loaded internal calls share state, process bytes, stack, and heap; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly"
     } else {
         "; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly"
     });
     Ok(PcodeInterproceduralCfgLlvmArtifact {
-        schema_version: if allocated.is_some() {
+        schema_version: if import_binary.is_some() {
+            PCODE_INTERPROCEDURAL_IMPORT_CONTRACT_CFG_LLVM_VERSION
+        } else if allocated.is_some() {
             PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION
         } else {
             PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION
@@ -1592,6 +1934,12 @@ fn emit_pcode_interprocedural_cfg_llvm_inner(
         snapshot_sha256: digests,
         snapshot_diagnostics: Vec::new(),
         max_call_depth,
+        import_calls: context
+            .imports
+            .as_ref()
+            .into_iter()
+            .flat_map(|indices| indices.iter().flat_map(|index| index.calls.iter().cloned()))
+            .collect(),
         llvm,
         semantic_fidelity: SemanticFidelity::Unknown,
         verification: VerificationStatus::NotRun,
@@ -1796,6 +2144,30 @@ fn emit_pcode_cfg_llvm_semantic(
                     direct_ram_copy_layout(&operation.source, &semantic.address_spaces)
             {
                 node_bytes(layout.value, &mut byte_keys)?;
+            }
+        }
+    }
+    if let Some(context) = call_context.filter(|context| context.imports.is_some()) {
+        for snapshot in context.snapshots {
+            for name in [
+                "RAX", "RDI", "RSP", "RBX", "RBP", "R12", "R13", "R14", "R15",
+            ] {
+                if let Some(register) = snapshot
+                    .register_layout
+                    .iter()
+                    .find(|item| item.name == name)
+                    && register.size_bytes == 8
+                    && register.storage.space == "register"
+                {
+                    node_bytes(
+                        &PcodeVarnode {
+                            space: register.storage.space.clone(),
+                            offset: register.storage.offset.clone(),
+                            size: 8,
+                        },
+                        &mut byte_keys,
+                    )?;
+                }
             }
         }
     }
@@ -2154,6 +2526,7 @@ fn emit_pcode_cfg_llvm_semantic(
                                 id,
                                 &index,
                                 current_index,
+                                &byte_map,
                                 &mut body,
                                 &mut sites,
                             )?;
@@ -2590,6 +2963,11 @@ fn emit_pcode_cfg_llvm_semantic(
     }
     llvm_ir.push_str(&helper_definitions(&byte_map));
     llvm_ir.push('\n');
+    if call_context.is_some_and(|context| context.imports.is_some()) {
+        llvm_ir.push_str(&import_strlen_helper(
+            process.expect("import contract requires process memory"),
+        ));
+    }
     llvm_ir.push_str(&helper_ir);
     llvm_ir.push_str(&body);
     if llvm_ir.len()
@@ -2602,7 +2980,9 @@ fn emit_pcode_cfg_llvm_semantic(
         return Err("P-code CFG LLVM module exceeds byte limit".into());
     }
     Ok(PcodeCfgLlvmArtifact {
-        schema_version: if allocations.is_some() {
+        schema_version: if call_context.is_some_and(|context| context.imports.is_some()) {
+            PCODE_CFG_IMPORT_CONTRACT_LLVM_VERSION
+        } else if allocations.is_some() {
             PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION
         } else if process.is_some() {
             PCODE_CFG_PROCESS_LLVM_VERSION
@@ -2621,7 +3001,12 @@ fn emit_pcode_cfg_llvm_semantic(
         state_abi: if let Some(((stack_base, stack_len), (heap_base, heap_len))) = allocation_shape
         {
             format!(
-                "hydir-pcode-cfg-state-v5: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr stack_ram, ptr stack_known, i64 stack_base, i64 stack_len, ptr heap_ram, ptr heap_known, i64 heap_base, i64 heap_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; stack=[0x{stack_base:x},0x{:x}), heap=[0x{heap_base:x},0x{:x}); supplied bounds must match the embedded declaration exactly; all arrays must be disjoint and allocated to their declared lengths; STORE preflights its full width and stops with MemoryUnmappedWrite outside ELF mappings and declared allocations; LOAD of unmapped or unknown bytes stops with MemoryUnknownBytes; known byte 0xff, unknown byte 0x00; combined guest bytes<={guest_ram_limit}",
+                "hydir-pcode-cfg-state-v{}: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr stack_ram, ptr stack_known, i64 stack_base, i64 stack_len, ptr heap_ram, ptr heap_known, i64 heap_base, i64 heap_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; stack=[0x{stack_base:x},0x{:x}), heap=[0x{heap_base:x},0x{:x}); supplied bounds must match the embedded declaration exactly; all arrays must be disjoint and allocated to their declared lengths; STORE preflights its full width and stops with MemoryUnmappedWrite outside ELF mappings and declared allocations; LOAD of unmapped or unknown bytes stops with MemoryUnknownBytes; known byte 0xff, unknown byte 0x00; combined guest bytes<={guest_ram_limit}",
+                if call_context.is_some_and(|context| context.imports.is_some()) {
+                    6
+                } else {
+                    5
+                },
                 stack_base + stack_len,
                 heap_base + heap_len
             )
@@ -3321,6 +3706,23 @@ mod tests {
     }
 
     #[test]
+    fn import_strlen_helper_is_valid_llvm() {
+        let snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshot, 64 * 1024).unwrap();
+        let module = format!(
+            "declare {{ i64, i1 }} @llvm.uadd.with.overflow.i64(i64, i64)\n\
+             declare i64 @hydir_read_varnode(ptr, i32, i64, i32)\n{}{}",
+            process_globals(&process),
+            import_strlen_helper(&process),
+        );
+        verify(&module);
+    }
+
+    #[test]
     fn process_memory_v4_load_store_permissions_and_guest_bounds() {
         let mut snapshot = stripped_password_secure_equals_fixture();
         let binary = include_bytes!(concat!(
@@ -3780,6 +4182,45 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn import_contract_module_keeps_internal_calls_on_a_binary_without_linked_imports() {
+        let snapshots = choose_call_snapshots();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshots[0],
+            &process,
+            vec![PcodeProcessAllocation {
+                kind: PcodeProcessAllocationKind::Stack,
+                space: "ram".into(),
+                base: 0x6ffff8,
+                byte_len: 16,
+            }],
+        )
+        .unwrap();
+        let artifact = emit_pcode_interprocedural_cfg_llvm_with_imports(
+            &snapshots,
+            binary,
+            4,
+            &process,
+            &allocations,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.schema_version,
+            PCODE_INTERPROCEDURAL_IMPORT_CONTRACT_CFG_LLVM_VERSION
+        );
+        assert_eq!(
+            artifact.llvm.schema_version,
+            PCODE_CFG_IMPORT_CONTRACT_LLVM_VERSION
+        );
+        assert!(artifact.import_calls.is_empty());
+        verify(&artifact.llvm.llvm_ir);
     }
 
     #[test]

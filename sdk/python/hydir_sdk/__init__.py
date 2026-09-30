@@ -613,6 +613,7 @@ class HydirClient:
         max_visits: int | None = None,
         max_depth: int | None = None,
         allocations: bytes | str | os.PathLike[str] | None = None,
+        assume_import_contracts: bool = False,
         timeout: float | None = None,
     ) -> dict:
         """Emit bounded interprocedural CFG LLVM from an uploaded ELF and seed."""
@@ -620,6 +621,7 @@ class HydirClient:
             project_id, revision, seed, function_entry=function_entry, llvm=True,
             max_functions=max_functions, max_operations=max_operations,
             max_visits=max_visits, max_depth=max_depth, allocations=allocations,
+            assume_import_contracts=assume_import_contracts,
             timeout=timeout,
         )
 
@@ -717,8 +719,8 @@ class HydirClient:
             raise ValueError("timeout must be positive")
         if assessment and allocations is not None:
             raise ValueError("Ghidra assessment does not support process allocations")
-        if assume_import_contracts and (llvm or assessment or allocations is None):
-            raise ValueError("import contracts require call tracing and allocations")
+        if assume_import_contracts and (assessment or allocations is None):
+            raise ValueError("import contracts require call tracing or LLVM and allocations")
         allocation_json = b""
         if allocations is not None:
             if isinstance(allocations, bytes):
@@ -750,7 +752,7 @@ class HydirClient:
         )
         if llvm:
             media = "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json"
-            version = 2 if allocations is not None else 1
+            version = 3 if assume_import_contracts else 2 if allocations is not None else 1
         elif assessment:
             media = "application/vnd.hydir.pcode-function-assessment+json"
             version = 1
@@ -773,10 +775,13 @@ class HydirClient:
                 or entries[0] != seed_json["entry"]
                 or not isinstance(module, dict)
                 or module.get("binary_sha256") != seed_json["binary_sha256"]
-                or module.get("schema_version") != (5 if allocations is not None else 2)
+                or module.get("schema_version") != (
+                    6 if assume_import_contracts else 5 if allocations is not None else 2
+                )
                 or module.get("start") != seed_json["entry"]
                 or not isinstance(module.get("llvm_ir"), str)
                 or (allocations is not None) != isinstance(module.get("allocations"), dict)
+                or (assume_import_contracts and not isinstance(artifact.get("import_calls", []), list))
             ):
                 raise RuntimeError("Ghidra call LLVM artifact differs from the requested binary or function")
         elif assessment:

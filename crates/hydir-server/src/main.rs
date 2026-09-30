@@ -32,7 +32,8 @@ use hydir_decompile::{
     PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, assess_pcode_function,
     compare_pcode_observed_path, decompile_function_unit_at, decompile_indexed_function,
     discover_functions, emit_pcode_cfg_llvm_with_allocations, emit_pcode_interprocedural_cfg_llvm,
-    emit_pcode_interprocedural_cfg_llvm_with_allocations, export_function_ir_llvm,
+    emit_pcode_interprocedural_cfg_llvm_with_allocations,
+    emit_pcode_interprocedural_cfg_llvm_with_imports, export_function_ir_llvm,
     lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
     measure_native_coverage,
 };
@@ -1886,6 +1887,7 @@ fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
             | "ghidra-call-trace-imports"
             | "ghidra-call-cfg-llvm"
             | "ghidra-call-cfg-llvm-allocated"
+            | "ghidra-call-cfg-llvm-imports"
             | "ghidra-call-assessment"
     ) {
         if argument.is_empty() || argument.len() > 1024 || argument.chars().any(char::is_control) {
@@ -2227,6 +2229,8 @@ const GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1";
 const GHIDRA_CALL_ALLOCATED_CFG_LLVM_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2";
+const GHIDRA_CALL_IMPORT_CONTRACT_CFG_LLVM_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=3";
 const GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-function-assessment+json;version=1";
 
@@ -2971,6 +2975,7 @@ fn ghidra_call_cfg_llvm_artifact(bytes: &[u8], selector_json: &str) -> Result<Ve
 fn ghidra_call_cfg_llvm_allocated_artifact(
     bytes: &[u8],
     selector_json: &str,
+    with_imports: bool,
 ) -> Result<Vec<u8>, String> {
     let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
         .map_err(|error| format!("invalid Ghidra allocated call LLVM selector: {error}"))?;
@@ -2994,12 +2999,22 @@ fn ghidra_call_cfg_llvm_allocated_artifact(
         PcodeElfProcessMemory::from_elf(binary, &snapshots[0], PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
     let allocations =
         PcodeProcessAllocations::parse_declared(allocation_bytes, &snapshots[0], &process)?;
-    let artifact = emit_pcode_interprocedural_cfg_llvm_with_allocations(
-        &snapshots,
-        selector.max_depth,
-        &process,
-        &allocations,
-    )?;
+    let artifact = if with_imports {
+        emit_pcode_interprocedural_cfg_llvm_with_imports(
+            &snapshots,
+            binary,
+            selector.max_depth,
+            &process,
+            &allocations,
+        )?
+    } else {
+        emit_pcode_interprocedural_cfg_llvm_with_allocations(
+            &snapshots,
+            selector.max_depth,
+            &process,
+            &allocations,
+        )?
+    };
     serde_json::to_vec(&artifact).map_err(|error| error.to_string())
 }
 
@@ -3865,7 +3880,10 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         }
         ("ghidra-call-cfg-llvm", Some(selector)) => ghidra_call_cfg_llvm_artifact(bytes, selector),
         ("ghidra-call-cfg-llvm-allocated", Some(selector)) => {
-            ghidra_call_cfg_llvm_allocated_artifact(bytes, selector)
+            ghidra_call_cfg_llvm_allocated_artifact(bytes, selector, false)
+        }
+        ("ghidra-call-cfg-llvm-imports", Some(selector)) => {
+            ghidra_call_cfg_llvm_allocated_artifact(bytes, selector, true)
         }
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
@@ -4116,6 +4134,7 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("ghidra-call-trace-imports") => MAX_CALL_TRACE_ALLOCATED_INPUT,
         Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
         Some("ghidra-call-cfg-llvm-allocated") => MAX_CALL_TRACE_ALLOCATED_INPUT,
+        Some("ghidra-call-cfg-llvm-imports") => MAX_CALL_TRACE_ALLOCATED_INPUT,
         Some("ghidra-call-assessment") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-snapshot-image-artifact") => MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT,
         Some("ghidra-allocated-process-artifact") => MAX_GHIDRA_ALLOCATED_PROCESS_INPUT,
@@ -5488,9 +5507,9 @@ async fn ghidra_call_artifact(
     }
     let allocated = !input.allocation_json.is_empty();
     let with_imports = input.assume_import_contracts;
-    if with_imports && (!allocated || !matches!(kind, GhidraCallArtifactKind::Trace)) {
+    if with_imports && (!allocated || matches!(kind, GhidraCallArtifactKind::Assessment)) {
         return Err(Status::invalid_argument(
-            "import contracts require TraceGhidraCalls and declared process allocations",
+            "import contracts require call tracing or LLVM and declared process allocations",
         ));
     }
     if allocated && matches!(kind, GhidraCallArtifactKind::Assessment) {
@@ -5668,7 +5687,11 @@ async fn ghidra_call_artifact(
     let (content, media_type) = if matches!(kind, GhidraCallArtifactKind::Llvm) {
         let (action, envelope) = if allocated {
             (
-                "ghidra-call-cfg-llvm-allocated",
+                if with_imports {
+                    "ghidra-call-cfg-llvm-imports"
+                } else {
+                    "ghidra-call-cfg-llvm-allocated"
+                },
                 pack_ghidra_call_allocated_input(
                     &binary,
                     &input.seed_json,
@@ -5695,9 +5718,35 @@ async fn ghidra_call_artifact(
                     .map_err(|_| Status::internal("Ghidra snapshot serialization failed"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if artifact.schema_version != if allocated { 2 } else { 1 }
+        let expected_import_calls = if with_imports {
+            parsed
+                .iter()
+                .map(|snapshot| PcodeElfImportIndex::from_elf(&binary, snapshot))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Status::internal)?
+                .into_iter()
+                .flat_map(|index| index.calls)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if artifact.schema_version
+            != if with_imports {
+                3
+            } else if allocated {
+                2
+            } else {
+                1
+            }
             || artifact.binary_sha256 != project.binary_sha256
-            || artifact.llvm.schema_version != if allocated { 5 } else { 2 }
+            || artifact.llvm.schema_version
+                != if with_imports {
+                    6
+                } else if allocated {
+                    5
+                } else {
+                    2
+                }
             || artifact.llvm.binary_sha256 != project.binary_sha256
             || allocated != artifact.llvm.allocations.is_some()
             || artifact.llvm.start != parsed[0].selected_function.entry
@@ -5713,6 +5762,7 @@ async fn ghidra_call_artifact(
                     .map(|snapshot| snapshot.selected_function.entry.clone())
                     .collect::<Vec<_>>()
             || artifact.snapshot_sha256 != snapshot_sha256
+            || artifact.import_calls != expected_import_calls
         {
             return Err(Status::internal(
                 "Ghidra call LLVM worker returned mismatched binary or function",
@@ -5722,7 +5772,9 @@ async fn ghidra_call_artifact(
         (
             serde_json::to_vec(&artifact)
                 .map_err(|_| Status::internal("Ghidra call LLVM serialization failed"))?,
-            if allocated {
+            if with_imports {
+                GHIDRA_CALL_IMPORT_CONTRACT_CFG_LLVM_MEDIA_TYPE
+            } else if allocated {
                 GHIDRA_CALL_ALLOCATED_CFG_LLVM_MEDIA_TYPE
             } else {
                 GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE
@@ -8035,16 +8087,20 @@ mod tests {
             hydir_ir::pcode::PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION
         );
         assert!(assumed_trace.contracted_imports.is_empty());
+        let assumed_llvm =
+            HydirV3::build_ghidra_call_cfg_llvm(&store, authorized(import_request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
         assert_eq!(
-            HydirV3::build_ghidra_call_cfg_llvm(
-                &store,
-                authorized(import_request.clone(), &token),
-            )
-            .await
-            .unwrap_err()
-            .code(),
-            tonic::Code::InvalidArgument
+            assumed_llvm.media_type,
+            GHIDRA_CALL_IMPORT_CONTRACT_CFG_LLVM_MEDIA_TYPE
         );
+        let assumed_module: PcodeInterproceduralCfgLlvmArtifact =
+            serde_json::from_slice(&assumed_llvm.content).unwrap();
+        assert_eq!(assumed_module.schema_version, 3);
+        assert_eq!(assumed_module.llvm.schema_version, 6);
+        assert!(assumed_module.import_calls.is_empty());
         import_request.allocation_json.clear();
         assert_eq!(
             HydirV3::trace_ghidra_calls(&store, authorized(import_request, &token))
