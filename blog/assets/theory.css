@@ -20,6 +20,9 @@
 .lab label { display: flex; flex-direction: column; gap: .3rem; font-size: .9rem; }
 .lab input, .lab select, .lab button { min-height: 2.75rem; padding: .4rem .65rem; border: 1px solid var(--site-rule); border-radius: 0; background: var(--body-bg-color); color: var(--body-color); font: .85rem system-ui, sans-serif; }
 .lab input { width: 6rem; }
+#pcode-test-lab input { width: 19rem; max-width: 100%; }
+#pcode-test-lab .flag-row { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+#pcode-test-lab input[aria-invalid="true"] { border-color: #c54b4b; }
 .lab button { cursor: pointer; }
 .lab button:hover, .lab button[aria-pressed="true"] { background: var(--site-accent); color: var(--body-bg-color); }
 .lab-result, .copy-result { font: 1.2rem/1.5 monospace; overflow-wrap: anywhere; }
@@ -27,6 +30,9 @@
 .flag-row dt { font: .75rem/1.5 system-ui, sans-serif; color: var(--site-muted); }
 .flag-row dd { margin: .25rem 0 0; font-size: 1.2rem; }
 .lab[hidden] { display: none; }
+@media (max-width: 38rem) {
+  #pcode-test-lab .flag-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 @media print {
   .lab, .equation-hint { display: none; }
   .equation, figure, pre { break-inside: avoid; }

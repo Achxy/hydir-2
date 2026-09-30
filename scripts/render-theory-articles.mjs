@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import MarkdownIt from 'markdown-it';
 
 const site = fileURLToPath(new URL('../blog/', import.meta.url));
@@ -13,6 +14,10 @@ const posts = JSON.parse(fs.readFileSync(path.join(site, 'posts.json'), 'utf8'))
 const escape = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;')
   .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 const slugify = value => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const assetVersion = name => createHash('sha256')
+  .update(fs.readFileSync(path.join(site, 'assets', name))).digest('hex').slice(0, 12);
+const theoryCssVersion = assetVersion('theory.css');
+const theoryJsVersion = assetVersion('theory.js');
 
 function math(tex, displayMode) {
   const rendered = katex.renderToString(tex, {
@@ -100,7 +105,7 @@ function head(post, redirect = false) {
     '  <link rel="stylesheet" href="/vendor/latex.css/style.css">\n' +
     '  <link rel="stylesheet" href="/vendor/katex/katex.min.css">\n' +
     '  <link rel="stylesheet" href="/styles.css">\n' +
-    '  <link rel="stylesheet" href="/assets/theory.css">\n' +
+    '  <link rel="stylesheet" href="/assets/theory.css?v=' + theoryCssVersion + '">\n' +
     '  <title>' + escape(post.title + ': ' + post.subtitle) + ' — HydIR</title>\n</head>\n';
 }
 
@@ -135,7 +140,7 @@ for (const post of posts) {
     '<p class="small muted"><a href="/content/' + post.slug + '.md">' +
       escape(post.source_label || 'Download the Markdown and LaTeX source') + '</a></p>\n' +
     '    </article>\n  </main>\n' + footer +
-    '  <script type="module" src="/assets/theory.js"></script>\n</body>\n</html>\n';
+    '  <script type="module" src="/assets/theory.js?v=' + theoryJsVersion + '"></script>\n</body>\n</html>\n';
   output('articles/' + post.slug + '.html', html);
   // Preserve draft preview bookmarks while keeping one canonical article URL.
   output(post.slug + '.html', head(post, true) + '<body class="latex-dark-auto">\n' + nav +

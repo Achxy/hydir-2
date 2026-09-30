@@ -68,6 +68,40 @@ Finally, a **P-code operation** has an opcode, zero or more input varnodes, and 
 
 In raw instruction translation, `unique` values are useful scratch space. A SLEIGH author can write a local temporary, and the compiler can allocate its storage in the unique space. [Spinsel's small processor-module walkthrough](https://spinsel.dev/2020/06/17/ghidra-brainfuck-processor-2.html) shows this in a compact setting: a SLEIGH local turns into a unique-space varnode, with `COPY` and `INT_ADD` operations updating it. This is easier to see in a tiny instruction set before approaching x86 flags.
 
+### Give the triple a precise meaning
+
+Let a varnode be $v=(s,o,n)$: space $s$, offset $o$, and size $n$ bytes. For an ordinary storage space, reading it means taking bytes $o$ through $o+n-1$ from that space's state. Two varnodes overlap when they name the same space and their byte ranges intersect:
+
+$$ {#varnode-overlap}
+\operatorname{overlap}(v_1,v_2)
+\iff s_1=s_2\ \land\
+\max(o_1,o_2)<\min(o_1+n_1,o_2+n_2).
+$$
+
+That formula explains why `RAX`, `EAX`, and `AL` cannot be modeled as unrelated variables. It also tells us what a partial write changes: exactly the bytes selected by its output varnode, plus any other writes explicitly present in the translated instruction. Endianness determines how a multi-byte value is assembled from those bytes. For example, four little-endian bytes `78 56 34 12` represent the integer `0x12345678`; the same bytes interpreted big-endian represent `0x78563412`. The space's endianness, not the spelling of `INT_ADD`, chooses the encoding. [Ghidra's P-code reference](https://ghidra.re/ghidra_docs/languages/html/pcoderef.html) defines that relationship.
+
+`const` needs its own rule. Its offset is the literal, so `(const, 0xff, 1)` yields `0xff`. It does not read $M_{\mathrm{const}}[0xff]$. This distinction matters again for branch destinations, where a constant-space varnode has a special instruction-local meaning.
+
+### Why a SLEIGH local becomes a unique varnode
+
+Take the semantic body of a toy swap instruction:
+
+~~~c
+local tmp:4 = r1;
+r1 = r2;
+r2 = tmp;
+~~~
+
+This follows the temporary-variable pattern in Ghidra's [SLEIGH constructor documentation](https://ghidra.re/ghidra_docs/languages/html/sleigh_constructors.html); it is a semantic fragment, not a complete processor specification. The temporary preserves the old value of `r1` before `r1` is overwritten. A simplified raw translation is:
+
+~~~text
+unique[tmp:4] = COPY register[r1:4]
+register[r1:4] = COPY register[r2:4]
+register[r2:4] = COPY unique[tmp:4]
+~~~
+
+Predict the result if the first operation were deleted. The last `COPY` would have no saved original `r1` to read. The `unique` space exists because the description of one machine instruction sometimes needs scratch values that are neither architectural registers nor process RAM. It is best understood as translation-time temporary storage, not as an address you can find in the executable's memory map.
+
 ## Widths are part of the meaning
 
 P-code's byte sizes are semantic, not decoration. An `INT_ADD` with two four-byte inputs and a four-byte output computes modulo `2^32`. The corresponding eight-byte operation computes modulo `2^64`. Neither operation silently keeps a ninth byte or sets a processor flag. The [operation reference](https://ghidra.re/ghidra_docs/languages/html/pcodedescription.html) defines separate operations such as `INT_CARRY` and `INT_SCARRY` for unsigned carry and signed overflow.
@@ -84,6 +118,44 @@ The notation above is explanatory, rather than a byte-for-byte dump from Ghidra.
 The same discipline applies to shifts and comparisons. `INT_RIGHT` is logical right shift; `INT_SRIGHT` is arithmetic right shift. `INT_LESS` and `INT_SLESS` disagree whenever the signed bit changes the ordering. An analyzer that translates every right shift to the same host-language operator, or every comparison to a signed comparison, will produce plausible-looking but incorrect results. The exact width and opcode matter more than the name an analyst assigns to the variable.
 
 Floating-point operations form their own family, including `FLOAT_ADD`, `FLOAT_EQUAL`, conversions, and NaN tests. Their presence does not let a consumer assume that ordinary integer operations are floating-point because a type hint says `double`. Raw P-code works at the operation level; later type recovery is another layer.
+
+Here is a small executable model for the integer rules. Python's integers do not overflow, so the mask is the step that gives a P-code operation its selected width. Run this fragment with `python pcode_widths.py`:
+
+~~~python
+def mask(nbytes):
+    return (1 << (8 * nbytes)) - 1
+
+def int_add(a, b, nbytes):
+    return (a + b) & mask(nbytes)
+
+def signed(bits, nbytes):
+    width = 8 * nbytes
+    bits &= mask(nbytes)
+    sign = 1 << (width - 1)
+    return bits - (1 << width) if bits & sign else bits
+
+def int_less(a, b, nbytes):
+    return int((a & mask(nbytes)) < (b & mask(nbytes)))
+
+def int_sless(a, b, nbytes):
+    return int(signed(a, nbytes) < signed(b, nbytes))
+
+assert int_add(0xff, 1, 1) == 0x00
+assert int_add(0xff, 1, 2) == 0x0100
+assert int_less(0xff, 1, 1) == 0
+assert int_sless(0xff, 1, 1) == 1
+~~~
+
+The final two assertions use identical input bits. Under unsigned comparison, `0xff` is $255$; under signed eight-bit comparison, it is $-1$. The code is a teaching model for these opcodes, not a complete emulator. It deliberately leaves out memory, float formats, exceptional cases, and the architecture's instruction sequencing. The test makes one point hard to miss: **the varnode's bytes do not carry a permanent signedness tag**. The operation decides how to read them.
+
+Here is another small decoding exercise. `SUBPIECE` takes its second input as a *byte count* to discard from the low end; `PIECE` takes a high part followed by a low part. These two lines select and then rebuild bytes, with no C type involved:
+
+~~~text
+hi:2 = SUBPIECE const[0x12345678:4], const[2:4]  ; hi = 0x1234
+whole:4 = PIECE hi:2, const[0xabcd:2]            ; whole = 0x1234abcd
+~~~
+
+The tempting mistake is to read `SUBPIECE(..., 2)` as “take two bytes starting from the left.” It actually drops **two least-significant bytes**. This matters when a processor splits a wide register into smaller operations: the byte slice you choose can reverse the meaning of a comparison or memory write. The [operation reference](https://ghidra.re/ghidra_docs/languages/html/pcodedescription.html) defines the operand order and width constraints.
 
 ## One x86 `TEST` becomes nine operations
 
@@ -131,6 +203,62 @@ RDI and RSI  ->  INT_AND  ->  t0  ->  INT_EQUAL(t0, 0)  ->  ZF  ->  CBRANCH
 
 That chain is also a useful recipe for reading unfamiliar P-code. Start at the branch condition. Find the operation that writes its varnode. Follow the inputs backward until you reach registers, constants, or memory. Only then summarize the condition in C-like language.
 
+Let's calculate every flag the nine operations set. The parity flag tests whether the **low byte** has an even number of set bits. Zero has zero set bits, so its parity is even.
+
+| RDI | RSI | `t0 = RDI & RSI` | SF | ZF | PF | `JE` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0x48` | `0x08` | `0x08` | 0 | 0 | 0 | Fall through |
+| `0x40` | `0x08` | `0x00` | 0 | 1 | 1 | Take branch |
+| `0x8000000000000000` | same | same | 1 | 0 | 1 | Fall through |
+
+In all three rows `CF = OF = 0`. The third row is instructive: the sign bit is set, but the low byte is zero, so `SF = 1` and `PF = 1` at the same time. Flags answer different questions about the same result. Here is a compact Python implementation of the fixture's `TEST` flag behavior:
+
+~~~python
+MASK64 = (1 << 64) - 1
+
+def test_flags(rdi, rsi):
+    result = (rdi & rsi) & MASK64
+    low_byte = result & 0xff
+    return {
+        "result": result,
+        "CF": 0,
+        "OF": 0,
+        "SF": (result >> 63) & 1,
+        "ZF": int(result == 0),
+        "PF": int(low_byte.bit_count() % 2 == 0),
+    }
+
+assert test_flags(0x48, 0x08)["ZF"] == 0
+assert test_flags(0x40, 0x08)["ZF"] == 1
+assert test_flags(1 << 63, 1 << 63)["SF"] == 1
+~~~
+
+<section class="lab" id="pcode-test-lab" aria-labelledby="pcode-test-heading" hidden>
+<h3 id="pcode-test-heading">Try the P-code chain</h3>
+<p>Enter two 64-bit hexadecimal values. The output follows the <code>INT_AND</code>, flag writes, and <code>CBRANCH</code> in the real <code>TEST</code> example.</p>
+<div class="lab-controls">
+<label>RDI in hex <input id="pcode-rdi" type="text" value="0x48" inputmode="text" spellcheck="false"></label>
+<label>RSI in hex <input id="pcode-rsi" type="text" value="0x08" inputmode="text" spellcheck="false"></label>
+</div>
+<div class="lab-presets">
+<button type="button" data-pcode-preset="0x48,0x08">Nonzero AND</button>
+<button type="button" data-pcode-preset="0x40,0x08">Zero AND</button>
+<button type="button" data-pcode-preset="0x8000000000000000,0x8000000000000000">Sign bit</button>
+</div>
+<p id="pcode-test-error" role="status"></p>
+<p class="lab-result">Temporary <code>t0</code> = <output id="pcode-and">0x08</output></p>
+<dl class="flag-row">
+<div><dt>CF</dt><dd><output id="pcode-cf">0</output></dd></div>
+<div><dt>OF</dt><dd><output id="pcode-of">0</output></dd></div>
+<div><dt>SF</dt><dd><output id="pcode-sf">0</output></dd></div>
+<div><dt>ZF</dt><dd><output id="pcode-zf">0</output></dd></div>
+<div><dt>PF</dt><dd><output id="pcode-pf">0</output></dd></div>
+</dl>
+<p>At <code>0x2013d9</code>, <output id="pcode-branch">JE falls through</output>.</p>
+</section>
+
+This little experiment is intentionally narrower than running an ELF. It computes the raw `TEST` effect on supplied register values. It does not claim anything about where a larger program obtained those values.
+
 ## Memory has two addresses in the picture
 
 The printed shape of a `LOAD` can be misleading. It has a special first input naming the **space being accessed**, a second input holding a **pointer offset**, and an output whose size determines how many bytes to read. `STORE` similarly has a destination space, pointer offset, and value whose size determines the write width. The [operation reference](https://ghidra.re/ghidra_docs/languages/html/pcodedescription.html) calls out this distinction explicitly.
@@ -146,11 +274,62 @@ value:4 = LOAD spaceid(ram), ptr:8
 
 On common x86-64 languages an addressable RAM unit is a byte. Ghidra's definition also allows a space whose addressable unit is larger. For those spaces, `LOAD` and `STORE` scale the pointer offset by the space's word size to obtain a byte offset. An emulator that assumes every space is byte-addressed can read the wrong location while still producing a perfectly well-formed P-code trace.
 
+The raw `RET` in our fixture makes the two roles of `const` unusually clear. Here are its three operations, with the exact exported offsets. This fixture's address-space table maps ID `0x1b1` to `ram`.
+
+~~~text
+0x2013e2:
+  (register,0x288,8) = LOAD (const,0x1b1,8), (register,0x20,8)
+  (register,0x20,8)  = INT_ADD (register,0x20,8), (const,0x8,8)
+  RETURN (register,0x288,8)
+~~~
+
+Read the first line slowly. `(register,0x20,8)` holds the stack pointer value. `(const,0x1b1,8)` is the special **space ID operand** to `LOAD`; it selects RAM. `(register,0x288,8)` receives the eight bytes loaded from that stack address. In the next line, `(const,0x8,8)` is an ordinary numeric eight, and the stack pointer advances. The final operation transfers control to the value just loaded. The same `const` space appears in both lines, but the opcode and operand position determine whether its offset is a space selector or a literal arithmetic input.
+
+For a word-addressed space, the pointer conversion is:
+
+$$ {#pcode-word-addressing}
+\operatorname{byteOffset}=\operatorname{pointerOffset}\times\operatorname{wordsize}.
+$$
+
+If `wordsize = 2` and the pointer offset is `0x10`, `LOAD` starts at byte offset `0x20`. This scaling is specific to dereferencing through `LOAD` or `STORE`; it is not a license to multiply every P-code address by two. [Ghidra's reference manual](https://ghidra.re/ghidra_docs/languages/html/pcoderef.html) makes that exception explicit.
+
 There is a second memory question that P-code alone cannot answer: **what bytes are there?** A `LOAD` specifies where to read and how much to read. It does not promise that a file has initialized those bytes, that a pointer is mapped, or that a previous call has a known effect. A decompiler can reason symbolically about the load. A concrete emulator needs an initial state or an explicit unknown result.
+
+For the x86-64 fixture's little-endian RAM, a minimal read can be written this way:
+
+~~~python
+def load_le(known_bytes, address, size):
+    missing = [address + i for i in range(size)
+               if address + i not in known_bytes]
+    if missing:
+        raise ValueError(f"unknown memory byte at {missing[0]:#x}")
+    return sum(known_bytes[address + i] << (8 * i)
+               for i in range(size))
+
+stack = {
+    0x700000 + i: byte
+    for i, byte in enumerate((0xef, 0xbe, 0xad, 0xde, 0, 0, 0, 0))
+}
+assert load_le(stack, 0x700000, 8) == 0xdeadbeef
+~~~
+
+The check for missing bytes is the important line. Replacing it with `known_bytes.get(address + i, 0)` would quietly turn unknown memory into a zero-filled stack. That would let an emulator “succeed” on a state nobody supplied. Real process modeling also needs mapped segments, permissions, and writes, but the small example already shows why a P-code `LOAD` cannot manufacture its own input.
 
 ## Branches, calls, and returns have precise quirks
 
 `BRANCH` uses its destination varnode as an address descriptor, not as a normal value to read. `CBRANCH` adds a one-byte condition: nonzero means take the branch. If the destination is in the **constant** space, it has a special meaning: a relative jump among the P-code operations generated for the *current machine instruction*. It is not a jump to a constant machine address. Ghidra's [branch definitions](https://ghidra.re/ghidra_docs/languages/html/pcodedescription.html) give the example of operation 5 moving to operation 8 with a relative offset of 3.
+
+Here is that example drawn as an operation list:
+
+~~~text
+machine instruction at 0x401000
+  op 5: CBRANCH (const,+3), condition
+  op 6: ...                 # condition was false
+  op 7: ...
+  op 8: ...                 # condition was true
+~~~
+
+When `condition` is true, `op 5 + 3` selects `op 8` **inside the translation of the same machine instruction**. It does not execute machine address `0x3` or `0x401003`. Why would an instruction need this? A SLEIGH specification may describe a conditional choice or loop inside one architectural instruction. Its [constructor documentation](https://ghidra.re/ghidra_docs/languages/html/sleigh_constructors.html) shows labels and conditional jumps inside a semantic section; the compiler encodes those label jumps as P-code-relative indices. A tool that only records instruction-to-instruction edges can miss this smaller control-flow layer.
 
 `BRANCHIND` gets the target offset from a varnode at runtime. That is the form to watch around jump tables and computed dispatch. The current address space supplies the target space. Without the runtime value or a sound finite target set, there may be more destinations than a static listing currently shows.
 
@@ -174,27 +353,144 @@ Some opcodes appear only after analysis. Ghidra's [additional operations page](h
 | `PTRSUB` | Pointer arithmetic recognized as an offset into a structure |
 | `CAST` | The bits are copied, but their inferred type interpretation changes |
 
-Suppose two branches define different values for `x` before merging. A high-P-code `MULTIEQUAL` can express the merge explicitly; a raw instruction sequence would instead show the writes and branches that produced it. The phi node is extremely useful for backward slicing. It is also a decompiler construct, not an instruction the CPU executes. Similarly, `PTRADD(base, i, 12)` says the decompiler recognized an array element stride of twelve bytes. It is more informative than a raw multiply and add, but it rests on type and dataflow analysis.
+Let's build a phi node by hand. Suppose a function's control flow is:
+
+~~~c
+if (condition) {
+    x = 4;
+} else {
+    x = 9;
+}
+return x;
+~~~
+
+At the merge block, raw P-code contains the branch and the concrete writes that implement each path. The decompiler can give each reaching value a distinct identity and insert a high-P-code merge:
+
+~~~text
+true predecessor:  x1 = COPY 4
+false predecessor: x2 = COPY 9
+merge block:       x3 = MULTIEQUAL x1, x2
+                   RETURN x3
+~~~
+
+The operation means “select the input associated with the predecessor actually taken.” It does **not** mean add `4 + 9`, pick either value at random, or execute a new instruction at the merge. The incoming edge determines the selection. In SSA notation, we write $x_3=\phi(x_1,x_2)$. That explicit definition is why a backward slice can follow `x3` to both possible sources. This example is schematic; the exact printed high P-code for a compiled function depends on Ghidra's analysis and simplification style.
+
+Now consider a different high-level clue: `PTRADD(base, i, 12)`. Its numeric calculation is `base + i * 12`, but its opcode says more: analysis currently treats `base` as an array pointer with twelve-byte elements. `PTRSUB(element, 8)` computes `element + 8` and expresses a proposed field offset inside a structured value. A decompiler might combine them into `array[i].field`. The raw P-code may show only multiplies, additions, and a `LOAD`. Those richer pointer operations help explain recovered C, while the numeric offsets remain worth checking against the original accesses. [Ghidra's additional-opcode reference](https://ghidra.re/ghidra_docs/languages/html/additionalpcode.html) spells out both calculations.
 
 This is why the two views serve different tasks. If you want to **emulate exact instruction effects**, raw P-code is the natural starting point. If you want to **trace a value through a function** or find a type-aware pattern, high P-code often saves a great deal of work. [A gentle introduction to static analysis with P-code](https://v0iddeck.com/articles/static-analysis-ghidra-pcode) uses the latter for taint-style traversal; [twevs' high-P-code case study](https://twevs.github.io/2023/03/10/using-high-p-code-to-detect-patterns-in-decompiler-output.html) uses it to identify PlayStation graphics patterns that would be awkward to recover from isolated machine instructions.
 
+High P-code is not one immutable snapshot either. Ghidra's [`DecompInterface.setSimplificationStyle` API](https://ghidra.re/ghidra_docs/api/ghidra/app/decompiler/DecompInterface.html) exposes styles such as `firstpass`, `normalize`, and `decompile`. `firstpass` gives a largely unmodified dataflow syntax tree, `normalize` omits type recovery and some final cleanup, and the default `decompile` performs the work aimed at C output. An analysis script that needs an early stack copy may obtain a different operation set from one that asks for final C-oriented high P-code. Record the style when you compare results; otherwise two correct screenshots can appear to contradict each other.
+
 There is a price for that convenience. [NCC Group's Ghostrings investigation](https://www.nccgroup.com/research/earlyremoval-in-the-conservatory-with-the-wrench-exploring-ghidra-s-decompiler-internals-to-make-automatic-p-code-analysis-scripts/) found that a decompiler simplification stage could remove stack-copy operations its Go-string recovery wanted to inspect. [PracticalPCode](https://github.com/kohnakagawa/PracticalPCode) shows a successful use of high-level dataflow to recover dynamically resolved Win32 API names. Both examples reward asking which stage of P-code you are reading and what transformations happened before your script received it.
+
+## Why P-code cannot simply be renamed LLVM IR
+
+This question comes up whenever someone wants to lift a binary into a compiler. Both P-code and LLVM IR have operations called “add” and “load.” Their surrounding contracts differ. Raw P-code can write overlapping architectural register bytes, uses named machine address spaces, and carries instruction-local control flow. LLVM IR gives computations SSA values and its own pointer, memory, and undefined-behavior rules. Translation needs a model for those differences.
+
+Consider an eight-bit P-code `INT_ADD`. Its result is the low eight bits of the sum. A corresponding LLVM fragment can use an ordinary `add i8`:
+
+~~~llvm
+%sum = add i8 %a, %b
+%carry = icmp ult i8 %sum, %a
+~~~
+
+The second line calculates unsigned carry for this addition. In an LLVM lift, the carry must be represented because a later machine branch may read it. Adding LLVM's `nsw` flag to the first line would assert that signed overflow cannot occur; if it does, LLVM produces a poison value. P-code's plain `INT_ADD` makes no such promise. The [LLVM language reference](https://llvm.org/docs/LangRef.html) defines these flags and poison behavior. A lift that adds `nsw` just because the machine instruction looked like ordinary C arithmetic has changed the program.
+
+The pointer story is similar. High P-code `PTRADD` can encode an inferred array stride, while LLVM's `getelementptr` computes addresses under LLVM's pointer rules. Qualifiers such as `inbounds` introduce additional conditions whose violation can produce poison; the [LLVM GEP guide](https://llvm.org/docs/GetElementPtr.html) explains why this is more than decorative syntax. Machine pointer arithmetic may wrap or target bytes that do not belong to a recovered C object. A lifter has to justify each stronger LLVM claim, or keep a more explicit machine-state representation.
+
+This contrast also explains why **high P-code is attractive for understanding C** and **raw P-code is attractive for checking instruction effects**. Each has removed a different amount of machine detail. Neither turns an unfamiliar binary into a well-typed, exception-free LLVM program by simple opcode substitution.
 
 ## How to inspect it yourself
 
-You can enable a P-code field in Ghidra's Listing. [Spinsel's walkthrough](https://spinsel.dev/2020/06/17/ghidra-brainfuck-processor-2.html) shows the field setup, including the “Display Raw Pcode” option. The listing is ideal for asking what one instruction does. For a script, the core raw API call is short:
+You can enable a P-code field in Ghidra's Listing. [Spinsel's walkthrough](https://spinsel.dev/2020/06/17/ghidra-brainfuck-processor-2.html) shows the field setup, including the “Display Raw Pcode” option. The listing is ideal for answering “what does this instruction do?” For repeatable inspection, save the following as a Ghidra Java script named `ExplainOneInstruction.java`. Put the cursor on an instruction and run it:
 
 ~~~java
-// GhidraScript fragment. Run with a program open.
-Instruction ins = currentProgram.getListing().getInstructionAt(toAddr(0x2013d6L));
-for (PcodeOp op : ins.getPcode(true)) {
-    println(op.getSeqnum().getTarget() + "  " + op);
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.pcode.PcodeOp;
+
+public class ExplainOneInstruction extends GhidraScript {
+    @Override
+    protected void run() throws Exception {
+        Instruction ins =
+            currentProgram.getListing().getInstructionAt(currentAddress);
+        if (ins == null) {
+            println("Put the cursor on a decoded instruction.");
+            return;
+        }
+
+        println(ins.getAddress() + "  " + ins.getMnemonicString());
+        for (PcodeOp op : ins.getPcode(true)) {
+            println("  #" + op.getSeqnum().getTime()
+                    + "  " + op.getMnemonic()
+                    + "  output=" + op.getOutput());
+            for (int i = 0; i < op.getNumInputs(); i++) {
+                println("      input[" + i + "]=" + op.getInput(i));
+            }
+        }
+    }
 }
 ~~~
 
-The `true` argument requests the version that includes Ghidra's flow overrides, as documented by the [`Instruction` API](https://ghidra.re/ghidra_docs/api/ghidra/program/model/listing/Instruction.html). In a real script, check for a missing instruction and import the relevant Ghidra classes. Use `op.getOpcode()`, `getInput(i)`, `getOutput()`, and `getSeqnum()` if you need structured data; parsing the printed line is fragile.
+The `true` argument requests the version that includes Ghidra's flow overrides, as documented by the [`Instruction` API](https://ghidra.re/ghidra_docs/api/ghidra/program/model/listing/Instruction.html). The script prints the opcode and each input separately because operand position can change meaning, as it did for `LOAD`'s special space ID. `getSeqnum().getTime()` distinguishes operations at the same machine instruction address. If you are building an analyzer, inspect these structured fields; parsing `op.toString()` is fragile.
 
-For high P-code, decompile a function through `DecompInterface`, obtain its `HighFunction`, and iterate `getPcodeOps()`. [The high-P-code pattern article](https://twevs.github.io/2023/03/10/using-high-p-code-to-detect-patterns-in-decompiler-output.html) includes a concrete Java example. A high varnode's definition and uses can be followed through [`Varnode.getDef()` and `getDescendants()`](https://ghidra.re/ghidra_docs/api/ghidra/program/model/pcode/Varnode.html). That is the basic machinery behind many backward-slicing and dataflow scripts.
+To see the *analyzed* view, use a different API. Save this as `ExplainHighPcode.java` and place the cursor inside a function:
+
+~~~java
+import java.util.Iterator;
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.pcode.PcodeOpAST;
+import ghidra.program.model.pcode.Varnode;
+
+public class ExplainHighPcode extends GhidraScript {
+    @Override
+    protected void run() throws Exception {
+        Function fn = currentProgram.getFunctionManager()
+                                    .getFunctionContaining(currentAddress);
+        if (fn == null) {
+            println("Put the cursor inside a function.");
+            return;
+        }
+        DecompInterface decompiler = new DecompInterface();
+        try {
+            decompiler.setSimplificationStyle("decompile");
+            if (!decompiler.openProgram(currentProgram)) {
+                println("Could not open the program in the decompiler.");
+                return;
+            }
+            DecompileResults results =
+                decompiler.decompileFunction(fn, 30, monitor);
+            if (!results.decompileCompleted()) {
+                println(results.getErrorMessage());
+                return;
+            }
+            HighFunction high = results.getHighFunction();
+            if (high == null) {
+                println("Decompilation produced no HighFunction.");
+                return;
+            }
+            Iterator<PcodeOpAST> ops = high.getPcodeOps();
+            while (ops.hasNext()) {
+                PcodeOpAST op = ops.next();
+                println(op.getSeqnum().getTarget() + "  " + op);
+                for (int i = 0; i < op.getNumInputs(); i++) {
+                    Varnode input = op.getInput(i);
+                    println("    input[" + i + "] " + input
+                            + " <- " + input.getDef());
+                }
+            }
+        } finally {
+            decompiler.dispose();
+        }
+    }
+}
+~~~
+
+This script prints high P-code in Ghidra's `decompile` style. The [`DecompInterface` API](https://ghidra.re/ghidra_docs/api/ghidra/app/decompiler/DecompInterface.html) documents opening the program, checking completion, and obtaining `HighFunction`. Each `input.getDef()` points to the high-P-code operation that defined that input, when one is available. A constant or live-in value may have no local definition. Try changing the simplification style to `normalize` and compare the operation set. A high varnode's definition and uses can be followed through [`Varnode.getDef()` and `getDescendants()`](https://ghidra.re/ghidra_docs/api/ghidra/program/model/pcode/Varnode.html). The operation iterator alone is not an execution trace; branches and `MULTIEQUAL` inputs still require control-flow context.
 
 A useful inspection order is: locate the source instruction; read the raw operations and their widths; map register varnodes through the selected language; follow the high-P-code value chain if you need cross-block context; then compare the resulting C-like expression with the original effects. This order catches errors caused by trusting a nice-looking expression before checking how it was derived.
 
@@ -208,6 +504,26 @@ Researchers have studied these edges formally. [Naus, Verbeek, Walker, and Ravin
 
 John Toterhi's [Ghidra P-code emulation walkthrough](https://medium.com/@cetfor/emulating-ghidras-pcode-why-how-dd736d22dfb) makes that state requirement concrete by setting up registers, memory, a starting address, and steps in Ghidra's emulator. It is a useful bridge between reading a listing and asking “what would these operations do for this input?” An emulator answers that question for a supplied state and path. Static analysis asks a broader question about many possible states.
 
+### The experiment has a boundary
+
+Imagine you seed `RDI = 0x48` and `RSI = 0x08` at our function's entry. The nine `TEST` operations determine the flags. The branch determines the next instruction. But the later `RET` reads eight bytes from `RSP`. Unless a caller or test harness supplied those stack bytes, the return destination remains unknown. We can state the experiment as a small transition system:
+
+$$ {#pcode-state-step}
+S_{i+1}=F_{\mathrm{op}_i}(S_i),\qquad
+S_i=(R_i,M_i,\mathrm{pc}_i).
+$$
+
+Here $R$ is register and temporary state, $M$ is memory, and $\mathrm{pc}$ identifies the current P-code operation or machine instruction. The function $F_{\mathrm{op}_i}$ is only defined for the inputs the operation actually has. For our `RET`, that includes eight readable stack bytes. We can calculate `ZF` from two registers without knowing the stack; we cannot calculate the return destination from those registers alone. This distinction prevents a local result from being mistaken for a whole-program result.
+
+Ghidra's own [debugger emulation guide](https://ghidra.re/ghidra_docs/GhidraClass/Debugger/B2-Emulation.html) offers a useful warning: emulating a program image only approximates the operating system's loader, external library linkage needs additional modeling, and some uninitialized reads can appear as stale zero values in that workflow. The same guide notes that some language specifications were optimized for decompilation and can contain user operations an emulator cannot execute without handlers. [VoidStar's password-cracking walkthrough](https://voidstarsec.com/blog/ghidra-pcode) is a practical example of the power of seeded emulation: when the state and scope are chosen carefully, P-code can evaluate a difficult routine without running the entire target program.
+
+When reading an emulation result, ask four questions in order:
+
+1. **Which instruction and P-code operation did it start from?** An address alone can hide multiple operations and instruction-local branches.
+2. **Which register and memory bytes were supplied?** A register name is not a value, and a mapped page is not necessarily initialized data.
+3. **Which external effects were modeled?** Imports, system calls, and `CALLOTHER` do not acquire behavior merely because execution reached them.
+4. **What was actually observed?** A successful local path shows behavior for that seed. It does not prove that every path has been explored.
+
 ## A brief note on HydIR
 
 HydIR uses Ghidra automatically as a frontend and imports **raw** P-code with source bytes, addresses, varnodes, operation order, and register-space information. The raw operations feed its Rust semantics and bounded lift; Ghidra's optional high P-code is kept as separate decompiler evidence. This follows the division above: a concise high-level value is useful for explanation, while the ordered raw effects are what a concrete executor must account for.
@@ -220,9 +536,11 @@ P-code is valuable because it makes small effects visible. Once you learn to rea
 
 - [Ghidra's SLEIGH manual](https://ghidra.re/ghidra_docs/languages/html/sleigh.html), [operation reference](https://ghidra.re/ghidra_docs/languages/html/pcodedescription.html), [pseudo operations](https://ghidra.re/ghidra_docs/languages/html/pseudo-ops.html), and [analysis-only operations](https://ghidra.re/ghidra_docs/languages/html/additionalpcode.html): the definitive definitions used throughout this article.
 - [Emulating Ghidra's PCode: Why/How](https://medium.com/@cetfor/emulating-ghidras-pcode-why-how-dd736d22dfb): a worked introduction to seeded P-code emulation.
+- [Ghidra's debugger emulation guide](https://ghidra.re/ghidra_docs/GhidraClass/Debugger/B2-Emulation.html) and [VoidStar's scripting walkthrough](https://voidstarsec.com/blog/ghidra-pcode): practical state, environment, and user-operation examples.
 - [Implementing a brainfuck CPU in Ghidra, part 2](https://spinsel.dev/2020/06/17/ghidra-brainfuck-processor-2.html): a small SLEIGH example that shows where unique varnodes come from and how to view raw P-code.
 - [A Gentle Introduction to Static Analysis with Ghidra Pcode](https://v0iddeck.com/articles/static-analysis-ghidra-pcode) and [using high P-code to detect patterns](https://twevs.github.io/2023/03/10/using-high-p-code-to-detect-patterns-in-decompiler-output.html): practical high-P-code dataflow examples.
 - [NCC Group's earlyremoval investigation](https://www.nccgroup.com/research/earlyremoval-in-the-conservatory-with-the-wrench-exploring-ghidra-s-decompiler-internals-to-make-automatic-p-code-analysis-scripts/) and [PracticalPCode](https://github.com/kohnakagawa/PracticalPCode): examples of what high-P-code transformation can hide and what it can make tractable.
 - [A Formal Semantics for P-Code](https://link.springer.com/chapter/10.1007/978-3-031-25803-9_7): a research treatment of high-P-code semantics.
+- [LLVM Language Reference](https://llvm.org/docs/LangRef.html) and [GetElementPtr FAQ](https://llvm.org/docs/GetElementPtr.html): the precise contracts behind the P-code-to-LLVM comparison.
 
 The concrete `TEST` sequence and operation counts above come from HydIR's [checked-in Ghidra snapshot](https://github.com/Achxy/hydir-2/blob/34dbb5b11d71e43feb10e8e83e87f307b92012eb/tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json), examined at repository revision [`34dbb5b`](https://github.com/Achxy/hydir-2/tree/34dbb5b11d71e43feb10e8e83e87f307b92012eb). The flag-name transcription is editorial; the snapshot retains the exact register and unique-space offsets.

@@ -25,8 +25,8 @@
     "category": "Binary lifting",
     "title": "Ghidra P-code, Explained",
     "subtitle": "Varnodes, State, and the Decompiler",
-    "description": "A deep guide to Ghidra P-code: address spaces, varnodes, widths, memory, branches, raw versus high P-code, and a real x86-64 example.",
-    "lead": "One x86 instruction can create many smaller effects. Learn to read the varnodes and operations between machine code and Ghidra's C view.",
+    "description": "A worked guide to Ghidra P-code with runnable examples, an interactive x86 flag experiment, raw and high P-code, memory, branches, and LLVM semantics.",
+    "lead": "Follow one x86 instruction through nine P-code operations. Change its inputs, calculate the flags, and learn what each varnode really names.",
     "source_label": "Download the Markdown source",
     "date": "2026-09-30"
   }

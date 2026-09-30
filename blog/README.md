@@ -14,7 +14,7 @@ npm run build:blog
 python3 scripts/serve-wiki-site.py --port 4173
 ~~~
 
-The renderer uses the existing vendored KaTeX 0.16.25 to produce HTML and MathML with strict parsing and no trusted HTML commands. It reuses `vendor/katex/` and its fonts; no additional math runtime or font copy is needed. Article text and equations work without JavaScript or a CDN. `assets/theory.js` powers optional flag and parallel-copy examples. `assets/theory.css` styles only the equations, diagram, and examples; the shared stylesheets own page typography and layout.
+The renderer uses the existing vendored KaTeX 0.16.25 to produce HTML and MathML with strict parsing and no trusted HTML commands. It reuses `vendor/katex/` and its fonts; no additional math runtime or font copy is needed. Article text and equations work without JavaScript or a CDN. `assets/theory.js` powers optional flag, parallel-copy, and P-code examples. `assets/theory.css` styles only the equations, diagram, and examples; the shared stylesheets own page typography and layout.
 
 Generated pages are checked in alongside their Markdown sources. `npm run check:blog` rejects stale generated output or malformed mathematics, validates HTML, and checks site links and fragment targets. The Python checker verifies canonical routes, the sitemap, and local assets. The existing Pages build packages the full site, including clean article routes.
 

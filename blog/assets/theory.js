@@ -9,9 +9,14 @@ const showEquationOverflow = () => {
   }
 };
 if (equationScrollers.length) {
-  const resizeObserver = new ResizeObserver(showEquationOverflow);
-  equationScrollers.forEach(scroller => resizeObserver.observe(scroller));
+  if (typeof ResizeObserver !== 'undefined') {
+    const resizeObserver = new ResizeObserver(showEquationOverflow);
+    equationScrollers.forEach(scroller => resizeObserver.observe(scroller));
+  } else {
+    window.addEventListener('resize', showEquationOverflow);
+  }
   document.fonts.ready.then(showEquationOverflow);
+  showEquationOverflow();
 }
 
 const flags = document.querySelector('#flags-lab');
@@ -80,4 +85,57 @@ if (copies) {
     });
   });
   copies.hidden = false;
+}
+
+const pcodeTest = document.querySelector('#pcode-test-lab');
+if (pcodeTest) {
+  const rdiInput = pcodeTest.querySelector('#pcode-rdi');
+  const rsiInput = pcodeTest.querySelector('#pcode-rsi');
+  const error = pcodeTest.querySelector('#pcode-test-error');
+  const show = (id, value) => {
+    pcodeTest.querySelector('#pcode-' + id).textContent = String(value);
+  };
+  const parseWord = input => {
+    const raw = input.value.trim();
+    if (!/^(?:0x)?[0-9a-f]{1,16}$/i.test(raw)) return null;
+    return BigInt('0x' + raw.replace(/^0x/i, ''));
+  };
+  const update = () => {
+    const rdi = parseWord(rdiInput);
+    const rsi = parseWord(rsiInput);
+    rdiInput.setAttribute('aria-invalid', String(rdi === null));
+    rsiInput.setAttribute('aria-invalid', String(rsi === null));
+    if (rdi === null || rsi === null) {
+      error.textContent = 'Enter one to sixteen hexadecimal digits in each register.';
+      for (const id of ['and', 'cf', 'of', 'sf', 'zf', 'pf', 'branch']) show(id, '—');
+      return;
+    }
+    error.textContent = '';
+    const result = rdi & rsi;
+    let lowByte = Number(result & 0xffn);
+    let setBits = 0;
+    while (lowByte !== 0) {
+      setBits += lowByte & 1;
+      lowByte >>= 1;
+    }
+    const zf = Number(result === 0n);
+    show('and', '0x' + result.toString(16).padStart(16, '0'));
+    show('cf', 0);
+    show('of', 0);
+    show('sf', Number((result >> 63n) & 1n));
+    show('zf', zf);
+    show('pf', Number(setBits % 2 === 0));
+    show('branch', zf ? 'JE takes the branch' : 'JE falls through');
+  };
+  [rdiInput, rsiInput].forEach(input => input.addEventListener('input', update));
+  pcodeTest.querySelectorAll('[data-pcode-preset]').forEach(button => {
+    button.addEventListener('click', () => {
+      const [rdi, rsi] = button.dataset.pcodePreset.split(',');
+      rdiInput.value = rdi;
+      rsiInput.value = rsi;
+      update();
+    });
+  });
+  update();
+  pcodeTest.hidden = false;
 }
