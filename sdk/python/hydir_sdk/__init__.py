@@ -589,6 +589,7 @@ class HydirClient:
         max_visits: int | None = None,
         max_depth: int | None = None,
         allocations: bytes | str | os.PathLike[str] | None = None,
+        assume_import_contracts: bool = False,
         timeout: float | None = None,
     ) -> dict:
         """Trace a seeded direct-call path through the uploaded ELF."""
@@ -596,6 +597,7 @@ class HydirClient:
             project_id, revision, seed, function_entry=function_entry, llvm=False,
             max_functions=max_functions, max_operations=max_operations,
             max_visits=max_visits, max_depth=max_depth, allocations=allocations,
+            assume_import_contracts=assume_import_contracts,
             timeout=timeout,
         )
 
@@ -656,6 +658,7 @@ class HydirClient:
         max_visits: int | None = None,
         max_depth: int | None = None,
         allocations: bytes | str | os.PathLike[str] | None = None,
+        assume_import_contracts: bool = False,
         timeout: float | None = None,
     ) -> dict:
         """Validate and request a seeded Ghidra call artifact."""
@@ -714,6 +717,8 @@ class HydirClient:
             raise ValueError("timeout must be positive")
         if assessment and allocations is not None:
             raise ValueError("Ghidra assessment does not support process allocations")
+        if assume_import_contracts and (llvm or assessment or allocations is None):
+            raise ValueError("import contracts require call tracing and allocations")
         allocation_json = b""
         if allocations is not None:
             if isinstance(allocations, bytes):
@@ -731,6 +736,7 @@ class HydirClient:
             function_entry=function_hex,
             seed_json=content,
             allocation_json=allocation_json,
+            assume_import_contracts=assume_import_contracts,
         )
         for name, value, _, _ in limits:
             if value is not None:
@@ -742,18 +748,19 @@ class HydirClient:
             request,
             timeout=max(self._timeout, 180.0) if timeout is None else timeout,
         )
+        if llvm:
+            media = "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json"
+            version = 2 if allocations is not None else 1
+        elif assessment:
+            media = "application/vnd.hydir.pcode-function-assessment+json"
+            version = 1
+        else:
+            media = "application/vnd.hydir.pcode-call-trace+json"
+            version = 4 if assume_import_contracts else 3 if allocations is not None else 2
         artifact = self._checked_json_artifact(
             reply, revision=revision,
-            media_type=(
-                "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2"
-                if llvm and allocations is not None else
-                "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
-                if llvm else "application/vnd.hydir.pcode-function-assessment+json;version=1"
-                if assessment else "application/vnd.hydir.pcode-call-trace+json;version=3"
-                if allocations is not None else "application/vnd.hydir.pcode-call-trace+json;version=2"
-            ),
-            schema_version=2 if llvm and allocations is not None else 1 if llvm or assessment
-            else 3 if allocations is not None else 2,
+            media_type=f"{media};version={version}",
+            schema_version=version,
         )
         if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
             raise RuntimeError("Ghidra call artifact belongs to another binary")

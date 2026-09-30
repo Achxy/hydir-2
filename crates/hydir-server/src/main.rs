@@ -47,8 +47,8 @@ use hydir_ir::pcode::{
     PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeAddress, PcodeElfImportIndex, PcodeElfProcessMemory,
     PcodeInterproceduralTrace, PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget,
     execute_concrete_call_path, execute_concrete_call_path_with_allocations,
-    execute_concrete_call_path_with_image, parse_ghidra_snapshot, parse_pcode_seed,
-    unloaded_call_target,
+    execute_concrete_call_path_with_image, execute_concrete_call_path_with_imports,
+    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
 };
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
@@ -1883,6 +1883,7 @@ fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
             | "ghidra-observation-artifact"
             | "ghidra-call-trace"
             | "ghidra-call-trace-allocated"
+            | "ghidra-call-trace-imports"
             | "ghidra-call-cfg-llvm"
             | "ghidra-call-cfg-llvm-allocated"
             | "ghidra-call-assessment"
@@ -2220,6 +2221,8 @@ struct GhidraCallTraceSelector {
 const GHIDRA_CALL_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.pcode-call-trace+json;version=2";
 const GHIDRA_CALL_ALLOCATED_TRACE_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-call-trace+json;version=3";
+const GHIDRA_CALL_IMPORT_CONTRACT_TRACE_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-call-trace+json;version=4";
 const GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1";
 const GHIDRA_CALL_ALLOCATED_CFG_LLVM_MEDIA_TYPE: &str =
@@ -2858,6 +2861,7 @@ fn ghidra_call_trace_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u
 fn ghidra_call_trace_allocated_artifact(
     bytes: &[u8],
     selector_json: &str,
+    with_imports: bool,
 ) -> Result<Vec<u8>, String> {
     let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
         .map_err(|error| format!("invalid Ghidra allocated call selector: {error}"))?;
@@ -2881,15 +2885,28 @@ fn ghidra_call_trace_allocated_artifact(
         PcodeElfProcessMemory::from_elf(binary, &snapshots[0], PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
     let allocations =
         PcodeProcessAllocations::parse_declared(allocation_bytes, &snapshots[0], &process)?;
-    let trace = execute_concrete_call_path_with_allocations(
-        &snapshots,
-        &seed,
-        &process,
-        &allocations,
-        selector.max_operations,
-        selector.max_visits,
-        selector.max_depth,
-    )?;
+    let trace = if with_imports {
+        execute_concrete_call_path_with_imports(
+            &snapshots,
+            &seed,
+            binary,
+            &process,
+            &allocations,
+            selector.max_operations,
+            selector.max_visits,
+            selector.max_depth,
+        )?
+    } else {
+        execute_concrete_call_path_with_allocations(
+            &snapshots,
+            &seed,
+            &process,
+            &allocations,
+            selector.max_operations,
+            selector.max_visits,
+            selector.max_depth,
+        )?
+    };
     serde_json::to_vec(&trace).map_err(|error| error.to_string())
 }
 
@@ -3838,7 +3855,10 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         }
         ("ghidra-call-trace", Some(selector)) => ghidra_call_trace_artifact(bytes, selector),
         ("ghidra-call-trace-allocated", Some(selector)) => {
-            ghidra_call_trace_allocated_artifact(bytes, selector)
+            ghidra_call_trace_allocated_artifact(bytes, selector, false)
+        }
+        ("ghidra-call-trace-imports", Some(selector)) => {
+            ghidra_call_trace_allocated_artifact(bytes, selector, true)
         }
         ("ghidra-call-assessment", Some(selector)) => {
             ghidra_call_assessment_artifact(bytes, selector)
@@ -4093,6 +4113,7 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("native-artifact-model") => MAX_BINARY_BYTES + MAX_MODEL_BYTES + 4,
         Some("ghidra-call-trace") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-call-trace-allocated") => MAX_CALL_TRACE_ALLOCATED_INPUT,
+        Some("ghidra-call-trace-imports") => MAX_CALL_TRACE_ALLOCATED_INPUT,
         Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
         Some("ghidra-call-cfg-llvm-allocated") => MAX_CALL_TRACE_ALLOCATED_INPUT,
         Some("ghidra-call-assessment") => MAX_CALL_TRACE_IMAGE_INPUT,
@@ -5466,6 +5487,12 @@ async fn ghidra_call_artifact(
         ));
     }
     let allocated = !input.allocation_json.is_empty();
+    let with_imports = input.assume_import_contracts;
+    if with_imports && (!allocated || !matches!(kind, GhidraCallArtifactKind::Trace)) {
+        return Err(Status::invalid_argument(
+            "import contracts require TraceGhidraCalls and declared process allocations",
+        ));
+    }
     if allocated && matches!(kind, GhidraCallArtifactKind::Assessment) {
         return Err(Status::invalid_argument(
             "Ghidra function assessment does not support declared process allocations",
@@ -5526,7 +5553,11 @@ async fn ghidra_call_artifact(
     let mut trace = loop {
         let (action, envelope) = if allocated {
             (
-                "ghidra-call-trace-allocated",
+                if with_imports {
+                    "ghidra-call-trace-imports"
+                } else {
+                    "ghidra-call-trace-allocated"
+                },
                 pack_ghidra_call_allocated_input(
                     &binary,
                     &input.seed_json,
@@ -5549,7 +5580,9 @@ async fn ghidra_call_artifact(
             ))
         })?;
         if trace.schema_version
-            != if allocated {
+            != if with_imports {
+                hydir_ir::pcode::PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION
+            } else if allocated {
                 hydir_ir::pcode::PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION
             } else {
                 hydir_ir::pcode::PCODE_CALL_PATH_VERSION
@@ -5732,7 +5765,9 @@ async fn ghidra_call_artifact(
         (
             serde_json::to_vec(&trace)
                 .map_err(|_| Status::internal("Ghidra call trace serialization failed"))?,
-            if allocated {
+            if with_imports {
+                GHIDRA_CALL_IMPORT_CONTRACT_TRACE_MEDIA_TYPE
+            } else if allocated {
                 GHIDRA_CALL_ALLOCATED_TRACE_MEDIA_TYPE
             } else {
                 GHIDRA_CALL_TRACE_MEDIA_TYPE
@@ -7712,6 +7747,7 @@ mod tests {
             max_visits: Some(16),
             max_depth: Some(4),
             allocation_json: Vec::new(),
+            assume_import_contracts: false,
         };
         let first = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -7832,6 +7868,7 @@ mod tests {
             max_visits: Some(16),
             max_depth: Some(4),
             allocation_json: Vec::new(),
+            assume_import_contracts: false,
         };
         let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -7944,6 +7981,7 @@ mod tests {
             max_visits: Some(16),
             max_depth: Some(4),
             allocation_json: declaration.clone(),
+            assume_import_contracts: false,
         };
         let traced = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -7978,6 +8016,43 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(stored.content, traced.content);
+
+        let mut import_request = request.clone();
+        import_request.assume_import_contracts = true;
+        let assumed =
+            HydirV3::trace_ghidra_calls(&store, authorized(import_request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            assumed.media_type,
+            GHIDRA_CALL_IMPORT_CONTRACT_TRACE_MEDIA_TYPE
+        );
+        let assumed_trace: PcodeInterproceduralTrace =
+            serde_json::from_slice(&assumed.content).unwrap();
+        assert_eq!(
+            assumed_trace.schema_version,
+            hydir_ir::pcode::PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION
+        );
+        assert!(assumed_trace.contracted_imports.is_empty());
+        assert_eq!(
+            HydirV3::build_ghidra_call_cfg_llvm(
+                &store,
+                authorized(import_request.clone(), &token),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+        import_request.allocation_json.clear();
+        assert_eq!(
+            HydirV3::trace_ghidra_calls(&store, authorized(import_request, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
 
         let lifted =
             HydirV3::build_ghidra_call_cfg_llvm(&store, authorized(request.clone(), &token))
@@ -8097,6 +8172,7 @@ mod tests {
                 max_visits: Some(16),
                 max_depth: Some(4),
                 allocation_json: Vec::new(),
+                assume_import_contracts: false,
             };
             let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request, &token))
                 .await
@@ -9134,6 +9210,7 @@ mod tests {
             max_visits: Some(16),
             max_depth: Some(4),
             allocation_json: Vec::new(),
+            assume_import_contracts: false,
         };
         let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -9925,6 +10002,7 @@ mod tests {
                 max_visits: Some(128),
                 max_depth: Some(1),
                 allocation_json: Vec::new(),
+                assume_import_contracts: false,
             };
             let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request, &token))
                 .await

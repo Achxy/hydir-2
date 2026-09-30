@@ -750,6 +750,8 @@ class ClientBoundaryTests(unittest.TestCase):
                  "root_entry": entry,
                  "process_binding": {"process_memory_sha256": "c" * 64,
                                      "allocations": bound}}
+        import_trace = {**trace, "schema_version": 4,
+                        "contracted_imports": [], "verification": "not_run"}
         llvm = {"schema_version": 2, "binary_sha256": digest,
                 "function_entries": [entry],
                 "llvm": {"schema_version": 5, "binary_sha256": digest,
@@ -759,13 +761,16 @@ class ClientBoundaryTests(unittest.TestCase):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
             def call(method, request, **kwargs):
                 requests.append(request)
-                value = llvm if method is client._stub_v3.BuildGhidraCallCfgLlvm else trace
+                value = (llvm if method is client._stub_v3.BuildGhidraCallCfgLlvm
+                         else import_trace if request.assume_import_contracts else trace)
                 content = json.dumps(value).encode()
                 return proto_v3.ArtifactReply(
                     sha256=hashlib.sha256(content).hexdigest(),
                     media_type=(
                         "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2"
                         if value is llvm else
+                        "application/vnd.hydir.pcode-call-trace+json;version=4"
+                        if value is import_trace else
                         "application/vnd.hydir.pcode-call-trace+json;version=3"
                     ), content=content, project_revision=4,
                 )
@@ -774,12 +779,22 @@ class ClientBoundaryTests(unittest.TestCase):
                 "project", 4, seed, function_entry=0x2013a9,
                 allocations=declaration,
             )["schema_version"], 3)
+            self.assertEqual(client.trace_ghidra_calls(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration, assume_import_contracts=True,
+            )["schema_version"], 4)
+            self.assertTrue(requests[-1].assume_import_contracts)
+            with self.assertRaises(ValueError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    assume_import_contracts=True,
+                )
             self.assertEqual(client.build_ghidra_call_cfg_llvm(
                 "project", 4, seed, function_entry=0x2013a9,
                 allocations=declaration,
             )["llvm"]["schema_version"], 5)
             self.assertEqual([request.allocation_json for request in requests],
-                             [declaration, declaration])
+                             [declaration, declaration, declaration])
             with self.assertRaises(ValueError):
                 client.trace_ghidra_calls(
                     "project", 4, seed, function_entry=0x2013a9,
