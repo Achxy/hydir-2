@@ -15,7 +15,8 @@ const escape = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '
   .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 const slugify = value => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const assetVersion = name => createHash('sha256')
-  .update(fs.readFileSync(path.join(site, 'assets', name))).digest('hex').slice(0, 12);
+  .update(fs.readFileSync(path.join(site, 'assets', name), 'utf8').replace(/\r\n/g, '\n'))
+  .digest('hex').slice(0, 12);
 const theoryCssVersion = assetVersion('theory.css');
 const theoryJsVersion = assetVersion('theory.js');
 
