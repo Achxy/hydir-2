@@ -44,7 +44,7 @@ use hydir_execution::{
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
     MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES, MAX_PCODE_SEED_BYTES,
-    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeAddress, PcodeElfProcessMemory,
+    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeAddress, PcodeElfImportIndex, PcodeElfProcessMemory,
     PcodeInterproceduralTrace, PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget,
     execute_concrete_call_path, execute_concrete_call_path_with_allocations,
     execute_concrete_call_path_with_image, parse_ghidra_snapshot, parse_pcode_seed,
@@ -2749,7 +2749,7 @@ fn ghidra_snapshot_image_artifact(bytes: &[u8], selector_json: &str) -> Result<V
         .map_err(|error| format!("invalid Ghidra image selector: {error}"))?;
     if !matches!(
         selector.stage.as_str(),
-        "llvm-cfg-image" | "llvm-cfg-process" | "process-memory"
+        "llvm-cfg-image" | "llvm-cfg-process" | "process-memory" | "imports"
     ) {
         return Err("Ghidra image worker requires an ELF-backed stage".to_owned());
     }
@@ -2765,6 +2765,10 @@ fn ghidra_snapshot_image_artifact(bytes: &[u8], selector_json: &str) -> Result<V
         return Err("Ghidra image binary digest disagrees with selector".to_owned());
     }
     let snapshot = parse_ghidra_snapshot(snapshot_bytes, &selector.binary_sha256)?;
+    if selector.stage == "imports" {
+        let imports = PcodeElfImportIndex::from_elf(binary, &snapshot)?;
+        return serde_json::to_vec(&imports).map_err(|error| error.to_string());
+    }
     if matches!(
         selector.stage.as_str(),
         "process-memory" | "llvm-cfg-process"
@@ -2997,6 +3001,7 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "llvm-cfg-process" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=4"),
         "llvm-cfg-process-allocated" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=5"),
         "process-memory" => Some("application/vnd.hydir.pcode-process-memory+json;version=1"),
+        "imports" => Some("application/vnd.hydir.pcode-elf-import-index+json;version=1"),
         "llvm-cfg-simplified" => {
             Some("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1")
         }
@@ -6255,7 +6260,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         .map_err(Status::invalid_argument)?;
         let image_stage = matches!(
             input.stage.as_str(),
-            "llvm-cfg-image" | "llvm-cfg-process" | "process-memory"
+            "llvm-cfg-image" | "llvm-cfg-process" | "process-memory" | "imports"
         );
         let allocated_stage = input.stage == "llvm-cfg-process-allocated";
         if allocated_stage != !input.allocation_json.is_empty() {
@@ -9427,6 +9432,19 @@ mod tests {
             .unwrap();
             assert_eq!(memory.binary_sha256(), uploaded.binary_sha256);
             assert!(memory.known().iter().any(|value| *value != 0));
+            let mut imports_request = request("imports", automatic);
+            imports_request.start_address.clear();
+            let imports_artifact =
+                HydirV3::analyze_ghidra_snapshot(&store, authorized(imports_request, &token))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(
+                imports_artifact.media_type,
+                "application/vnd.hydir.pcode-elf-import-index+json;version=1"
+            );
+            PcodeElfImportIndex::parse_bound(&imports_artifact.content, binary, &parsed_snapshot)
+                .unwrap();
 
             let process_artifact = HydirV3::analyze_ghidra_snapshot(
                 &store,

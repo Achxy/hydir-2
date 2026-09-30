@@ -138,7 +138,7 @@ class LocalGhidra:
         binary: str | os.PathLike[str],
         snapshot: str | os.PathLike[str],
     ) -> dict[str, Any]:
-        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "capability", "process-memory", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
+        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "capability", "process-memory", "imports", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
             raise ValueError("unsupported Ghidra artifact kind")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)

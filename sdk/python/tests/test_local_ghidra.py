@@ -398,6 +398,12 @@ class LocalGhidraTests(unittest.TestCase):
         }).encode()) as run:
             self.client.artifact("process-memory", self.binary, self.snapshot)
         self.assertEqual(run.call_args.args[1], "process-memory")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "schema_version": 1,
+            "snapshot_layout_sha256": "a" * 64, "imports": [], "calls": [],
+        }).encode()) as run:
+            self.client.artifact("imports", self.binary, self.snapshot)
+        self.assertEqual(run.call_args.args[1], "imports")
 
     def test_observe_checks_input_and_selected_function(self):
         input_path = Path(self.directory.name) / "input.json"

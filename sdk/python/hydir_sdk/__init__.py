@@ -292,6 +292,7 @@ class HydirClient:
             "llvm-cfg-process": ("application/vnd.hydir.pcode-cfg-llvm+json;version=4", 4),
             "llvm-cfg-process-allocated": ("application/vnd.hydir.pcode-cfg-llvm+json;version=5", 5),
             "process-memory": ("application/vnd.hydir.pcode-process-memory+json;version=1", 1),
+            "imports": ("application/vnd.hydir.pcode-elf-import-index+json;version=1", 1),
             "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
             "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
@@ -463,6 +464,25 @@ class HydirClient:
             if any((known[i] and not mapped[i]) or (writable[i] and not mapped[i])
                    for i in range(len(byte_values))):
                 raise RuntimeError("Process memory has contradictory mapping masks")
+        if stage == "imports":
+            imports = artifact.get("imports")
+            calls = artifact.get("calls")
+            digest = artifact.get("binary_sha256")
+            layout = artifact.get("snapshot_layout_sha256")
+            if (
+                not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or not isinstance(layout, str) or len(layout) != 64
+                or any(c not in "0123456789abcdef" for c in layout)
+                or not isinstance(imports, list) or not isinstance(calls, list)
+                or any(not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+                       or not isinstance(entry.get("got"), dict) for entry in imports)
+                or any(not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+                       or not isinstance(entry.get("got"), dict)
+                       or not isinstance(entry.get("call_site"), dict)
+                       or not isinstance(entry.get("plt_target"), dict) for entry in calls)
+            ):
+                raise RuntimeError("Import index lacks a valid binary and snapshot binding")
         return artifact
 
     def analyze_ghidra_observation(

@@ -336,6 +336,29 @@ class ClientBoundaryTests(unittest.TestCase):
                     "project", 4, snapshot, "process-memory", start_address=0x10
                 )
 
+            import_artifact = json.dumps({
+                "schema_version": 1,
+                "binary_sha256": "a" * 64,
+                "snapshot_layout_sha256": "b" * 64,
+                "imports": [{"name": "strlen", "got": {"space": "ram", "offset": "0x2000"}}],
+                "calls": [],
+            }).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(import_artifact).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-elf-import-index+json;version=1",
+                    content=import_artifact,
+                    project_revision=4,
+                )
+            )
+            self.assertEqual(
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "imports")["imports"][0]["name"],
+                "strlen",
+            )
+            self.assertEqual(requests[-1].stage, "imports")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "imports", start_address=0x10)
+
             process_llvm_artifact = json.dumps({
                 "schema_version": 4,
                 "process_memory": {
