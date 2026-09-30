@@ -7,12 +7,16 @@ on:
       - LICENSE
       - crates/hydir-cli/**
       - crates/hydir-execution/**
+      - crates/hydir-decompile/**
+      - crates/hydir-ir/**
       - crates/hydir-frida-observer/**
       - vendor/frida-rust-0.17.2/**
       - tests/fixtures/frida_branch.c
       - tests/fixtures/frida_indirect_jump.c
       - tests/frida_observer_gate.py
       - scripts/package-frida-linux.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
       - .github/workflows/frida-gate.yml
   pull_request:
     paths:
@@ -21,12 +25,16 @@ on:
       - LICENSE
       - crates/hydir-cli/**
       - crates/hydir-execution/**
+      - crates/hydir-decompile/**
+      - crates/hydir-ir/**
       - crates/hydir-frida-observer/**
       - vendor/frida-rust-0.17.2/**
       - tests/fixtures/frida_branch.c
       - tests/fixtures/frida_indirect_jump.c
       - tests/frida_observer_gate.py
       - scripts/package-frida-linux.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
       - .github/workflows/frida-gate.yml
 jobs:
   linux-x86-64:
@@ -80,6 +88,18 @@ jobs:
           export HYDIRCTL="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydirctl"
           export HYDIR_FRIDA_OBSERVER="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydir-frida-observer"
           python3 tests/frida_observer_gate.py
+      - name: Run held-out ELFs through bundled CLI, automatic Ghidra, and Frida
+        run: |
+          set -euo pipefail
+          export HYDIRCTL="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydirctl"
+          export HYDIR_FRIDA_OBSERVER="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydir-frida-observer"
+          python3 scripts/demo-heldout-musl.py --output-dir "$RUNNER_TEMP/hydir-heldout-musl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hydir-heldout-musl-frida
+          path: ${{ runner.temp }}/hydir-heldout-musl/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: hydir-linux-x86_64-frida

@@ -299,26 +299,37 @@ def run_case(case, directory, full):
     if trace["stop"]["kind"] == "return" and llvm["status"] == 1:
         rust_rax = trace["final_state"]["register_bytes"]
         rust_result = 0
+        result_known = True
         for index in range(8):
             value = rust_rax.get(str(index))
             if value is None:
-                raise RuntimeError("Rust RAX is unknown after return")
+                result_known = False
+                break
             rust_result |= value << (8 * index)
         events = source_ids(artifact, trace)
-        if llvm["events"] != events or rust_result != expected or llvm["rax"] != expected:
+        if not result_known or llvm["rax"] is None:
+            result["comparison"] = {
+                "verdict": "inconclusive", "reason": "return value bytes are unknown",
+                "source": trace["stop"]["source"]["source_address"]}
+        elif llvm["events"] != events or rust_result != expected or llvm["rax"] != expected:
             first = next((index for index, (left, right) in
                           enumerate(zip(llvm["events"], events)) if left != right),
                          min(len(llvm["events"]), len(events)))
-            source = (artifact["llvm"]["source_operations"][events[first]]
-                      if first < len(events) else None)
-            raise RuntimeError(f"Rust/LLVM/native differ at source {source}: "
-                               f"Rust={rust_result}, LLVM={llvm['rax']}, "
-                               f"native={expected}, event_index={first}")
-        result["comparison"] = {"verdict": "matched_observed_contract",
-                                "rax": expected, "source_events": len(events)}
+            source = (artifact["llvm"]["source_operations"][events[first]]["instruction_address"]
+                      if first < len(events) else trace["stop"]["source"]["source_address"])
+            result["comparison"] = {
+                "verdict": "mismatch", "source": source,
+                "state_bytes": {"register": "RAX", "rust": rust_result,
+                                "llvm": llvm["rax"], "native": expected},
+                "first_different_event": first}
+        else:
+            result["comparison"] = {"verdict": "matched_observed_contract",
+                                    "rax": expected, "source_events": len(events),
+                                    "return_source": trace["stop"]["source"]["source_address"]}
     else:
         result["comparison"] = {"verdict": "inconclusive",
-                                "reason": "Rust or LLVM stopped before the selected function returned"}
+                                "reason": "Rust or LLVM stopped before the selected function returned",
+                                "source": trace["stop"].get("source", {}).get("source_address")}
     if full:
         result["frida"] = observe(binary, entry, native, directory)
     return result

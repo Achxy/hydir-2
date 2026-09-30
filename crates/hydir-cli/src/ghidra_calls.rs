@@ -211,7 +211,7 @@ pub fn run_assessment_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("assess needs binary and seed".into());
     };
     let options = parse_options(options, true)?;
-    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options, false)?;
     let binary_bytes = read_binary(binary)?;
     emit_assessment(&snapshots, &binary_bytes, seed, &options, diagnostics)
 }
@@ -255,7 +255,7 @@ pub fn run_automatic(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("trace-calls needs binary and seed".into());
     };
     let options = parse_options(options, true)?;
-    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options, false)?;
     let binary_bytes = read_binary(binary)?;
     emit(
         &snapshots,
@@ -272,7 +272,7 @@ pub fn run_automatic_imports(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("trace-calls-imports needs binary and seed".into());
     };
     let options = parse_options(options, true)?;
-    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options, true)?;
     let binary_bytes = read_binary(binary)?;
     emit(&snapshots, &binary_bytes, seed, &options, diagnostics, true)
 }
@@ -293,7 +293,7 @@ fn run_automatic_llvm_inner(args: &[String], with_imports: bool) -> Result<(), B
     if with_imports && options.allocations.is_none() {
         return Err("import LLVM contracts require --allocations".into());
     }
-    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options)?;
+    let (snapshots, diagnostics) = collect_automatic(binary, seed, &options, with_imports)?;
     let mut artifact = if let Some(path) = options.allocations {
         let binary_bytes = read_binary(binary)?;
         let (process, allocations) = strict_allocations(&snapshots, &binary_bytes, path)?;
@@ -330,6 +330,7 @@ fn collect_automatic(
     binary: &str,
     seed: &str,
     options: &Options<'_>,
+    with_imports: bool,
 ) -> Result<(Vec<GhidraSnapshot>, Vec<String>), Box<dyn Error>> {
     let root_entry = options.function.ok_or("missing Ghidra function entry")?;
     let binary_bytes = read_binary(binary)?;
@@ -354,15 +355,28 @@ fn collect_automatic(
     loop {
         let trace = if let Some(path) = options.allocations {
             let (process, allocations) = strict_allocations(&snapshots, &binary_bytes, path)?;
-            execute_concrete_call_path_with_allocations(
-                &snapshots,
-                &parsed_seed,
-                &process,
-                &allocations,
-                options.max_operations,
-                options.max_visits,
-                options.max_depth,
-            )?
+            if with_imports {
+                execute_concrete_call_path_with_imports(
+                    &snapshots,
+                    &parsed_seed,
+                    &binary_bytes,
+                    &process,
+                    &allocations,
+                    options.max_operations,
+                    options.max_visits,
+                    options.max_depth,
+                )?
+            } else {
+                execute_concrete_call_path_with_allocations(
+                    &snapshots,
+                    &parsed_seed,
+                    &process,
+                    &allocations,
+                    options.max_operations,
+                    options.max_visits,
+                    options.max_depth,
+                )?
+            }
         } else if let Some(image) = &image {
             execute_concrete_call_path_with_image(
                 &snapshots,
