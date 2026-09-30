@@ -82,6 +82,11 @@ class HydirV3Stub:
                 request_serializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.SerializeToString,
                 response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
                 _registered_method=True)
+        self.AnalyzeGhidraObservation = channel.unary_unary(
+                '/hydir.v3.HydirV3/AnalyzeGhidraObservation',
+                request_serializer=hydir__v3__pb2.GhidraObservationArtifactRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
         self.TraceGhidraCalls = channel.unary_unary(
                 '/hydir.v3.HydirV3/TraceGhidraCalls',
                 request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
@@ -90,6 +95,21 @@ class HydirV3Stub:
         self.BuildGhidraCallCfgLlvm = channel.unary_unary(
                 '/hydir.v3.HydirV3/BuildGhidraCallCfgLlvm',
                 request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
+        self.AssessGhidraFunction = channel.unary_unary(
+                '/hydir.v3.HydirV3/AssessGhidraFunction',
+                request_serializer=hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
+                _registered_method=True)
+        self.StartFridaObservation = channel.unary_unary(
+                '/hydir.v3.HydirV3/StartFridaObservation',
+                request_serializer=hydir__v3__pb2.StartFridaObservationRequest.SerializeToString,
+                response_deserializer=hydir__v3__pb2.JobReply.FromString,
+                _registered_method=True)
+        self.GetFridaObservation = channel.unary_unary(
+                '/hydir.v3.HydirV3/GetFridaObservation',
+                request_serializer=hydir__v3__pb2.FridaObservationArtifactRequest.SerializeToString,
                 response_deserializer=hydir__v3__pb2.ArtifactReply.FromString,
                 _registered_method=True)
         self.UpdateAnalystFact = channel.unary_unary(
@@ -159,6 +179,12 @@ class HydirV3Servicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AnalyzeGhidraObservation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def TraceGhidraCalls(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -166,6 +192,24 @@ class HydirV3Servicer:
         raise NotImplementedError('Method not implemented!')
 
     def BuildGhidraCallCfgLlvm(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AssessGhidraFunction(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StartFridaObservation(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetFridaObservation(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -225,6 +269,11 @@ def add_HydirV3Servicer_to_server(servicer, server):
                     request_deserializer=hydir__v3__pb2.GhidraSnapshotArtifactRequest.FromString,
                     response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
             ),
+            'AnalyzeGhidraObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnalyzeGhidraObservation,
+                    request_deserializer=hydir__v3__pb2.GhidraObservationArtifactRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
             'TraceGhidraCalls': grpc.unary_unary_rpc_method_handler(
                     servicer.TraceGhidraCalls,
                     request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
@@ -233,6 +282,21 @@ def add_HydirV3Servicer_to_server(servicer, server):
             'BuildGhidraCallCfgLlvm': grpc.unary_unary_rpc_method_handler(
                     servicer.BuildGhidraCallCfgLlvm,
                     request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'AssessGhidraFunction': grpc.unary_unary_rpc_method_handler(
+                    servicer.AssessGhidraFunction,
+                    request_deserializer=hydir__v3__pb2.GhidraCallTraceRequest.FromString,
+                    response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
+            ),
+            'StartFridaObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartFridaObservation,
+                    request_deserializer=hydir__v3__pb2.StartFridaObservationRequest.FromString,
+                    response_serializer=hydir__v3__pb2.JobReply.SerializeToString,
+            ),
+            'GetFridaObservation': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetFridaObservation,
+                    request_deserializer=hydir__v3__pb2.FridaObservationArtifactRequest.FromString,
                     response_serializer=hydir__v3__pb2.ArtifactReply.SerializeToString,
             ),
             'UpdateAnalystFact': grpc.unary_unary_rpc_method_handler(
@@ -498,6 +562,33 @@ class HydirV3:
             _registered_method=True)
 
     @staticmethod
+    def AnalyzeGhidraObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/AnalyzeGhidraObservation',
+            hydir__v3__pb2.GhidraObservationArtifactRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def TraceGhidraCalls(request,
             target,
             options=(),
@@ -540,6 +631,87 @@ class HydirV3:
             target,
             '/hydir.v3.HydirV3/BuildGhidraCallCfgLlvm',
             hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AssessGhidraFunction(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/AssessGhidraFunction',
+            hydir__v3__pb2.GhidraCallTraceRequest.SerializeToString,
+            hydir__v3__pb2.ArtifactReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartFridaObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/StartFridaObservation',
+            hydir__v3__pb2.StartFridaObservationRequest.SerializeToString,
+            hydir__v3__pb2.JobReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetFridaObservation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hydir.v3.HydirV3/GetFridaObservation',
+            hydir__v3__pb2.FridaObservationArtifactRequest.SerializeToString,
             hydir__v3__pb2.ArtifactReply.FromString,
             options,
             channel_credentials,

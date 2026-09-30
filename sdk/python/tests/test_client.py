@@ -144,6 +144,75 @@ class ClientBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(artifact["schema_version"], 3)
 
+    def test_v3_frida_observation_job_and_artifact_are_revision_checked(self):
+        binary_sha = "a" * 64
+        spec = {"schema_version": 1, "binary_sha256": binary_sha}
+        selected = 0x401000
+        trace = {
+            "schema_version": 2, "binary_sha256": binary_sha,
+            "selected_elf_vaddr": selected, "observer": "hydir-frida-observer",
+            "status": "completed", "events": [],
+        }
+        content = json.dumps(trace).encode()
+        digest = hashlib.sha256(content).hexdigest()
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def start_call(method, request):
+                self.assertIs(method, client._stub_v3.StartFridaObservation)
+                requests.append(request)
+                return proto_v3.JobReply(
+                    project_id="project", job_id="job", project_revision=4,
+                    kind="frida-observation", state="queued",
+                )
+
+            client._call = start_call
+            job = client.start_frida_observation(
+                "project", 4, spec, selected, idempotency_key="frida-1",
+            )
+            self.assertEqual(job.job_id, "job")
+            self.assertEqual(requests[0].expected_revision, 4)
+            self.assertEqual(requests[0].selected_elf_vaddr, selected)
+            self.assertEqual(json.loads(requests[0].input_spec_json), spec)
+            with self.assertRaises(ValueError):
+                client.start_frida_observation("project", 4, spec, 0)
+            with self.assertRaises(ValueError):
+                client.start_frida_observation("project", 4, spec, selected,
+                                               idempotency_key="bad\nkey")
+
+            def artifact_call(method, request):
+                self.assertIs(method, client._stub_v3.GetFridaObservation)
+                self.assertEqual(request.job_id, "job")
+                return proto_v3.ArtifactReply(
+                    sha256=digest,
+                    media_type="application/vnd.hydir.dynamic-trace+json;version=2",
+                    content=content, project_revision=4,
+                )
+
+            client._call = artifact_call
+            self.assertEqual(client.get_frida_observation(
+                "project", "job", revision=4, artifact_sha256=digest,
+                binary_sha256=binary_sha, selected_elf_vaddr=selected,
+            ), trace)
+            with self.assertRaises(RuntimeError):
+                client.get_frida_observation(
+                    "project", "job", revision=5, artifact_sha256=digest,
+                    binary_sha256=binary_sha, selected_elf_vaddr=selected,
+                )
+            changed = dict(trace, exit_code=0)
+            changed_content = json.dumps(changed).encode()
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(changed_content).hexdigest(),
+                media_type="application/vnd.hydir.dynamic-trace+json;version=2",
+                content=changed_content, project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.get_frida_observation(
+                    "project", "job", revision=4,
+                    artifact_sha256=hashlib.sha256(changed_content).hexdigest(),
+                    binary_sha256=binary_sha, selected_elf_vaddr=selected,
+                )
+
     def test_v3_analysis_model_read_and_revisioned_save(self):
         model = {"schema_version": 1, "binary_sha256": "a" * 64, "revision": 2}
         content = json.dumps(model).encode("utf-8")
@@ -241,6 +310,77 @@ class ClientBoundaryTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 client.analyze_ghidra_snapshot("project", 4, snapshot, "llvm-cfg-image")
 
+            process_artifact = json.dumps({
+                "schema_version": 1,
+                "binary_sha256": "a" * 64,
+                "snapshot_layout_sha256": "b" * 64,
+                "space": "ram", "base": 0x200000,
+                "bytes": [42, 0], "known": [255, 255],
+                "mapped": [255, 255], "writable": [0, 255],
+            }).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(process_artifact).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-process-memory+json;version=1",
+                    content=process_artifact,
+                    project_revision=4,
+                )
+            )
+            process_result = client.analyze_ghidra_snapshot(
+                "project", 4, snapshot, "process-memory"
+            )
+            self.assertEqual(process_result["writable"], [0, 255])
+            self.assertEqual(requests[-1].stage, "process-memory")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "process-memory", start_address=0x10
+                )
+
+            import_artifact = json.dumps({
+                "schema_version": 1,
+                "binary_sha256": "a" * 64,
+                "snapshot_layout_sha256": "b" * 64,
+                "imports": [{"name": "strlen", "got": {"space": "ram", "offset": "0x2000"}}],
+                "calls": [],
+            }).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(import_artifact).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-elf-import-index+json;version=1",
+                    content=import_artifact,
+                    project_revision=4,
+                )
+            )
+            self.assertEqual(
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "imports")["imports"][0]["name"],
+                "strlen",
+            )
+            self.assertEqual(requests[-1].stage, "imports")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "imports", start_address=0x10)
+
+            process_llvm_artifact = json.dumps({
+                "schema_version": 4,
+                "process_memory": {
+                    "space": "ram", "base": 0x200000, "byte_len": 2,
+                    "known_byte_count": 2, "mapped_byte_count": 2,
+                    "writable_byte_count": 1, "contents_sha256": "c" * 64,
+                },
+            }).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(process_llvm_artifact).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=4",
+                    content=process_llvm_artifact,
+                    project_revision=4,
+                )
+            )
+            process_llvm = client.analyze_ghidra_snapshot(
+                "project", 4, snapshot, "llvm-cfg-process", start_address=0x20137C
+            )
+            self.assertEqual(process_llvm["process_memory"]["writable_byte_count"], 1)
+            self.assertEqual(requests[-1].start_address, "0x20137c")
+
             simplified = json.dumps({"schema_version": 1, "rewrites": []}).encode()
             client._call = lambda *_: proto_v3.ArtifactReply(
                 sha256=hashlib.sha256(simplified).hexdigest(),
@@ -252,6 +392,21 @@ class ClientBoundaryTests(unittest.TestCase):
                 client.analyze_ghidra_snapshot("project", 4, snapshot, "simplify")["rewrites"],
                 [],
             )
+
+            capability = json.dumps({"schema_version": 1, "stop_sites": []}).encode()
+            client._call = lambda _, request: (
+                requests.append(request) or proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(capability).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-capability+json;version=1",
+                    content=capability,
+                    project_revision=4,
+                )
+            )
+            self.assertEqual(
+                client.analyze_ghidra_snapshot("project", 4, snapshot, "capability")["stop_sites"],
+                [],
+            )
+            self.assertEqual(requests[-1].stage, "capability")
 
             transformed = json.dumps({"schema_version": 1, "simplification": {"rewrites": []}}).encode()
             client._call = lambda *_: proto_v3.ArtifactReply(
@@ -275,6 +430,148 @@ class ClientBoundaryTests(unittest.TestCase):
             )
             with self.assertRaises(RuntimeError):
                 client.analyze_ghidra_snapshot("project", 4, snapshot.read_bytes(), "llvm-cfg")
+
+    def test_v3_allocated_process_llvm_requires_declared_ranges_and_v5_binding(self):
+        snapshot = b'{"schema_version":2}'
+        declaration = b'{"schema_version":1,"regions":[]}'
+        artifact = json.dumps({
+            "schema_version": 5, "binary_sha256": "a" * 64,
+            "process_memory": {
+                "space": "ram", "base": 0x200000, "byte_len": 2,
+                "known_byte_count": 2, "mapped_byte_count": 2,
+                "writable_byte_count": 1, "contents_sha256": "b" * 64,
+            },
+            "allocations": {
+                "schema_version": 1, "binary_sha256": "a" * 64,
+                "snapshot_layout_sha256": "c" * 64, "regions": [],
+            },
+            "state_abi": "hydir-pcode-cfg-state-v5: test",
+        }).encode()
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def call(method, request):
+                self.assertIs(method, client._stub_v3.AnalyzeGhidraSnapshot)
+                requests.append(request)
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(artifact).hexdigest(), content=artifact,
+                    media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=5",
+                    project_revision=4,
+                )
+
+            client._call = call
+            result = client.analyze_ghidra_snapshot(
+                "project", 4, snapshot, "llvm-cfg-process-allocated",
+                start_address=0x20137C, allocations=declaration,
+            )
+            self.assertEqual(result["allocations"]["schema_version"], 1)
+            self.assertEqual(requests[-1].allocation_json, declaration)
+            self.assertEqual(requests[-1].start_address, "0x20137c")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated"
+                )
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process", allocations=declaration
+                )
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated", allocations=b"x" * 4097
+                )
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(artifact).hexdigest(), content=artifact,
+                media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=4",
+                project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated", allocations=declaration
+                )
+            wrong = json.loads(artifact)
+            wrong["allocations"]["regions"] = [
+                {"kind": "stack", "space": "ram", "base": 7340032, "byte_len": 16}
+            ]
+            wrong_bytes = json.dumps(wrong).encode()
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(wrong_bytes).hexdigest(), content=wrong_bytes,
+                media_type="application/vnd.hydir.pcode-cfg-llvm+json;version=5",
+                project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_snapshot(
+                    "project", 4, snapshot, "llvm-cfg-process-allocated", allocations=declaration
+                )
+
+    def test_v3_observation_artifacts_are_revision_and_claim_checked(self):
+        snapshot = b'{"schema_version":2}'
+        input_spec = b'{"schema_version":1}'
+        trace = b'{"schema_version":1}'
+        seed = b'{"schema_version":1}'
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            requests = []
+
+            def call(method, request):
+                self.assertIs(method, client._stub_v3.AnalyzeGhidraObservation)
+                requests.append(request)
+                if request.stage == "observed-call-rediscovery":
+                    content = b'{"schema_version":1,"input_sha256":"abc","changed_targets":[],"unresolved_call_sites":[]}'
+                    media_type = "application/vnd.hydir.observed-call-rediscovery+json;version=1"
+                elif request.stage == "observed-jump-rediscovery":
+                    content = b'{"schema_version":1,"input_sha256":"abc","changed_targets":[],"unresolved_jump_sites":[]}'
+                    media_type = "application/vnd.hydir.observed-jump-rediscovery+json;version=1"
+                else:
+                    content = b'{"schema_version":1,"same_initial_state_proven":false}'
+                    media_type = "application/vnd.hydir.pcode-observed-path-comparison+json;version=1"
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type=media_type, content=content, project_revision=4,
+                )
+
+            client._call = call
+            plan = client.analyze_ghidra_observation(
+                "project", 4, snapshot, input_spec, trace, "observed-call-rediscovery"
+            )
+            self.assertEqual(plan["changed_targets"], [])
+            self.assertEqual(requests[-1].snapshot_json, snapshot)
+            self.assertEqual(requests[-1].input_spec_json, input_spec)
+            self.assertEqual(requests[-1].trace_json, trace)
+            self.assertEqual(requests[-1].seed_json, b"")
+            jump_plan = client.analyze_ghidra_observation(
+                "project", 4, snapshot, input_spec, trace, "observed-jump-rediscovery"
+            )
+            self.assertEqual(jump_plan["unresolved_jump_sites"], [])
+            self.assertEqual(requests[-1].seed_json, b"")
+            comparison = client.analyze_ghidra_observation(
+                "project", 4, snapshot, input_spec, trace,
+                "observed-path-comparison", seed=seed,
+            )
+            self.assertIs(comparison["same_initial_state_proven"], False)
+            self.assertEqual(requests[-1].seed_json, seed)
+            client._call = lambda *_: self.fail("invalid request reached server")
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_observation(
+                    "project", 4, snapshot, input_spec, trace, "observed-path-comparison"
+                )
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_observation(
+                    "project", 4, snapshot, input_spec, trace, "observed-call-rediscovery", seed=seed
+                )
+            with self.assertRaises(ValueError):
+                client.analyze_ghidra_observation(
+                    "project", 4, b"", input_spec, trace, "observed-call-rediscovery"
+                )
+            client._call = lambda *_: proto_v3.ArtifactReply(
+                sha256=hashlib.sha256(b'{"schema_version":1,"same_initial_state_proven":true}').hexdigest(),
+                media_type="application/vnd.hydir.pcode-observed-path-comparison+json;version=1",
+                content=b'{"schema_version":1,"same_initial_state_proven":true}',
+                project_revision=4,
+            )
+            with self.assertRaises(RuntimeError):
+                client.analyze_ghidra_observation(
+                    "project", 4, snapshot, input_spec, trace,
+                    "observed-path-comparison", seed=seed,
+                )
 
     def test_v3_ghidra_snapshot_rejects_invalid_request_before_network(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:
@@ -438,6 +735,127 @@ class ClientBoundaryTests(unittest.TestCase):
                     "project", 4, seed, function_entry=0x2013a2,
                 )
             self.assertEqual(len(requests), 2)
+
+    def test_v3_allocated_calls_check_version_and_bound_contract(self):
+        digest = "a" * 64
+        entry = {"space": "ram", "offset": "0x2013a9"}
+        seed = json.dumps({
+            "schema_version": 1, "binary_sha256": digest, "entry": entry,
+            "registers": [], "memory": [],
+        }).encode()
+        declaration = b'{"schema_version":1,"regions":[]}'
+        bound = {"schema_version": 1, "binary_sha256": digest,
+                 "snapshot_layout_sha256": "b" * 64, "regions": []}
+        trace = {"schema_version": 3, "binary_sha256": digest,
+                 "root_entry": entry,
+                 "process_binding": {"process_memory_sha256": "c" * 64,
+                                     "allocations": bound}}
+        import_trace = {**trace, "schema_version": 4,
+                        "contracted_imports": [], "verification": "not_run"}
+        llvm = {"schema_version": 2, "binary_sha256": digest,
+                "function_entries": [entry],
+                "llvm": {"schema_version": 5, "binary_sha256": digest,
+                         "start": entry, "allocations": bound,
+                         "llvm_ir": "define void @f() { ret void }"}}
+        import_llvm = {**llvm, "schema_version": 3, "import_calls": [],
+                       "llvm": {**llvm["llvm"], "schema_version": 6}}
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request, **kwargs):
+                requests.append(request)
+                value = (import_llvm if method is client._stub_v3.BuildGhidraCallCfgLlvm
+                         and request.assume_import_contracts else
+                         llvm if method is client._stub_v3.BuildGhidraCallCfgLlvm else
+                         import_trace if request.assume_import_contracts else trace)
+                content = json.dumps(value).encode()
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type=(
+                        "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2"
+                        if value is llvm else
+                        "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=3"
+                        if value is import_llvm else
+                        "application/vnd.hydir.pcode-call-trace+json;version=4"
+                        if value is import_trace else
+                        "application/vnd.hydir.pcode-call-trace+json;version=3"
+                    ), content=content, project_revision=4,
+                )
+            client._call = call
+            self.assertEqual(client.trace_ghidra_calls(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration,
+            )["schema_version"], 3)
+            self.assertEqual(client.trace_ghidra_calls(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration, assume_import_contracts=True,
+            )["schema_version"], 4)
+            self.assertTrue(requests[-1].assume_import_contracts)
+            with self.assertRaises(ValueError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    assume_import_contracts=True,
+                )
+            self.assertEqual(client.build_ghidra_call_cfg_llvm(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration,
+            )["llvm"]["schema_version"], 5)
+            self.assertEqual(client.build_ghidra_call_cfg_llvm(
+                "project", 4, seed, function_entry=0x2013a9,
+                allocations=declaration, assume_import_contracts=True,
+            )["llvm"]["schema_version"], 6)
+            self.assertTrue(requests[-1].assume_import_contracts)
+            with self.assertRaises(ValueError):
+                client.build_ghidra_call_cfg_llvm(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    assume_import_contracts=True,
+                )
+            self.assertEqual([request.allocation_json for request in requests],
+                             [declaration, declaration, declaration, declaration])
+            with self.assertRaises(ValueError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    allocations=b"x" * 4097,
+                )
+            trace["process_binding"]["allocations"]["binary_sha256"] = "0" * 64
+            with self.assertRaises(RuntimeError):
+                client.trace_ghidra_calls(
+                    "project", 4, seed, function_entry=0x2013a9,
+                    allocations=declaration,
+                )
+
+    def test_v3_function_assessment_is_seed_bound_and_unverified(self):
+        digest = "a" * 64
+        entry = {"space": "ram", "offset": "0x2013a9"}
+        seed = json.dumps({
+            "schema_version": 1, "binary_sha256": digest,
+            "entry": entry, "registers": [], "memory": [],
+        }).encode()
+        artifact = {
+            "schema_version": 1, "binary_sha256": digest,
+            "seed_sha256": hashlib.sha256(seed).hexdigest(),
+            "entry": entry, "static_capability": {},
+            "trace": {"root_entry": entry}, "verification": "not_run",
+        }
+        requests = []
+        with HydirClient("http://127.0.0.1:50051", self.token) as client:
+            def call(method, request, **kwargs):
+                self.assertIs(method, client._stub_v3.AssessGhidraFunction)
+                requests.append(request)
+                content = json.dumps(artifact).encode()
+                return proto_v3.ArtifactReply(
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type="application/vnd.hydir.pcode-function-assessment+json;version=1",
+                    content=content, project_revision=4,
+                )
+            client._call = call
+            self.assertEqual(
+                client.assess_ghidra_function("project", 4, seed, function_entry=0x2013a9)["entry"],
+                entry,
+            )
+            self.assertEqual(requests[0].seed_json, seed)
+            artifact["verification"] = "passed"
+            with self.assertRaises(RuntimeError):
+                client.assess_ghidra_function("project", 4, seed, function_entry=0x2013a9)
 
     def test_v3_fact_updates_validate_before_network_use_and_check_identity(self):
         with HydirClient("http://127.0.0.1:50051", self.token) as client:

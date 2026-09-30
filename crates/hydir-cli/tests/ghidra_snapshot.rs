@@ -125,6 +125,65 @@ fn real_prism_call_trace_uses_two_binary_bound_snapshots() {
 }
 
 #[test]
+fn seeded_capability_assessment_distinguishes_loaded_callee_and_reached_memory() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("demo/hydir-prism.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_prism_calls_flow_v2.json");
+    let seed = root.join("tests/fixtures/ghidra_prism_call_seed_v1.json");
+    let callee = root.join("tests/fixtures/ghidra_prism_leaf_add_v2.json");
+    let command = |include_callee: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hydirctl"));
+        command.args(["ghidra-snapshot", "assess"]);
+        command.arg(&binary).arg(&snapshot).arg(&seed);
+        if include_callee {
+            command.arg("--callee").arg(&callee);
+        }
+        command.output().unwrap()
+    };
+    let loaded = command(true);
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&loaded.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["static_capability"]["schema_version"], 1);
+    assert_eq!(
+        report["seed_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&seed).unwrap()))
+    );
+    assert_eq!(report["snapshot_sha256"].as_array().unwrap().len(), 2);
+    assert_eq!(report["trace"]["stop"]["kind"], "return");
+    assert_eq!(report["llvm"]["emitted"], true);
+    assert_eq!(report["verification"], "not_run");
+    assert!(
+        report["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|call| { call["snapshot_loaded"] == true && call["reached"] == true })
+    );
+    assert!(!report["memory_witnesses"].as_array().unwrap().is_empty());
+
+    let missing = command(false);
+    assert!(
+        missing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(report["trace"]["stop"]["kind"], "call_boundary");
+    assert!(
+        report["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|call| { call["snapshot_loaded"] == false && call["reached"] == false })
+    );
+}
+
+#[test]
 fn real_prism_call_snapshots_emit_one_binary_bound_llvm_module() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let binary = root.join("demo/hydir-prism.elf");
@@ -157,6 +216,77 @@ fn real_prism_call_snapshots_emit_one_binary_bound_llvm_module() {
             .as_str()
             .unwrap()
             .contains("%call_depth = alloca i32")
+    );
+}
+
+#[test]
+fn allocated_call_cli_shares_bounded_stack_across_validated_callees() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/ghidra_choose_calls.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_choose_root_v2.json");
+    let right = root.join("tests/fixtures/ghidra_choose_right_v2.json");
+    let left = root.join("tests/fixtures/ghidra_choose_left_v2.json");
+    let allocations = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        allocations.path(),
+        br#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340024,"byte_len":16}]}"#,
+    )
+    .unwrap();
+    for (seed, expected, callee) in [
+        ("ghidra_choose_right_seed_v1.json", 2, "0x201185"),
+        ("ghidra_choose_left_seed_v1.json", 1, "0x20118d"),
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+            .args(["ghidra-snapshot", "trace-calls"])
+            .arg(&binary)
+            .arg(&snapshot)
+            .arg(root.join("tests/fixtures").join(seed))
+            .arg("--callee")
+            .arg(&right)
+            .arg("--callee")
+            .arg(&left)
+            .arg("--allocations")
+            .arg(allocations.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let trace: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(trace["schema_version"], 3);
+        assert_eq!(trace["stop"]["kind"], "return");
+        assert_eq!(trace["calls"][0]["callee_entry"]["offset"], callee);
+        assert_eq!(trace["final_state"]["register_bytes"]["0"], expected);
+        assert_eq!(
+            trace["process_binding"]["allocations"]["regions"][0]["base"],
+            7340024
+        );
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-calls"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .arg("--callee")
+        .arg(&right)
+        .arg("--callee")
+        .arg(&left)
+        .arg("--allocations")
+        .arg(allocations.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(artifact["llvm"]["schema_version"], 5);
+    assert_eq!(
+        artifact["llvm"]["allocations"]["regions"][0]["kind"],
+        "stack"
     );
 }
 
@@ -883,6 +1013,55 @@ fn stripped_secure_equals_cli_emits_versioned_binary_bound_image_llvm() {
         .args(["ghidra-snapshot", "llvm-cfg-image"])
         .arg(changed.path())
         .arg(&snapshot)
+        .output()
+        .unwrap();
+    assert!(!wrong_binary.status.success());
+}
+
+#[test]
+fn allocated_cfg_llvm_cli_binds_declaration_to_verified_elf() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("tests/fixtures/hydir-password-gate-stripped.elf");
+    let snapshot = root.join("tests/fixtures/ghidra_password_secure_equals_o1_v2.json");
+    let allocations = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        allocations.path(),
+        br#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}"#,
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-allocated"])
+        .arg(&binary)
+        .arg(&snapshot)
+        .arg("--allocations")
+        .arg(allocations.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(artifact["schema_version"], 5);
+    assert_eq!(
+        artifact["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()))
+    );
+    assert_eq!(artifact["allocations"]["regions"][0]["kind"], "stack");
+    assert_eq!(artifact["allocations"]["regions"][0]["base"], 7340032);
+    assert!(artifact["llvm_ir"].as_str().unwrap().contains("define i32"));
+
+    let changed = tempfile::NamedTempFile::new().unwrap();
+    let mut tampered = fs::read(&binary).unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    fs::write(changed.path(), tampered).unwrap();
+    let wrong_binary = Command::new(env!("CARGO_BIN_EXE_hydirctl"))
+        .args(["ghidra-snapshot", "llvm-cfg-allocated"])
+        .arg(changed.path())
+        .arg(&snapshot)
+        .arg("--allocations")
+        .arg(allocations.path())
         .output()
         .unwrap();
     assert!(!wrong_binary.status.success());

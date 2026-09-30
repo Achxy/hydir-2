@@ -24,7 +24,10 @@ from .ghidra import LocalGhidra
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_GHIDRA_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_PCODE_SEED_BYTES = 1024 * 1024
+MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES = 4096
 MAX_ANALYSIS_MODEL_BYTES = 16 * 1024 * 1024
+MAX_INPUT_SPEC_BYTES = 2 * 1024 * 1024
+FRIDA_TRACE_MEDIA_TYPE = "application/vnd.hydir.dynamic-trace+json;version=2"
 
 
 class HydirClient:
@@ -268,6 +271,7 @@ class HydirClient:
         input_index: int | None = None,
         selected_function_entry: int | str | None = None,
         automatic: bool = False,
+        allocations: bytes | str | os.PathLike[str] | None = None,
     ) -> dict:
         """Analyze a Ghidra export bound to this project's uploaded binary.
 
@@ -282,15 +286,22 @@ class HydirClient:
             "state": ("application/vnd.hydir.pcode-state-ir+json;version=1", 1),
             "cfg": ("application/vnd.hydir.pcode-cfg-ir+json;version=1", 1),
             "coverage": ("application/vnd.hydir.pcode-coverage+json;version=1", 1),
+            "capability": ("application/vnd.hydir.pcode-capability+json;version=1", 1),
             "llvm-cfg": ("application/vnd.hydir.pcode-cfg-llvm+json;version=2", 2),
             "llvm-cfg-image": ("application/vnd.hydir.pcode-cfg-llvm+json;version=3", 3),
+            "llvm-cfg-process": ("application/vnd.hydir.pcode-cfg-llvm+json;version=4", 4),
+            "llvm-cfg-process-allocated": ("application/vnd.hydir.pcode-cfg-llvm+json;version=5", 5),
+            "process-memory": ("application/vnd.hydir.pcode-process-memory+json;version=1", 1),
+            "imports": ("application/vnd.hydir.pcode-elf-import-index+json;version=1", 1),
             "llvm-cfg-simplified": ("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1", 1),
             "slice": ("application/vnd.hydir.pcode-slice+json;version=1", 1),
         }
         if stage not in media_types:
             raise ValueError("Unsupported Ghidra snapshot artifact stage")
-        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-simplified"}:
+        if start_address is not None and stage not in {"llvm-cfg", "llvm-cfg-image", "llvm-cfg-process", "llvm-cfg-process-allocated", "llvm-cfg-simplified"}:
             raise ValueError("Start address is supported only for CFG LLVM stages")
+        if (stage == "llvm-cfg-process-allocated") != (allocations is not None):
+            raise ValueError("Allocated process LLVM requires allocations; other stages must omit them")
         if stage == "slice":
             if instruction_index is None or operation_index is None:
                 raise ValueError("Slice requires instruction and operation indices")
@@ -336,6 +347,17 @@ class HydirClient:
             raise ValueError("Ghidra snapshot must be 1..=16 MiB")
         if automatic and content:
             raise ValueError("Automatic Ghidra analysis does not accept a caller snapshot")
+        allocation_json = b""
+        if allocations is not None:
+            if isinstance(allocations, bytes):
+                allocation_json = allocations
+            else:
+                path = Path(allocations)
+                if path.stat().st_size > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                    raise ValueError("Process allocation declaration exceeds 4 KiB")
+                allocation_json = path.read_bytes()
+            if not 1 <= len(allocation_json) <= MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                raise ValueError("Process allocation declaration must be 1..=4096 bytes")
         request = proto_v3.GhidraSnapshotArtifactRequest(
             project_id=project_id,
             expected_revision=revision,
@@ -344,6 +366,7 @@ class HydirClient:
             start_address=start_address or "",
             selected_function_entry=selected_function_entry or "",
             automatic=automatic,
+            allocation_json=allocation_json,
         )
         if stage == "slice":
             request.instruction_index = instruction_index
@@ -376,6 +399,157 @@ class HydirClient:
                        for character in image["contents_sha256"])
             ):
                 raise RuntimeError("Image-backed CFG LLVM lacks a valid ELF image binding")
+        if stage in {"llvm-cfg-process", "llvm-cfg-process-allocated"}:
+            process = artifact.get("process_memory")
+            if (
+                not isinstance(process, dict)
+                or not isinstance(process.get("space"), str)
+                or type(process.get("base")) is not int
+                or type(process.get("byte_len")) is not int
+                or type(process.get("known_byte_count")) is not int
+                or type(process.get("mapped_byte_count")) is not int
+                or type(process.get("writable_byte_count")) is not int
+                or not 0 <= process["base"] <= 0xFFFFFFFFFFFFFFFF
+                or not 0 <= process["known_byte_count"] <= process["mapped_byte_count"] <= process["byte_len"] <= 1_048_576
+                or not 0 <= process["writable_byte_count"] <= process["mapped_byte_count"]
+                or not isinstance(process.get("contents_sha256"), str)
+                or len(process["contents_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in process["contents_sha256"])
+            ):
+                raise RuntimeError("Process-backed CFG LLVM lacks a valid ELF memory binding")
+        if stage == "llvm-cfg-process-allocated":
+            declared = artifact.get("allocations")
+            regions = declared.get("regions") if isinstance(declared, dict) else None
+            requested = json.loads(allocation_json)
+            if (
+                not isinstance(declared, dict)
+                or declared.get("schema_version") != 1
+                or declared.get("binary_sha256") != artifact.get("binary_sha256")
+                or not isinstance(declared.get("snapshot_layout_sha256"), str)
+                or len(declared["snapshot_layout_sha256"]) != 64
+                or not isinstance(regions, list)
+                or len(regions) > 2
+                or not isinstance(requested, dict)
+                or requested.get("schema_version") != 1
+                or not isinstance(requested.get("regions"), list)
+                or sorted(json.dumps(region, sort_keys=True) for region in regions)
+                   != sorted(json.dumps(region, sort_keys=True)
+                             for region in requested["regions"])
+                or not str(artifact.get("state_abi", "")).startswith("hydir-pcode-cfg-state-v5:")
+            ):
+                raise RuntimeError("Allocated process LLVM lacks a valid bound allocation contract")
+        if stage == "process-memory":
+            byte_values = artifact.get("bytes")
+            masks = [artifact.get(key) for key in ("known", "mapped", "writable")]
+            if (
+                not isinstance(artifact.get("binary_sha256"), str)
+                or len(artifact["binary_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in artifact["binary_sha256"])
+                or not isinstance(artifact.get("snapshot_layout_sha256"), str)
+                or len(artifact["snapshot_layout_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in artifact["snapshot_layout_sha256"])
+                or not isinstance(artifact.get("space"), str)
+                or type(artifact.get("base")) is not int
+                or not 0 <= artifact["base"] <= 0xFFFFFFFFFFFFFFFF
+                or not isinstance(byte_values, list)
+                or not 0 < len(byte_values) <= 1_048_576
+                or any(type(value) is not int or not 0 <= value <= 255
+                       for value in byte_values)
+                or any(not isinstance(mask, list) or len(mask) != len(byte_values)
+                       or any(type(value) is not int or value not in (0, 255)
+                              for value in mask) for mask in masks)
+            ):
+                raise RuntimeError("Process memory lacks a valid ELF image binding")
+            known, mapped, writable = masks
+            if any((known[i] and not mapped[i]) or (writable[i] and not mapped[i])
+                   for i in range(len(byte_values))):
+                raise RuntimeError("Process memory has contradictory mapping masks")
+        if stage == "imports":
+            imports = artifact.get("imports")
+            calls = artifact.get("calls")
+            digest = artifact.get("binary_sha256")
+            layout = artifact.get("snapshot_layout_sha256")
+            if (
+                not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or not isinstance(layout, str) or len(layout) != 64
+                or any(c not in "0123456789abcdef" for c in layout)
+                or not isinstance(imports, list) or not isinstance(calls, list)
+                or any(not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+                       or not isinstance(entry.get("got"), dict) for entry in imports)
+                or any(not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+                       or not isinstance(entry.get("got"), dict)
+                       or not isinstance(entry.get("call_site"), dict)
+                       or not isinstance(entry.get("plt_target"), dict) for entry in calls)
+            ):
+                raise RuntimeError("Import index lacks a valid binary and snapshot binding")
+        return artifact
+
+    def analyze_ghidra_observation(
+        self,
+        project_id: str,
+        revision: int,
+        snapshot: bytes | str | os.PathLike[str],
+        input_spec: bytes | str | os.PathLike[str],
+        trace: bytes | str | os.PathLike[str],
+        stage: str,
+        *,
+        seed: bytes | str | os.PathLike[str] | None = None,
+    ) -> dict:
+        """Plan observed calls or jumps, or compare a seeded ELF memory P-code path.
+
+        A comparison does not prove that the seed matches Frida's initial state.
+        """
+        media_types = {
+            "observed-call-rediscovery":
+                "application/vnd.hydir.observed-call-rediscovery+json;version=1",
+            "observed-jump-rediscovery":
+                "application/vnd.hydir.observed-jump-rediscovery+json;version=1",
+            "observed-path-comparison":
+                "application/vnd.hydir.pcode-observed-path-comparison+json;version=1",
+        }
+        if stage not in media_types:
+            raise ValueError("Unsupported Ghidra observation stage")
+        if (stage == "observed-path-comparison") != (seed is not None):
+            raise ValueError("Comparison requires a seed; plan must omit it")
+
+        def bounded(value, limit: int, label: str) -> bytes:
+            if isinstance(value, bytes):
+                data = value
+            else:
+                path = Path(value)
+                if path.stat().st_size > limit:
+                    raise ValueError(f"{label} exceeds size limit")
+                data = path.read_bytes()
+            if not 1 <= len(data) <= limit:
+                raise ValueError(f"{label} must be 1..={limit} bytes")
+            return data
+
+        request = proto_v3.GhidraObservationArtifactRequest(
+            project_id=project_id,
+            expected_revision=revision,
+            stage=stage,
+            snapshot_json=bounded(snapshot, MAX_GHIDRA_SNAPSHOT_BYTES, "Snapshot"),
+            input_spec_json=bounded(input_spec, MAX_INPUT_SPEC_BYTES, "InputSpec"),
+            trace_json=bounded(trace, 16 * 1024 * 1024, "DynamicTrace"),
+            seed_json=bounded(seed, MAX_PCODE_SEED_BYTES, "P-code seed")
+                if seed is not None else b"",
+        )
+        reply = self._call(self._stub_v3.AnalyzeGhidraObservation, request)
+        artifact = self._checked_json_artifact(
+            reply, revision=revision, media_type=media_types[stage], schema_version=1,
+        )
+        if stage in {"observed-call-rediscovery", "observed-jump-rediscovery"}:
+            unresolved = ("unresolved_call_sites" if stage == "observed-call-rediscovery"
+                          else "unresolved_jump_sites")
+            if (not isinstance(artifact.get("changed_targets"), list)
+                    or not isinstance(artifact.get(unresolved), list)
+                    or not isinstance(artifact.get("input_sha256"), str)):
+                raise RuntimeError("Observed rediscovery plan is malformed")
+        if stage == "observed-path-comparison" and (
+            artifact.get("same_initial_state_proven") is not False
+        ):
+            raise RuntimeError("Observed path artifact has an unsupported initial-state claim")
         return artifact
 
     def analyze_ghidra_binary(
@@ -389,6 +563,7 @@ class HydirClient:
         instruction_index: int | None = None,
         operation_index: int | None = None,
         input_index: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
     ) -> dict:
         """Analyze the project's uploaded ELF with managed headless Ghidra."""
         return self.analyze_ghidra_snapshot(
@@ -399,6 +574,7 @@ class HydirClient:
             operation_index=operation_index,
             input_index=input_index,
             automatic=True,
+            allocations=allocations,
         )
 
     def trace_ghidra_calls(
@@ -412,13 +588,17 @@ class HydirClient:
         max_operations: int | None = None,
         max_visits: int | None = None,
         max_depth: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
+        assume_import_contracts: bool = False,
         timeout: float | None = None,
     ) -> dict:
         """Trace a seeded direct-call path through the uploaded ELF."""
         return self._ghidra_call_artifact(
             project_id, revision, seed, function_entry=function_entry, llvm=False,
             max_functions=max_functions, max_operations=max_operations,
-            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+            max_visits=max_visits, max_depth=max_depth, allocations=allocations,
+            assume_import_contracts=assume_import_contracts,
+            timeout=timeout,
         )
 
     def build_ghidra_call_cfg_llvm(
@@ -432,13 +612,38 @@ class HydirClient:
         max_operations: int | None = None,
         max_visits: int | None = None,
         max_depth: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
+        assume_import_contracts: bool = False,
         timeout: float | None = None,
     ) -> dict:
         """Emit bounded interprocedural CFG LLVM from an uploaded ELF and seed."""
         return self._ghidra_call_artifact(
             project_id, revision, seed, function_entry=function_entry, llvm=True,
             max_functions=max_functions, max_operations=max_operations,
-            max_visits=max_visits, max_depth=max_depth, timeout=timeout,
+            max_visits=max_visits, max_depth=max_depth, allocations=allocations,
+            assume_import_contracts=assume_import_contracts,
+            timeout=timeout,
+        )
+
+    def assess_ghidra_function(
+        self,
+        project_id: str,
+        revision: int,
+        seed: bytes | str | os.PathLike[str],
+        *,
+        function_entry: int | str,
+        max_functions: int | None = None,
+        max_operations: int | None = None,
+        max_visits: int | None = None,
+        max_depth: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Assess one seed against loaded Ghidra functions and LLVM emission."""
+        return self._ghidra_call_artifact(
+            project_id, revision, seed, function_entry=function_entry,
+            llvm=False, assessment=True, max_functions=max_functions,
+            max_operations=max_operations, max_visits=max_visits,
+            max_depth=max_depth, timeout=timeout,
         )
 
     def _ghidra_call_artifact(
@@ -449,10 +654,13 @@ class HydirClient:
         *,
         function_entry: int | str,
         llvm: bool,
+        assessment: bool = False,
         max_functions: int | None = None,
         max_operations: int | None = None,
         max_visits: int | None = None,
         max_depth: int | None = None,
+        allocations: bytes | str | os.PathLike[str] | None = None,
+        assume_import_contracts: bool = False,
         timeout: float | None = None,
     ) -> dict:
         """Validate and request a seeded Ghidra call artifact."""
@@ -509,27 +717,52 @@ class HydirClient:
                 raise ValueError(f"{name} must be {minimum}..={maximum}")
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
+        if assessment and allocations is not None:
+            raise ValueError("Ghidra assessment does not support process allocations")
+        if assume_import_contracts and (assessment or allocations is None):
+            raise ValueError("import contracts require call tracing or LLVM and allocations")
+        allocation_json = b""
+        if allocations is not None:
+            if isinstance(allocations, bytes):
+                allocation_json = allocations
+            else:
+                path = Path(allocations)
+                if path.stat().st_size > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                    raise ValueError("Process allocation declaration exceeds 4 KiB")
+                allocation_json = path.read_bytes()
+            if not 1 <= len(allocation_json) <= MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES:
+                raise ValueError("Process allocation declaration must be 1..=4096 bytes")
         request = proto_v3.GhidraCallTraceRequest(
             project_id=project_id,
             expected_revision=revision,
             function_entry=function_hex,
             seed_json=content,
+            allocation_json=allocation_json,
+            assume_import_contracts=assume_import_contracts,
         )
         for name, value, _, _ in limits:
             if value is not None:
                 setattr(request, name, value)
         reply = self._call(
-            self._stub_v3.BuildGhidraCallCfgLlvm if llvm else self._stub_v3.TraceGhidraCalls,
+            (self._stub_v3.BuildGhidraCallCfgLlvm if llvm
+             else self._stub_v3.AssessGhidraFunction if assessment
+             else self._stub_v3.TraceGhidraCalls),
             request,
             timeout=max(self._timeout, 180.0) if timeout is None else timeout,
         )
+        if llvm:
+            media = "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json"
+            version = 3 if assume_import_contracts else 2 if allocations is not None else 1
+        elif assessment:
+            media = "application/vnd.hydir.pcode-function-assessment+json"
+            version = 1
+        else:
+            media = "application/vnd.hydir.pcode-call-trace+json"
+            version = 4 if assume_import_contracts else 3 if allocations is not None else 2
         artifact = self._checked_json_artifact(
             reply, revision=revision,
-            media_type=(
-                "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1"
-                if llvm else "application/vnd.hydir.pcode-call-trace+json;version=2"
-            ),
-            schema_version=1 if llvm else 2,
+            media_type=f"{media};version={version}",
+            schema_version=version,
         )
         if artifact.get("binary_sha256") != seed_json["binary_sha256"]:
             raise RuntimeError("Ghidra call artifact belongs to another binary")
@@ -542,13 +775,32 @@ class HydirClient:
                 or entries[0] != seed_json["entry"]
                 or not isinstance(module, dict)
                 or module.get("binary_sha256") != seed_json["binary_sha256"]
-                or module.get("schema_version") != 2
+                or module.get("schema_version") != (
+                    6 if assume_import_contracts else 5 if allocations is not None else 2
+                )
                 or module.get("start") != seed_json["entry"]
                 or not isinstance(module.get("llvm_ir"), str)
+                or (allocations is not None) != isinstance(module.get("allocations"), dict)
+                or (assume_import_contracts and not isinstance(artifact.get("import_calls", []), list))
             ):
                 raise RuntimeError("Ghidra call LLVM artifact differs from the requested binary or function")
+        elif assessment:
+            if (
+                artifact.get("entry") != seed_json["entry"]
+                or artifact.get("seed_sha256") != hashlib.sha256(content).hexdigest()
+                or not isinstance(artifact.get("static_capability"), dict)
+                or not isinstance(artifact.get("trace"), dict)
+                or artifact["trace"].get("root_entry") != seed_json["entry"]
+                or artifact.get("verification") != "not_run"
+            ):
+                raise RuntimeError("Ghidra assessment differs from the requested seed or function")
         elif artifact.get("root_entry", {}).get("offset") != function_hex:
             raise RuntimeError("Ghidra call trace differs from the requested function")
+        if allocations is not None:
+            binding = (artifact.get("llvm", {}).get("allocations") if llvm else
+                       artifact.get("process_binding", {}).get("allocations"))
+            if not isinstance(binding, dict) or binding.get("binary_sha256") != seed_json["binary_sha256"]:
+                raise RuntimeError("Ghidra allocated call artifact lacks the binary-bound allocation contract")
         return artifact
 
     def start_program_analysis(
@@ -562,6 +814,85 @@ class HydirClient:
                 idempotency_key=idempotency_key or str(uuid4()),
             ),
         )
+
+    def start_frida_observation(
+        self, project_id: str, revision: int, input_spec: dict | bytes,
+        selected_elf_vaddr: int, *, snapshot_json: bytes | None = None,
+        idempotency_key: str | None = None,
+    ):
+        """Queue a bounded Linux x86-64 observation of the uploaded ELF."""
+        if not 0 < selected_elf_vaddr < 1 << 64:
+            raise ValueError("Selected ELF address must be a nonzero 64-bit integer")
+        content = (
+            json.dumps(input_spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if isinstance(input_spec, dict) else input_spec
+        )
+        if not isinstance(content, bytes) or not 0 < len(content) <= MAX_INPUT_SPEC_BYTES:
+            raise ValueError("InputSpec must be bounded JSON bytes or a dictionary")
+        try:
+            spec = json.loads(content)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("InputSpec is not valid JSON") from error
+        digest = spec.get("binary_sha256") if isinstance(spec, dict) else None
+        if (
+            spec.get("schema_version") != 1
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("InputSpec version or binary digest is invalid")
+        snapshot = snapshot_json or b""
+        if not isinstance(snapshot, bytes) or len(snapshot) > MAX_GHIDRA_SNAPSHOT_BYTES:
+            raise ValueError("Ghidra snapshot must be at most 16 MiB JSON bytes")
+        key = idempotency_key or str(uuid4())
+        if not 1 <= len(key) <= 128 or any(ord(character) < 32 for character in key):
+            raise ValueError("Idempotency key must be 1..=128 non-control characters")
+        reply = self._call(
+            self._stub_v3.StartFridaObservation,
+            proto_v3.StartFridaObservationRequest(
+                project_id=project_id, expected_revision=revision,
+                idempotency_key=key, input_spec_json=content,
+                selected_elf_vaddr=selected_elf_vaddr, snapshot_json=snapshot,
+            ),
+        )
+        if (
+            reply.project_id != project_id
+            or reply.project_revision != revision
+            or reply.kind != "frida-observation"
+            or not reply.job_id
+        ):
+            raise RuntimeError("Frida job identity differs from request")
+        return reply
+
+    def get_frida_observation(
+        self, project_id: str, job_id: str, *, revision: int,
+        artifact_sha256: str, binary_sha256: str, selected_elf_vaddr: int,
+    ) -> dict:
+        """Fetch a completed DynamicTrace v2 with its job and binary identity."""
+        if not job_id or revision < 0 or not 0 < selected_elf_vaddr < 1 << 64:
+            raise ValueError("Frida job identity is invalid")
+        for digest in (artifact_sha256, binary_sha256):
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError("Frida artifact and binary digests must be lowercase SHA-256")
+        reply = self._call(
+            self._stub_v3.GetFridaObservation,
+            proto_v3.FridaObservationArtifactRequest(project_id=project_id, job_id=job_id),
+        )
+        content = self._checked_artifact(
+            reply, expected_sha256=artifact_sha256, revision=revision,
+        )
+        if reply.media_type != FRIDA_TRACE_MEDIA_TYPE:
+            raise RuntimeError("Frida artifact media type differs from DynamicTrace v2")
+        trace = json.loads(content)
+        if (
+            not isinstance(trace, dict)
+            or trace.get("schema_version") != 2
+            or trace.get("binary_sha256") != binary_sha256
+            or trace.get("selected_elf_vaddr") != selected_elf_vaddr
+            or "exit_code" in trace
+        ):
+            raise RuntimeError("Frida trace identity or exit-code claim is invalid")
+        return trace
 
     def get_analysis_job(self, project_id: str, job_id: str):
         return self._call(

@@ -322,6 +322,12 @@ impl<'a> Graph<'a> {
                 Some(*left)
             }
             (HighCfgTerminator::Return { .. }, HighCfgTerminator::Return { .. }) => None,
+            (HighCfgTerminator::Return { .. }, HighCfgTerminator::Goto { target, .. })
+            | (HighCfgTerminator::Goto { target, .. }, HighCfgTerminator::Return { .. })
+                if !reserved.contains(target) && !fallthrough_path.contains(target) =>
+            {
+                Some(*target)
+            }
             _ => return false,
         };
         output.push_str(&format!("{}:\n", c_label(head[0])));

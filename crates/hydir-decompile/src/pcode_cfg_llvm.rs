@@ -5,9 +5,10 @@
 use crate::pcode_llvm::{emit_pcode_exact_operation_llvm, pcode_offset, pcode_space_id};
 use crate::pcode_standalone::{MAX_STATE_BYTES, PcodeStateByte, helper_definitions, node_bytes};
 use hydir_ir::pcode::{
-    GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect, PcodeExactOp,
-    PcodeOpaqueClass, PcodeOperation, PcodeReadOnlyElfWindow, PcodeSemanticFunctionIr,
-    PcodeSimplificationArtifact, PcodeVarnode, validate_ghidra_snapshot,
+    GhidraAddressSpace, GhidraFlowKind, GhidraSnapshot, PcodeAddress, PcodeEffect,
+    PcodeElfImportCall, PcodeElfImportIndex, PcodeElfProcessMemory, PcodeExactOp, PcodeOpaqueClass,
+    PcodeOperation, PcodeProcessAllocationKind, PcodeProcessAllocations, PcodeReadOnlyElfWindow,
+    PcodeSemanticFunctionIr, PcodeSimplificationArtifact, PcodeVarnode, validate_ghidra_snapshot,
 };
 use hydir_ir::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
@@ -17,14 +18,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const PCODE_CFG_LLVM_VERSION: u32 = 2;
 pub const PCODE_CFG_IMAGE_LLVM_VERSION: u32 = 3;
+pub const PCODE_CFG_PROCESS_LLVM_VERSION: u32 = 4;
+pub const PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION: u32 = 5;
+pub const PCODE_CFG_IMPORT_CONTRACT_LLVM_VERSION: u32 = 6;
 pub const PCODE_CFG_ELF_IMAGE_MAX_BYTES: usize = 65_536;
 pub const PCODE_SIMPLIFIED_CFG_LLVM_VERSION: u32 = 1;
 pub const PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION: u32 = 1;
+pub const PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION: u32 = 2;
+pub const PCODE_INTERPROCEDURAL_IMPORT_CONTRACT_CFG_LLVM_VERSION: u32 = 3;
 pub const PCODE_CFG_GUEST_RAM_MAX_BYTES: u64 = 1_048_576;
 const MAX_CFG_INSTRUCTIONS: usize = 4096;
 const MAX_CFG_OPERATIONS: usize = 4096;
 const MAX_RUNTIME_STEPS: u32 = 262_144;
 const MAX_LLVM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROCESS_LLVM_BYTES: usize = 16 * 1024 * 1024;
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,6 +63,7 @@ pub enum PcodeCfgLlvmStatus {
     ReturnMismatch = 24,
     RecursiveCall = 25,
     MemoryReadOnly = 26,
+    MemoryUnmappedWrite = 27,
 }
 
 impl PcodeCfgLlvmStatus {
@@ -97,6 +105,20 @@ pub struct PcodeCfgLlvmImageBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeCfgLlvmProcessBinding {
+    pub space: String,
+    pub base: u64,
+    pub byte_len: usize,
+    pub known_byte_count: usize,
+    pub mapped_byte_count: usize,
+    pub writable_byte_count: usize,
+    pub unresolved_relocation_bytes: usize,
+    /// SHA-256 of initial bytes followed by known, mapped and writable masks.
+    pub contents_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PcodeCfgLlvmArtifact {
     pub schema_version: u32,
     pub binary_sha256: String,
@@ -109,6 +131,10 @@ pub struct PcodeCfgLlvmArtifact {
     pub state_abi: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only_image: Option<PcodeCfgLlvmImageBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_memory: Option<PcodeCfgLlvmProcessBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocations: Option<PcodeProcessAllocations>,
     pub llvm_ir: String,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
@@ -138,6 +164,10 @@ pub struct PcodeInterproceduralCfgLlvmArtifact {
     /// an explicit stop in the LLVM module.
     pub snapshot_diagnostics: Vec<String>,
     pub max_call_depth: usize,
+    /// Byte-verified direct PLT calls eligible for an opt-in import contract.
+    /// The ELF name assumes, but cannot prove, the final runtime binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_calls: Vec<PcodeElfImportCall>,
     pub llvm: PcodeCfgLlvmArtifact,
     pub semantic_fidelity: SemanticFidelity,
     pub verification: VerificationStatus,
@@ -147,6 +177,28 @@ struct CallLlvmContext<'a> {
     snapshots: &'a [GhidraSnapshot],
     owners: Vec<usize>,
     max_call_depth: usize,
+    process: Option<&'a PcodeElfProcessMemory>,
+    allocations: Option<&'a PcodeProcessAllocations>,
+    imports: Option<Vec<PcodeElfImportIndex>>,
+}
+
+fn internal_process_call_target(
+    snapshot: &GhidraSnapshot,
+    process: &PcodeElfProcessMemory,
+    space: &str,
+    address: u64,
+) -> bool {
+    process.is_mapped(space, address)
+        && process.initial_byte(space, address).is_some()
+        && snapshot.memory_blocks.iter().any(|block| {
+            block.start.space == space
+                && block.loaded
+                && block.execute
+                && !block.overlay
+                && (block.name == ".text" || block.name.starts_with(".text."))
+                && offset(&block.start.offset).is_ok_and(|start| start <= address)
+                && offset(&block.end.offset).is_ok_and(|end| address <= end)
+        })
 }
 
 fn offset(value: &str) -> Result<u64, String> {
@@ -249,6 +301,7 @@ fn stop_label(status: PcodeCfgLlvmStatus) -> &'static str {
         PcodeCfgLlvmStatus::ReturnMismatch => "stop_return_mismatch",
         PcodeCfgLlvmStatus::RecursiveCall => "stop_recursive_call",
         PcodeCfgLlvmStatus::MemoryReadOnly => "stop_memory_read_only",
+        PcodeCfgLlvmStatus::MemoryUnmappedWrite => "stop_memory_unmapped_write",
     }
 }
 
@@ -309,6 +362,169 @@ fn emit_known_guard(
     ));
 }
 
+fn import_abi_register(snapshot: &GhidraSnapshot, name: &str) -> Result<PcodeVarnode, String> {
+    let layout = snapshot
+        .register_layout
+        .iter()
+        .find(|register| register.name == name)
+        .ok_or_else(|| format!("SysV import contract requires Ghidra {name} layout"))?;
+    if layout.size_bytes != 8 || layout.storage.space != "register" {
+        return Err(format!(
+            "SysV import contract has invalid Ghidra {name} layout"
+        ));
+    }
+    Ok(PcodeVarnode {
+        space: "register".to_owned(),
+        offset: layout.storage.offset.clone(),
+        size: 8,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_interprocedural_import_call(
+    context: &CallLlvmContext<'_>,
+    snapshot: &GhidraSnapshot,
+    import: &PcodeElfImportCall,
+    source: &PcodeOperation,
+    operation_index: usize,
+    id: usize,
+    return_index: usize,
+    continuation: u64,
+    byte_map: &[PcodeStateByte],
+    body: &mut String,
+    sites: &mut Vec<PcodeCfgLlvmStopSite>,
+) -> Result<(), String> {
+    if import.name != "strlen" {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            format!("import {} has no checked SysV call contract", import.name),
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    }
+    let registers = (|| -> Result<_, String> {
+        let rax = import_abi_register(snapshot, "RAX")?;
+        let rdi = import_abi_register(snapshot, "RDI")?;
+        let rsp = import_abi_register(snapshot, "RSP")?;
+        let mut occupied = Vec::<u64>::new();
+        let mut preserved = Vec::<u64>::new();
+        for node in [&rax, &rdi, &rsp] {
+            let start = offset(&node.offset)?;
+            if occupied
+                .iter()
+                .any(|other| start < *other + 8 && *other < start + 8)
+            {
+                return Err("SysV import register layout overlaps".to_owned());
+            }
+            occupied.push(start);
+        }
+        preserved.push(offset(&rsp.offset)?);
+        for name in ["RBX", "RBP", "R12", "R13", "R14", "R15"] {
+            if snapshot
+                .register_layout
+                .iter()
+                .any(|register| register.name == name)
+            {
+                let node = import_abi_register(snapshot, name)?;
+                let start = offset(&node.offset)?;
+                if occupied
+                    .iter()
+                    .any(|other| start < *other + 8 && *other < start + 8)
+                {
+                    return Err("SysV import register layout overlaps".to_owned());
+                }
+                occupied.push(start);
+                preserved.push(start);
+            }
+        }
+        Ok((rax, rdi, rsp, preserved))
+    })();
+    let (rax, rdi, rsp, preserved) = match registers {
+        Ok(registers) => registers,
+        Err(reason) => {
+            stop_site(
+                sites,
+                &source.source_address,
+                Some(operation_index),
+                PcodeCfgLlvmStatus::Call,
+                reason,
+            );
+            body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+            return Ok(());
+        }
+    };
+    if context.process.is_none() || context.allocations.is_none() {
+        return Err("import LLVM contract requires process and allocations".to_owned());
+    }
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(operation_index),
+        PcodeCfgLlvmStatus::CallDepth,
+        "call depth budget exhausted",
+    );
+    stop_site(
+        sites,
+        &source.source_address,
+        Some(operation_index),
+        PcodeCfgLlvmStatus::Call,
+        "strlen requires known SysV arguments, a matching declared return slot, and a mapped known NUL-terminated string of at most 4096 bytes",
+    );
+    body.push_str(&format!(
+        "  %import_depth_{id} = load i32, ptr %call_depth\n\
+         %import_full_{id} = icmp uge i32 %import_depth_{id}, {}\n\
+         br i1 %import_full_{id}, label %stop_call_depth, label %import_run_{id}\n\
+         import_run_{id}:\n\
+         %import_result_{id} = call {{ i64, i1 }} @hydir_import_strlen(ptr %state, ptr %known, ptr %process_bytes, ptr %process_known, ptr %guest_ram, ptr %guest_known, i64 %guest_base, i64 %guest_len, ptr %heap_ram, ptr %heap_known, i64 %heap_base, i64 %heap_len, i64 {}, i64 {}, i64 {continuation})\n\
+         %import_length_{id} = extractvalue {{ i64, i1 }} %import_result_{id}, 0\n\
+         %import_ok_{id} = extractvalue {{ i64, i1 }} %import_result_{id}, 1\n\
+         br i1 %import_ok_{id}, label %import_apply_{id}, label %stop_call\n\
+         import_apply_{id}:\n\
+         %import_rsp_{id} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 8)\n\
+         %import_rsp_next_{id} = add i64 %import_rsp_{id}, 8\n",
+        context.max_call_depth,
+        offset(&rdi.offset)?,
+        offset(&rsp.offset)?,
+        pcode_space_id("register")?,
+        offset(&rsp.offset)?,
+    ));
+    for byte in byte_map.iter().filter(|byte| byte.space == "register") {
+        let address = offset(&byte.offset)?;
+        if preserved
+            .iter()
+            .any(|start| address >= *start && address - *start < 8)
+        {
+            continue;
+        }
+        body.push_str(&format!(
+            "  %import_unknown_ptr_{id}_{} = getelementptr i8, ptr %known, i64 {}\n\
+             store i8 0, ptr %import_unknown_ptr_{id}_{}\n",
+            byte.index, byte.index, byte.index,
+        ));
+    }
+    let register_space = pcode_space_id("register")?;
+    body.push_str(&format!(
+        "  call void @hydir_write_varnode(ptr %state, i32 {register_space}, i64 {}, i32 8, i64 %import_length_{id})\n\
+         call void @hydir_write_varnode(ptr %known, i32 {register_space}, i64 {}, i32 8, i64 -1)\n\
+         call void @hydir_write_varnode(ptr %state, i32 {register_space}, i64 {}, i32 8, i64 %import_rsp_next_{id})\n\
+         call void @hydir_write_varnode(ptr %known, i32 {register_space}, i64 {}, i32 8, i64 -1)\n",
+        offset(&rax.offset)?,
+        offset(&rax.offset)?,
+        offset(&rsp.offset)?,
+        offset(&rsp.offset)?,
+    ));
+    body.push_str(&log_event(
+        id,
+        &format!("%count_{id}"),
+        "import",
+        &format!("ins_{return_index}"),
+    ));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_interprocedural_call(
     context: &CallLlvmContext<'_>,
@@ -319,6 +535,7 @@ fn emit_interprocedural_call(
     id: usize,
     index: &BTreeMap<(String, u64), usize>,
     caller_index: &BTreeMap<(String, u64), usize>,
+    byte_map: &[PcodeStateByte],
     body: &mut String,
     sites: &mut Vec<PcodeCfgLlvmStopSite>,
 ) -> Result<(), String> {
@@ -447,6 +664,47 @@ fn emit_interprocedural_call(
         body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
         return Ok(());
     }
+    if !indirect
+        && let Some(import) = context
+            .imports
+            .as_ref()
+            .and_then(|indices| indices.get(owner))
+            .and_then(|index| {
+                index.calls.iter().find(|call| {
+                    call.call_site == *site
+                        && offset(&call.plt_target.offset).ok().is_some_and(|address| {
+                            Some((call.plt_target.space.clone(), address)) == target_key
+                        })
+                })
+            })
+    {
+        return emit_interprocedural_import_call(
+            context,
+            snapshot,
+            import,
+            source,
+            operation_index,
+            id,
+            return_index,
+            continuation_key.1,
+            byte_map,
+            body,
+            sites,
+        );
+    }
+    if let (Some(process), Some((space, address))) = (context.process, target_key.as_ref())
+        && !internal_process_call_target(snapshot, process, space, *address)
+    {
+        stop_site(
+            sites,
+            &source.source_address,
+            Some(operation_index),
+            PcodeCfgLlvmStatus::Call,
+            "CALL target is not a loaded internal executable ELF function",
+        );
+        body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
+        return Ok(());
+    }
     let routes = context
         .snapshots
         .iter()
@@ -458,6 +716,9 @@ fn emit_interprocedural_call(
                 || evidence_target
                     .as_ref()
                     .is_some_and(|target| target != &key)
+                || context.process.is_some_and(|process| {
+                    !internal_process_call_target(snapshot, process, &key.0, key.1)
+                })
             {
                 return None;
             }
@@ -470,13 +731,6 @@ fn emit_interprocedural_call(
         Some(operation_index),
         PcodeCfgLlvmStatus::CallDepth,
         "call depth budget exhausted",
-    );
-    stop_site(
-        sites,
-        &source.source_address,
-        Some(operation_index),
-        PcodeCfgLlvmStatus::RecursiveCall,
-        "recursive call requires a separate bounded model",
     );
     let target_value =
         if indirect {
@@ -530,7 +784,11 @@ fn emit_interprocedural_call(
             &source.source_address,
             Some(operation_index),
             PcodeCfgLlvmStatus::Call,
-            "CALLIND target is not a loaded, evidenced callee",
+            if context.process.is_some() {
+                "CALLIND target is not a loaded, evidenced internal ELF callee"
+            } else {
+                "CALLIND target is not a loaded, evidenced callee"
+            },
         );
     } else if let Some((_, callee)) = routes.first() {
         body.push_str(&format!("  br label %call_route_{id}_{callee}\n"));
@@ -540,15 +798,18 @@ fn emit_interprocedural_call(
             &source.source_address,
             Some(operation_index),
             PcodeCfgLlvmStatus::Call,
-            "CALL callee snapshot is unavailable",
+            if context.process.is_some() {
+                "CALL target is not a loaded internal executable ELF function"
+            } else {
+                "CALL callee snapshot is unavailable"
+            },
         );
         body.push_str(&branch_to_stop(PcodeCfgLlvmStatus::Call));
     }
     for (_, callee_index) in routes {
-        let callee_owner = context.owners[callee_index];
         body.push_str(&format!(
-            "call_route_{id}_{callee_index}:\n  %active_ptr_{id}_{callee_index} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {callee_owner}\n  %active_value_{id}_{callee_index} = load i8, ptr %active_ptr_{id}_{callee_index}\n  %recursive_{id}_{callee_index} = icmp ne i8 %active_value_{id}_{callee_index}, 0\n  br i1 %recursive_{id}_{callee_index}, label %{}, label %call_enter_{id}_{callee_index}\ncall_enter_{id}_{callee_index}:\n  store i8 1, ptr %active_ptr_{id}_{callee_index}\n  %return_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %depth_{id}\n  store i32 {return_index}, ptr %return_slot_{id}_{callee_index}\n  %address_slot_{id}_{callee_index} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %depth_{id}\n  store i64 {}, ptr %address_slot_{id}_{callee_index}\n  %width_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_widths, i32 0, i32 %depth_{id}\n  store i32 {continuation_width}, ptr %width_slot_{id}_{callee_index}\n  %depth_next_{id}_{callee_index} = add i32 %depth_{id}, 1\n  store i32 %depth_next_{id}_{callee_index}, ptr %call_depth\n",
-            stop_label(PcodeCfgLlvmStatus::RecursiveCall), continuation_key.1
+            "call_route_{id}_{callee_index}:\n  %return_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %depth_{id}\n  store i32 {return_index}, ptr %return_slot_{id}_{callee_index}\n  %address_slot_{id}_{callee_index} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %depth_{id}\n  store i64 {}, ptr %address_slot_{id}_{callee_index}\n  %width_slot_{id}_{callee_index} = getelementptr [16 x i32], ptr %return_widths, i32 0, i32 %depth_{id}\n  store i32 {continuation_width}, ptr %width_slot_{id}_{callee_index}\n  %depth_next_{id}_{callee_index} = add i32 %depth_{id}, 1\n  store i32 %depth_next_{id}_{callee_index}, ptr %call_depth\n",
+            continuation_key.1
         ));
         body.push_str(&log_event(
             id,
@@ -563,7 +824,6 @@ fn emit_interprocedural_call(
 fn emit_interprocedural_return(
     source: &PcodeOperation,
     id: usize,
-    owner: usize,
     return_sites: &BTreeSet<usize>,
     body: &mut String,
     sites: &mut Vec<PcodeCfgLlvmStopSite>,
@@ -628,7 +888,7 @@ fn emit_interprocedural_return(
         name
     };
     body.push_str(&format!(
-        "  %return_address_slot_{id} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %return_prev_{id}\n  %return_expected_{id} = load i64, ptr %return_address_slot_{id}\n  %return_matches_{id} = icmp eq i64 {value}, %return_expected_{id}\n  br i1 %return_matches_{id}, label %return_dispatch_{id}, label %{}\nreturn_dispatch_{id}:\n  store i32 %return_prev_{id}, ptr %call_depth\n  %returned_active_{id} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {owner}\n  store i8 0, ptr %returned_active_{id}\n  %return_site_slot_{id} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %return_prev_{id}\n  %return_site_{id} = load i32, ptr %return_site_slot_{id}\n  switch i32 %return_site_{id}, label %{} [\n",
+        "  %return_address_slot_{id} = getelementptr [16 x i64], ptr %return_addresses, i32 0, i32 %return_prev_{id}\n  %return_expected_{id} = load i64, ptr %return_address_slot_{id}\n  %return_matches_{id} = icmp eq i64 {value}, %return_expected_{id}\n  br i1 %return_matches_{id}, label %return_dispatch_{id}, label %{}\nreturn_dispatch_{id}:\n  store i32 %return_prev_{id}, ptr %call_depth\n  %return_site_slot_{id} = getelementptr [16 x i32], ptr %return_sites, i32 0, i32 %return_prev_{id}\n  %return_site_{id} = load i32, ptr %return_site_slot_{id}\n  switch i32 %return_site_{id}, label %{} [\n",
         stop_label(PcodeCfgLlvmStatus::ReturnMismatch),
         stop_label(PcodeCfgLlvmStatus::ReturnMismatch)
     ));
@@ -724,7 +984,7 @@ fn memory_layout<'a>(
     };
     if !matches!(value.space.as_str(), "register" | "unique" | "const")
         || kind == MemoryKind::Load && value.space == "const"
-        || !(1..=8).contains(&value.size)
+        || !(1..=16).contains(&value.size)
         || space.addressable_unit_size == 0
     {
         return Err(invalid("memory value width or state space is unsupported"));
@@ -833,6 +1093,49 @@ fn validate_image_window(
     })
 }
 
+fn validate_process_memory(
+    snapshot: &GhidraSnapshot,
+    process: &PcodeElfProcessMemory,
+) -> Result<PcodeCfgLlvmProcessBinding, String> {
+    process.validate_for_snapshot(snapshot)?;
+    let space = snapshot
+        .address_spaces
+        .iter()
+        .find(|space| space.name == process.space() && space.space_type == 1)
+        .ok_or("ELF process memory space is not a Ghidra RAM space")?;
+    if space.id < 0 {
+        return Err("ELF process memory space ID is negative".into());
+    }
+    let len = process.bytes().len();
+    process
+        .base()
+        .checked_add(len as u64 - 1)
+        .ok_or("ELF process memory address range overflows u64")?;
+    let mut digest = Sha256::new();
+    digest.update(process.bytes());
+    digest.update(process.known());
+    digest.update(process.mapped());
+    digest.update(process.writable());
+    Ok(PcodeCfgLlvmProcessBinding {
+        space: process.space().to_owned(),
+        base: process.base(),
+        byte_len: len,
+        known_byte_count: process.known().iter().filter(|byte| **byte == 0xff).count(),
+        mapped_byte_count: process
+            .mapped()
+            .iter()
+            .filter(|byte| **byte == 0xff)
+            .count(),
+        writable_byte_count: process
+            .writable()
+            .iter()
+            .filter(|byte| **byte == 0xff)
+            .count(),
+        unresolved_relocation_bytes: process.unresolved_relocation_bytes(),
+        contents_sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
 fn encode_llvm_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut literal = String::with_capacity(bytes.len() * 3);
@@ -852,12 +1155,286 @@ fn image_globals(image: &PcodeReadOnlyElfWindow) -> String {
     )
 }
 
+fn process_globals(process: &PcodeElfProcessMemory) -> String {
+    let len = process.bytes().len();
+    format!(
+        "@hydir_process_initial_bytes = private constant [{len} x i8] c\"{}\"\n\
+         @hydir_process_initial_known = private constant [{len} x i8] c\"{}\"\n\
+         @hydir_process_mapped = private constant [{len} x i8] c\"{}\"\n\
+         @hydir_process_writable = private constant [{len} x i8] c\"{}\"\n\n",
+        encode_llvm_bytes(process.bytes()),
+        encode_llvm_bytes(process.known()),
+        encode_llvm_bytes(process.mapped()),
+        encode_llvm_bytes(process.writable()),
+    )
+}
+
+/// The result is valid only when every argument, return-slot, and string byte
+/// is known in the same sparse process contract used by Rust execution.
+fn import_strlen_helper(process: &PcodeElfProcessMemory) -> String {
+    r#"
+define { i64, i1 } @hydir_import_strlen(ptr %state, ptr %known, ptr %process_bytes, ptr %process_known, ptr %stack_ram, ptr %stack_known, i64 %stack_base, i64 %stack_len, ptr %heap_ram, ptr %heap_known, i64 %heap_base, i64 %heap_len, i64 %rdi_offset, i64 %rsp_offset, i64 %continuation) {
+entry:
+  %rdi_mask = call i64 @hydir_read_varnode(ptr %known, i32 1, i64 %rdi_offset, i32 8)
+  %rsp_mask = call i64 @hydir_read_varnode(ptr %known, i32 1, i64 %rsp_offset, i32 8)
+  %rdi_known = icmp eq i64 %rdi_mask, -1
+  %rsp_known = icmp eq i64 %rsp_mask, -1
+  %arguments_known = and i1 %rdi_known, %rsp_known
+  br i1 %arguments_known, label %return_slot, label %fail
+return_slot:
+  %pointer = call i64 @hydir_read_varnode(ptr %state, i32 1, i64 %rdi_offset, i32 8)
+  %rsp = call i64 @hydir_read_varnode(ptr %state, i32 1, i64 %rsp_offset, i32 8)
+  %rsp_above = icmp uge i64 %rsp, %stack_base
+  %rsp_relative = sub i64 %rsp, %stack_base
+  %stack_has_slot = icmp uge i64 %stack_len, 8
+  %slot_last = sub i64 %stack_len, 8
+  %slot_inside = icmp ule i64 %rsp_relative, %slot_last
+  %slot_ge = and i1 %rsp_above, %stack_has_slot
+  %slot_valid = and i1 %slot_ge, %slot_inside
+  br i1 %slot_valid, label %read_return, label %fail
+read_return:
+  %return_known_ptr = getelementptr i8, ptr %stack_known, i64 %rsp_relative
+  %return_known = load i64, ptr %return_known_ptr, align 1
+  %return_known_ok = icmp eq i64 %return_known, -1
+  %return_ptr = getelementptr i8, ptr %stack_ram, i64 %rsp_relative
+  %return_value = load i64, ptr %return_ptr, align 1
+  %return_matches = icmp eq i64 %return_value, %continuation
+  %return_ok = and i1 %return_known_ok, %return_matches
+  br i1 %return_ok, label %scan, label %fail
+scan:
+  %index = phi i64 [ 0, %read_return ], [ %next, %advance ]
+  %within_budget = icmp ult i64 %index, 4096
+  br i1 %within_budget, label %address_step, label %fail
+address_step:
+  %addition = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %pointer, i64 %index)
+  %address = extractvalue { i64, i1 } %addition, 0
+  %overflow = extractvalue { i64, i1 } %addition, 1
+  br i1 %overflow, label %fail, label %select_memory
+select_memory:
+  %process_above = icmp uge i64 %address, __PROCESS_BASE__
+  %process_relative = sub i64 %address, __PROCESS_BASE__
+  %process_inside = icmp ult i64 %process_relative, __PROCESS_LEN__
+  %in_process = and i1 %process_above, %process_inside
+  br i1 %in_process, label %check_process, label %check_stack
+check_process:
+  %mapped_ptr = getelementptr [__PROCESS_LEN__ x i8], ptr @hydir_process_mapped, i64 0, i64 %process_relative
+  %mapped = load i8, ptr %mapped_ptr
+  %process_known_ptr = getelementptr i8, ptr %process_known, i64 %process_relative
+  %process_known_byte = load i8, ptr %process_known_ptr
+  %mapped_ok = icmp eq i8 %mapped, -1
+  %process_known_ok = icmp eq i8 %process_known_byte, -1
+  %process_ok = and i1 %mapped_ok, %process_known_ok
+  br i1 %process_ok, label %read_process, label %fail
+read_process:
+  %process_ptr = getelementptr i8, ptr %process_bytes, i64 %process_relative
+  %process_byte = load i8, ptr %process_ptr
+  br label %check_zero
+check_stack:
+  %stack_above = icmp uge i64 %address, %stack_base
+  %stack_relative = sub i64 %address, %stack_base
+  %stack_inside = icmp ult i64 %stack_relative, %stack_len
+  %in_stack = and i1 %stack_above, %stack_inside
+  br i1 %in_stack, label %check_stack_known, label %check_heap
+check_stack_known:
+  %stack_known_ptr = getelementptr i8, ptr %stack_known, i64 %stack_relative
+  %stack_known_byte = load i8, ptr %stack_known_ptr
+  %stack_ok = icmp eq i8 %stack_known_byte, -1
+  br i1 %stack_ok, label %read_stack, label %fail
+read_stack:
+  %stack_ptr = getelementptr i8, ptr %stack_ram, i64 %stack_relative
+  %stack_byte = load i8, ptr %stack_ptr
+  br label %check_zero
+check_heap:
+  %heap_above = icmp uge i64 %address, %heap_base
+  %heap_relative = sub i64 %address, %heap_base
+  %heap_inside = icmp ult i64 %heap_relative, %heap_len
+  %in_heap = and i1 %heap_above, %heap_inside
+  br i1 %in_heap, label %check_heap_known, label %fail
+check_heap_known:
+  %heap_known_ptr = getelementptr i8, ptr %heap_known, i64 %heap_relative
+  %heap_known_byte = load i8, ptr %heap_known_ptr
+  %heap_ok = icmp eq i8 %heap_known_byte, -1
+  br i1 %heap_ok, label %read_heap, label %fail
+read_heap:
+  %heap_ptr = getelementptr i8, ptr %heap_ram, i64 %heap_relative
+  %heap_byte = load i8, ptr %heap_ptr
+  br label %check_zero
+check_zero:
+  %byte = phi i8 [ %process_byte, %read_process ], [ %stack_byte, %read_stack ], [ %heap_byte, %read_heap ]
+  %terminal = icmp eq i8 %byte, 0
+  br i1 %terminal, label %success, label %advance
+advance:
+  %next = add i64 %index, 1
+  br label %scan
+success:
+  %result_length = insertvalue { i64, i1 } undef, i64 %index, 0
+  %result_ok = insertvalue { i64, i1 } %result_length, i1 true, 1
+  ret { i64, i1 } %result_ok
+fail:
+  ret { i64, i1 } { i64 0, i1 false }
+}
+"#
+    .replace("__PROCESS_BASE__", &process.base().to_string())
+    .replace("__PROCESS_LEN__", &process.bytes().len().to_string())
+}
+
+fn emit_process_memory_value(
+    layout: &MemoryLayout<'_>,
+    id: usize,
+    body: &mut String,
+    next_label: &str,
+    process: &PcodeElfProcessMemory,
+    strict_allocations: bool,
+) -> Result<(), String> {
+    let len = process.bytes().len();
+    let load_bits = if layout.width > 8 { 128 } else { 64 };
+    let load_writer = if layout.width > 8 {
+        "hydir_write_varnode_wide"
+    } else {
+        "hydir_write_varnode"
+    };
+    body.push_str(&format!("process_memory_value_{id}:\n"));
+    let mut mapped_checks = Vec::new();
+    let mut read_only_checks = Vec::new();
+    let mut known_checks = Vec::new();
+    for byte in 0..layout.width {
+        body.push_str(&format!(
+            "  %process_index_{id}_{byte} = add i64 %process_relative_{id}, {byte}\n\
+             %process_map_ptr_{id}_{byte} = getelementptr [{len} x i8], ptr @hydir_process_mapped, i64 0, i64 %process_index_{id}_{byte}\n\
+             %process_map_byte_{id}_{byte} = load i8, ptr %process_map_ptr_{id}_{byte}\n\
+             %process_map_ok_{id}_{byte} = icmp eq i8 %process_map_byte_{id}_{byte}, -1\n\
+             %process_known_ptr_{id}_{byte} = getelementptr i8, ptr %process_known, i64 %process_index_{id}_{byte}\n"
+        ));
+        mapped_checks.push(format!("%process_map_ok_{id}_{byte}"));
+        if layout.kind == MemoryKind::Store {
+            body.push_str(&format!(
+                "  %process_write_ptr_{id}_{byte} = getelementptr [{len} x i8], ptr @hydir_process_writable, i64 0, i64 %process_index_{id}_{byte}\n\
+                 %process_write_byte_{id}_{byte} = load i8, ptr %process_write_ptr_{id}_{byte}\n\
+                 %process_write_denied_{id}_{byte} = icmp eq i8 %process_write_byte_{id}_{byte}, 0\n\
+                 %process_read_only_{id}_{byte} = and i1 %process_map_ok_{id}_{byte}, %process_write_denied_{id}_{byte}\n"
+            ));
+            read_only_checks.push(format!("%process_read_only_{id}_{byte}"));
+        } else {
+            body.push_str(&format!(
+                "  %process_known_byte_{id}_{byte} = load i8, ptr %process_known_ptr_{id}_{byte}\n\
+                 %process_known_ok_{id}_{byte} = icmp eq i8 %process_known_byte_{id}_{byte}, -1\n"
+            ));
+            known_checks.push(format!("%process_known_ok_{id}_{byte}"));
+        }
+    }
+    if layout.kind == MemoryKind::Store {
+        let mut any_read_only = read_only_checks[0].clone();
+        for (byte, check) in read_only_checks.iter().enumerate().skip(1) {
+            let name = format!("%process_any_read_only_{id}_{byte}");
+            body.push_str(&format!("  {name} = or i1 {any_read_only}, {check}\n"));
+            any_read_only = name;
+        }
+        body.push_str(&format!(
+            "  br i1 {any_read_only}, label %stop_memory_read_only, label %process_read_only_clear_{id}\n\
+             process_read_only_clear_{id}:\n"
+        ));
+    }
+    emit_known_guard(
+        &mapped_checks,
+        &format!("process_mapped_{id}"),
+        body,
+        &format!("process_mapped_ready_{id}"),
+        if strict_allocations && layout.kind == MemoryKind::Store {
+            PcodeCfgLlvmStatus::MemoryUnmappedWrite
+        } else {
+            PcodeCfgLlvmStatus::MemoryUnknownBytes
+        },
+    );
+    body.push_str(&format!("process_mapped_ready_{id}:\n"));
+    if layout.kind == MemoryKind::Store {
+        let data = layout.value;
+        if let Some(check) = known_check(data, &format!("process_store_data_{id}"), body)? {
+            body.push_str(&format!(
+                "  br i1 {check}, label %process_store_{id}, label %stop_unknown\n"
+            ));
+        } else {
+            body.push_str(&format!("  br label %process_store_{id}\n"));
+        }
+        body.push_str(&format!("process_store_{id}:\n"));
+        let value = if data.space == "const" {
+            let bits = data.size * 8;
+            let mask = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            format!("{}", offset(&data.offset)? & mask)
+        } else {
+            body.push_str(&format!(
+                "  %process_store_value_{id} = call i{load_bits} @{}(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                if load_bits == 128 { "hydir_read_varnode_wide" } else { "hydir_read_varnode" },
+                pcode_space_id(&data.space)?, pcode_offset(data)?, data.size
+            ));
+            format!("%process_store_value_{id}")
+        };
+        for byte in 0..layout.width {
+            body.push_str(&format!(
+                "  %process_shifted_{id}_{byte} = lshr i{load_bits} {value}, {}\n\
+                 %process_store_byte_{id}_{byte} = trunc i{load_bits} %process_shifted_{id}_{byte} to i8\n\
+                 %process_byte_ptr_{id}_{byte} = getelementptr i8, ptr %process_bytes, i64 %process_index_{id}_{byte}\n\
+                 store i8 %process_store_byte_{id}_{byte}, ptr %process_byte_ptr_{id}_{byte}\n\
+                 store i8 -1, ptr %process_known_ptr_{id}_{byte}\n",
+                byte * 8
+            ));
+        }
+    } else {
+        emit_known_guard(
+            &known_checks,
+            &format!("process_known_{id}"),
+            body,
+            &format!("process_load_{id}"),
+            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+        );
+        body.push_str(&format!("process_load_{id}:\n"));
+        let mut previous = None::<String>;
+        for byte in 0..layout.width {
+            body.push_str(&format!(
+                "  %process_byte_ptr_{id}_{byte} = getelementptr i8, ptr %process_bytes, i64 %process_index_{id}_{byte}\n\
+                 %process_byte_{id}_{byte} = load i8, ptr %process_byte_ptr_{id}_{byte}\n\
+                 %process_wide_{id}_{byte} = zext i8 %process_byte_{id}_{byte} to i{load_bits}\n\
+                 %process_part_{id}_{byte} = shl i{load_bits} %process_wide_{id}_{byte}, {}\n",
+                byte * 8
+            ));
+            let part = format!("%process_part_{id}_{byte}");
+            previous = Some(if let Some(previous) = previous {
+                let name = format!("%process_acc_{id}_{byte}");
+                body.push_str(&format!("  {name} = or i{load_bits} {previous}, {part}\n"));
+                name
+            } else {
+                part
+            });
+        }
+        let result = previous.expect("memory width checked nonzero");
+        let output_space = pcode_space_id(&layout.value.space)?;
+        let output_offset = pcode_offset(layout.value)?;
+        body.push_str(&format!(
+            "  call void @{load_writer}(ptr %state, i32 {output_space}, i64 {output_offset}, i32 {}, i{load_bits} {result})\n\
+             call void @{load_writer}(ptr %known, i32 {output_space}, i64 {output_offset}, i32 {}, i{load_bits} -1)\n",
+            layout.width, layout.width
+        ));
+    }
+    body.push_str(&log_event(
+        id,
+        &format!("%count_{id}"),
+        "process_memory",
+        next_label,
+    ));
+    Ok(())
+}
+
 fn emit_memory_operation(
     layout: &MemoryLayout<'_>,
     id: usize,
     body: &mut String,
     next_label: &str,
     image: Option<&PcodeReadOnlyElfWindow>,
+    process: Option<&PcodeElfProcessMemory>,
+    allocations: Option<&PcodeProcessAllocations>,
 ) -> Result<(), String> {
     let space_id = layout.space.id;
     let load_bits = if layout.width > 8 { 128 } else { 64 };
@@ -901,7 +1478,82 @@ fn emit_memory_operation(
         "  %scaled_{id} = call {{ i64, i1 }} @llvm.umul.with.overflow.i64(i64 {pointer}, i64 {unit})\n  %byte_address_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 0\n  %scale_overflow_{id} = extractvalue {{ i64, i1 }} %scaled_{id}, 1\n  %last_{id} = call {{ i64, i1 }} @llvm.uadd.with.overflow.i64(i64 %byte_address_{id}, i64 {last})\n  %end_overflow_{id} = extractvalue {{ i64, i1 }} %last_{id}, 1\n  %address_overflow_{id} = or i1 %scale_overflow_{id}, %end_overflow_{id}\n  br i1 %address_overflow_{id}, label %stop_memory_overflow, label %memory_bounds_{id}\nmemory_bounds_{id}:\n  %below_base_{id} = icmp ult i64 %byte_address_{id}, %guest_base\n  %relative_{id} = sub i64 %byte_address_{id}, %guest_base\n  %enough_{id} = icmp uge i64 %guest_len, {}\n  %last_start_{id} = sub i64 %guest_len, {}\n  %inside_{id} = icmp ule i64 %relative_{id}, %last_start_{id}\n  %room_{id} = and i1 %enough_{id}, %inside_{id}\n  %not_below_{id} = xor i1 %below_base_{id}, true\n  %in_bounds_{id} = and i1 %room_{id}, %not_below_{id}\n",
         layout.width, layout.width
     ));
-    if let Some(image) = image.filter(|image| image.space() == layout.space.name) {
+    // Rust checks every read-only byte before checking whether the complete
+    // STORE is mapped. Do the same even when a write straddles the process
+    // span boundary, without ever indexing the embedded masks out of range.
+    if let Some(process) =
+        process.filter(|_| allocations.is_some() && layout.kind == MemoryKind::Store)
+    {
+        let len = process.bytes().len();
+        let mut any_read_only = String::new();
+        for byte in 0..layout.width {
+            body.push_str(&format!(
+                "  %pre_addr_{id}_{byte} = add i64 %byte_address_{id}, {byte}\n\
+                   %pre_ge_{id}_{byte} = icmp uge i64 %pre_addr_{id}_{byte}, {}\n\
+                   %pre_relative_{id}_{byte} = sub i64 %pre_addr_{id}_{byte}, {}\n\
+                   %pre_lt_{id}_{byte} = icmp ult i64 %pre_relative_{id}_{byte}, {len}\n\
+                   %pre_in_{id}_{byte} = and i1 %pre_ge_{id}_{byte}, %pre_lt_{id}_{byte}\n\
+                   %pre_safe_{id}_{byte} = select i1 %pre_in_{id}_{byte}, i64 %pre_relative_{id}_{byte}, i64 0\n\
+                   %pre_map_ptr_{id}_{byte} = getelementptr [{len} x i8], ptr @hydir_process_mapped, i64 0, i64 %pre_safe_{id}_{byte}\n\
+                   %pre_map_{id}_{byte} = load i8, ptr %pre_map_ptr_{id}_{byte}\n\
+                   %pre_write_ptr_{id}_{byte} = getelementptr [{len} x i8], ptr @hydir_process_writable, i64 0, i64 %pre_safe_{id}_{byte}\n\
+                   %pre_write_{id}_{byte} = load i8, ptr %pre_write_ptr_{id}_{byte}\n\
+                   %pre_mapped_{id}_{byte} = icmp eq i8 %pre_map_{id}_{byte}, -1\n\
+                   %pre_denied_{id}_{byte} = icmp eq i8 %pre_write_{id}_{byte}, 0\n\
+                   %pre_readonly_map_{id}_{byte} = and i1 %pre_mapped_{id}_{byte}, %pre_denied_{id}_{byte}\n\
+                   %pre_readonly_{id}_{byte} = and i1 %pre_in_{id}_{byte}, %pre_readonly_map_{id}_{byte}\n",
+                process.base(), process.base()
+            ));
+            let check = format!("%pre_readonly_{id}_{byte}");
+            if any_read_only.is_empty() {
+                any_read_only = check;
+            } else {
+                let next = format!("%pre_any_readonly_{id}_{byte}");
+                body.push_str(&format!("  {next} = or i1 {any_read_only}, {check}\n"));
+                any_read_only = next;
+            }
+        }
+        body.push_str(&format!(
+            "  br i1 {any_read_only}, label %stop_memory_read_only, label %memory_route_{id}\nmemory_route_{id}:\n"
+        ));
+    }
+    if let Some(process) =
+        process.filter(|process| allocations.is_some() && process.space() == layout.space.name)
+    {
+        let len = process.bytes().len();
+        let enough = len >= layout.width as usize;
+        let last_start = len.saturating_sub(layout.width as usize);
+        let outside = if layout.kind == MemoryKind::Store {
+            stop_label(PcodeCfgLlvmStatus::MemoryUnmappedWrite)
+        } else {
+            stop_label(PcodeCfgLlvmStatus::MemoryUnknownBytes)
+        };
+        body.push_str(&format!(
+            "  br i1 %in_bounds_{id}, label %memory_stack_value_{id}, label %memory_heap_bounds_{id}\n\
+             memory_heap_bounds_{id}:\n  %heap_below_{id} = icmp ult i64 %byte_address_{id}, %heap_base\n\
+               %heap_relative_{id} = sub i64 %byte_address_{id}, %heap_base\n\
+               %heap_enough_{id} = icmp uge i64 %heap_len, {}\n\
+               %heap_last_start_{id} = sub i64 %heap_len, {}\n\
+               %heap_inside_{id} = icmp ule i64 %heap_relative_{id}, %heap_last_start_{id}\n\
+               %heap_not_below_{id} = xor i1 %heap_below_{id}, true\n\
+               %heap_candidate_{id} = and i1 %heap_inside_{id}, %heap_not_below_{id}\n\
+               %heap_room_{id} = and i1 %heap_candidate_{id}, %heap_enough_{id}\n\
+               br i1 %heap_room_{id}, label %memory_heap_value_{id}, label %memory_process_bounds_{id}\n\
+             memory_process_bounds_{id}:\n  %process_below_{id} = icmp ult i64 %byte_address_{id}, {}\n\
+               %process_relative_{id} = sub i64 %byte_address_{id}, {}\n\
+               %process_inside_{id} = icmp ule i64 %process_relative_{id}, {last_start}\n\
+               %process_not_below_{id} = xor i1 %process_below_{id}, true\n\
+               %process_candidate_{id} = and i1 %process_inside_{id}, %process_not_below_{id}\n\
+               %process_in_bounds_{id} = and i1 %process_candidate_{id}, {enough}\n\
+               br i1 %process_in_bounds_{id}, label %process_memory_value_{id}, label %{outside}\n\
+             memory_stack_value_{id}:\n  br label %memory_value_{id}\n\
+             memory_heap_value_{id}:\n  br label %memory_value_{id}\n\
+             memory_value_{id}:\n  %active_relative_{id} = phi i64 [ %relative_{id}, %memory_stack_value_{id} ], [ %heap_relative_{id}, %memory_heap_value_{id} ]\n\
+               %active_ram_{id} = phi ptr [ %guest_ram, %memory_stack_value_{id} ], [ %heap_ram, %memory_heap_value_{id} ]\n\
+               %active_known_{id} = phi ptr [ %guest_known, %memory_stack_value_{id} ], [ %heap_known, %memory_heap_value_{id} ]\n",
+            layout.width, layout.width, process.base(), process.base()
+        ));
+    } else if let Some(image) = image.filter(|image| image.space() == layout.space.name) {
         let image_len = image.bytes().len();
         let enough = image_len >= layout.width as usize;
         let last_start = image_len.saturating_sub(layout.width as usize);
@@ -909,17 +1561,48 @@ fn emit_memory_operation(
             "  br i1 %in_bounds_{id}, label %memory_value_{id}, label %memory_image_bounds_{id}\nmemory_image_bounds_{id}:\n  %image_below_{id} = icmp ult i64 %byte_address_{id}, {}\n  %image_relative_{id} = sub i64 %byte_address_{id}, {}\n  %image_inside_{id} = icmp ule i64 %image_relative_{id}, {last_start}\n  %image_not_below_{id} = xor i1 %image_below_{id}, true\n  %image_candidate_{id} = and i1 %image_inside_{id}, %image_not_below_{id}\n  %image_in_bounds_{id} = and i1 %image_candidate_{id}, {}\n  br i1 %image_in_bounds_{id}, label %memory_image_value_{id}, label %stop_memory_bounds\nmemory_value_{id}:\n",
             image.base(), image.base(), enough
         ));
+    } else if let Some(process) = process.filter(|process| process.space() == layout.space.name) {
+        let len = process.bytes().len();
+        let enough = len >= layout.width as usize;
+        let last_start = len.saturating_sub(layout.width as usize);
+        body.push_str(&format!(
+            "  br i1 %in_bounds_{id}, label %memory_value_{id}, label %memory_process_bounds_{id}\n\
+             memory_process_bounds_{id}:\n  %process_below_{id} = icmp ult i64 %byte_address_{id}, {}\n\
+               %process_relative_{id} = sub i64 %byte_address_{id}, {}\n\
+               %process_inside_{id} = icmp ule i64 %process_relative_{id}, {last_start}\n\
+               %process_not_below_{id} = xor i1 %process_below_{id}, true\n\
+               %process_candidate_{id} = and i1 %process_inside_{id}, %process_not_below_{id}\n\
+               %process_in_bounds_{id} = and i1 %process_candidate_{id}, {}\n\
+               br i1 %process_in_bounds_{id}, label %process_memory_value_{id}, label %stop_memory_bounds\n\
+             memory_value_{id}:\n",
+            process.base(), process.base(), enough
+        ));
     } else {
         body.push_str(&format!(
             "  br i1 %in_bounds_{id}, label %memory_value_{id}, label %stop_memory_bounds\nmemory_value_{id}:\n"
         ));
     }
+    let guest_relative = if allocations.is_some() {
+        format!("%active_relative_{id}")
+    } else {
+        format!("%relative_{id}")
+    };
+    let guest_ram = if allocations.is_some() {
+        format!("%active_ram_{id}")
+    } else {
+        "%guest_ram".into()
+    };
+    let guest_known = if allocations.is_some() {
+        format!("%active_known_{id}")
+    } else {
+        "%guest_known".into()
+    };
     match layout.kind {
         MemoryKind::Load => {
             let mut known_checks = Vec::new();
             for byte in 0..layout.width {
                 body.push_str(&format!(
-                    "  %relative_{id}_{byte} = add i64 %relative_{id}, {byte}\n  %guest_known_ptr_{id}_{byte} = getelementptr i8, ptr %guest_known, i64 %relative_{id}_{byte}\n  %guest_known_byte_{id}_{byte} = load i8, ptr %guest_known_ptr_{id}_{byte}\n  %guest_byte_ok_{id}_{byte} = icmp eq i8 %guest_known_byte_{id}_{byte}, -1\n"
+                    "  %relative_{id}_{byte} = add i64 {guest_relative}, {byte}\n  %guest_known_ptr_{id}_{byte} = getelementptr i8, ptr {guest_known}, i64 %relative_{id}_{byte}\n  %guest_known_byte_{id}_{byte} = load i8, ptr %guest_known_ptr_{id}_{byte}\n  %guest_byte_ok_{id}_{byte} = icmp eq i8 %guest_known_byte_{id}_{byte}, -1\n"
                 ));
                 known_checks.push(format!("%guest_byte_ok_{id}_{byte}"));
             }
@@ -934,7 +1617,7 @@ fn emit_memory_operation(
             let mut previous = None::<String>;
             for byte in 0..layout.width {
                 body.push_str(&format!(
-                    "  %guest_ptr_{id}_{byte} = getelementptr i8, ptr %guest_ram, i64 %relative_{id}_{byte}\n  %guest_byte_{id}_{byte} = load i8, ptr %guest_ptr_{id}_{byte}\n  %guest_wide_{id}_{byte} = zext i8 %guest_byte_{id}_{byte} to i{load_bits}\n  %guest_part_{id}_{byte} = shl i{load_bits} %guest_wide_{id}_{byte}, {}\n",
+                    "  %guest_ptr_{id}_{byte} = getelementptr i8, ptr {guest_ram}, i64 %relative_{id}_{byte}\n  %guest_byte_{id}_{byte} = load i8, ptr %guest_ptr_{id}_{byte}\n  %guest_wide_{id}_{byte} = zext i8 %guest_byte_{id}_{byte} to i{load_bits}\n  %guest_part_{id}_{byte} = shl i{load_bits} %guest_wide_{id}_{byte}, {}\n",
                     byte * 8
                 ));
                 let part = format!("%guest_part_{id}_{byte}");
@@ -966,26 +1649,32 @@ fn emit_memory_operation(
                 body.push_str(&format!("  br label %memory_store_{id}\n"));
             }
             body.push_str(&format!("memory_store_{id}:\n"));
-            let value =
-                if data.space == "const" {
-                    let bits = data.size * 8;
-                    let mask = if bits == 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << bits) - 1
-                    };
-                    format!("{}", offset(&data.offset)? & mask)
+            let value = if data.space == "const" {
+                let bits = data.size * 8;
+                let mask = if bits >= 64 {
+                    u64::MAX
                 } else {
-                    let name = format!("%store_value_{id}");
-                    body.push_str(&format!(
-                    "  {name} = call i64 @hydir_read_varnode(ptr %state, i32 {}, i64 {}, i32 {})\n",
-                    pcode_space_id(&data.space)?, pcode_offset(data)?, data.size
-                ));
-                    name
+                    (1u64 << bits) - 1
                 };
+                format!("{}", offset(&data.offset)? & mask)
+            } else {
+                let name = format!("%store_value_{id}");
+                body.push_str(&format!(
+                    "  {name} = call i{load_bits} @{}(ptr %state, i32 {}, i64 {}, i32 {})\n",
+                    if load_bits == 128 {
+                        "hydir_read_varnode_wide"
+                    } else {
+                        "hydir_read_varnode"
+                    },
+                    pcode_space_id(&data.space)?,
+                    pcode_offset(data)?,
+                    data.size
+                ));
+                name
+            };
             for byte in 0..layout.width {
                 body.push_str(&format!(
-                    "  %store_shifted_{id}_{byte} = lshr i64 {value}, {}\n  %store_byte_{id}_{byte} = trunc i64 %store_shifted_{id}_{byte} to i8\n  %store_relative_{id}_{byte} = add i64 %relative_{id}, {byte}\n  %store_guest_ptr_{id}_{byte} = getelementptr i8, ptr %guest_ram, i64 %store_relative_{id}_{byte}\n  store i8 %store_byte_{id}_{byte}, ptr %store_guest_ptr_{id}_{byte}\n  %store_known_ptr_{id}_{byte} = getelementptr i8, ptr %guest_known, i64 %store_relative_{id}_{byte}\n  store i8 -1, ptr %store_known_ptr_{id}_{byte}\n",
+                    "  %store_shifted_{id}_{byte} = lshr i{load_bits} {value}, {}\n  %store_byte_{id}_{byte} = trunc i{load_bits} %store_shifted_{id}_{byte} to i8\n  %store_relative_{id}_{byte} = add i64 {guest_relative}, {byte}\n  %store_guest_ptr_{id}_{byte} = getelementptr i8, ptr {guest_ram}, i64 %store_relative_{id}_{byte}\n  store i8 %store_byte_{id}_{byte}, ptr %store_guest_ptr_{id}_{byte}\n  %store_known_ptr_{id}_{byte} = getelementptr i8, ptr {guest_known}, i64 %store_relative_{id}_{byte}\n  store i8 -1, ptr %store_known_ptr_{id}_{byte}\n",
                     byte * 8
                 ));
             }
@@ -1050,6 +1739,9 @@ fn emit_memory_operation(
             next_label,
         ));
     }
+    if let Some(process) = process.filter(|process| process.space() == layout.space.name) {
+        emit_process_memory_value(layout, id, body, next_label, process, allocations.is_some())?;
+    }
     Ok(())
 }
 
@@ -1064,7 +1756,7 @@ pub fn emit_pcode_cfg_llvm(
     start: Option<&PcodeAddress>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
     let semantic = snapshot.pcode_function_ir()?.lower_semantics();
-    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, None)
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, None, None, None)
 }
 
 /// Emit a v3 module with the validated, immutable ELF bytes embedded in LLVM.
@@ -1076,7 +1768,43 @@ pub fn emit_pcode_cfg_llvm_with_image(
     image: &PcodeReadOnlyElfWindow,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
     let semantic = snapshot.pcode_function_ir()?.lower_semantics();
-    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, Some(image))
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, Some(image), None, None)
+}
+
+/// Emit a v4 path module with binary-bound PT_LOAD bytes and permissions.
+/// Writable ELF globals are private, fresh mutable state for each invocation;
+/// unresolved relocation bytes retain an unknown mask until overwritten.
+/// The separate guest window can supply explicitly known stack/heap bytes but
+/// must not overlap the bounded ELF process span.
+pub fn emit_pcode_cfg_llvm_with_process_memory(
+    snapshot: &GhidraSnapshot,
+    start: Option<&PcodeAddress>,
+    process: &PcodeElfProcessMemory,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    let semantic = snapshot.pcode_function_ir()?.lower_semantics();
+    emit_pcode_cfg_llvm_semantic(snapshot, start, semantic, None, None, Some(process), None)
+}
+
+/// Emit a v5 module whose two guest windows are exactly the declared stack
+/// and heap allocations. The caller supplies byte and known-mask arrays for
+/// each range; neither allocation implies initial byte values.
+pub fn emit_pcode_cfg_llvm_with_allocations(
+    snapshot: &GhidraSnapshot,
+    start: Option<&PcodeAddress>,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+) -> Result<PcodeCfgLlvmArtifact, String> {
+    allocations.validate_for(snapshot, process)?;
+    let semantic = snapshot.pcode_function_ir()?.lower_semantics();
+    emit_pcode_cfg_llvm_semantic(
+        snapshot,
+        start,
+        semantic,
+        None,
+        None,
+        Some(process),
+        Some(allocations),
+    )
 }
 
 /// Emit a single bounded LLVM state machine over validated function snapshots.
@@ -1086,19 +1814,73 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
     snapshots: &[GhidraSnapshot],
     max_call_depth: usize,
 ) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    emit_pcode_interprocedural_cfg_llvm_inner(snapshots, max_call_depth, None, None)
+}
+
+/// Emit an opt-in v5 interprocedural module with one shared ELF process and
+/// declared stack/heap contract. Only loaded internal RAM callees are entered;
+/// PLT and unresolved external calls stop at their source operation.
+pub fn emit_pcode_interprocedural_cfg_llvm_with_allocations(
+    snapshots: &[GhidraSnapshot],
+    max_call_depth: usize,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    emit_pcode_interprocedural_cfg_llvm_inner(
+        snapshots,
+        max_call_depth,
+        Some((process, allocations)),
+        None,
+    )
+}
+
+/// Opt in to ELF JUMP_SLOT import contracts. Only exact PLT bytes linked to
+/// Ghidra's direct CALL evidence qualify; the named dynamic binding remains
+/// an explicit assumption rather than a proven property of the binary.
+pub fn emit_pcode_interprocedural_cfg_llvm_with_imports(
+    snapshots: &[GhidraSnapshot],
+    binary: &[u8],
+    max_call_depth: usize,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
+    emit_pcode_interprocedural_cfg_llvm_inner(
+        snapshots,
+        max_call_depth,
+        Some((process, allocations)),
+        Some(binary),
+    )
+}
+
+fn emit_pcode_interprocedural_cfg_llvm_inner(
+    snapshots: &[GhidraSnapshot],
+    max_call_depth: usize,
+    allocated: Option<(&PcodeElfProcessMemory, &PcodeProcessAllocations)>,
+    import_binary: Option<&[u8]>,
+) -> Result<PcodeInterproceduralCfgLlvmArtifact, String> {
     let root = snapshots
         .first()
         .ok_or("interprocedural LLVM needs a root snapshot")?;
     if snapshots.len() > 128 || max_call_depth > 16 {
         return Err("interprocedural LLVM snapshot or call-depth limit exceeded".into());
     }
+    if import_binary.is_some() && allocated.is_none() {
+        return Err("import contracts require declared process allocations".into());
+    }
     let mut owners = Vec::new();
     let mut semantic = root.pcode_function_ir()?.lower_semantics();
     semantic.instructions.clear();
     let mut entries = BTreeSet::new();
     let mut digests = Vec::new();
+    let mut import_indices = Vec::new();
     for (owner, snapshot) in snapshots.iter().enumerate() {
         validate_ghidra_snapshot(snapshot, &root.binary_sha256)?;
+        if let Some((process, allocations)) = allocated {
+            allocations.validate_for(snapshot, process)?;
+        }
+        if let Some(binary) = import_binary {
+            import_indices.push(PcodeElfImportIndex::from_elf(binary, snapshot)?);
+        }
         snapshot.pcode_cfg_ir()?;
         if snapshot.program != root.program
             || snapshot.address_spaces != root.address_spaces
@@ -1123,11 +1905,34 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
         snapshots,
         owners,
         max_call_depth,
+        process: allocated.map(|(process, _)| process),
+        allocations: allocated.map(|(_, allocations)| allocations),
+        imports: import_binary.map(|_| import_indices),
     };
-    let mut llvm = emit_pcode_cfg_llvm_semantic(root, None, semantic, Some(&context), None)?;
-    llvm.state_abi.push_str("; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly");
+    let mut llvm = emit_pcode_cfg_llvm_semantic(
+        root,
+        None,
+        semantic,
+        Some(&context),
+        None,
+        allocated.map(|(process, _)| process),
+        allocated.map(|(_, allocations)| allocations),
+    )?;
+    llvm.state_abi.push_str(if import_binary.is_some() {
+        "; checked direct PLT calls may execute bounded SysV import contracts under the explicit ELF JUMP_SLOT final-binding assumption; unsupported imports and unknown bytes stop at the call"
+    } else if allocated.is_some() {
+        "; loaded internal calls share state, process bytes, stack, and heap; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly"
+    } else {
+        "; loaded calls share state and guest RAM; successful CALL and nested RETURN operations append source IDs to events; active-function recursion and call depth stop explicitly"
+    });
     Ok(PcodeInterproceduralCfgLlvmArtifact {
-        schema_version: PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION,
+        schema_version: if import_binary.is_some() {
+            PCODE_INTERPROCEDURAL_IMPORT_CONTRACT_CFG_LLVM_VERSION
+        } else if allocated.is_some() {
+            PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION
+        } else {
+            PCODE_INTERPROCEDURAL_CFG_LLVM_VERSION
+        },
         binary_sha256: root.binary_sha256.clone(),
         function_entries: snapshots
             .iter()
@@ -1136,6 +1941,12 @@ pub fn emit_pcode_interprocedural_cfg_llvm(
         snapshot_sha256: digests,
         snapshot_diagnostics: Vec::new(),
         max_call_depth,
+        import_calls: context
+            .imports
+            .as_ref()
+            .into_iter()
+            .flat_map(|indices| indices.iter().flat_map(|index| index.calls.iter().cloned()))
+            .collect(),
         llvm,
         semantic_fidelity: SemanticFidelity::Unknown,
         verification: VerificationStatus::NotRun,
@@ -1156,6 +1967,8 @@ pub fn emit_pcode_simplified_cfg_llvm(
         simplification.after.lower_semantics(),
         None,
         None,
+        None,
+        None,
     )?;
     Ok(PcodeSimplifiedCfgLlvmArtifact {
         schema_version: PCODE_SIMPLIFIED_CFG_LLVM_VERSION,
@@ -1173,10 +1986,24 @@ fn emit_pcode_cfg_llvm_semantic(
     semantic: PcodeSemanticFunctionIr,
     call_context: Option<&CallLlvmContext<'_>>,
     image: Option<&PcodeReadOnlyElfWindow>,
+    process: Option<&PcodeElfProcessMemory>,
+    allocations: Option<&PcodeProcessAllocations>,
 ) -> Result<PcodeCfgLlvmArtifact, String> {
+    if image.is_some() && process.is_some() {
+        return Err("read-only image and process memory cannot be combined".into());
+    }
+    if let Some(allocations) = allocations {
+        allocations.validate_for(
+            snapshot,
+            process.ok_or("allocations require process memory")?,
+        )?;
+    }
     snapshot.pcode_cfg_ir()?;
     let image_binding = image
         .map(|image| validate_image_window(snapshot, image))
+        .transpose()?;
+    let process_binding = process
+        .map(|process| validate_process_memory(snapshot, process))
         .transpose()?;
     if !snapshot.program.language_id.starts_with("x86:LE:64:") {
         return Err("P-code CFG LLVM currently requires x86-64 little endian".into());
@@ -1327,6 +2154,30 @@ fn emit_pcode_cfg_llvm_semantic(
             }
         }
     }
+    if let Some(context) = call_context.filter(|context| context.imports.is_some()) {
+        for snapshot in context.snapshots {
+            for name in [
+                "RAX", "RDI", "RSP", "RBX", "RBP", "R12", "R13", "R14", "R15",
+            ] {
+                if let Some(register) = snapshot
+                    .register_layout
+                    .iter()
+                    .find(|item| item.name == name)
+                    && register.size_bytes == 8
+                    && register.storage.space == "register"
+                {
+                    node_bytes(
+                        &PcodeVarnode {
+                            space: register.storage.space.clone(),
+                            offset: register.storage.offset.clone(),
+                            size: 8,
+                        },
+                        &mut byte_keys,
+                    )?;
+                }
+            }
+        }
+    }
     if byte_keys.len() > MAX_STATE_BYTES {
         return Err("P-code CFG LLVM state byte limit exceeded".into());
     }
@@ -1346,26 +2197,62 @@ fn emit_pcode_cfg_llvm_semantic(
     // Reserve every mapped state byte against the Rust executor's combined
     // one-MiB known-state limit, even if the caller marks all of them known.
     let guest_ram_limit = PCODE_CFG_GUEST_RAM_MAX_BYTES - byte_map.len() as u64;
-    let (image_argument_check, bad_argument_name) = if let Some(image) = image {
-        let image_end = image.base() + image.bytes().len() as u64 - 1;
+    let allocation_shape = allocations.map(|allocations| {
+        let region = |kind| {
+            allocations
+                .regions()
+                .iter()
+                .find(|region| region.kind == kind)
+                .map_or((0, 0), |region| (region.base, region.byte_len))
+        };
+        (
+            region(PcodeProcessAllocationKind::Stack),
+            region(PcodeProcessAllocationKind::Heap),
+        )
+    });
+    if allocation_shape
+        .is_some_and(|((_, stack_len), (_, heap_len))| stack_len + heap_len > guest_ram_limit)
+    {
+        return Err("declared stack and heap exceed the available guest RAM budget".into());
+    }
+    let bound_memory = image
+        .map(|image| (image.space(), image.base(), image.bytes().len()))
+        .or_else(|| {
+            process.map(|process| (process.space(), process.base(), process.bytes().len()))
+        });
+    let (mut memory_argument_check, mut bad_argument_name) = if let Some((space, base, len)) =
+        bound_memory
+    {
+        let image_end = base + len as u64 - 1;
         let image_space_id = semantic
             .address_spaces
             .iter()
-            .find(|space| space.name == image.space())
-            .expect("validated image RAM space")
+            .find(|candidate| candidate.name == space)
+            .expect("validated ELF RAM space")
             .id;
         (
             format!(
                 "  %bad_image_space = icmp ne i32 %guest_space_id, {image_space_id}\n  %guest_end = add i64 %guest_base, %guest_tail\n  %guest_before_image_end = icmp ule i64 %guest_base, {image_end}\n  %image_before_guest_end = icmp ule i64 {}, %guest_end\n  %overlap_candidate = and i1 %guest_before_image_end, %image_before_guest_end\n  %guest_nonempty = icmp ne i64 %guest_len, 0\n  %image_guest_overlap = and i1 %overlap_candidate, %guest_nonempty\n  %bad_image_window = or i1 %bad_image_space, %image_guest_overlap\n  %bad_image_args = or i1 %bad_args, %bad_image_window\n",
-                image.base()
+                base
             ),
             "%bad_image_args",
         )
     } else {
         (String::new(), "%bad_args")
     };
+    if let Some(((stack_base, stack_len), (heap_base, heap_len))) = allocation_shape {
+        memory_argument_check.push_str(&format!(
+            "  %bad_heap_ram = icmp eq ptr %heap_ram, null\n  %bad_heap_known = icmp eq ptr %heap_known, null\n  %bad_heap_ptr = or i1 %bad_heap_ram, %bad_heap_known\n  %bad_stack_base = icmp ne i64 %guest_base, {stack_base}\n  %bad_stack_len = icmp ne i64 %guest_len, {stack_len}\n  %bad_heap_base = icmp ne i64 %heap_base, {heap_base}\n  %bad_heap_len = icmp ne i64 %heap_len, {heap_len}\n  %bad_stack_shape = or i1 %bad_stack_base, %bad_stack_len\n  %bad_heap_shape = or i1 %bad_heap_base, %bad_heap_len\n  %bad_allocation_shape = or i1 %bad_stack_shape, %bad_heap_shape\n  %bad_allocation_ptr = or i1 %bad_heap_ptr, %bad_allocation_shape\n  %bad_allocated_args = or i1 %bad_image_args, %bad_allocation_ptr\n"
+        ));
+        bad_argument_name = "%bad_allocated_args";
+    }
+    let heap_signature = if allocations.is_some() {
+        "ptr %heap_ram, ptr %heap_known, i64 %heap_base, i64 %heap_len, "
+    } else {
+        ""
+    };
     let mut body = format!(
-        "define i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 %guest_space_id, ptr %guest_ram, ptr %guest_known, i64 %guest_base, i64 %guest_len, ptr %events, ptr %event_count, i32 %event_capacity, i32 %max_steps) {{\n\
+        "define i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 %guest_space_id, ptr %guest_ram, ptr %guest_known, i64 %guest_base, i64 %guest_len, {heap_signature}ptr %events, ptr %event_count, i32 %event_capacity, i32 %max_steps) {{\n\
          entry:\n  %bad_state = icmp eq ptr %state, null\n  %bad_known = icmp eq ptr %known, null\n\
            %bad_guest_ram = icmp eq ptr %guest_ram, null\n  %bad_guest_known = icmp eq ptr %guest_known, null\n\
            %bad_events = icmp eq ptr %events, null\n  %bad_count = icmp eq ptr %event_count, null\n\
@@ -1384,20 +2271,25 @@ fn emit_pcode_cfg_llvm_semantic(
            %bad_guest_range = or i1 %guest_too_large, %guest_base_overflow\n\
            %bad_bounds = or i1 %bad_steps, %bad_guest_range\n\
            %bad_args = or i1 %bad_ptr, %bad_bounds\n\
-           {image_argument_check}br i1 {bad_argument_name}, label %stop_invalid_args, label %initialize\n\
+           {memory_argument_check}br i1 {bad_argument_name}, label %stop_invalid_args, label %initialize\n\
          initialize:\n  store i32 0, ptr %event_count\n  %visit_counter = alloca i32\n\
            store i32 0, ptr %visit_counter\n",
     );
-    if let Some(context) = call_context {
+    if let Some(process) = process {
+        let len = process.bytes().len();
+        body.push_str(&format!(
+            "  %process_bytes_array = alloca [{len} x i8]\n\
+             %process_bytes = getelementptr [{len} x i8], ptr %process_bytes_array, i64 0, i64 0\n\
+             %process_known_array = alloca [{len} x i8]\n\
+             %process_known = getelementptr [{len} x i8], ptr %process_known_array, i64 0, i64 0\n\
+             call void @llvm.memcpy.p0.p0.i64(ptr %process_bytes, ptr @hydir_process_initial_bytes, i64 {len}, i1 false)\n\
+             call void @llvm.memcpy.p0.p0.i64(ptr %process_known, ptr @hydir_process_initial_known, i64 {len}, i1 false)\n"
+        ));
+    }
+    if call_context.is_some() {
         body.push_str(
-            "  %call_depth = alloca i32\n  store i32 0, ptr %call_depth\n  %return_sites = alloca [16 x i32]\n  %return_addresses = alloca [16 x i64]\n  %return_widths = alloca [16 x i32]\n  %active_functions = alloca [128 x i8]\n"
+            "  %call_depth = alloca i32\n  store i32 0, ptr %call_depth\n  %return_sites = alloca [16 x i32]\n  %return_addresses = alloca [16 x i64]\n  %return_widths = alloca [16 x i32]\n"
         );
-        for owner in 0..context.snapshots.len() {
-            body.push_str(&format!(
-                "  %initial_active_{owner} = getelementptr [128 x i8], ptr %active_functions, i32 0, i32 {owner}\n  store i8 {}, ptr %initial_active_{owner}\n",
-                u8::from(owner == 0)
-            ));
-        }
     }
     body.push_str(&format!("  br label %ins_{start_index}\n"));
     for (instruction_index, instruction) in semantic.instructions.iter().enumerate() {
@@ -1625,7 +2517,6 @@ fn emit_pcode_cfg_llvm_semantic(
                             emit_interprocedural_return(
                                 source,
                                 id,
-                                context.owners[instruction_index],
                                 return_sites
                                     .as_ref()
                                     .expect("call context has return sites"),
@@ -1642,6 +2533,7 @@ fn emit_pcode_cfg_llvm_semantic(
                                 id,
                                 &index,
                                 current_index,
+                                &byte_map,
                                 &mut body,
                                 &mut sites,
                             )?;
@@ -1701,6 +2593,11 @@ fn emit_pcode_cfg_llvm_semantic(
                                     },
                                 ),
                             ] {
+                                if status == PcodeCfgLlvmStatus::MemoryOutOfBounds
+                                    && allocations.is_some()
+                                {
+                                    continue;
+                                }
                                 stop_site(
                                     &mut sites,
                                     &source.source_address,
@@ -1715,7 +2612,7 @@ fn emit_pcode_cfg_llvm_semantic(
                                     &source.source_address,
                                     Some(operation_index),
                                     PcodeCfgLlvmStatus::MemoryUnknownBytes,
-                                    if image.is_some() {
+                                    if image.is_some() || process.is_some() {
                                         "loaded guest RAM or read-only ELF image bytes are unknown"
                                     } else {
                                         "loaded guest RAM bytes are unknown"
@@ -1745,8 +2642,45 @@ fn emit_pcode_cfg_llvm_semantic(
                                         "STORE targets immutable file-backed ELF bytes",
                                     );
                                 }
+                                if process
+                                    .is_some_and(|process| process.space() == layout.space.name)
+                                {
+                                    if allocations.is_none() {
+                                        stop_site(
+                                            &mut sites,
+                                            &source.source_address,
+                                            Some(operation_index),
+                                            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+                                            "STORE spans unmapped bytes in bounded ELF process memory",
+                                        );
+                                    }
+                                    stop_site(
+                                        &mut sites,
+                                        &source.source_address,
+                                        Some(operation_index),
+                                        PcodeCfgLlvmStatus::MemoryReadOnly,
+                                        "STORE targets a read-only ELF process mapping",
+                                    );
+                                    if allocations.is_some() {
+                                        stop_site(
+                                            &mut sites,
+                                            &source.source_address,
+                                            Some(operation_index),
+                                            PcodeCfgLlvmStatus::MemoryUnmappedWrite,
+                                            "STORE crosses an undeclared stack/heap or unmapped ELF byte",
+                                        );
+                                    }
+                                }
                             }
-                            emit_memory_operation(&layout, id, &mut body, &next_label, image)?;
+                            emit_memory_operation(
+                                &layout,
+                                id,
+                                &mut body,
+                                &next_label,
+                                image,
+                                process,
+                                allocations,
+                            )?;
                         }
                         Err((status, reason)) => {
                             stop_site(
@@ -2004,11 +2938,18 @@ fn emit_pcode_cfg_llvm_semantic(
             status.code()
         ));
     }
-    if image.is_some() {
+    if image.is_some() || process.is_some() {
         body.push_str(&format!(
             "{}:\n  ret i32 {}\n",
             stop_label(PcodeCfgLlvmStatus::MemoryReadOnly),
             PcodeCfgLlvmStatus::MemoryReadOnly.code()
+        ));
+    }
+    if allocations.is_some() {
+        body.push_str(&format!(
+            "{}:\n  ret i32 {}\n",
+            stop_label(PcodeCfgLlvmStatus::MemoryUnmappedWrite),
+            PcodeCfgLlvmStatus::MemoryUnmappedWrite.code()
         ));
     }
     body.push_str("}\n");
@@ -2018,18 +2959,41 @@ fn emit_pcode_cfg_llvm_semantic(
     );
     llvm_ir.push_str("declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)\n");
     llvm_ir.push_str("declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)\n\n");
+    if process.is_some() {
+        llvm_ir.push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n");
+    }
     if let Some(image) = image {
         llvm_ir.push_str(&image_globals(image));
     }
+    if let Some(process) = process {
+        llvm_ir.push_str(&process_globals(process));
+    }
     llvm_ir.push_str(&helper_definitions(&byte_map));
     llvm_ir.push('\n');
+    if call_context.is_some_and(|context| context.imports.is_some()) {
+        llvm_ir.push_str(&import_strlen_helper(
+            process.expect("import contract requires process memory"),
+        ));
+    }
     llvm_ir.push_str(&helper_ir);
     llvm_ir.push_str(&body);
-    if llvm_ir.len() > MAX_LLVM_BYTES {
+    if llvm_ir.len()
+        > if process.is_some() {
+            MAX_PROCESS_LLVM_BYTES
+        } else {
+            MAX_LLVM_BYTES
+        }
+    {
         return Err("P-code CFG LLVM module exceeds byte limit".into());
     }
     Ok(PcodeCfgLlvmArtifact {
-        schema_version: if image.is_some() {
+        schema_version: if call_context.is_some_and(|context| context.imports.is_some()) {
+            PCODE_CFG_IMPORT_CONTRACT_LLVM_VERSION
+        } else if allocations.is_some() {
+            PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION
+        } else if process.is_some() {
+            PCODE_CFG_PROCESS_LLVM_VERSION
+        } else if image.is_some() {
             PCODE_CFG_IMAGE_LLVM_VERSION
         } else {
             PCODE_CFG_LLVM_VERSION
@@ -2041,7 +3005,25 @@ fn emit_pcode_cfg_llvm_semantic(
         state_bytes: byte_map.len(),
         guest_ram_limit_bytes: guest_ram_limit,
         byte_map,
-        state_abi: if let Some(image) = image {
+        state_abi: if let Some(((stack_base, stack_len), (heap_base, heap_len))) = allocation_shape
+        {
+            format!(
+                "hydir-pcode-cfg-state-v{}: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr stack_ram, ptr stack_known, i64 stack_base, i64 stack_len, ptr heap_ram, ptr heap_known, i64 heap_base, i64 heap_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; stack=[0x{stack_base:x},0x{:x}), heap=[0x{heap_base:x},0x{:x}); supplied bounds must match the embedded declaration exactly; all arrays must be disjoint and allocated to their declared lengths; STORE preflights its full width and stops with MemoryUnmappedWrite outside ELF mappings and declared allocations; LOAD of unmapped or unknown bytes stops with MemoryUnknownBytes; known byte 0xff, unknown byte 0x00; combined guest bytes<={guest_ram_limit}",
+                if call_context.is_some_and(|context| context.imports.is_some()) {
+                    6
+                } else {
+                    5
+                },
+                stack_base + stack_len,
+                heap_base + heap_len
+            )
+        } else if let Some(process) = process {
+            format!(
+                "hydir-pcode-cfg-state-v4: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram, ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; checked ELF process bytes, known mask, mapped mask and writable mask are embedded at {} in {}; fresh private mutable process bytes and known mask are initialized on every invocation; guest arrays supply a disjoint stack/heap window in the same RAM space and cannot overlap the entire process span; LOAD requires all bytes mapped and known; STORE requires all bytes mapped and writable and marks written bytes known; known byte 0xff, unknown byte 0x00; state/known use byte_map; event_count initialized after argument validation; event_capacity>=max_steps; guest_len<={guest_ram_limit}; max_steps<=262144; arrays must be separate and allocated to declared lengths",
+                process.base(),
+                process.space()
+            )
+        } else if let Some(image) = image {
             format!(
                 "hydir-pcode-cfg-state-v3: @hydir_pcode_cfg(ptr state, ptr known, i32 guest_space_id, ptr guest_ram, ptr guest_known, i64 guest_base, i64 guest_len, ptr events, ptr event_count, i32 event_capacity, i32 max_steps) -> i32 status; mutable guest arrays hold guest_len bytes in guest_space_id from guest_base byte offset; immutable read-only ELF bytes and known mask are embedded at {} in {}; guest_space_id must match image space ID; guest and image address ranges must not overlap; LOAD requires one full-width known window; STORE to image stops with MemoryReadOnly; known byte 0xff, unknown 0x00; state/known use byte_map; event_count initialized after argument validation; event_capacity>=max_steps; guest_len<={guest_ram_limit}; max_steps<=262144; arrays must be separate and allocated to declared lengths",
                 image.base(),
@@ -2053,6 +3035,8 @@ fn emit_pcode_cfg_llvm_semantic(
             )
         },
         read_only_image: image_binding,
+        process_memory: process_binding,
+        allocations: allocations.cloned(),
         llvm_ir,
         semantic_fidelity: SemanticFidelity::Unknown,
         verification: VerificationStatus::NotRun,
@@ -2063,7 +3047,8 @@ fn emit_pcode_cfg_llvm_semantic(
 mod tests {
     use super::*;
     use hydir_ir::pcode::{
-        PcodeConcreteState, PcodePathEvent, PcodePathStop, PcodeReadOnlyElfImage,
+        PcodeConcreteState, PcodeElfProcessMemory, PcodeExecutionStop, PcodeMemoryBoundaryKind,
+        PcodePathEvent, PcodePathStop, PcodeProcessAllocation, PcodeReadOnlyElfImage,
         parse_ghidra_snapshot,
     };
     use std::io::Write;
@@ -2188,6 +3173,30 @@ mod tests {
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tests/fixtures/ghidra_prism_leaf_add_v2.json"
+            ))
+            .as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, digest).unwrap())
+        .collect()
+    }
+
+    fn choose_call_snapshots() -> Vec<GhidraSnapshot> {
+        let digest = "dc459793ce9edcc543c9ffcadbecc27c6a2e1976782f1da4d3adc2119dd27723";
+        [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_root_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_right_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_left_v2.json"
             ))
             .as_slice(),
         ]
@@ -2704,6 +3713,740 @@ mod tests {
     }
 
     #[test]
+    fn import_strlen_helper_is_valid_llvm() {
+        let snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshot, 64 * 1024).unwrap();
+        let module = format!(
+            "declare {{ i64, i1 }} @llvm.uadd.with.overflow.i64(i64, i64)\n\
+             declare i64 @hydir_read_varnode(ptr, i32, i64, i32)\n{}{}",
+            process_globals(&process),
+            import_strlen_helper(&process),
+        );
+        verify(&module);
+    }
+
+    #[test]
+    fn process_memory_v4_load_store_permissions_and_guest_bounds() {
+        let mut snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshot, 64 * 1024).unwrap();
+        assert_eq!(process.initial_byte("ram", 0x2028f0), Some(0));
+        let operation = &mut snapshot.selected_function.instructions[0].pcode[0];
+        operation.opcode = 2;
+        operation.mnemonic = "LOAD".into();
+        operation.inputs = vec![
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x1b1".into(),
+                size: 4,
+            },
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x2028f0".into(),
+                size: 8,
+            },
+        ];
+        operation.output = Some(PcodeVarnode {
+            space: "register".into(),
+            offset: "0x0".into(),
+            size: 1,
+        });
+        snapshot.selected_function.instructions[0].pcode.truncate(1);
+        let load = emit_pcode_cfg_llvm_with_process_memory(&snapshot, None, &process).unwrap();
+        assert_eq!(load.schema_version, PCODE_CFG_PROCESS_LLVM_VERSION);
+        assert!(load.state_abi.starts_with("hydir-pcode-cfg-state-v4"));
+        assert_eq!(load.process_memory.as_ref().unwrap().base, process.base());
+        assert!(load.read_only_image.is_none());
+        verify(&load.llvm_ir);
+        run_lli_with_guest(
+            &load,
+            &PcodeConcreteState::default(),
+            &GuestTestMemory {
+                space_id: 433,
+                base: 0x700000,
+                bytes: Vec::new(),
+                expected: Vec::new(),
+                expected_state: Vec::new(),
+            },
+            1,
+            PcodeCfgLlvmStatus::StepBudget,
+            &[0],
+            Some(0),
+        );
+        run_lli_with_guest(
+            &load,
+            &PcodeConcreteState::default(),
+            &GuestTestMemory {
+                space_id: 433,
+                base: process.base(),
+                bytes: vec![None],
+                expected: Vec::new(),
+                expected_state: Vec::new(),
+            },
+            8,
+            PcodeCfgLlvmStatus::InvalidArguments,
+            &[],
+            None,
+        );
+
+        let operation = &mut snapshot.selected_function.instructions[0].pcode[0];
+        operation.opcode = 3;
+        operation.mnemonic = "STORE".into();
+        operation.inputs.push(PcodeVarnode {
+            space: "const".into(),
+            offset: "0x5a".into(),
+            size: 1,
+        });
+        operation.output = None;
+        let store = emit_pcode_cfg_llvm_with_process_memory(&snapshot, None, &process).unwrap();
+        verify(&store.llvm_ir);
+        run_lli(
+            &store,
+            &PcodeConcreteState::default(),
+            1,
+            PcodeCfgLlvmStatus::StepBudget,
+            &[0],
+            None,
+        );
+        assert_eq!(process.initial_byte("ram", 0x2028f0), Some(0));
+
+        let mut load_after_store = snapshot.selected_function.instructions[0].pcode[0].clone();
+        load_after_store.sequence_index = 1;
+        load_after_store.sequence_time += 1;
+        load_after_store.opcode = 2;
+        load_after_store.mnemonic = "LOAD".into();
+        load_after_store.inputs.truncate(2);
+        load_after_store.output = Some(PcodeVarnode {
+            space: "register".into(),
+            offset: "0x0".into(),
+            size: 1,
+        });
+        snapshot.selected_function.instructions[0]
+            .pcode
+            .push(load_after_store);
+        let roundtrip = emit_pcode_cfg_llvm_with_process_memory(&snapshot, None, &process).unwrap();
+        verify(&roundtrip.llvm_ir);
+        run_lli(
+            &roundtrip,
+            &PcodeConcreteState::default(),
+            2,
+            PcodeCfgLlvmStatus::StepBudget,
+            &[0, 1],
+            Some(0x5a),
+        );
+        snapshot.selected_function.instructions[0].pcode.truncate(1);
+
+        let mut direct_copy = snapshot.clone();
+        let operation = &mut direct_copy.selected_function.instructions[0].pcode[0];
+        operation.opcode = 1;
+        operation.mnemonic = "COPY".into();
+        operation.inputs = vec![PcodeVarnode {
+            space: "ram".into(),
+            offset: "0x2028f0".into(),
+            size: 16,
+        }];
+        operation.output = Some(PcodeVarnode {
+            space: "register".into(),
+            offset: "0x0".into(),
+            size: 16,
+        });
+        let direct_copy =
+            emit_pcode_cfg_llvm_with_process_memory(&direct_copy, None, &process).unwrap();
+        verify(&direct_copy.llvm_ir);
+        run_lli(
+            &direct_copy,
+            &PcodeConcreteState::default(),
+            1,
+            PcodeCfgLlvmStatus::StepBudget,
+            &[0],
+            Some(0),
+        );
+
+        snapshot.selected_function.instructions[0].pcode[0].inputs[1].offset = "0x2001f0".into();
+        let readonly = emit_pcode_cfg_llvm_with_process_memory(&snapshot, None, &process).unwrap();
+        verify(&readonly.llvm_ir);
+        run_lli(
+            &readonly,
+            &PcodeConcreteState::default(),
+            8,
+            PcodeCfgLlvmStatus::MemoryReadOnly,
+            &[],
+            None,
+        );
+
+        let mixed_index = (0..process.mapped().len() - 1)
+            .find(|&index| {
+                process.mapped()[index] == 0xff
+                    && process.writable()[index] == 0
+                    && process.mapped()[index + 1] == 0
+            })
+            .expect("fixture has a read-only mapping followed by a gap");
+        let mixed_address = process.base() + mixed_index as u64;
+        let operation = &mut snapshot.selected_function.instructions[0].pcode[0];
+        operation.inputs[1].offset = format!("0x{mixed_address:x}");
+        operation.inputs[2].size = 2;
+        let rust = snapshot
+            .execute_concrete_path_with_process_memory(
+                &PcodeConcreteState::default(),
+                &process,
+                None,
+                1,
+                4,
+            )
+            .unwrap();
+        assert!(matches!(
+            rust.stop,
+            PcodePathStop::EffectBoundary {
+                boundary: PcodeExecutionStop::MemoryBoundary {
+                    reason: PcodeMemoryBoundaryKind::ReadOnlyImageWrite,
+                    ..
+                }
+            }
+        ));
+        let mixed = emit_pcode_cfg_llvm_with_process_memory(&snapshot, None, &process).unwrap();
+        verify(&mixed.llvm_ir);
+        assert!(mixed.stop_sites.iter().any(|site| {
+            site.status == PcodeCfgLlvmStatus::MemoryUnknownBytes && site.operation_index == Some(0)
+        }));
+        run_lli(
+            &mixed,
+            &PcodeConcreteState::default(),
+            8,
+            PcodeCfgLlvmStatus::MemoryReadOnly,
+            &[],
+            None,
+        );
+
+        let operation = &mut snapshot.selected_function.instructions[0].pcode[0];
+        operation.inputs[1].offset = format!("0x{:x}", mixed_address + 1);
+        operation.inputs[2].size = 1;
+        let gap = emit_pcode_cfg_llvm_with_process_memory(&snapshot, None, &process).unwrap();
+        verify(&gap.llvm_ir);
+        assert!(gap.stop_sites.iter().any(|site| {
+            site.status == PcodeCfgLlvmStatus::MemoryUnknownBytes && site.operation_index == Some(0)
+        }));
+        run_lli(
+            &gap,
+            &PcodeConcreteState::default(),
+            8,
+            PcodeCfgLlvmStatus::MemoryUnknownBytes,
+            &[],
+            None,
+        );
+    }
+
+    #[test]
+    fn allocated_process_v5_stack_boundary_matches_rust_without_partial_write() {
+        let mut snapshot = stripped_password_secure_equals_fixture();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/hydir-password-gate-stripped.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshot, 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshot,
+            &process,
+            vec![
+                PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Stack,
+                    space: "ram".into(),
+                    base: 0x700000,
+                    byte_len: 16,
+                },
+                PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Heap,
+                    space: "ram".into(),
+                    base: 0x800000,
+                    byte_len: 16,
+                },
+            ],
+        )
+        .unwrap();
+        let operation = &mut snapshot.selected_function.instructions[0].pcode[0];
+        operation.opcode = 3;
+        operation.mnemonic = "STORE".into();
+        operation.inputs = vec![
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x1b1".into(),
+                size: 4,
+            },
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0x70000f".into(),
+                size: 8,
+            },
+            PcodeVarnode {
+                space: "const".into(),
+                offset: "0xbeef".into(),
+                size: 2,
+            },
+        ];
+        operation.output = None;
+        snapshot.selected_function.instructions[0].pcode.truncate(1);
+        let mut seed = PcodeConcreteState::default();
+        seed.write_memory("ram", 0x70000f, 1, 0xaa).unwrap();
+        let gap = process.base()
+            + process
+                .mapped()
+                .windows(2)
+                .position(|pair| pair == [0, 0])
+                .expect("fixture has a two-byte unmapped process gap") as u64;
+        let mixed = process.base()
+            + process
+                .mapped()
+                .windows(2)
+                .enumerate()
+                .find(|(index, pair)| pair == &[0xff, 0] && process.writable()[*index] == 0)
+                .expect("fixture has a read-only byte followed by a gap")
+                .0 as u64;
+
+        for (address, status, event_count, byte14, known14, byte15, heap14, heap15) in [
+            (
+                0x70000f,
+                PcodeCfgLlvmStatus::MemoryUnmappedWrite,
+                0,
+                0,
+                0,
+                0xaa,
+                0,
+                0,
+            ),
+            (
+                0x70000e,
+                PcodeCfgLlvmStatus::StepBudget,
+                1,
+                0xef,
+                0xff,
+                0xbe,
+                0,
+                0,
+            ),
+            (
+                0x80000e,
+                PcodeCfgLlvmStatus::StepBudget,
+                1,
+                0,
+                0,
+                0xaa,
+                0xef,
+                0xbe,
+            ),
+            (
+                gap,
+                PcodeCfgLlvmStatus::MemoryUnmappedWrite,
+                0,
+                0,
+                0,
+                0xaa,
+                0,
+                0,
+            ),
+            (
+                mixed,
+                PcodeCfgLlvmStatus::MemoryReadOnly,
+                0,
+                0,
+                0,
+                0xaa,
+                0,
+                0,
+            ),
+            (
+                0x900000,
+                PcodeCfgLlvmStatus::MemoryUnknownBytes,
+                0,
+                0,
+                0,
+                0xaa,
+                0,
+                0,
+            ),
+        ] {
+            let operation = &mut snapshot.selected_function.instructions[0].pcode[0];
+            operation.inputs[1].offset = format!("0x{address:x}");
+            if status == PcodeCfgLlvmStatus::MemoryUnknownBytes {
+                operation.opcode = 2;
+                operation.mnemonic = "LOAD".into();
+                operation.inputs.truncate(2);
+                operation.output = Some(PcodeVarnode {
+                    space: "register".into(),
+                    offset: "0x0".into(),
+                    size: 2,
+                });
+            }
+            let rust = snapshot
+                .execute_concrete_path_with_allocations(&seed, &process, &allocations, None, 1, 4)
+                .unwrap();
+            if status != PcodeCfgLlvmStatus::StepBudget {
+                let expected_reason = if status == PcodeCfgLlvmStatus::MemoryReadOnly {
+                    PcodeMemoryBoundaryKind::ReadOnlyImageWrite
+                } else if status == PcodeCfgLlvmStatus::MemoryUnknownBytes {
+                    PcodeMemoryBoundaryKind::UnknownBytes
+                } else {
+                    PcodeMemoryBoundaryKind::UnmappedWrite
+                };
+                assert!(matches!(
+                    rust.stop,
+                    PcodePathStop::EffectBoundary {
+                        boundary: PcodeExecutionStop::MemoryBoundary {
+                            reason,
+                            ..
+                        }
+                    } if reason == expected_reason
+                ));
+                assert_eq!(
+                    rust.final_state.read_memory("ram", 0x70000f, 1).unwrap(),
+                    Some(0xaa)
+                );
+                if address == 0x70000f {
+                    assert_eq!(
+                        rust.final_state.read_memory("ram", 0x700010, 1).unwrap(),
+                        None
+                    );
+                }
+            } else {
+                assert_eq!(
+                    rust.final_state.read_memory("ram", address, 2).unwrap(),
+                    Some(0xbeef)
+                );
+            }
+            let artifact =
+                emit_pcode_cfg_llvm_with_allocations(&snapshot, None, &process, &allocations)
+                    .unwrap();
+            assert_eq!(
+                artifact.schema_version,
+                PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION
+            );
+            assert_eq!(artifact.allocations.as_ref(), Some(&allocations));
+            if status != PcodeCfgLlvmStatus::MemoryUnknownBytes {
+                assert!(artifact.stop_sites.iter().any(|site| {
+                    site.status == PcodeCfgLlvmStatus::MemoryUnmappedWrite
+                        && site.address
+                            == snapshot.selected_function.instructions[0].pcode[0].source_address
+                }));
+            }
+            verify(&artifact.llvm_ir);
+            if Command::new("lli").arg("--version").output().is_err() {
+                continue;
+            }
+            let state_size = artifact.state_bytes.max(1);
+            let main = format!(
+                "define i32 @main() {{\nentry:\n\
+                 %state = alloca [{state_size} x i8]\n  %known = alloca [{state_size} x i8]\n\
+                 %stack = alloca [16 x i8]\n  %stack_known = alloca [16 x i8]\n\
+                 %heap = alloca [16 x i8]\n  %heap_known = alloca [16 x i8]\n\
+                 %events = alloca [1 x i32]\n  %count = alloca i32\n\
+                 call void @llvm.memset.p0.i64(ptr %state, i8 0, i64 {state_size}, i1 false)\n\
+                 call void @llvm.memset.p0.i64(ptr %known, i8 0, i64 {state_size}, i1 false)\n\
+                 call void @llvm.memset.p0.i64(ptr %stack, i8 0, i64 16, i1 false)\n\
+                 call void @llvm.memset.p0.i64(ptr %stack_known, i8 0, i64 16, i1 false)\n\
+                 call void @llvm.memset.p0.i64(ptr %heap, i8 0, i64 16, i1 false)\n\
+                 call void @llvm.memset.p0.i64(ptr %heap_known, i8 0, i64 16, i1 false)\n\
+                 %last = getelementptr i8, ptr %stack, i64 15\n  store i8 -86, ptr %last\n\
+                 %last_known = getelementptr i8, ptr %stack_known, i64 15\n  store i8 -1, ptr %last_known\n\
+                 %status = call i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 433, ptr %stack, ptr %stack_known, i64 7340032, i64 16, ptr %heap, ptr %heap_known, i64 8388608, i64 16, ptr %events, ptr %count, i32 1, i32 1)\n\
+                 %actual_count = load i32, ptr %count\n\
+                 %a14 = getelementptr i8, ptr %stack, i64 14\n  %v14 = load i8, ptr %a14\n\
+                 %k14 = getelementptr i8, ptr %stack_known, i64 14\n  %m14 = load i8, ptr %k14\n\
+                 %v15 = load i8, ptr %last\n\
+                 %h14 = getelementptr i8, ptr %heap, i64 14\n  %hv14 = load i8, ptr %h14\n\
+                 %h15 = getelementptr i8, ptr %heap, i64 15\n  %hv15 = load i8, ptr %h15\n\
+                 %ok_status = icmp eq i32 %status, {}\n\
+                 %ok_count = icmp eq i32 %actual_count, {event_count}\n\
+                 %ok14 = icmp eq i8 %v14, {byte14}\n\
+                 %okm14 = icmp eq i8 %m14, {known14}\n\
+                 %ok15 = icmp eq i8 %v15, {byte15}\n\
+                 %okh14 = icmp eq i8 %hv14, {heap14}\n\
+                 %okh15 = icmp eq i8 %hv15, {heap15}\n\
+                 %ok_a = and i1 %ok_status, %ok_count\n\
+                 %ok_b = and i1 %ok14, %okm14\n\
+                 %ok_c = and i1 %ok_a, %ok_b\n\
+                 %ok_d = and i1 %okh14, %okh15\n\
+                 %ok_e = and i1 %ok_c, %ok_d\n\
+                 %ok = and i1 %ok_e, %ok15\n\
+                 %failed = xor i1 %ok, true\n  %result = zext i1 %failed to i32\n  ret i32 %result\n}}\n",
+                status.code()
+            );
+            let module = format!(
+                "{}\ndeclare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n{main}",
+                artifact.llvm_ir
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), module).unwrap();
+            let output = Command::new("lli").arg(file.path()).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn import_contract_module_keeps_internal_calls_on_a_binary_without_linked_imports() {
+        let snapshots = choose_call_snapshots();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshots[0],
+            &process,
+            vec![PcodeProcessAllocation {
+                kind: PcodeProcessAllocationKind::Stack,
+                space: "ram".into(),
+                base: 0x6ffff8,
+                byte_len: 16,
+            }],
+        )
+        .unwrap();
+        let artifact = emit_pcode_interprocedural_cfg_llvm_with_imports(
+            &snapshots,
+            binary,
+            4,
+            &process,
+            &allocations,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.schema_version,
+            PCODE_INTERPROCEDURAL_IMPORT_CONTRACT_CFG_LLVM_VERSION
+        );
+        assert_eq!(
+            artifact.llvm.schema_version,
+            PCODE_CFG_IMPORT_CONTRACT_LLVM_VERSION
+        );
+        assert!(artifact.import_calls.is_empty());
+        verify(&artifact.llvm.llvm_ir);
+    }
+
+    #[test]
+    fn allocated_interprocedural_calls_match_rust_and_stop_on_stack_boundary() {
+        let snapshots = choose_call_snapshots();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        for (argument, expected_rax, call_site, return_low) in [
+            (1u64, 2u8, "0x201179", 0x7e_u8),
+            (0u64, 1u8, "0x20117f", 0x84_u8),
+        ] {
+            let mut seed = PcodeConcreteState::default();
+            seed.write_varnode(&register("0x38", 8), argument).unwrap();
+            seed.write_varnode(&register("0x20", 8), 0x700000).unwrap();
+            seed.write_memory("ram", 0x700000, 8, 0x201195).unwrap();
+            for (stack_base, stack_len, expected_status, expected_first, expected_known) in [
+                (
+                    0x6ffff8_u64,
+                    16_u64,
+                    PcodeCfgLlvmStatus::Return,
+                    return_low,
+                    255_u8,
+                ),
+                (
+                    0x6ffffc_u64,
+                    12_u64,
+                    PcodeCfgLlvmStatus::MemoryUnmappedWrite,
+                    0,
+                    0,
+                ),
+            ] {
+                let allocations = PcodeProcessAllocations::new(
+                    &snapshots[0],
+                    &process,
+                    vec![PcodeProcessAllocation {
+                        kind: PcodeProcessAllocationKind::Stack,
+                        space: "ram".into(),
+                        base: stack_base,
+                        byte_len: stack_len,
+                    }],
+                )
+                .unwrap();
+                let rust = hydir_ir::pcode::execute_concrete_call_path_with_allocations(
+                    &snapshots,
+                    &seed,
+                    &process,
+                    &allocations,
+                    128,
+                    16,
+                    4,
+                )
+                .unwrap();
+                let artifact = emit_pcode_interprocedural_cfg_llvm_with_allocations(
+                    &snapshots,
+                    4,
+                    &process,
+                    &allocations,
+                )
+                .unwrap();
+                assert_eq!(
+                    artifact.schema_version,
+                    PCODE_INTERPROCEDURAL_ALLOCATED_PROCESS_CFG_LLVM_VERSION
+                );
+                assert_eq!(
+                    artifact.llvm.schema_version,
+                    PCODE_CFG_ALLOCATED_PROCESS_LLVM_VERSION
+                );
+                assert_eq!(artifact.llvm.allocations.as_ref(), Some(&allocations));
+                assert_eq!(
+                    rust.process_binding.as_ref().unwrap().allocations,
+                    allocations
+                );
+                verify(&artifact.llvm.llvm_ir);
+                let expected_events = if expected_status == PcodeCfgLlvmStatus::Return {
+                    assert_eq!(rust.calls.len(), 1);
+                    assert_eq!(
+                        rust.final_state.read_varnode(&register("0x0", 8)).unwrap(),
+                        Some(expected_rax as u64)
+                    );
+                    call_event_ids(&artifact.llvm, &rust)
+                } else {
+                    assert_eq!(rust.calls.len(), 0);
+                    assert!(matches!(
+                        rust.stop,
+                        hydir_ir::pcode::PcodeCallPathStop::PathBoundary {
+                            stop: PcodePathStop::EffectBoundary {
+                                boundary: PcodeExecutionStop::MemoryBoundary {
+                                    reason: PcodeMemoryBoundaryKind::UnmappedWrite,
+                                    ..
+                                }
+                            }
+                        }
+                    ));
+                    assert!(artifact.llvm.stop_sites.iter().any(|site| {
+                        site.status == PcodeCfgLlvmStatus::MemoryUnmappedWrite
+                            && site.address.offset == call_site
+                            && site.operation_index == Some(1)
+                    }));
+                    source_event_ids(&artifact.llvm, &rust.segments[0].path)
+                };
+                if Command::new("lli").arg("--version").output().is_err() {
+                    continue;
+                }
+                let state_len = artifact.llvm.state_bytes.max(1);
+                let mut main = format!(
+                    "define i32 @main() {{\nentry:\n  %state = alloca [{state_len} x i8]\n  %known = alloca [{state_len} x i8]\n  %stack = alloca [{stack_len} x i8]\n  %stack_known = alloca [{stack_len} x i8]\n  %heap = alloca [1 x i8]\n  %heap_known = alloca [1 x i8]\n  %events = alloca [128 x i32]\n  %count = alloca i32\n"
+                );
+                for byte in &artifact.llvm.byte_map {
+                    let value = seed
+                        .read_varnode(&PcodeVarnode {
+                            space: byte.space.clone(),
+                            offset: byte.offset.clone(),
+                            size: 1,
+                        })
+                        .unwrap();
+                    main.push_str(&format!(
+                        "  %s{} = getelementptr i8, ptr %state, i64 {}\n  store i8 {}, ptr %s{}\n  %k{} = getelementptr i8, ptr %known, i64 {}\n  store i8 {}, ptr %k{}\n",
+                        byte.index, byte.index, value.unwrap_or(0), byte.index,
+                        byte.index, byte.index, if value.is_some() { 255 } else { 0 }, byte.index
+                    ));
+                }
+                for index in 0..stack_len {
+                    let value = seed.read_memory("ram", stack_base + index, 1).unwrap();
+                    main.push_str(&format!(
+                        "  %ss{index} = getelementptr i8, ptr %stack, i64 {index}\n  store i8 {}, ptr %ss{index}\n  %sk{index} = getelementptr i8, ptr %stack_known, i64 {index}\n  store i8 {}, ptr %sk{index}\n",
+                        value.unwrap_or(0), if value.is_some() { 255 } else { 0 }
+                    ));
+                }
+                main.push_str(&format!(
+                    "  %status = call i32 @hydir_pcode_cfg(ptr %state, ptr %known, i32 433, ptr %stack, ptr %stack_known, i64 {stack_base}, i64 {stack_len}, ptr %heap, ptr %heap_known, i64 0, i64 0, ptr %events, ptr %count, i32 128, i32 128)\n  %count_value = load i32, ptr %count\n  %status_ok = icmp eq i32 %status, {}\n  %count_ok = icmp eq i32 %count_value, {}\n  %ok0 = and i1 %status_ok, %count_ok\n",
+                    expected_status.code(), expected_events.len()
+                ));
+                let mut last = "%ok0".to_owned();
+                for (index, event) in expected_events.iter().enumerate() {
+                    main.push_str(&format!(
+                        "  %event_ptr{index} = getelementptr i32, ptr %events, i64 {index}\n  %event_value{index} = load i32, ptr %event_ptr{index}\n  %event_ok{index} = icmp eq i32 %event_value{index}, {event}\n  %ok_event{index} = and i1 {last}, %event_ok{index}\n"
+                    ));
+                    last = format!("%ok_event{index}");
+                }
+                main.push_str(&format!(
+                    "  %first = load i8, ptr %stack\n  %first_known = load i8, ptr %stack_known\n  %first_ok = icmp eq i8 %first, {expected_first}\n  %known_ok = icmp eq i8 %first_known, {expected_known}\n  %stack_ok = and i1 %first_ok, %known_ok\n  %ok_stack = and i1 {last}, %stack_ok\n"
+                ));
+                let mut last = "%ok_stack".to_owned();
+                if expected_status == PcodeCfgLlvmStatus::Return {
+                    let rax = artifact
+                        .llvm
+                        .byte_map
+                        .iter()
+                        .find(|byte| byte.space == "register" && byte.offset == "0x0")
+                        .unwrap();
+                    main.push_str(&format!(
+                        "  %rax_ptr = getelementptr i8, ptr %state, i64 {}\n  %rax_low = load i8, ptr %rax_ptr\n  %rax_ok = icmp eq i8 %rax_low, {expected_rax}\n  %ok_rax = and i1 {last}, %rax_ok\n",
+                        rax.index
+                    ));
+                    last = "%ok_rax".to_owned();
+                }
+                main.push_str(&format!(
+                    "  %failed = xor i1 {last}, true\n  %exit = zext i1 %failed to i32\n  ret i32 %exit\n}}\n"
+                ));
+                let module = format!("{}\n{main}", artifact.llvm.llvm_ir);
+                let file = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(file.path(), module).unwrap();
+                let output = Command::new("lli").arg(file.path()).output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allocated_interprocedural_llvm_marks_plt_call_source() {
+        let mut snapshots = choose_call_snapshots();
+        for snapshot in &mut snapshots {
+            snapshot
+                .memory_blocks
+                .iter_mut()
+                .find(|block| block.name == ".text")
+                .unwrap()
+                .name = ".plt".into();
+        }
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshots[0],
+            &process,
+            vec![PcodeProcessAllocation {
+                kind: PcodeProcessAllocationKind::Stack,
+                space: "ram".into(),
+                base: 0x6ffff8,
+                byte_len: 16,
+            }],
+        )
+        .unwrap();
+        let artifact = emit_pcode_interprocedural_cfg_llvm_with_allocations(
+            &snapshots,
+            4,
+            &process,
+            &allocations,
+        )
+        .unwrap();
+        assert!(artifact.llvm.stop_sites.iter().any(|site| {
+            site.status == PcodeCfgLlvmStatus::Call
+                && site.address.offset == "0x201179"
+                && site.reason.contains("internal executable")
+        }));
+        verify(&artifact.llvm.llvm_ir);
+    }
+
+    #[test]
     fn interprocedural_direct_call_llvm_matches_shared_rust_state() {
         let snapshots = call_snapshots();
         let artifact = emit_pcode_interprocedural_cfg_llvm(&snapshots, 4).unwrap();
@@ -2875,14 +4618,23 @@ mod tests {
                 .unwrap();
         assert!(matches!(recursive.stop,
             hydir_ir::pcode::PcodeCallPathStop::CallBoundary { ref reason, .. }
-                if reason.contains("recursive")));
+                if reason.contains("depth")));
+        assert_eq!(recursive.calls.len(), 4);
+        let mut recursive_guest = GuestTestMemory {
+            space_id: 433,
+            base: 0x6fffc0,
+            bytes: vec![None; 0x48],
+            expected: Vec::new(),
+            expected_state: Vec::new(),
+        };
+        recursive_guest.bytes[0x40..0x48].copy_from_slice(&guest.bytes[8..16]);
         run_lli_with_guest(
             &artifact.llvm,
             &recursive_seed,
-            &guest,
+            &recursive_guest,
             128,
-            PcodeCfgLlvmStatus::RecursiveCall,
-            &source_event_ids(&artifact.llvm, &recursive.segments[0].path),
+            PcodeCfgLlvmStatus::CallDepth,
+            &call_event_ids(&artifact.llvm, &recursive),
             Some(0x7c),
         );
 

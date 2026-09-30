@@ -76,10 +76,19 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf
 cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
 cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
 cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c --max-functions 2
+cargo run --locked -p hydir-cli -- ghidra-snapshot trace-calls tests/fixtures/ghidra_choose_calls.elf tests/fixtures/ghidra_choose_root_v2.json tests/fixtures/ghidra_choose_right_seed_v1.json --callee tests/fixtures/ghidra_choose_right_v2.json --callee tests/fixtures/ghidra_choose_left_v2.json --allocations allocations.json
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
 cargo run --locked -p hydir-cli -- ghidra llvm-cfg-image tests/fixtures/hydir-password-gate-stripped.elf --function 0x2016d0 --output target/password-image-llvm.json
 cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
 ```
+
+For the declared-stack example, create `allocations.json` containing
+`{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340024,"byte_len":16}]}`.
+The declaration bounds memory; the seed supplies any known initial bytes.
+For a completed DynamicTrace v3, `ghidra-snapshot rediscover-jumps` produces a
+byte-verified, input-specific candidate plan. `rediscover-jumps-apply` runs
+targeted Ghidra reanalysis in an isolated project copy and keeps the unknown
+computed branch edge in the resulting snapshot.
 
 For a stripped ELF with no function names, open
 `tests/fixtures/hydir-password-gate-stripped.elf` in the GUI and select the

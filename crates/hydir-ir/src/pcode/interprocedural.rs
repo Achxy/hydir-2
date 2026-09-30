@@ -4,19 +4,23 @@
 
 use super::{
     GhidraFlowKind, GhidraSnapshot, MAX_OPERATIONS, PcodeAddress, PcodeConcreteState,
-    PcodeOperation, PcodePathEvent, PcodePathStop, PcodePathTrace, hex_u64,
-    validate_ghidra_snapshot,
+    PcodeElfImportCall, PcodeElfImportIndex, PcodeElfProcessMemory, PcodeOperation, PcodePathEvent,
+    PcodePathStop, PcodePathTrace, PcodeProcessAllocationKind, PcodeProcessAllocations,
+    PcodeVarnode, hex_u64, validate_ghidra_snapshot,
 };
 use crate::{SemanticFidelity, VerificationStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub const PCODE_CALL_PATH_VERSION: u32 = 2;
+pub const PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION: u32 = 3;
+pub const PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION: u32 = 4;
 const MAX_SNAPSHOTS: usize = 128;
 const MAX_SEGMENTS: usize = 128;
 const MAX_CALL_DEPTH: usize = 16;
 const MISSING_CALLEE_REASON: &str = "CALL callee snapshot is unavailable";
+const MAX_IMPORT_STRING_BYTES: u64 = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +38,31 @@ pub struct PcodeCallTransition {
     pub call_site: PcodeAddress,
     pub return_address: PcodeAddress,
     pub depth: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeCallProcessBinding {
+    /// Digest of the canonical, binary-bound process image including its
+    /// initial bytes and masks. The allocation contract carries the ELF and
+    /// snapshot-layout digests.
+    pub process_memory_sha256: String,
+    pub allocations: PcodeProcessAllocations,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PcodeContractedImportCall {
+    pub call_site: PcodeAddress,
+    pub plt_target: PcodeAddress,
+    pub got: PcodeAddress,
+    pub name: String,
+    pub return_address: PcodeAddress,
+    pub result: u64,
+    pub contract_version: u32,
+    /// The ELF name and PLT bytes do not prove the dynamic linker's binding.
+    /// This call result is conditional on the named import obeying its ABI.
+    pub binding_assumption: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,9 +90,13 @@ pub enum PcodeCallPathStop {
 pub struct PcodeInterproceduralTrace {
     pub schema_version: u32,
     pub binary_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_binding: Option<PcodeCallProcessBinding>,
     pub root_entry: PcodeAddress,
     pub segments: Vec<PcodeCallPathSegment>,
     pub calls: Vec<PcodeCallTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracted_imports: Vec<PcodeContractedImportCall>,
     /// Worker collection failures can be attached by an orchestrator without
     /// turning a missing callee into an invented call effect.
     pub snapshot_diagnostics: Vec<String>,
@@ -228,7 +261,7 @@ pub fn unloaded_call_target(
     Ok(Some(target))
 }
 
-/// Follow direct and concretely resolved indirect, nonrecursive calls in a
+/// Follow direct and concretely resolved indirect calls in a
 /// bounded set of snapshots. The first snapshot is the root. Unknown,
 /// mismatched, or missing call evidence stops explicitly. Shared register and RAM state follows raw
 /// P-code; no ABI clobbers or return values are invented.
@@ -242,6 +275,8 @@ pub fn execute_concrete_call_path(
     execute_concrete_call_path_inner(
         snapshots,
         initial_state,
+        None,
+        None,
         None,
         max_operations,
         max_instruction_visits,
@@ -263,16 +298,227 @@ pub fn execute_concrete_call_path_with_image(
         snapshots,
         initial_state,
         Some(image),
+        None,
+        None,
         max_operations,
         max_instruction_visits,
         max_call_depth,
     )
 }
 
+/// Follow loaded, internal x86-64 ELF calls with one binary-bound process and
+/// explicit stack/heap allocation contract shared across every call segment.
+/// Raw P-code supplies the call and return effects; external effects are not
+/// synthesized.
+pub fn execute_concrete_call_path_with_allocations(
+    snapshots: &[GhidraSnapshot],
+    initial_state: &PcodeConcreteState,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+    max_operations: usize,
+    max_instruction_visits: usize,
+    max_call_depth: usize,
+) -> Result<PcodeInterproceduralTrace, String> {
+    execute_concrete_call_path_inner(
+        snapshots,
+        initial_state,
+        None,
+        Some((process, allocations)),
+        None,
+        max_operations,
+        max_instruction_visits,
+        max_call_depth,
+    )
+}
+
+/// Apply only byte-verified PLT imports with a bounded SysV effect contract.
+/// The ELF import name is an explicit binding assumption, never proof of the
+/// dynamic linker's chosen implementation. Unknown imports stop at their
+/// P-code call site. This v4 trace does not reinterpret older v2/v3 artifacts.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_concrete_call_path_with_imports(
+    snapshots: &[GhidraSnapshot],
+    initial_state: &PcodeConcreteState,
+    binary: &[u8],
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+    max_operations: usize,
+    max_instruction_visits: usize,
+    max_call_depth: usize,
+) -> Result<PcodeInterproceduralTrace, String> {
+    if format!("{:x}", Sha256::digest(binary)) != process.binary_sha256() {
+        return Err("import contract binary disagrees with ELF process memory".to_owned());
+    }
+    execute_concrete_call_path_inner(
+        snapshots,
+        initial_state,
+        None,
+        Some((process, allocations)),
+        Some(binary),
+        max_operations,
+        max_instruction_visits,
+        max_call_depth,
+    )
+}
+
+fn internal_process_target(
+    snapshot: &GhidraSnapshot,
+    process: &PcodeElfProcessMemory,
+    target: &PcodeAddress,
+) -> bool {
+    if target.space != process.space() {
+        return false;
+    }
+    let Ok(address) = hex_u64(&target.offset) else {
+        return false;
+    };
+    process.is_mapped(&target.space, address)
+        && process.initial_byte(&target.space, address).is_some()
+        && snapshot.memory_blocks.iter().any(|block| {
+            block.start.space == target.space
+                && block.loaded
+                && block.execute
+                && !block.overlay
+                && (block.name == ".text" || block.name.starts_with(".text."))
+                && hex_u64(&block.start.offset).is_ok_and(|start| start <= address)
+                && hex_u64(&block.end.offset).is_ok_and(|end| address <= end)
+        })
+}
+
+fn abi_register(snapshot: &GhidraSnapshot, name: &str) -> Result<PcodeVarnode, String> {
+    let layout = snapshot
+        .register_layout
+        .iter()
+        .find(|register| register.name == name)
+        .ok_or_else(|| format!("SysV import contract requires Ghidra {name} layout"))?;
+    if layout.size_bytes != 8 || layout.storage.space != "register" {
+        return Err(format!(
+            "SysV import contract has invalid Ghidra {name} layout"
+        ));
+    }
+    Ok(PcodeVarnode {
+        space: "register".to_owned(),
+        offset: layout.storage.offset.clone(),
+        size: 8,
+    })
+}
+
+fn apply_strlen_contract(
+    snapshot: &GhidraSnapshot,
+    state: &PcodeConcreteState,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+    continuation: &PcodeAddress,
+) -> Result<(PcodeConcreteState, u64), String> {
+    let rax = abi_register(snapshot, "RAX")?;
+    let rdi = abi_register(snapshot, "RDI")?;
+    let rsp = abi_register(snapshot, "RSP")?;
+    let mut register_ranges = Vec::new();
+    for node in [&rax, &rdi, &rsp] {
+        let start = hex_u64(&node.offset)?;
+        if register_ranges
+            .iter()
+            .any(|(other, _): &(u64, u32)| start < *other + 8 && *other < start + 8)
+        {
+            return Err("SysV import register layout overlaps".to_owned());
+        }
+        register_ranges.push((start, 8));
+    }
+    let mut preserve = vec![(hex_u64(&rsp.offset)?, 8)];
+    for name in ["RBX", "RBP", "R12", "R13", "R14", "R15"] {
+        if snapshot
+            .register_layout
+            .iter()
+            .any(|register| register.name == name)
+        {
+            let node = abi_register(snapshot, name)?;
+            let start = hex_u64(&node.offset)?;
+            if register_ranges
+                .iter()
+                .any(|(other, _)| start < *other + 8 && *other < start + 8)
+            {
+                return Err("SysV import register layout overlaps".to_owned());
+            }
+            register_ranges.push((start, 8));
+            preserve.push((start, 8));
+        }
+    }
+
+    let pointer = state
+        .read_varnode(&rdi)?
+        .ok_or("strlen argument pointer is unknown")?;
+    let stack_pointer = state
+        .read_varnode(&rsp)?
+        .ok_or("strlen return stack pointer is unknown")?;
+    let stack_end = stack_pointer
+        .checked_add(8)
+        .ok_or("strlen return stack pointer overflows")?;
+    if !allocations.regions().iter().any(|region| {
+        region.kind == PcodeProcessAllocationKind::Stack
+            && region.space == process.space()
+            && stack_pointer >= region.base
+            && region
+                .base
+                .checked_add(region.byte_len)
+                .is_some_and(|end| stack_end <= end)
+    }) {
+        return Err("strlen return slot is outside the declared stack".to_owned());
+    }
+    let return_address = state
+        .read_memory(process.space(), stack_pointer, 8)?
+        .ok_or("strlen return slot bytes are unknown")?;
+    if continuation.space != process.space() || return_address != hex_u64(&continuation.offset)? {
+        return Err("strlen return slot differs from analyzed caller continuation".to_owned());
+    }
+
+    let mut length = None;
+    for offset in 0..MAX_IMPORT_STRING_BYTES {
+        let address = pointer
+            .checked_add(offset)
+            .ok_or("strlen argument pointer overflows")?;
+        if !process.is_mapped(process.space(), address)
+            && !allocations.contains(process.space(), address)
+        {
+            return Err(format!("strlen reads unmapped byte at 0x{address:x}"));
+        }
+        let byte = state
+            .read_memory(process.space(), address, 1)?
+            .map(|value| value as u8)
+            .or_else(|| process.initial_byte(process.space(), address))
+            .ok_or_else(|| format!("strlen byte at 0x{address:x} is unknown"))?;
+        if byte == 0 {
+            length = Some(offset);
+            break;
+        }
+    }
+    let length = length.ok_or("strlen terminator exceeds 4096-byte contract budget")?;
+    let mut next = state.clone();
+    next.retain_register_ranges(&preserve);
+    next.write_varnode(&rax, length)?;
+    next.write_varnode(&rsp, stack_end)?;
+    Ok((next, length))
+}
+
+fn apply_import_contract(
+    import: &PcodeElfImportCall,
+    snapshot: &GhidraSnapshot,
+    state: &PcodeConcreteState,
+    process: &PcodeElfProcessMemory,
+    allocations: &PcodeProcessAllocations,
+    continuation: &PcodeAddress,
+) -> Result<(PcodeConcreteState, u64), String> {
+    match import.name.as_str() {
+        "strlen" => apply_strlen_contract(snapshot, state, process, allocations, continuation),
+        name => Err(format!("import {name} has no checked SysV call contract")),
+    }
+}
+
 fn execute_concrete_call_path_inner(
     snapshots: &[GhidraSnapshot],
     initial_state: &PcodeConcreteState,
     image: Option<&super::PcodeReadOnlyElfImage>,
+    allocated: Option<(&PcodeElfProcessMemory, &PcodeProcessAllocations)>,
+    import_binary: Option<&[u8]>,
     max_operations: usize,
     max_instruction_visits: usize,
     max_call_depth: usize,
@@ -293,6 +539,9 @@ fn execute_concrete_call_path_inner(
     let mut digests = Vec::with_capacity(snapshots.len());
     for (number, snapshot) in snapshots.iter().enumerate() {
         validate_ghidra_snapshot(snapshot, &root.binary_sha256)?;
+        if let Some((process, allocations)) = allocated {
+            allocations.validate_for(snapshot, process)?;
+        }
         if snapshot.program != root.program
             || snapshot.address_spaces != root.address_spaces
             || snapshot.functions != root.functions
@@ -314,10 +563,10 @@ fn execute_concrete_call_path_inner(
     let mut start = root.selected_function.entry.clone();
     let mut state = initial_state.clone();
     let mut frames = Vec::<Frame>::new();
-    let mut active_entries = BTreeSet::new();
-    active_entries.insert(key(&start)?);
     let mut segments = Vec::new();
     let mut calls = Vec::new();
+    let mut contracted_imports = Vec::new();
+    let mut import_indices = vec![None; snapshots.len()];
     let mut executed_operations = 0usize;
     let mut instruction_visits = 0usize;
 
@@ -328,7 +577,16 @@ fn execute_concrete_call_path_inner(
         let snapshot = &snapshots[current];
         let remaining_operations = max_operations.saturating_sub(executed_operations);
         let remaining_visits = max_instruction_visits.saturating_sub(instruction_visits);
-        let path = if let Some(image) = image {
+        let path = if let Some((process, allocations)) = allocated {
+            snapshot.execute_concrete_path_with_allocations(
+                &state,
+                process,
+                allocations,
+                Some(&start),
+                remaining_operations,
+                remaining_visits,
+            )?
+        } else if let Some(image) = image {
             snapshot.execute_concrete_path_with_image(
                 &state,
                 image,
@@ -375,6 +633,68 @@ fn execute_concrete_call_path_inner(
                     Ok(value) => value,
                     Err(reason) => break PcodeCallPathStop::CallBoundary { source, reason },
                 };
+                if let (Some(binary), Some((process, allocations))) = (import_binary, allocated) {
+                    if import_indices[current].is_none() {
+                        import_indices[current] =
+                            match PcodeElfImportIndex::from_elf(binary, snapshot) {
+                                Ok(index) => Some(index),
+                                Err(reason) => {
+                                    break PcodeCallPathStop::CallBoundary { source, reason };
+                                }
+                            };
+                    }
+                    let index = import_indices[current].as_ref().expect("set above");
+                    if let Some(import) = index
+                        .calls
+                        .iter()
+                        .find(|import| import.call_site == site && import.plt_target == target)
+                    {
+                        if frames.len() >= max_call_depth {
+                            break PcodeCallPathStop::CallBoundary {
+                                source,
+                                reason: "call depth budget exhausted".to_owned(),
+                            };
+                        }
+                        let (next, result) = match apply_import_contract(
+                            import,
+                            snapshot,
+                            &state,
+                            process,
+                            allocations,
+                            &continuation,
+                        ) {
+                            Ok(value) => value,
+                            Err(reason) => {
+                                break PcodeCallPathStop::CallBoundary { source, reason };
+                            }
+                        };
+                        state = next;
+                        contracted_imports.push(PcodeContractedImportCall {
+                            call_site: site,
+                            plt_target: target,
+                            got: import.got.clone(),
+                            name: import.name.clone(),
+                            return_address: continuation.clone(),
+                            result,
+                            contract_version: 1,
+                            binding_assumption: format!(
+                                "ELF JUMP_SLOT {name} resolves to a conforming SysV {name}",
+                                name = import.name
+                            ),
+                        });
+                        start = continuation;
+                        continue;
+                    }
+                }
+                if let Some((process, _)) = allocated
+                    && !internal_process_target(snapshot, process, &target)
+                {
+                    break PcodeCallPathStop::CallBoundary {
+                        source,
+                        reason: "CALL target is not a loaded internal executable ELF function"
+                            .to_owned(),
+                    };
+                }
                 if frames.len() >= max_call_depth {
                     break PcodeCallPathStop::CallBoundary {
                         source,
@@ -387,12 +707,6 @@ fn execute_concrete_call_path_inner(
                         reason: MISSING_CALLEE_REASON.to_owned(),
                     };
                 };
-                if !active_entries.insert(key(&target)?) {
-                    break PcodeCallPathStop::CallBoundary {
-                        source,
-                        reason: "recursive call requires a separate bounded model".to_owned(),
-                    };
-                }
                 calls.push(PcodeCallTransition {
                     caller_entry: snapshot.selected_function.entry.clone(),
                     callee_entry: target.clone(),
@@ -442,7 +756,6 @@ fn execute_concrete_call_path_inner(
                             .to_owned(),
                     };
                 }
-                active_entries.remove(&key(&snapshot.selected_function.entry)?);
                 current = frame.caller_index;
                 start = frame.return_address;
             }
@@ -450,11 +763,33 @@ fn execute_concrete_call_path_inner(
         }
     };
     Ok(PcodeInterproceduralTrace {
-        schema_version: PCODE_CALL_PATH_VERSION,
+        schema_version: if import_binary.is_some() {
+            PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION
+        } else if allocated.is_some() {
+            PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION
+        } else {
+            PCODE_CALL_PATH_VERSION
+        },
         binary_sha256: root.binary_sha256.clone(),
+        process_binding: allocated
+            .map(
+                |(process, allocations)| -> Result<PcodeCallProcessBinding, String> {
+                    Ok(PcodeCallProcessBinding {
+                        process_memory_sha256: format!(
+                            "{:x}",
+                            Sha256::digest(
+                                serde_json::to_vec(process).map_err(|error| error.to_string())?
+                            )
+                        ),
+                        allocations: allocations.clone(),
+                    })
+                },
+            )
+            .transpose()?,
         root_entry: root.selected_function.entry.clone(),
         segments,
         calls,
+        contracted_imports,
         snapshot_diagnostics: Vec::new(),
         executed_operations,
         instruction_visits,
@@ -468,7 +803,256 @@ fn execute_concrete_call_path_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pcode::{PcodeVarnode, parse_ghidra_snapshot};
+    use crate::pcode::{
+        GhidraRegisterLayout, PcodeExecutionStop, PcodeMemoryBoundaryKind, PcodeProcessAllocation,
+        PcodeProcessAllocationKind, PcodeVarnode, parse_ghidra_snapshot,
+    };
+
+    fn choose_snapshots() -> Vec<GhidraSnapshot> {
+        let digest = "dc459793ce9edcc543c9ffcadbecc27c6a2e1976782f1da4d3adc2119dd27723";
+        [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_root_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_right_v2.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/ghidra_choose_left_v2.json"
+            ))
+            .as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, digest).unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn strlen_contract_uses_known_bytes_and_sysv_register_effects() {
+        let mut snapshot = choose_snapshots().remove(0);
+        snapshot.register_layout = [
+            ("RAX", "0x0"),
+            ("RBX", "0x18"),
+            ("RDI", "0x38"),
+            ("RSP", "0x20"),
+        ]
+        .into_iter()
+        .map(|(name, offset)| GhidraRegisterLayout {
+            name: name.to_owned(),
+            storage: PcodeAddress {
+                space: "register".to_owned(),
+                offset: offset.to_owned(),
+            },
+            size_bytes: 8,
+        })
+        .collect();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshot, 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshot,
+            &process,
+            vec![
+                PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Stack,
+                    space: "ram".into(),
+                    base: 0x6ffff0,
+                    byte_len: 32,
+                },
+                PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Heap,
+                    space: "ram".into(),
+                    base: 0x700100,
+                    byte_len: 256,
+                },
+            ],
+        )
+        .unwrap();
+        let mut state = PcodeConcreteState::default();
+        state.write_varnode(&register("0x0"), 77).unwrap();
+        state.write_varnode(&register("0x18"), 123).unwrap();
+        state.write_varnode(&register("0x38"), 0x700100).unwrap();
+        state.write_varnode(&register("0x20"), 0x700000).unwrap();
+        state.write_memory("ram", 0x700000, 8, 0x201195).unwrap();
+        for (index, byte) in b"hello\0".iter().enumerate() {
+            state
+                .write_memory("ram", 0x700100 + index as u64, 1, u64::from(*byte))
+                .unwrap();
+        }
+        let continuation = PcodeAddress {
+            space: "ram".into(),
+            offset: "0x201195".into(),
+        };
+        let (after, length) =
+            apply_strlen_contract(&snapshot, &state, &process, &allocations, &continuation)
+                .unwrap();
+        assert_eq!(length, 5);
+        assert_eq!(after.read_varnode(&register("0x0")).unwrap(), Some(5));
+        assert_eq!(after.read_varnode(&register("0x18")).unwrap(), Some(123));
+        assert_eq!(
+            after.read_varnode(&register("0x20")).unwrap(),
+            Some(0x700008)
+        );
+        assert_eq!(after.read_varnode(&register("0x38")).unwrap(), None);
+        assert_eq!(
+            after.read_memory("ram", 0x700100, 1).unwrap(),
+            Some(u64::from(b'h'))
+        );
+
+        let mut unknown = state.clone();
+        unknown.write_varnode(&register("0x38"), 0x700180).unwrap();
+        assert!(
+            apply_strlen_contract(&snapshot, &unknown, &process, &allocations, &continuation,)
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert_eq!(state.read_varnode(&register("0x0")).unwrap(), Some(77));
+    }
+
+    #[test]
+    fn allocated_process_calls_share_stack_and_stop_before_crossing_store() {
+        let snapshots = choose_snapshots();
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        for (argument, expected, callee) in [(1, 2, "0x201185"), (0, 1, "0x20118d")] {
+            let allocations = PcodeProcessAllocations::new(
+                &snapshots[0],
+                &process,
+                vec![PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Stack,
+                    space: "ram".into(),
+                    base: 0x6ffff8,
+                    byte_len: 16,
+                }],
+            )
+            .unwrap();
+            let mut input = PcodeConcreteState::default();
+            input.write_varnode(&register("0x38"), argument).unwrap();
+            input.write_varnode(&register("0x20"), 0x700000).unwrap();
+            input.write_memory("ram", 0x700000, 8, 0x201195).unwrap();
+            let trace = execute_concrete_call_path_with_allocations(
+                &snapshots,
+                &input,
+                &process,
+                &allocations,
+                128,
+                16,
+                4,
+            )
+            .unwrap();
+            assert_eq!(
+                trace.schema_version,
+                PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION
+            );
+            assert_eq!(
+                trace.process_binding.as_ref().unwrap().allocations,
+                allocations
+            );
+            assert!(matches!(trace.stop, PcodeCallPathStop::Return { .. }));
+            assert_eq!(trace.calls.len(), 1);
+            assert_eq!(trace.calls[0].callee_entry.offset, callee);
+            assert_eq!(
+                trace.final_state.read_varnode(&register("0x0")).unwrap(),
+                Some(expected)
+            );
+            assert_eq!(
+                trace.final_state.read_memory("ram", 0x6ffff8, 8).unwrap(),
+                Some(if argument == 1 { 0x20117e } else { 0x201184 })
+            );
+
+            let narrow = PcodeProcessAllocations::new(
+                &snapshots[0],
+                &process,
+                vec![PcodeProcessAllocation {
+                    kind: PcodeProcessAllocationKind::Stack,
+                    space: "ram".into(),
+                    base: 0x6ffffc,
+                    byte_len: 12,
+                }],
+            )
+            .unwrap();
+            let stopped = execute_concrete_call_path_with_allocations(
+                &snapshots, &input, &process, &narrow, 128, 16, 4,
+            )
+            .unwrap();
+            assert!(matches!(
+                &stopped.stop,
+                PcodeCallPathStop::PathBoundary {
+                    stop: PcodePathStop::EffectBoundary {
+                        boundary: PcodeExecutionStop::MemoryBoundary {
+                            source,
+                            reason: PcodeMemoryBoundaryKind::UnmappedWrite,
+                            ..
+                        }
+                    }
+                } if source.mnemonic == "STORE" && source.source_address == stopped.segments[0].path.instruction_visits.last().unwrap().clone()
+            ));
+            assert_eq!(stopped.calls.len(), 0);
+            assert_eq!(
+                stopped.final_state.read_memory("ram", 0x6ffff8, 8).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn allocated_process_call_stops_at_plt_without_external_effects() {
+        let mut snapshots = choose_snapshots();
+        for snapshot in &mut snapshots {
+            snapshot
+                .memory_blocks
+                .iter_mut()
+                .find(|block| block.name == ".text")
+                .unwrap()
+                .name = ".plt".into();
+        }
+        let binary = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ghidra_choose_calls.elf"
+        ));
+        let process = PcodeElfProcessMemory::from_elf(binary, &snapshots[0], 64 * 1024).unwrap();
+        let allocations = PcodeProcessAllocations::new(
+            &snapshots[0],
+            &process,
+            vec![PcodeProcessAllocation {
+                kind: PcodeProcessAllocationKind::Stack,
+                space: "ram".into(),
+                base: 0x6ffff8,
+                byte_len: 16,
+            }],
+        )
+        .unwrap();
+        let mut input = PcodeConcreteState::default();
+        input.write_varnode(&register("0x38"), 1).unwrap();
+        input.write_varnode(&register("0x20"), 0x700000).unwrap();
+        input.write_memory("ram", 0x700000, 8, 0x201195).unwrap();
+        let trace = execute_concrete_call_path_with_allocations(
+            &snapshots,
+            &input,
+            &process,
+            &allocations,
+            128,
+            16,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(
+            trace.stop,
+            PcodeCallPathStop::CallBoundary { ref source, ref reason }
+                if source.source_address.offset == "0x201179" && reason.contains("internal executable")
+        ));
+        assert!(trace.calls.is_empty());
+    }
 
     fn snapshots() -> Vec<GhidraSnapshot> {
         let digest = "4b3d29186ad32957cd12f1f4b581f3cad544903f0c4da152603394cc45ee3bb0";
@@ -539,6 +1123,13 @@ mod tests {
             );
             assert_eq!(trace.verification, VerificationStatus::NotRun);
             assert_eq!(trace.semantic_fidelity, SemanticFidelity::Unknown);
+            assert_eq!(trace.schema_version, PCODE_CALL_PATH_VERSION);
+            assert!(trace.process_binding.is_none());
+            assert!(
+                !serde_json::to_string(&trace)
+                    .unwrap()
+                    .contains("process_binding")
+            );
         }
     }
 

@@ -1,0 +1,109 @@
+name: Frida observer gate
+on:
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - LICENSE
+      - crates/hydir-cli/**
+      - crates/hydir-execution/**
+      - crates/hydir-decompile/**
+      - crates/hydir-ghidra-worker/**
+      - crates/hydir-ir/**
+      - crates/hydir-frida-observer/**
+      - vendor/frida-rust-0.17.2/**
+      - tests/fixtures/frida_branch.c
+      - tests/fixtures/frida_indirect_jump.c
+      - tests/frida_observer_gate.py
+      - scripts/package-frida-linux.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
+      - .github/workflows/frida-gate.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - LICENSE
+      - crates/hydir-cli/**
+      - crates/hydir-execution/**
+      - crates/hydir-decompile/**
+      - crates/hydir-ghidra-worker/**
+      - crates/hydir-ir/**
+      - crates/hydir-frida-observer/**
+      - vendor/frida-rust-0.17.2/**
+      - tests/fixtures/frida_branch.c
+      - tests/fixtures/frida_indirect_jump.c
+      - tests/frida_observer_gate.py
+      - scripts/package-frida-linux.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
+      - .github/workflows/frida-gate.yml
+jobs:
+  linux-x86-64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Install native tools and existing Bubblewrap profile
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm bubblewrap apparmor-profiles apparmor-utils libclang-dev
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --unshare-user --unshare-net --ro-bind / / -- /bin/true
+      - name: Fetch and verify pinned Frida 17.9.5 core devkit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/frida-devkit"
+          curl --fail --location --retry 3 \
+            https://github.com/frida/frida/releases/download/17.9.5/frida-core-devkit-17.9.5-linux-x86_64.tar.xz \
+            -o "$RUNNER_TEMP/frida-devkit.tar.xz"
+          echo "e98803f6cad21c41a1b67eaa495963955afab6ed7ae95a18dc485ab2188bb021  $RUNNER_TEMP/frida-devkit.tar.xz" | sha256sum --check
+          tar -xf "$RUNNER_TEMP/frida-devkit.tar.xz" -C "$RUNNER_TEMP/frida-devkit"
+      - name: Test patched Frida callback
+        env:
+          HYDIR_FRIDA_OBSERVER: target/debug/hydir-frida-observer
+        run: |
+          set -euo pipefail
+          export CPATH="$RUNNER_TEMP/frida-devkit"
+          export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
+          cargo test --locked -p frida ordinary_send_dispatches_to_registered_handler
+          cargo test --locked -p hydir-frida-observer --features frida-runtime \
+            dropped_batches_count_observations_not_messages
+      - name: Build pinned Linux x86-64 release bundle
+        run: |
+          set -euo pipefail
+          python3 scripts/package-frida-linux.py build \
+            --devkit-archive "$RUNNER_TEMP/frida-devkit.tar.xz" \
+            --output "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz"
+      - name: Verify offline installation and real observation from bundle
+        run: |
+          set -euo pipefail
+          unset CPATH RUSTFLAGS
+          python3 scripts/package-frida-linux.py verify \
+            "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz" \
+            --require-observation-ready
+          mkdir -p "$RUNNER_TEMP/frida-installed"
+          tar -xzf "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/frida-installed"
+          export HYDIRCTL="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydirctl"
+          export HYDIR_FRIDA_OBSERVER="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydir-frida-observer"
+          python3 tests/frida_observer_gate.py
+      - name: Run held-out ELFs through bundled CLI, automatic Ghidra, and Frida
+        run: |
+          set -euo pipefail
+          export HYDIRCTL="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydirctl"
+          export HYDIR_FRIDA_OBSERVER="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydir-frida-observer"
+          python3 scripts/demo-heldout-musl.py --output-dir "$RUNNER_TEMP/hydir-heldout-musl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hydir-heldout-musl-frida
+          path: ${{ runner.temp }}/hydir-heldout-musl/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydir-linux-x86_64-frida
+          path: ${{ runner.temp }}/hydir-linux-x86_64.tar.gz
+          if-no-files-found: error

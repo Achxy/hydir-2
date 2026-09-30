@@ -31,14 +31,19 @@ use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_
 use hydir_interchange::{MAX_SPECIFICATION_BYTES, SpecificationDocument};
 use hydir_ir::MachineFunctionIr;
 use hydir_ir::pcode::{
-    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeReadOnlyElfImage,
-    PcodeSliceTarget, parse_ghidra_snapshot, parse_pcode_seed,
+    GhidraSnapshot, MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+    MAX_PCODE_SEED_BYTES, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeElfImportIndex,
+    PcodeElfProcessMemory, PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget,
+    parse_ghidra_snapshot, parse_pcode_seed,
 };
 use hydir_model::{
     import_dwarf, import_ghidra_functions, infer_model, init_model, parse_model, validate_model,
 };
 use hydir_project::{LocalProjectStore, default_db_path};
 use hydir_vm::{VmProfile, explore_profile, validate_profile};
+mod compare;
+mod frida;
+mod frida_seed;
 mod ghidra_calls;
 mod local;
 mod passes;
@@ -62,6 +67,9 @@ const HELP: &str = "Hydir: Ghidra-backed binary lifting and reverse engineering
 
 Usage:
   hydirctl doctor
+  hydirctl observe frida <elf> <input.json> --function <0xelf-vaddr> [--snapshot <snapshot.json>] [--output <trace.json>]
+  hydirctl observe seed <elf> <input.json> <snapshot.json> <trace.json> [--output <seed.json>]
+  hydirctl compare-executions <elf> <seed.json> <engine-evidence.json>... [--output <comparison.json>]
   hydirctl inspect <elf>
   hydirctl disassemble <elf>
   hydirctl discover <elf>
@@ -70,9 +78,14 @@ Usage:
   hydirctl analyze <linked-elf>
   hydirctl ghidra analyze <binary> --output <snapshot.json> [--function <0xhex>]
   hydirctl ghidra llvm-cfg-image <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-image.json>]
+  hydirctl ghidra llvm-cfg-process <binary> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-process.json>]
+  hydirctl ghidra llvm-cfg-allocated <binary> --allocations <allocations.json> [--function <0xhex>] [--start <0xhex>] [--output <cfg-llvm-allocated.json>]
   hydirctl ghidra import-project <binary> <project.gpr> --program <project-relative/path> [--function <0xhex>] --output <snapshot.json>
-  hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
-  hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra trace-calls <binary> <seed.json> --function <0xentry> [--allocations <allocations.json>] [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra trace-calls-imports <binary> <seed.json> --function <0xentry> --allocations <allocations.json> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra assess <binary> <seed.json> --function <0xentry> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
+  hydirctl ghidra llvm-cfg-calls <binary> <seed.json> --function <0xentry> [--allocations <allocations.json>] [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra llvm-cfg-calls-imports <binary> <seed.json> --function <0xentry> --allocations <allocations.json> [--max-functions <n>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-project save <elf> <snapshot.json>
   hydirctl ghidra-project get <elf> --function <0xaddress> [--output <snapshot.json>]
   hydirctl ghidra-snapshot verify <binary> <snapshot.json>
@@ -82,16 +95,30 @@ Usage:
   hydirctl ghidra-snapshot state <binary> <snapshot.json> [--output <state-ir.json>]
   hydirctl ghidra-snapshot cfg <binary> <snapshot.json> [--output <cfg-ir.json>]
   hydirctl ghidra-snapshot coverage <binary> <snapshot.json> [--output <coverage.json>]
+  hydirctl ghidra-snapshot capability <binary> <snapshot.json> [--output <capability.json>]
+  hydirctl ghidra-snapshot process-memory <binary> <snapshot.json> [--output <memory.json>]
+  hydirctl ghidra-snapshot imports <binary> <snapshot.json> [--output <imports.json>]
+  hydirctl ghidra-snapshot rediscover-calls <binary> <snapshot.json> <input.json> <trace.json> [--output <plan.json>]
+  hydirctl ghidra-snapshot rediscover-jumps <binary> <snapshot.json> <input.json> <trace-v3.json> [--output <plan.json>]
+  hydirctl ghidra-snapshot rediscover-apply <binary> <snapshot.json> <input.json> <trace.json> [--output <snapshot.json>]
+  hydirctl ghidra-snapshot rediscover-jumps-apply <binary> <snapshot.json> <input.json> <trace-v3.json> [--output <snapshot.json>]
+  hydirctl ghidra-snapshot compare-observed-path <binary> <snapshot.json> <input.json> <trace.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--output <comparison.json>]
+  hydirctl ghidra-snapshot llvm-cfg-process <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-process.json>]
+  hydirctl ghidra-snapshot llvm-cfg-allocated <binary> <snapshot.json> --allocations <allocations.json> [--start <0xaddress>] [--output <cfg-llvm-allocated.json>]
   hydirctl ghidra-snapshot llvm-prefix <binary> <snapshot.json> [--output <prefix.json>]
   hydirctl ghidra-snapshot llvm-standalone <binary> <snapshot.json> [--output <standalone.json>]
   hydirctl ghidra-snapshot llvm-cfg <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm.json>]
   hydirctl ghidra-snapshot llvm-cfg-image <binary> <snapshot.json> [--start <0xaddress>] [--output <cfg-llvm-image.json>]
   hydirctl ghidra-snapshot llvm-cfg-simplified <binary> <snapshot.json> [--start <0xaddress>] [--output <simplified-cfg-llvm.json>]
-  hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-calls <binary> <root-snapshot.json> [--callee <snapshot.json>]... [--allocations <allocations.json>] [--max-depth <n>] [--output <call-cfg-llvm.json>]
+  hydirctl ghidra-snapshot llvm-cfg-calls-imports <binary> <root-snapshot.json> --allocations <allocations.json> [--callee <snapshot.json>]... [--max-depth <n>] [--output <call-cfg-llvm.json>]
   hydirctl ghidra-snapshot slice <binary> <snapshot.json> --instruction <index> --op <index> [--input <index>] [--output <slice.json>]
   hydirctl ghidra-snapshot trace-prefix <binary> <snapshot.json> <seed.json> [--max-ops <n>] [--output <trace.json>]
-  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
-  hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-path <binary> <snapshot.json> <seed.json> [--memory readonly|process|allocated|seed] [--allocations <allocations.json>] [--start <0xaddress>] [--max-ops <n>] [--max-visits <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-calls <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--allocations <allocations.json>] [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+  hydirctl ghidra-snapshot trace-calls-imports <binary> <root-snapshot.json> <seed.json> --allocations <allocations.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <trace.json>]
+    Import contracts assume a conforming dynamic binding; the ELF symbol name alone does not prove it.
+  hydirctl ghidra-snapshot assess <binary> <root-snapshot.json> <seed.json> [--callee <snapshot.json>]... [--max-ops <n>] [--max-visits <n>] [--max-depth <n>] [--output <assessment.json>]
   hydirctl ghidra-snapshot llvm-op <binary> <snapshot.json> --instruction <hex> --op <index> [--output <file.ll>]
   hydirctl analyze-spec <linked-elf>
   hydirctl hydir-spec-inspect <hydir-spec.pb> [--canonical-output <canonical.pb>]
@@ -229,6 +256,11 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("observe") if args.get(1).is_some_and(|value| value == "seed") => {
+            frida_seed::run(&args[2..])?
+        }
+        Some("observe") => frida::run(&args)?,
+        Some("compare-executions") => compare::run(&args[1..])?,
         Some("ghidra-project") if args.len() == 4 && args[1] == "save" => {
             let binary = read_binary(&args[2])?;
             let spec = import_elf(&binary)?;
@@ -291,14 +323,230 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Some("ghidra-snapshot")
+            if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
+                && args[1] == "process-memory" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let memory = PcodeElfProcessMemory::from_elf(
+                &binary,
+                &snapshot,
+                PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&memory)?;
+            if args.len() == 6 {
+                write_new_or_identical(&args[5], &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if (args.len() == 4 || args.len() == 6 && args[4] == "--output")
+                && args[1] == "imports" =>
+        {
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let imports = PcodeElfImportIndex::from_elf(&binary, &snapshot)?;
+            let bytes = serde_json::to_vec_pretty(&imports)?;
+            if args.len() == 6 {
+                write_new_or_identical(&args[5], &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if (args.len() == 6 || args.len() == 8 && args[6] == "--output")
+                && matches!(args[1].as_str(), "rediscover-calls" | "rediscover-jumps") =>
+        {
+            let binary = read_binary(&args[2])?;
+            let snapshot = read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?;
+            let input = parse_input_spec(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let trace = hydir_execution::parse_dynamic_trace(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES,
+            )?)?;
+            let bytes = if args[1] == "rediscover-jumps" {
+                serde_json::to_vec_pretty(&ghidra_worker::plan_observed_jumps(
+                    &binary, &input, &trace, &snapshot,
+                )?)?
+            } else {
+                serde_json::to_vec_pretty(&ghidra_worker::plan_observed_calls(
+                    &binary, &input, &trace, &snapshot,
+                )?)?
+            };
+            if args.len() == 8 {
+                write_new_or_identical(&args[7], &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot") if args.len() >= 7 && args[1] == "compare-observed-path" => {
+            let mut output_path = None;
+            let mut memory_mode = "readonly";
+            let mut memory_option_seen = false;
+            let mut allocations_path = None;
+            let mut options = args[7..].chunks_exact(2);
+            for pair in &mut options {
+                match pair[0].as_str() {
+                    "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
+                    "--memory"
+                        if !memory_option_seen
+                            && matches!(
+                                pair[1].as_str(),
+                                "readonly" | "process" | "allocated" | "seed"
+                            ) =>
+                    {
+                        memory_mode = pair[1].as_str();
+                        memory_option_seen = true;
+                    }
+                    _ => return Err(HELP.into()),
+                }
+            }
+            if !options.remainder().is_empty() {
+                return Err(HELP.into());
+            }
+            if (memory_mode == "allocated") != allocations_path.is_some() {
+                return Err("allocated memory requires exactly one --allocations file".into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
+            let snapshot = parse_ghidra_snapshot(
+                &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
+                &digest,
+            )?;
+            let input = parse_input_spec(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let trace = hydir_execution::parse_dynamic_trace(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES,
+            )?)?;
+            let seed = parse_pcode_seed(
+                &read_bounded_json(&args[6], MAX_PCODE_SEED_BYTES)?,
+                &snapshot,
+            )?;
+            let path = match memory_mode {
+                "allocated" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    let allocations = PcodeProcessAllocations::parse_declared(
+                        &read_bounded_json(
+                            allocations_path.unwrap(),
+                            MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                        )?,
+                        &snapshot,
+                        &memory,
+                    )?;
+                    snapshot.execute_concrete_path_with_allocations(
+                        &seed,
+                        &memory,
+                        &allocations,
+                        None,
+                        4096,
+                        1024,
+                    )?
+                }
+                "process" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    snapshot.execute_concrete_path_with_process_memory(
+                        &seed, &memory, None, 4096, 1024,
+                    )?
+                }
+                "readonly" => {
+                    if let Some(image) = pcode_image_or_legacy(&binary, &snapshot)? {
+                        snapshot
+                            .execute_concrete_path_with_image(&seed, &image, None, 4096, 1024)?
+                    } else {
+                        snapshot.execute_concrete_path(&seed, None, 4096, 1024)?
+                    }
+                }
+                "seed" => snapshot.execute_concrete_path(&seed, None, 4096, 1024)?,
+                _ => unreachable!("validated memory mode"),
+            };
+            let comparison = hydir_decompile::compare_pcode_observed_path(
+                &binary, &input, &snapshot, &trace, &path,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&comparison)?;
+            if let Some(output) = output_path {
+                write_new_or_identical(output, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
+            if (args.len() == 6 || args.len() == 8 && args[6] == "--output")
+                && matches!(
+                    args[1].as_str(),
+                    "rediscover-apply" | "rediscover-jumps-apply"
+                ) =>
+        {
+            let snapshot = read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?;
+            let input = parse_input_spec(&read_bounded_json(
+                &args[4],
+                hydir_execution::MAX_INPUT_SPEC_BYTES,
+            )?)?;
+            let trace = hydir_execution::parse_dynamic_trace(&read_bounded_json(
+                &args[5],
+                hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES,
+            )?)?;
+            let result = if args[1] == "rediscover-jumps-apply" {
+                ghidra_worker::reanalyze_observed_jumps(
+                    Path::new(&args[2]),
+                    &input,
+                    &trace,
+                    &snapshot,
+                )?
+            } else {
+                ghidra_worker::reanalyze_observed_calls(
+                    Path::new(&args[2]),
+                    &input,
+                    &trace,
+                    &snapshot,
+                )?
+            };
+            let bytes = serde_json::to_vec_pretty(&result)?;
+            if args.len() == 8 {
+                write_new_or_identical(&args[7], &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
+        Some("ghidra-snapshot")
             if args.len() >= 4
                 && matches!(
                     args[1].as_str(),
-                    "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-simplified"
+                    "llvm-cfg"
+                        | "llvm-cfg-image"
+                        | "llvm-cfg-process"
+                        | "llvm-cfg-allocated"
+                        | "llvm-cfg-simplified"
                 ) =>
         {
             let mut start_address = None;
             let mut output_path = None;
+            let mut allocations_path = None;
             let mut options = args[4..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -306,11 +554,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                         start_address = Some(parse_u64_auto(&pair[1], "P-code start address")?);
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
+            }
+            if (args[1] == "llvm-cfg-allocated") != allocations_path.is_some() {
+                return Err("allocated LLVM requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let digest = format!("{:x}", sha2::Sha256::digest(&binary));
@@ -336,6 +590,43 @@ fn run() -> Result<(), Box<dyn Error>> {
                         &window,
                     )?)?
                 }
+                "llvm-cfg-process" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    serde_json::to_vec_pretty(
+                        &hydir_decompile::emit_pcode_cfg_llvm_with_process_memory(
+                            &snapshot,
+                            start.as_ref(),
+                            &memory,
+                        )?,
+                    )?
+                }
+                "llvm-cfg-allocated" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    let allocations = PcodeProcessAllocations::parse_declared(
+                        &read_bounded_json(
+                            allocations_path.unwrap(),
+                            MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                        )?,
+                        &snapshot,
+                        &memory,
+                    )?;
+                    serde_json::to_vec_pretty(
+                        &hydir_decompile::emit_pcode_cfg_llvm_with_allocations(
+                            &snapshot,
+                            start.as_ref(),
+                            &memory,
+                            &allocations,
+                        )?,
+                    )?
+                }
                 _ => serde_json::to_vec_pretty(&hydir_decompile::emit_pcode_cfg_llvm(
                     &snapshot,
                     start.as_ref(),
@@ -347,11 +638,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!("{}", String::from_utf8(bytes)?);
             }
         }
-        Some("ghidra-snapshot") if args.len() >= 4 && args[1] == "llvm-cfg-calls" => {
+        Some("ghidra-snapshot")
+            if args.len() >= 4
+                && matches!(
+                    args[1].as_str(),
+                    "llvm-cfg-calls" | "llvm-cfg-calls-imports"
+                ) =>
+        {
+            let with_imports = args[1] == "llvm-cfg-calls-imports";
             let mut callee_paths = Vec::new();
             let mut max_depth = 4usize;
             let mut depth_seen = false;
             let mut output_path = None;
+            let mut allocations_path = None;
             let mut options = args[4..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -361,13 +660,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                         depth_seen = true;
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
             }
-            let digest = format!("{:x}", sha2::Sha256::digest(read_binary(&args[2])?));
+            if with_imports && allocations_path.is_none() {
+                return Err("import LLVM contracts require --allocations".into());
+            }
+            let binary = read_binary(&args[2])?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&binary));
             let mut snapshots = vec![parse_ghidra_snapshot(
                 &read_bounded_json(&args[3], MAX_GHIDRA_SNAPSHOT_BYTES)?,
                 &digest,
@@ -378,9 +684,37 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &digest,
                 )?);
             }
-            let bytes = serde_json::to_vec_pretty(
-                &hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?,
-            )?;
+            let artifact = if let Some(path) = allocations_path {
+                let process = PcodeElfProcessMemory::from_elf(
+                    &binary,
+                    &snapshots[0],
+                    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                )?;
+                let allocations = PcodeProcessAllocations::parse_declared(
+                    &read_bounded_json(path, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES)?,
+                    &snapshots[0],
+                    &process,
+                )?;
+                if with_imports {
+                    hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_imports(
+                        &snapshots,
+                        &binary,
+                        max_depth,
+                        &process,
+                        &allocations,
+                    )?
+                } else {
+                    hydir_decompile::emit_pcode_interprocedural_cfg_llvm_with_allocations(
+                        &snapshots,
+                        max_depth,
+                        &process,
+                        &allocations,
+                    )?
+                }
+            } else {
+                hydir_decompile::emit_pcode_interprocedural_cfg_llvm(&snapshots, max_depth)?
+            };
+            let bytes = serde_json::to_vec_pretty(&artifact)?;
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
             } else {
@@ -429,17 +763,35 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("ghidra") if args.len() >= 6 && args[1] == "trace-calls" => {
             ghidra_calls::run_automatic(&args[2..])?;
         }
+        Some("ghidra") if args.len() >= 8 && args[1] == "trace-calls-imports" => {
+            ghidra_calls::run_automatic_imports(&args[2..])?;
+        }
+        Some("ghidra") if args.len() >= 6 && args[1] == "assess" => {
+            ghidra_calls::run_assessment_automatic(&args[2..])?;
+        }
         Some("ghidra") if args.len() >= 6 && args[1] == "llvm-cfg-calls" => {
             ghidra_calls::run_automatic_llvm(&args[2..])?;
         }
+        Some("ghidra") if args.len() >= 8 && args[1] == "llvm-cfg-calls-imports" => {
+            ghidra_calls::run_automatic_llvm_imports(&args[2..])?;
+        }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-calls" => {
             ghidra_calls::run_snapshots(&args[2..])?;
+        }
+        Some("ghidra-snapshot") if args.len() >= 7 && args[1] == "trace-calls-imports" => {
+            ghidra_calls::run_snapshots_imports(&args[2..])?;
+        }
+        Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "assess" => {
+            ghidra_calls::run_assessment_snapshots(&args[2..])?;
         }
         Some("ghidra-snapshot") if args.len() >= 5 && args[1] == "trace-path" => {
             let mut max_operations = 4096usize;
             let mut max_visits = 1024usize;
             let mut start_address = None;
             let mut output_path = None;
+            let mut memory_mode = "readonly";
+            let mut memory_option_seen = false;
+            let mut allocations_path = None;
             let mut options = args[5..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -461,11 +813,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     "--output" if output_path.is_none() => output_path = Some(pair[1].as_str()),
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
+                    "--memory"
+                        if !memory_option_seen
+                            && matches!(
+                                pair[1].as_str(),
+                                "readonly" | "process" | "allocated" | "seed"
+                            ) =>
+                    {
+                        memory_mode = pair[1].as_str();
+                        memory_option_seen = true;
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err(HELP.into());
+            }
+            if (memory_mode == "allocated") != allocations_path.is_some() {
+                return Err("allocated memory requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let digest = format!("{:x}", sha2::Sha256::digest(&binary));
@@ -477,26 +845,73 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &read_bounded_json(&args[4], MAX_PCODE_SEED_BYTES)?,
                 &snapshot,
             )?;
-            let image = pcode_image_or_legacy(&binary, &snapshot)?;
             let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let trace = if let Some(image) = &image {
-                snapshot.execute_concrete_path_with_image(
+            let trace = match memory_mode {
+                "allocated" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    let allocations = PcodeProcessAllocations::parse_declared(
+                        &read_bounded_json(
+                            allocations_path.unwrap(),
+                            MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                        )?,
+                        &snapshot,
+                        &memory,
+                    )?;
+                    snapshot.execute_concrete_path_with_allocations(
+                        &initial,
+                        &memory,
+                        &allocations,
+                        start.as_ref(),
+                        max_operations,
+                        max_visits,
+                    )?
+                }
+                "process" => {
+                    let memory = PcodeElfProcessMemory::from_elf(
+                        &binary,
+                        &snapshot,
+                        PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                    )?;
+                    snapshot.execute_concrete_path_with_process_memory(
+                        &initial,
+                        &memory,
+                        start.as_ref(),
+                        max_operations,
+                        max_visits,
+                    )?
+                }
+                "readonly" => {
+                    if let Some(image) = pcode_image_or_legacy(&binary, &snapshot)? {
+                        snapshot.execute_concrete_path_with_image(
+                            &initial,
+                            &image,
+                            start.as_ref(),
+                            max_operations,
+                            max_visits,
+                        )?
+                    } else {
+                        snapshot.execute_concrete_path(
+                            &initial,
+                            start.as_ref(),
+                            max_operations,
+                            max_visits,
+                        )?
+                    }
+                }
+                "seed" => snapshot.execute_concrete_path(
                     &initial,
-                    image,
                     start.as_ref(),
                     max_operations,
                     max_visits,
-                )?
-            } else {
-                snapshot.execute_concrete_path(
-                    &initial,
-                    start.as_ref(),
-                    max_operations,
-                    max_visits,
-                )?
+                )?,
+                _ => unreachable!("validated memory mode"),
             };
             let bytes = serde_json::to_vec_pretty(&trace)?;
             if let Some(path) = output_path {
@@ -660,10 +1075,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }))?
             );
         }
-        Some("ghidra") if args.len() >= 3 && args[1] == "llvm-cfg-image" => {
+        Some("ghidra")
+            if args.len() >= 3
+                && matches!(
+                    args[1].as_str(),
+                    "llvm-cfg-image" | "llvm-cfg-process" | "llvm-cfg-allocated"
+                ) =>
+        {
             let mut selected = None;
             let mut start_address = None;
             let mut output_path = None;
+            let mut allocations_path = None;
             let mut options = args[3..].chunks_exact(2);
             for pair in &mut options {
                 match pair[0].as_str() {
@@ -676,11 +1098,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "--output" if output_path.is_none() && !pair[1].is_empty() => {
                         output_path = Some(pair[1].as_str());
                     }
+                    "--allocations" if allocations_path.is_none() => {
+                        allocations_path = Some(pair[1].as_str());
+                    }
                     _ => return Err("invalid automatic Ghidra image LLVM option".into()),
                 }
             }
             if !options.remainder().is_empty() {
                 return Err("Ghidra image LLVM options require values".into());
+            }
+            if (args[1] == "llvm-cfg-allocated") != allocations_path.is_some() {
+                return Err("allocated LLVM requires exactly one --allocations file".into());
             }
             let binary = read_binary(&args[2])?;
             let scratch = tempfile::tempdir()?;
@@ -689,18 +1117,47 @@ fn run() -> Result<(), Box<dyn Error>> {
                 selected,
                 &scratch.path().join("snapshot.json"),
             )?;
-            let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot)?;
-            let window =
-                image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
             let start = start_address.map(|address| hydir_ir::pcode::PcodeAddress {
                 space: snapshot.selected_function.entry.space.clone(),
                 offset: format!("0x{address:x}"),
             });
-            let artifact = hydir_decompile::emit_pcode_cfg_llvm_with_image(
-                &snapshot,
-                start.as_ref(),
-                &window,
-            )?;
+            let artifact = if args[1] == "llvm-cfg-allocated" {
+                let memory = PcodeElfProcessMemory::from_elf(
+                    &binary,
+                    &snapshot,
+                    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                )?;
+                let allocations = PcodeProcessAllocations::parse_declared(
+                    &read_bounded_json(
+                        allocations_path.unwrap(),
+                        MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+                    )?,
+                    &snapshot,
+                    &memory,
+                )?;
+                hydir_decompile::emit_pcode_cfg_llvm_with_allocations(
+                    &snapshot,
+                    start.as_ref(),
+                    &memory,
+                    &allocations,
+                )?
+            } else if args[1] == "llvm-cfg-process" {
+                let memory = PcodeElfProcessMemory::from_elf(
+                    &binary,
+                    &snapshot,
+                    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+                )?;
+                hydir_decompile::emit_pcode_cfg_llvm_with_process_memory(
+                    &snapshot,
+                    start.as_ref(),
+                    &memory,
+                )?
+            } else {
+                let image = PcodeReadOnlyElfImage::from_elf(&binary, &snapshot)?;
+                let window =
+                    image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
+                hydir_decompile::emit_pcode_cfg_llvm_with_image(&snapshot, start.as_ref(), &window)?
+            };
             let bytes = serde_json::to_vec_pretty(&artifact)?;
             if let Some(path) = output_path {
                 write_new_or_identical(path, &bytes)?;
@@ -719,6 +1176,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         | "state"
                         | "cfg"
                         | "coverage"
+                        | "capability"
                         | "llvm-prefix"
                         | "llvm-standalone"
                 ) =>
@@ -757,6 +1215,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "state" => serde_json::to_vec_pretty(&ir.lower_state())?,
                     "cfg" => serde_json::to_vec_pretty(&snapshot.pcode_cfg_ir()?)?,
                     "coverage" => serde_json::to_vec_pretty(&snapshot.pcode_coverage_report()?)?,
+                    "capability" => {
+                        serde_json::to_vec_pretty(&snapshot.pcode_capability_report()?)?
+                    }
                     "llvm-prefix" => serde_json::to_vec_pretty(
                         &hydir_decompile::emit_pcode_linear_prefix_llvm(&snapshot)?,
                     )?,
@@ -1528,6 +1989,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
         }
         Some("doctor") if args.len() == 1 => {
+            let frida_helper = frida::helper_path()?;
             let gdb_version = Command::new("gdb")
                 .arg("--version")
                 .output()
@@ -1636,6 +2098,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_replay_v1": replay_ready,
                     "native_replay_scope": "local Linux x86-64 Bubblewrap replay with private network namespace, bounded argv/stdin/files, exact exit/output goals and explicit setup/timeout/output-limit failures; Ubuntu 24.04 smoke gate passed",
                     "bubblewrap_installed": bwrap_version.is_some(),
+                    "frida_observer_helper": frida_helper.display().to_string(),
+                    "frida_observation_ready": bubblewrap_isolation_ready && frida::helper_ready(&frida_helper),
+                    "frida_observation_scope": "InputSpec-bound Linux x86-64 ELF paths with byte-checked block/call witnesses; no process exit-code claim or static CFG-completeness claim",
                     "bubblewrap_isolation_ready": bubblewrap_isolation_ready,
                     "bubblewrap_version": bwrap_version,
                     "gdb_installed": gdb_version.is_some(),

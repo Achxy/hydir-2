@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 mod bridge_result;
+mod dynamic_trace;
 mod gdb_mi;
 mod investigation;
 mod investigation_logic;
@@ -13,6 +14,11 @@ mod origin_probe;
 mod snapshot;
 mod snapshot_resume;
 pub use bridge_result::{validate_input_condition_slice, validate_snapshot_bridge_result};
+pub use dynamic_trace::{
+    ComputedJumpEvidence, DYNAMIC_TRACE_V2_VERSION, DYNAMIC_TRACE_V3_VERSION,
+    DYNAMIC_TRACE_VERSION, DynamicTrace, MAX_DYNAMIC_TRACE_JSON_BYTES, TraceBudget, TraceEvent,
+    TraceEventKind, TraceStatus, TraceWitness, parse_dynamic_trace, validate_dynamic_trace,
+};
 pub use gdb_mi::{MiListEntry, MiRecord, MiValue, parse_mi_line};
 pub use investigation::{
     ANALYSIS_RECIPE_VERSION, AnalysisRecipe, ChangedOriginByte, ClaimDependency,

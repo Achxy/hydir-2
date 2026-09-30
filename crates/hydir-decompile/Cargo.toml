@@ -11,6 +11,7 @@ hydir-analysis = { path = "../hydir-analysis" }
 hydir-c = { path = "../hydir-c" }
 hydir-core = { path = "../hydir-core" }
 hydir-ir = { path = "../hydir-ir" }
+hydir-execution = { path = "../hydir-execution" }
 hydir-loader = { path = "../hydir-loader" }
 hydir-semantics = { path = "../hydir-semantics" }
 iced-x86.workspace = true

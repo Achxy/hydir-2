@@ -1,7 +1,8 @@
 // Bounded, independent Ghidra P-code emulator oracle for exact fixture checks.
 // Run after analysis with:
 // -postScript HydIROracle.java <output.json> <binary> <entry-hex> <max-steps>
-//   <register-seeds> <memory-seeds> <register-watches> <memory-watches> [start-hex]
+//   <register-seeds> <memory-seeds> <register-watches> <memory-watches>
+//   [start-hex [h-encoded-comma-separated-internal-function-entries]]
 
 import ghidra.app.emulator.EmulatorHelper;
 import ghidra.app.script.GhidraScript;
@@ -26,7 +27,7 @@ public class HydIROracle extends GhidraScript {
     private static final int MAX_STEPS = 256;
     private static final int MAX_ITEMS = 64;
     private static final int MAX_MEMORY_WIDTH = 8;
-    private static final int MAX_OUTPUT_BYTES = 64 * 1024;
+    private static final int MAX_OUTPUT_BYTES = 1024 * 1024;
 
     private record MemoryItem(Address address, int size) {}
 
@@ -185,8 +186,8 @@ public class HydIROracle extends GhidraScript {
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length != 8 && args.length != 9) {
-            throw new IllegalArgumentException("Usage: HydIROracle.java <output.json> <binary> <entry-hex> <max-steps> <register-seeds> <memory-seeds> <register-watches> <memory-watches> [start-hex]");
+        if (args.length != 8 && args.length != 9 && args.length != 10) {
+            throw new IllegalArgumentException("Usage: HydIROracle.java <output.json> <binary> <entry-hex> <max-steps> <register-seeds> <memory-seeds> <register-watches> <memory-watches> [start-hex [internal-entries]]");
         }
         Path binary = Path.of(args[1]);
         Path output = Path.of(args[0]);
@@ -205,9 +206,24 @@ public class HydIROracle extends GhidraScript {
         Address entry = ram(args[2]);
         Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
         if (function == null) throw new IllegalArgumentException("function entry not found in analyzed Ghidra program");
-        Address start = args.length == 9 ? ram(args[8]) : entry;
+        Address start = args.length >= 9 ? ram(args[8]) : entry;
         if (!function.getBody().contains(start) || currentProgram.getListing().getInstructionAt(start) == null) {
             throw new IllegalArgumentException("start must be an analyzed instruction in selected function");
+        }
+        boolean allowInternalCalls = args.length == 10;
+        Set<Address> allowedEntries = new HashSet<>();
+        allowedEntries.add(entry);
+        if (allowInternalCalls) {
+            String entries = decodeArg(args[9]);
+            if (entries.isEmpty()) throw new IllegalArgumentException("internal function list is empty");
+            for (String item : entries.split(",", -1)) {
+                if (allowedEntries.size() >= MAX_ITEMS) throw new IllegalArgumentException("too many internal functions");
+                Address candidate = ram(item);
+                if (currentProgram.getFunctionManager().getFunctionAt(candidate) == null) {
+                    throw new IllegalArgumentException("internal function is not analyzed: " + candidate);
+                }
+                allowedEntries.add(candidate);
+            }
         }
         String registerSeeds = decodeArg(args[4]);
         String memorySeeds = decodeArg(args[5]);
@@ -234,6 +250,7 @@ public class HydIROracle extends GhidraScript {
         String stop = "step_budget";
         String reason = "bounded instruction step budget reached";
         EmulatorHelper emulator = new EmulatorHelper(currentProgram);
+        int callDepth = 0;
         try {
             seedRegisters(emulator, registerSeeds);
             seedMemory(emulator, memorySeeds);
@@ -241,9 +258,12 @@ public class HydIROracle extends GhidraScript {
             for (int step = 0; step < maxSteps; step++) {
                 monitor.checkCancelled();
                 Address pc = emulator.getExecutionAddress();
-                if (pc == null || !function.getBody().contains(pc)) {
+                Function owner = pc == null ? null : currentProgram.getFunctionManager().getFunctionContaining(pc);
+                if (owner == null || !allowedEntries.contains(owner.getEntryPoint())) {
                     stop = "left_function";
-                    reason = "next instruction is outside selected function";
+                    reason = allowInternalCalls
+                            ? "next instruction is outside allowed internal functions"
+                            : "next instruction is outside selected function";
                     break;
                 }
                 Instruction instruction = currentProgram.getListing().getInstructionAt(pc);
@@ -252,15 +272,24 @@ public class HydIROracle extends GhidraScript {
                     reason = "Ghidra has no instruction at execution address";
                     break;
                 }
-                boolean unsupported = instruction.getFlowType().isCall();
+                boolean calls = instruction.getFlowType().isCall();
+                boolean unsupported = false;
                 boolean returns = false;
                 for (PcodeOp op : instruction.getPcode()) {
-                    if (op.getOpcode() == PcodeOp.CALL || op.getOpcode() == PcodeOp.CALLIND || op.getOpcode() == PcodeOp.CALLOTHER) unsupported = true;
+                    if (op.getOpcode() == PcodeOp.CALL || op.getOpcode() == PcodeOp.CALLIND) calls = true;
+                    if (op.getOpcode() == PcodeOp.CALLOTHER) unsupported = true;
                     if (op.getOpcode() == PcodeOp.RETURN) returns = true;
+                }
+                if (calls) {
+                    Address[] flows = instruction.getFlows();
+                    if (!allowInternalCalls || flows == null || flows.length != 1
+                            || !allowedEntries.contains(flows[0])) unsupported = true;
                 }
                 if (unsupported) {
                     stop = "unsupported_effect";
-                    reason = "call or CALLOTHER requires an external effect model";
+                    reason = allowInternalCalls
+                            ? "call target or CALLOTHER requires an external effect model"
+                            : "call or CALLOTHER requires an external effect model";
                     break;
                 }
                 if (!emulator.step(monitor)) {
@@ -276,13 +305,40 @@ public class HydIROracle extends GhidraScript {
                 quoted(json, instruction.getMnemonicString());
                 json.append(",\"next_address\":");
                 addressJson(json, emulator.getExecutionAddress());
-                json.append('}');
-                if (returns) {
-                    stop = "return";
-                    reason = "RETURN P-code instruction executed";
-                    break;
+                json.append(",\"register_values\":[");
+                for (int i = 0; i < watchedRegisters.size(); i++) {
+                    if (i != 0) json.append(',');
+                    BigInteger value = emulator.readRegister(watchedRegisters.get(i));
+                    if (value == null) json.append("null"); else quoted(json, hex(value));
                 }
-                if (instruction.getFlowType().isTerminal()) {
+                json.append("],\"memory_values\":[");
+                for (int i = 0; i < watchedMemory.size(); i++) {
+                    if (i != 0) json.append(',');
+                    MemoryItem item = watchedMemory.get(i);
+                    byte[] bytes = emulator.readMemory(item.address, item.size);
+                    if (bytes == null || bytes.length != item.size) json.append("null");
+                    else quoted(json, hex(littleEndian(bytes)));
+                }
+                json.append(']');
+                json.append('}');
+                if (calls) {
+                    Address target = emulator.getExecutionAddress();
+                    if (!allowedEntries.contains(target)) {
+                        stop = "unsupported_effect";
+                        reason = "call left the declared internal function set";
+                        break;
+                    }
+                    callDepth++;
+                }
+                if (returns) {
+                    if (callDepth == 0) {
+                        stop = "return";
+                        reason = "selected function returned";
+                        break;
+                    }
+                    callDepth--;
+                }
+                if (!returns && instruction.getFlowType().isTerminal()) {
                     stop = "terminal";
                     reason = "terminal instruction executed without RETURN P-code";
                     break;

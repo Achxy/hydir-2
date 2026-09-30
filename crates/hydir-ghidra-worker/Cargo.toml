@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 hydir-backend = { path = "../hydir-backend" }
+hydir-execution = { path = "../hydir-execution" }
 hydir-ir = { path = "../hydir-ir" }
 quick-xml = "0.41"
 serde.workspace = true

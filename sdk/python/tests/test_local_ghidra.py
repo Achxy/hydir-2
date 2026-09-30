@@ -103,6 +103,12 @@ class LocalGhidraTests(unittest.TestCase):
             self.assertEqual(self.client.artifact("coverage", self.binary, self.snapshot)["opaque_effects"], 2)
         with patch.object(self.client, "_run", return_value=json.dumps({
             "binary_sha256": self.digest, "schema_version": 1,
+            "stop_sites": [{"reason": "unsupported user operation"}],
+        }).encode()) as run:
+            self.assertEqual(len(self.client.artifact("capability", self.binary, self.snapshot)["stop_sites"]), 1)
+            self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "capability"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "schema_version": 1,
             "rewrites": [],
         }).encode()) as run:
             self.assertEqual(self.client.artifact("simplify", self.binary, self.snapshot)["rewrites"], [])
@@ -128,10 +134,116 @@ class LocalGhidraTests(unittest.TestCase):
         with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()):
             with self.assertRaises(RuntimeError):
                 self.client.llvm_cfg(self.binary, self.snapshot, image=True)
+        process_artifact = {**artifact, "schema_version": 4, "process_memory": {"space": "ram"}}
+        with patch.object(self.client, "_run", return_value=json.dumps(process_artifact).encode()) as run:
+            self.client.llvm_cfg(self.binary, self.snapshot, process=True)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-process"))
+        with patch.object(self.client, "_run", return_value=json.dumps(artifact).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.llvm_cfg(self.binary, self.snapshot, process=True)
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated_artifact = {
+            **artifact, "schema_version": 5,
+            "process_memory": {"space": "ram"}, "allocations": {"regions": []},
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated_artifact).encode()) as run:
+            self.client.llvm_cfg(self.binary, self.snapshot, allocations=allocations)
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-allocated"))
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        with self.assertRaises(ValueError):
+            self.client.llvm_cfg(self.binary, self.snapshot, process=True, allocations=allocations)
         with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, image=True, simplified=True)
         with self.assertRaises(ValueError):
+            self.client.llvm_cfg(self.binary, self.snapshot, process=True, image=True)
+        with self.assertRaises(ValueError):
             self.client.llvm_cfg(self.binary, self.snapshot, start=-1)
+
+    def test_observed_call_rediscovery_uses_bounded_cli_contract(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        input_path = Path(self.directory.name) / "input.json"
+        trace_path = Path(self.directory.name) / "trace.json"
+        input_path.write_text("{}", encoding="utf-8")
+        trace_path.write_text("{}", encoding="utf-8")
+        plan = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "changed_targets": [], "unresolved_call_sites": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(plan).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_calls(self.binary, self.snapshot, input_path, trace_path),
+                plan,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-calls"))
+        applied = {
+            "schema_version": 2, "binary_sha256": self.digest,
+            "selected_function": {"entry": {"space": "ram", "offset": "0x401000"}},
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(applied).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_calls(
+                    self.binary, self.snapshot, input_path, trace_path, apply=True
+                ),
+                applied,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-apply"))
+        with patch.object(self.client, "_run", return_value=b"{}"):
+            with self.assertRaises(RuntimeError):
+                self.client.rediscover_calls(self.binary, self.snapshot, input_path, trace_path)
+
+        jump_plan = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "changed_targets": [], "unresolved_jump_sites": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(jump_plan).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_jumps(self.binary, self.snapshot, input_path, trace_path),
+                jump_plan,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-jumps"))
+        with patch.object(self.client, "_run", return_value=json.dumps(applied).encode()) as run:
+            self.assertEqual(
+                self.client.rediscover_jumps(
+                    self.binary, self.snapshot, input_path, trace_path, apply=True,
+                ),
+                applied,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "rediscover-jumps-apply"))
+
+    def test_observed_path_comparison_uses_bounded_cli_contract(self):
+        self.snapshot.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        paths = [Path(self.directory.name) / name for name in
+                 ("input.json", "trace.json", "seed.json")]
+        for path in paths:
+            path.write_text("{}", encoding="utf-8")
+        comparison = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "verdict": "inconclusive", "inconclusive_reasons": ["unknown memory"],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(comparison).encode()) as run:
+            self.assertEqual(
+                self.client.compare_observed_path(self.binary, self.snapshot, *paths),
+                comparison,
+            )
+        self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "compare-observed-path"))
+        self.assertEqual(run.call_args.args[-2:], ("--memory", "readonly"))
+        with self.assertRaises(ValueError):
+            self.client.compare_observed_path(self.binary, self.snapshot, *paths, memory="unknown")
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        with patch.object(self.client, "_run", return_value=json.dumps(comparison).encode()) as run:
+            self.client.compare_observed_path(
+                self.binary, self.snapshot, *paths, memory="allocated", allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        with self.assertRaises(ValueError):
+            self.client.compare_observed_path(
+                self.binary, self.snapshot, *paths, memory="allocated",
+            )
+        with patch.object(self.client, "_run", return_value=b"{}"):
+            with self.assertRaises(RuntimeError):
+                self.client.compare_observed_path(self.binary, self.snapshot, *paths)
 
     def test_call_trace_uses_managed_worker_and_checks_binary(self):
         seed = Path(self.directory.name) / "seed.json"
@@ -143,6 +255,19 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("ghidra", "trace-calls"))
         self.assertIn("--function", run.call_args.args)
         self.assertIn("0x401000", run.call_args.args)
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated = {**artifact, "schema_version": 3}
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
+            self.client.trace_calls(self.binary, seed, function=0x401000, allocations=allocations)
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        contracted = {**artifact, "schema_version": 4, "contracted_imports": []}
+        with patch.object(self.client, "_run", return_value=json.dumps(contracted).encode()) as run:
+            self.client.trace_calls(self.binary, seed, function=0x401000,
+                                    allocations=allocations, imports=True)
+        self.assertEqual(run.call_args.args[:2], ("ghidra", "trace-calls-imports"))
+        with self.assertRaises(ValueError):
+            self.client.trace_calls(self.binary, seed, function=0x401000, imports=True)
         with self.assertRaises(ValueError):
             self.client.trace_calls(self.binary, seed, function=0x401000, max_depth=17)
         with patch.object(self.client, "_run", return_value=b'{"binary_sha256":"wrong"}'):
@@ -164,6 +289,14 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("ghidra-snapshot", "llvm-cfg-calls"))
         self.assertIn("--callee", run.call_args.args)
         self.assertEqual(run.call_args.args[-2:], ("--max-depth", "2"))
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated = {**artifact, "llvm": {**artifact["llvm"], "schema_version": 5, "allocations": {}}}
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
+            self.client.llvm_cfg_calls(
+                self.binary, self.snapshot, (callee,), allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
         with self.assertRaises(ValueError):
             self.client.llvm_cfg_calls(self.binary, self.snapshot, (callee,), max_depth=17)
         callee.write_text(json.dumps({"binary_sha256": "0" * 64}), encoding="utf-8")
@@ -182,6 +315,14 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:2], ("ghidra", "llvm-cfg-calls"))
         self.assertIn("0x401000", run.call_args.args)
         self.assertIn("--max-functions", run.call_args.args)
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        allocated = {**artifact, "llvm": {**artifact["llvm"], "schema_version": 5, "allocations": {}}}
+        with patch.object(self.client, "_run", return_value=json.dumps(allocated).encode()) as run:
+            self.client.llvm_cfg_calls_auto(
+                self.binary, seed, function=0x401000, allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
         with self.assertRaises(ValueError):
             self.client.llvm_cfg_calls_auto(self.binary, seed, function=0x401000, max_depth=17)
 
@@ -241,3 +382,85 @@ class LocalGhidraTests(unittest.TestCase):
         self.assertEqual(path["events"], [])
         self.assertEqual(run.call_args.args[1], "trace-path")
         self.assertEqual(run.call_args.args[-2:], ("--start", "0x401000"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "events": [],
+        }).encode()) as run:
+            self.client.trace_path(self.binary, self.snapshot, seed, memory="process")
+        self.assertEqual(run.call_args.args[-2:], ("--memory", "process"))
+        allocations = Path(self.directory.name) / "allocations.json"
+        allocations.write_text('{"schema_version":1,"regions":[]}', encoding="utf-8")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "events": [],
+        }).encode()) as run:
+            self.client.trace_path(
+                self.binary, self.snapshot, seed, memory="allocated", allocations=allocations,
+            )
+        self.assertEqual(run.call_args.args[-2:], ("--allocations", str(allocations.resolve())))
+        with self.assertRaises(ValueError):
+            self.client.trace_path(self.binary, self.snapshot, seed, memory="allocated")
+        with self.assertRaises(ValueError):
+            self.client.trace_path(self.binary, self.snapshot, seed, memory="invented")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "schema_version": 1,
+        }).encode()) as run:
+            self.client.artifact("process-memory", self.binary, self.snapshot)
+        self.assertEqual(run.call_args.args[1], "process-memory")
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            "binary_sha256": self.digest, "schema_version": 1,
+            "snapshot_layout_sha256": "a" * 64, "imports": [], "calls": [],
+        }).encode()) as run:
+            self.client.artifact("imports", self.binary, self.snapshot)
+        self.assertEqual(run.call_args.args[1], "imports")
+
+    def test_observe_checks_input_and_selected_function(self):
+        input_path = Path(self.directory.name) / "input.json"
+        input_path.write_text(json.dumps({"binary_sha256": self.digest}), encoding="utf-8")
+        trace = {
+            "schema_version": 1, "binary_sha256": self.digest,
+            "input_sha256": "a" * 64, "selected_elf_vaddr": 0x401000,
+            "status": "completed", "events": [],
+        }
+        with patch.object(self.client, "_run", return_value=json.dumps(trace).encode()) as run:
+            self.assertEqual(
+                self.client.observe(self.binary, input_path, function=0x401000)["status"],
+                "completed",
+            )
+        self.assertEqual(run.call_args.args[:2], ("observe", "frida"))
+        self.assertEqual(run.call_args.args[-2:], ("--function", "0x401000"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            **trace, "schema_version": 2,
+        }).encode()):
+            self.client.observe(self.binary, input_path, function=0x401000)
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            **trace, "selected_elf_vaddr": 0x401001,
+        }).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.observe(self.binary, input_path, function=0x401000)
+        input_path.write_text(json.dumps({"binary_sha256": "0" * 64}), encoding="utf-8")
+        with patch.object(self.client, "_run") as run:
+            with self.assertRaises(ValueError):
+                self.client.observe(self.binary, input_path, function=0x401000)
+            run.assert_not_called()
+
+    def test_observation_seed_uses_checked_cli_bridge(self):
+        input_path = Path(self.directory.name) / "input.json"
+        trace_path = Path(self.directory.name) / "trace.json"
+        input_path.write_text("{}", encoding="utf-8")
+        trace_path.write_text("{}", encoding="utf-8")
+        selected = {"space": "ram", "offset": "0x401000"}
+        self.snapshot.write_text(json.dumps({
+            "binary_sha256": self.digest,
+            "selected_function": {"entry": selected},
+        }), encoding="utf-8")
+        seed = {"schema_version": 1, "binary_sha256": self.digest,
+                "entry": selected, "registers": [], "memory": []}
+        with patch.object(self.client, "_run", return_value=json.dumps(seed).encode()) as run:
+            self.assertEqual(self.client.seed_from_observation(
+                self.binary, input_path, self.snapshot, trace_path), seed)
+        self.assertEqual(run.call_args.args[:2], ("observe", "seed"))
+        with patch.object(self.client, "_run", return_value=json.dumps({
+            **seed, "memory": [{"space": "ram"}],
+        }).encode()):
+            with self.assertRaises(RuntimeError):
+                self.client.seed_from_observation(
+                    self.binary, input_path, self.snapshot, trace_path)

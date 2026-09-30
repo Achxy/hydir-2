@@ -13,7 +13,7 @@ state = client.artifact("state", "sample.elf", "snapshot.json")
 
 `analyze(..., function=0x...)` selects another function from the managed
 Ghidra project. `artifact` also accepts `pcode`, `simplify`, `semantics`, `cfg`,
-`llvm-prefix`, and `llvm-standalone`;
+`process-memory`, `llvm-prefix`, and `llvm-standalone`;
 `llvm_operation` emits LLVM for one exact P-code operation. Artifacts are
 checked against the binary SHA-256, and a function-level state artifact is
 an effect inventory rather than an executable lift. `llvm-standalone` provides
@@ -36,8 +36,46 @@ provides the same artifact through the authenticated v3 service.
 emits one bounded LLVM state machine across validated loaded callees. Its
 fidelity claim remains unknown until a concrete path is compared with an
 execution oracle.
+`LocalGhidra.llvm_cfg(binary, snapshot, process=True)` emits LLVM v4 with
+checked ELF process bytes, zero-filled tails, and writable globals. Its
+mapping and known-byte masks keep unresolved relocations explicit.
+For explicit stack or heap ranges, supply a small declaration file:
+
+```json
+{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}
+```
+
+`LocalGhidra.llvm_cfg(binary, snapshot, allocations="allocations.json")`
+emits LLVM v5. `trace_path(..., memory="allocated",
+allocations="allocations.json")` uses the same bounds in the Rust executor.
+Declaring a range does not initialize its bytes; put known input bytes in the
+seed. An access outside the ELF mappings and declared ranges stops explicitly.
+The service exposes the same v5 artifact through
+`analyze_ghidra_binary(project_id, revision, "llvm-cfg-process-allocated",
+allocations="allocations.json")`.
+`LocalGhidra.rediscover_calls(binary, snapshot, input_spec, trace)` returns
+bounded, byte-verified candidate targets from one observed input while
+retaining unresolved static call edges. Pass `apply=True` to reanalyze an
+isolated copy of the managed Ghidra project; the original static snapshot
+remains available. `compare_observed_path(binary, snapshot, input_spec, trace,
+seed, memory="process")` executes a bounded P-code path from the supplied seed
+and compares it with one Frida trace; `inconclusive` does
+not mean the paths match.
+`LocalGhidra.rediscover_jumps(...)` uses the independent DynamicTrace v3
+computed-jump witnesses for already analyzed instructions inside the selected
+function. Its plan and isolated `apply=True` route keep the unresolved branch
+visible alongside observed targets.
+The revision-checked service exposes the same read-only jump plan through
+`HydirClient.analyze_ghidra_observation(..., "observed-jump-rediscovery")`.
 `LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)` runs the
 managed worker and collects only callees reached by the seed before lifting.
+Add `allocations="allocations.json"` to `trace_calls`, `llvm_cfg_calls`, or
+`llvm_cfg_calls_auto` to share validated ELF process bytes and declared stack
+or heap ranges across those calls. The strict trace is v3 and the call CFG
+contains LLVM v5. The remote `trace_ghidra_calls` and
+`build_ghidra_call_cfg_llvm` methods accept the same declaration as bytes or
+a file path, bound to the uploaded ELF and project revision. Unknown imports,
+relocations, and undeclared memory still stop at their source instruction.
 `HydirClient.build_ghidra_call_cfg_llvm(project_id, revision, seed,
 function_entry=...)` runs that bounded lift for an uploaded ELF through the
 v3 service and returns a revision-bound LLVM artifact. The returned module
@@ -71,7 +109,9 @@ idempotency key when retrying an uncertain save.
 exported Ghidra snapshot as bytes or a file path to the v3 service. The
 project must already contain the same binary. The server checks the snapshot
 digest against that binary and runs a bounded worker. Supported stages are
-`snapshot`, `pcode`, `simplify`, `semantics`, `state`, `cfg`, `coverage`, `llvm-cfg`, and `slice`. The
+`snapshot`, `pcode`, `simplify`, `semantics`, `state`, `cfg`, `coverage`,
+`process-memory`, `llvm-cfg`, `llvm-cfg-image`, `llvm-cfg-process`,
+`llvm-cfg-process-allocated`, and `slice`. The
 `simplify` stage returns original and rewritten raw P-code with per-operation
 preconditions; its local bitvector identities do not claim native equivalence. For
 `llvm-cfg`, pass `start_address=0x...` to select a CFG entry. For `slice`, pass
@@ -135,9 +175,17 @@ sandbox.
 for trusted static ELFs. It requires `--trusted-fixture`, a JSON list of
 hex-encoded stdin cases, and a new report path. It compares stdout, stderr,
 and exit status under no-network, read-only, CPU/memory/process/time controls.
-This does not establish hostile-input isolation or general equivalence. The
-remote service still has no execution endpoint. A ready case list is
+This does not establish hostile-input isolation or general equivalence. A ready case list is
 `../../tests/fixtures/whole_choice_cases.json`.
+
+On a Linux x86-64 server with the separately bundled Frida observer,
+`start_frida_observation(project_id, revision, input_spec, selected_elf_vaddr)`
+queues an explicit operator-only job for the uploaded ELF. Use
+`get_analysis_job` or `analysis_events` to follow it, then pass the completed
+job's revision and artifact digest, the InputSpec binary digest, and the
+selected address to `get_frida_observation`. The SDK checks the artifact hash,
+revision, schema, binary, and address. DynamicTrace v2 records bounded path
+events and output; process exit code remains unknown.
 
 Install Python 3.10+ in a private virtual environment:
 

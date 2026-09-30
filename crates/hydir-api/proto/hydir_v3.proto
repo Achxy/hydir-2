@@ -14,8 +14,12 @@ service HydirV3 {
   rpc GetAnalysisModel (AnalysisModelRequest) returns (ArtifactReply);
   rpc SaveAnalysisModel (SaveAnalysisModelRequest) returns (MutationReply);
   rpc AnalyzeGhidraSnapshot (GhidraSnapshotArtifactRequest) returns (ArtifactReply);
+  rpc AnalyzeGhidraObservation (GhidraObservationArtifactRequest) returns (ArtifactReply);
   rpc TraceGhidraCalls (GhidraCallTraceRequest) returns (ArtifactReply);
   rpc BuildGhidraCallCfgLlvm (GhidraCallTraceRequest) returns (ArtifactReply);
+  rpc AssessGhidraFunction (GhidraCallTraceRequest) returns (ArtifactReply);
+  rpc StartFridaObservation (StartFridaObservationRequest) returns (JobReply);
+  rpc GetFridaObservation (FridaObservationArtifactRequest) returns (ArtifactReply);
   rpc UpdateAnalystFact (AnalystFactRequest) returns (MutationReply);
 }
 
@@ -37,6 +41,10 @@ message DiscoverReply {
   bool revisioned_analysis_model_edits = 14;
   bool ghidra_call_tracing = 15;
   bool ghidra_call_cfg_llvm = 16;
+  bool ghidra_function_assessment = 17;
+  bool frida_observation_jobs = 18;
+  bool ghidra_observation_artifacts = 19;
+  bool ghidra_process_allocations = 20;
 }
 
 // Returns the newest saved model for the current binary, or an inferred v1
@@ -121,6 +129,9 @@ message ArtifactReply {
 // Ghidra RAM address (0x-prefixed lowercase hex). Empty selects the first
 // analyzed function. A selected entry is kept separate from llvm-cfg's
 // start_address, which selects a path inside that function.
+// llvm-cfg-process-allocated requires allocation_json: a v1 declaration of
+// bounded stack/heap ranges, bound to the current ELF process layout in the
+// isolated worker. Every other stage requires allocation_json to be empty.
 message GhidraSnapshotArtifactRequest {
   string project_id = 1;
   uint64 expected_revision = 2;
@@ -132,6 +143,22 @@ message GhidraSnapshotArtifactRequest {
   optional uint32 input_index = 8;
   string selected_function_entry = 9;
   bool automatic = 10;
+  bytes allocation_json = 11;
+}
+
+// Read-only artifacts from a caller-supplied DynamicTrace bound to a selected
+// Ghidra snapshot and InputSpec for the current project revision. The server
+// supplies the uploaded ELF. stage is observed-call-rediscovery,
+// observed-jump-rediscovery, or observed-path-comparison. Only comparison
+// accepts seed_json (PcodeSeed v1).
+message GhidraObservationArtifactRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  bytes snapshot_json = 3;
+  bytes input_spec_json = 4;
+  bytes trace_json = 5;
+  bytes seed_json = 6;
+  string stage = 7;
 }
 
 // Runs the managed Ghidra worker on the project's uploaded ELF, collects a
@@ -148,6 +175,30 @@ message GhidraCallTraceRequest {
   optional uint32 max_operations = 6;
   optional uint32 max_visits = 7;
   optional uint32 max_depth = 8;
+  // Optional v1 stack/heap declaration. Trace and LLVM use strict ELF process
+  // memory when supplied; assessment requires this field to be empty.
+  bytes allocation_json = 9;
+  // TraceGhidraCalls or BuildGhidraCallCfgLlvm: opt into SysV import contracts.
+  // Requires allocation_json. A checked PLT
+  // name is an explicit assumption about the dynamic linker's final binding.
+  bool assume_import_contracts = 10;
+}
+
+// Runs the separately bundled Linux x86-64 observer on the project's ELF.
+// InputSpec and optional Ghidra snapshot are validated against that binary.
+// The job stores a DynamicTrace v2 artifact; it does not claim an exit code.
+message StartFridaObservationRequest {
+  string project_id = 1;
+  uint64 expected_revision = 2;
+  string idempotency_key = 3;
+  bytes input_spec_json = 4;
+  uint64 selected_elf_vaddr = 5;
+  bytes snapshot_json = 6;
+}
+
+message FridaObservationArtifactRequest {
+  string project_id = 1;
+  string job_id = 2;
 }
 
 // Facts are revision-checked project mutations and retain analyst provenance.

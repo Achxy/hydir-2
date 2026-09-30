@@ -2,7 +2,7 @@ name: Ghidra worker smoke
 
 on:
   push:
-    branches: [main, hydir-launch, fuzz-ci-split]
+    branches: [main, hydir-launch, lifting-engine, fuzz-ci-split]
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
       - crates/hydir-ghidra-worker/**
@@ -15,9 +15,18 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - integrations/ghidra/HydIRRediscover.java
+      - integrations/ghidra/HydIROracle.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
+      - scripts/check-ghidra-recursion.py
+      - scripts/check-ghidra-relative-reloc.py
+      - scripts/check-ghidra-import-index.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
+      - tests/fixtures/ghidra_relative_reloc.S
+      - 'tests/fixtures/ghidra_import_calls*'
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
       - scripts/check-ghidra-frame-holdout.py
@@ -26,6 +35,7 @@ on:
       - tests/fixtures/ghidra_float_compare.S
       - tests/fixtures/hydir_frame_holdout.c
       - tests/fixtures/ghidra_frame_holdout_native.gdb
+      - tests/fixtures/ghidra_recursive_native.gdb
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -36,11 +46,17 @@ on:
       - 'tests/fixtures/ghidra_userop_rdtsc*'
       - 'tests/fixtures/ghidra_division*'
       - tests/fixtures/ghidra_indirect_jump.S
+      - tests/fixtures/ghidra_recursive_calls.S
       - tests/fixtures/ghidra_indirect_jump.elf
       - tests/fixtures/ghidra_indirect_jump_v2.json
       - 'tests/fixtures/ghidra_choose_*'
       - tests/fixtures/hydir-password-gate-stripped.elf
       - tests/fixtures/ghidra_password_mix_o1_v2.json
+      - tests/fixtures/ghidra_prism_patch_portal_v2.json
+      - tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json
+      - tests/ghidra_oracle_test.py
+      - tests/ghidra_four_engine_gate.py
+      - demo/hydir-prism.elf
   pull_request:
     paths:
       - .github/workflows/ghidra-worker-smoke.yml
@@ -54,9 +70,18 @@ on:
       - crates/hydir-server/**
       - integrations/ghidra/Dockerfile.worker
       - integrations/ghidra/HydIRSnapshot.java
+      - integrations/ghidra/HydIRRediscover.java
+      - integrations/ghidra/HydIROracle.java
       - scripts/demo-ghidra-password-lift.sh
       - scripts/check-ghidra-opt-matrix.py
       - scripts/check-ghidra-call-loop.py
+      - scripts/check-ghidra-recursion.py
+      - scripts/check-ghidra-relative-reloc.py
+      - scripts/check-ghidra-import-index.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
+      - tests/fixtures/ghidra_relative_reloc.S
+      - 'tests/fixtures/ghidra_import_calls*'
       - scripts/check-ghidra-aggregate-walk.py
       - scripts/check-ghidra-float-compare.py
       - scripts/check-ghidra-frame-holdout.py
@@ -65,6 +90,7 @@ on:
       - tests/fixtures/ghidra_float_compare.S
       - tests/fixtures/hydir_frame_holdout.c
       - tests/fixtures/ghidra_frame_holdout_native.gdb
+      - tests/fixtures/ghidra_recursive_native.gdb
       - tests/fixtures/prism_bit_gate_native.gdb
       - tests/fixtures/ghidra_matrix_native.gdb
       - tests/fixtures/ghidra_aggregate_native.gdb
@@ -75,17 +101,23 @@ on:
       - 'tests/fixtures/ghidra_userop_rdtsc*'
       - 'tests/fixtures/ghidra_division*'
       - tests/fixtures/ghidra_indirect_jump.S
+      - tests/fixtures/ghidra_recursive_calls.S
       - tests/fixtures/ghidra_indirect_jump.elf
       - tests/fixtures/ghidra_indirect_jump_v2.json
       - 'tests/fixtures/ghidra_choose_*'
       - tests/fixtures/hydir-password-gate-stripped.elf
       - tests/fixtures/ghidra_password_mix_o1_v2.json
+      - tests/fixtures/ghidra_prism_patch_portal_v2.json
+      - tests/fixtures/ghidra_prism_bit_gate_oracle_v2.json
+      - tests/ghidra_oracle_test.py
+      - tests/ghidra_four_engine_gate.py
+      - demo/hydir-prism.elf
   workflow_dispatch:
 
 jobs:
   container-frontend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -117,6 +149,97 @@ jobs:
           assert high and high['source'] == 'ghidra_decompiler'
           assert high['status'] == 'complete' and high['operations']
           PY
+      - name: Report selected function lifting capability
+        run: |
+          cargo run --locked -p hydir-cli -- ghidra-snapshot capability \
+            tests/fixtures/ghidra_prototype.elf \
+            "$RUNNER_TEMP/ghidra-snapshot.json" \
+            --output "$RUNNER_TEMP/ghidra-capability.json"
+          python3 - "$RUNNER_TEMP/ghidra-capability.json" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_text())
+          binary = Path('tests/fixtures/ghidra_prototype.elf').read_bytes()
+          assert report['schema_version'] == 1
+          assert report['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          assert len(report['snapshot_sha256']) == 64
+          assert report['entry']['offset'] == '0x101320'
+          assert report['operations'] > 0
+          assert report['discovery']['complete'] is False
+          assert report['semantic_fidelity'] == 'unknown'
+          assert report['verification'] == 'not_run'
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install native four-engine gate tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang gdb
+      - name: Compare Rust path execution with Ghidra EmulatorHelper
+        run: |
+          set -euo pipefail
+          # The preceding analysis built the SHA-verified Ghidra image. Reuse
+          # that exact image so the independent oracle tests the same release.
+          image="$(python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          digest = hashlib.sha256()
+          for source in ('integrations/ghidra/Dockerfile.worker',
+                         'integrations/ghidra/HydIRSnapshot.java',
+                         'integrations/ghidra/HydIRRediscover.java'):
+              digest.update(Path(source).read_bytes())
+          print(f'hydir-ghidra:12.1.4-{digest.hexdigest()[:16]}')
+          PY
+          )"
+          docker image inspect "$image" > /dev/null
+          container="$(docker create --entrypoint /bin/true "$image")"
+          trap 'docker rm "$container" > /dev/null' EXIT
+          docker cp "$container:/opt/ghidra" "$RUNNER_TEMP/ghidra"
+          export HYDIR_GHIDRA_HOME="$RUNNER_TEMP/ghidra"
+          export HYDIRCTL_BIN="$PWD/target/debug/hydirctl"
+          test -x "$HYDIR_GHIDRA_HOME/support/analyzeHeadless"
+          test -x "$HYDIRCTL_BIN"
+          python3 -m unittest -v tests/ghidra_oracle_test.py
+          chmod +x tests/fixtures/ghidra_add_zero.elf
+          python3 tests/ghidra_four_engine_gate.py
+          cargo test --locked -p hydir-ghidra-worker --lib \
+            headless_rediscovery_preserves_unresolved_call -- --ignored --nocapture
+          cargo test --locked -p hydir-ghidra-worker --lib \
+            headless_rediscovery_preserves_unresolved_jump -- --ignored --nocapture
+      - name: Compare recursive ELF paths in Ghidra Rust LLVM and native code
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/check-ghidra-recursion.py \
+            --output-dir "$RUNNER_TEMP/ghidra-recursion"
+      - name: Resolve a disjoint PIE RELATIVE relocation for Rust execution
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/check-ghidra-relative-reloc.py \
+            --output-dir "$RUNNER_TEMP/ghidra-relative-reloc"
+      - name: Bind ELF JUMP_SLOT imports to Ghidra calls
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL_BIN: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/check-ghidra-import-index.py \
+            --output-dir "$RUNNER_TEMP/ghidra-import-index"
+      - name: Run two upstream ELF functions through Ghidra Rust LLVM and native
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/demo-heldout-musl.py --static-only \
+            --output-dir "$RUNNER_TEMP/hydir-heldout-musl"
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -133,6 +256,10 @@ jobs:
           binary = pathlib.Path('tests/fixtures/hydir-password-gate-stripped.elf').read_bytes()
           assert snapshot['binary_sha256'] == hashlib.sha256(binary).hexdigest()
           assert len(snapshot['functions']) == 7
+          layout = {register['name']: register for register in snapshot['register_layout']}
+          assert {'RAX', 'RSP', 'RIP'} <= layout.keys()
+          assert all(layout[name]['storage']['space'] == 'register' and
+                     layout[name]['size_bytes'] == 8 for name in ('RAX', 'RSP', 'RIP'))
           selected = snapshot['selected_function']
           assert selected['entry']['offset'] == '0x2015d0'
           operations = [op for row in selected['instructions'] for op in row['pcode']]
@@ -161,6 +288,61 @@ jobs:
           PY
           clang -x ir -c "$RUNNER_TEMP/hydir-password.ll" \
             -o "$RUNNER_TEMP/hydir-password.o"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-process \
+            tests/fixtures/hydir-password-gate-stripped.elf \
+            "$RUNNER_TEMP/hydir-password-snapshot.json" \
+            --output "$RUNNER_TEMP/hydir-password-process-llvm.json"
+          python3 - "$RUNNER_TEMP/hydir-password-process-llvm.json" \
+            "$RUNNER_TEMP/hydir-password-process.ll" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          memory = artifact['process_memory']
+          binary = pathlib.Path('tests/fixtures/hydir-password-gate-stripped.elf').read_bytes()
+          assert artifact['schema_version'] == 4
+          assert artifact['binary_sha256'] == hashlib.sha256(binary).hexdigest()
+          assert memory['known_byte_count'] > 0
+          assert memory['writable_byte_count'] > 0
+          assert memory['mapped_byte_count'] >= memory['known_byte_count']
+          assert '@hydir_process_initial_bytes' in artifact['llvm_ir']
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/hydir-password-process.ll" \
+            -o "$RUNNER_TEMP/hydir-password-process.o"
+          printf '%s\n' '{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340032,"byte_len":4096}]}' \
+            > "$RUNNER_TEMP/hydir-allocations.json"
+          cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-allocated \
+            tests/fixtures/hydir-password-gate-stripped.elf \
+            "$RUNNER_TEMP/hydir-password-snapshot.json" \
+            --allocations "$RUNNER_TEMP/hydir-allocations.json" \
+            --output "$RUNNER_TEMP/hydir-password-allocated-llvm.json"
+          python3 - "$RUNNER_TEMP/hydir-password-allocated-llvm.json" \
+            "$RUNNER_TEMP/hydir-password-allocated.ll" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifact = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert artifact['schema_version'] == 5
+          assert artifact['allocations']['regions'] == [
+              {'kind': 'stack', 'space': 'ram', 'base': 7340032, 'byte_len': 4096}
+          ]
+          assert artifact['state_abi'].startswith('hydir-pcode-cfg-state-v5:')
+          pathlib.Path(sys.argv[2]).write_text(artifact['llvm_ir'])
+          PY
+          clang -x ir -c "$RUNNER_TEMP/hydir-password-allocated.ll" \
+            -o "$RUNNER_TEMP/hydir-password-allocated.o"
+      - name: Require Rust and compiled LLVM v5 allocation parity
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm
+          command -v opt
+          command -v lli
+          cargo test --locked -p hydir-decompile --lib \
+            allocated_process_v5_stack_boundary_matches_rust_without_partial_write -- --nocapture
       - name: Probe the Hydir desktop import path with the container worker
         env:
           HYDIR_LOCAL_DB: ${{ runner.temp }}/hydir-gui-demo.sqlite
@@ -226,8 +408,14 @@ jobs:
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}/ghidra-snapshot.json
+            ${{ runner.temp }}/ghidra-capability.json
             ${{ runner.temp }}/hydir-password-snapshot.json
             ${{ runner.temp }}/hydir-password-llvm.json
+            ${{ runner.temp }}/hydir-password-process-llvm.json
+            ${{ runner.temp }}/ghidra-recursion/report.json
+            ${{ runner.temp }}/ghidra-relative-reloc/report.json
+            ${{ runner.temp }}/ghidra-import-index/
+            ${{ runner.temp }}/hydir-heldout-musl/
 
   differential-fixtures:
     runs-on: ubuntu-24.04

@@ -20,6 +20,7 @@ hydir-transform = { path = "../hydir-transform" }
 hydir-recompile = { path = "../hydir-recompile" }
 hydir-analysis = { path = "../hydir-analysis" }
 hydir-decompile = { path = "../hydir-decompile" }
+hydir-execution = { path = "../hydir-execution" }
 hydir-ir = { path = "../hydir-ir" }
 hydir-loader = { path = "../hydir-loader" }
 hydir-model = { path = "../hydir-model" }

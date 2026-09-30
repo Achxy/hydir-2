@@ -1,4 +1,5 @@
-//! Authenticated local-or-TLS HydIR RPC slice. No sample execution endpoint.
+//! Authenticated local-or-TLS HydIR RPC slice. Runtime observation is an
+//! explicit operator job using the separately bundled Linux Frida helper.
 
 mod interchange;
 
@@ -28,17 +29,27 @@ use hydir_core::{
     parse_annotation_address, parse_program_spec_json, validate_analyst_annotation,
 };
 use hydir_decompile::{
-    PcodeInterproceduralCfgLlvmArtifact, decompile_function_unit_at, decompile_indexed_function,
-    discover_functions, emit_pcode_interprocedural_cfg_llvm, export_function_ir_llvm,
+    PcodeFunctionAssessment, PcodeInterproceduralCfgLlvmArtifact, assess_pcode_function,
+    compare_pcode_observed_path, decompile_function_unit_at, decompile_indexed_function,
+    discover_functions, emit_pcode_cfg_llvm_with_allocations, emit_pcode_interprocedural_cfg_llvm,
+    emit_pcode_interprocedural_cfg_llvm_with_allocations,
+    emit_pcode_interprocedural_cfg_llvm_with_imports, export_function_ir_llvm,
     lift_machine_function_at, lower_cir, lower_function_ir, lower_state_ir,
     measure_native_coverage,
 };
+use hydir_execution::MAX_DYNAMIC_TRACE_JSON_BYTES;
+use hydir_execution::{
+    DYNAMIC_TRACE_V2_VERSION, InputSpec, MAX_INPUT_SPEC_BYTES, parse_dynamic_trace,
+    parse_input_spec, validate_dynamic_trace, validate_input_spec,
+};
 use hydir_hlc::{emit_typed_c, emit_typed_cfg_c, lower_high_level_cfg_cir, lower_high_level_cir};
 use hydir_ir::pcode::{
-    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_SEED_BYTES, PcodeAddress, PcodeInterproceduralTrace,
-    PcodeReadOnlyElfImage, PcodeSliceTarget, execute_concrete_call_path,
-    execute_concrete_call_path_with_image, parse_ghidra_snapshot, parse_pcode_seed,
-    unloaded_call_target,
+    MAX_GHIDRA_SNAPSHOT_BYTES, MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES, MAX_PCODE_SEED_BYTES,
+    PCODE_ELF_PROCESS_MEMORY_MAX_BYTES, PcodeAddress, PcodeElfImportIndex, PcodeElfProcessMemory,
+    PcodeInterproceduralTrace, PcodeProcessAllocations, PcodeReadOnlyElfImage, PcodeSliceTarget,
+    execute_concrete_call_path, execute_concrete_call_path_with_allocations,
+    execute_concrete_call_path_with_image, execute_concrete_call_path_with_imports,
+    parse_ghidra_snapshot, parse_pcode_seed, unloaded_call_target,
 };
 use hydir_ir::{
     CIR_VERSION, FUNCTION_INDEX_VERSION, FUNCTION_IR_VERSION, MACHINE_FUNCTION_IR_VERSION,
@@ -92,14 +103,30 @@ use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/source_offer.rs"));
 
-const MAX_WORKER_OUTPUT: usize = 16 * 1024 * 1024;
+// A maximal 1 MiB process image expands to roughly 16 MiB when its four
+// byte arrays are serialized as JSON or embedded in escaped LLVM text.
+const MAX_WORKER_OUTPUT: usize = 24 * 1024 * 1024;
+const FRIDA_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.dynamic-trace+json;version=2";
 const MAX_CALL_TRACE_FUNCTIONS: usize = 8;
 const MAX_CALL_TRACE_INPUT: usize =
     MAX_CALL_TRACE_FUNCTIONS * (MAX_GHIDRA_SNAPSHOT_BYTES + 4) + MAX_PCODE_SEED_BYTES + 8;
 const GHIDRA_CALL_IMAGE_MAGIC: &[u8; 4] = b"HCIM";
 const MAX_CALL_TRACE_IMAGE_INPUT: usize = MAX_CALL_TRACE_INPUT + MAX_BINARY_BYTES + 12;
+const GHIDRA_CALL_ALLOCATED_MAGIC: &[u8; 4] = b"HCAL";
+const MAX_CALL_TRACE_ALLOCATED_INPUT: usize =
+    MAX_CALL_TRACE_IMAGE_INPUT + MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES + 12;
 const GHIDRA_SNAPSHOT_IMAGE_MAGIC: &[u8; 4] = b"HSIM";
 const MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT: usize = MAX_GHIDRA_SNAPSHOT_BYTES + MAX_BINARY_BYTES + 12;
+const MAX_GHIDRA_ALLOCATED_PROCESS_INPUT: usize =
+    MAX_GHIDRA_SNAPSHOT_BYTES + MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES + MAX_BINARY_BYTES + 12;
+const MAX_GHIDRA_OBSERVATION_INPUT: usize = MAX_GHIDRA_SNAPSHOT_BYTES
+    + MAX_INPUT_SPEC_BYTES
+    + MAX_DYNAMIC_TRACE_JSON_BYTES
+    + MAX_PCODE_SEED_BYTES
+    + MAX_BINARY_BYTES
+    + 20;
+const MAX_OBSERVED_PATH_OPERATIONS: usize = 16_384;
+const MAX_OBSERVED_PATH_VISITS: usize = 2_048;
 const LEGACY_CALL_IMAGE_DIAGNOSTIC: &str =
     "root Ghidra snapshot has no memory blocks; trace uses seed-only memory";
 const MAX_CALL_TRACE_OPERATIONS: usize = 65_536;
@@ -1612,11 +1639,13 @@ impl Store {
         }
     }
 
-    async fn finish_native_analysis_job(
+    async fn finish_analysis_job(
         &self,
         job_id: &str,
         project_id: &str,
         revision: u64,
+        media_type: &str,
+        ready_message: &str,
         result: Result<Vec<u8>, Status>,
     ) -> Result<(), Status> {
         let prepared = match result {
@@ -1638,25 +1667,13 @@ impl Store {
         match prepared {
             Ok(staged) => {
                 let digest = staged.digest.clone();
-                insert_artifact(
-                    &tx,
-                    project_id,
-                    revision as i64,
-                    "application/vnd.hydir.native-analysis+json;version=1",
-                    &staged,
-                )?;
+                insert_artifact(&tx, project_id, revision as i64, media_type, &staged)?;
                 tx.execute(
                     "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
                     params![digest, job_id],
                 )
                 .map_err(internal)?;
-                insert_event(
-                    &tx,
-                    job_id,
-                    "succeeded",
-                    "native program analysis artifact ready",
-                    &digest,
-                )?;
+                insert_event(&tx, job_id, "succeeded", ready_message, &digest)?;
             }
             Err(diagnostic) => {
                 tx.execute(
@@ -1688,10 +1705,54 @@ impl Store {
         }
         let result = run_worker("native-analysis", None, bytes).await;
         if let Err(error) = self
-            .finish_native_analysis_job(&job_id, &project_id, revision, result)
+            .finish_analysis_job(
+                &job_id,
+                &project_id,
+                revision,
+                "application/vnd.hydir.native-analysis+json;version=1",
+                "native program analysis artifact ready",
+                result,
+            )
             .await
         {
             eprintln!("hydird native job completion failed: {error}");
+        }
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.remove(&job_id);
+        }
+    }
+
+    async fn execute_frida_observation_job(
+        self,
+        job_id: String,
+        project_id: String,
+        revision: u64,
+        elf: Vec<u8>,
+        input_json: Vec<u8>,
+        snapshot_json: Vec<u8>,
+        selected: u64,
+    ) {
+        match self.transition_job(&job_id, "queued", "running", "Frida observer started") {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("hydird Frida job transition failed: {error}");
+                return;
+            }
+        }
+        let result = run_frida_observer(elf, input_json, snapshot_json, selected).await;
+        if let Err(error) = self
+            .finish_analysis_job(
+                &job_id,
+                &project_id,
+                revision,
+                FRIDA_TRACE_MEDIA_TYPE,
+                "DynamicTrace v2 artifact ready",
+                result,
+            )
+            .await
+        {
+            eprintln!("hydird Frida job completion failed: {error}");
         }
         if let Ok(mut workers) = self.workers.lock() {
             workers.remove(&job_id);
@@ -1819,8 +1880,15 @@ fn valid_worker_argument(action: &str, argument: &str) -> Result<(), Status> {
         "native-artifact"
             | "ghidra-snapshot-artifact"
             | "ghidra-snapshot-image-artifact"
+            | "ghidra-allocated-process-artifact"
+            | "ghidra-observation-artifact"
             | "ghidra-call-trace"
+            | "ghidra-call-trace-allocated"
+            | "ghidra-call-trace-imports"
             | "ghidra-call-cfg-llvm"
+            | "ghidra-call-cfg-llvm-allocated"
+            | "ghidra-call-cfg-llvm-imports"
+            | "ghidra-call-assessment"
     ) {
         if argument.is_empty() || argument.len() > 1024 || argument.chars().any(char::is_control) {
             return Err(Status::invalid_argument(
@@ -2060,7 +2128,7 @@ fn pack_worker_parts(parts: &[&[u8]]) -> Result<Vec<u8>, String> {
         .checked_add(parts.iter().map(|part| part.len()).sum::<usize>())
         .ok_or("worker output size overflow")?;
     if total > MAX_WORKER_OUTPUT {
-        return Err("artifacts exceed 16 MiB worker output limit".to_owned());
+        return Err("artifacts exceed 24 MiB worker output limit".to_owned());
     }
     let mut packed = Vec::with_capacity(total);
     for part in parts {
@@ -2123,6 +2191,28 @@ struct GhidraSnapshotArtifactSelector {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct GhidraObservationArtifactSelector {
+    stage: String,
+    binary_sha256: String,
+}
+
+fn ghidra_observation_media_type(stage: &str) -> Option<&'static str> {
+    match stage {
+        "observed-call-rediscovery" => {
+            Some("application/vnd.hydir.observed-call-rediscovery+json;version=1")
+        }
+        "observed-jump-rediscovery" => {
+            Some("application/vnd.hydir.observed-jump-rediscovery+json;version=1")
+        }
+        "observed-path-comparison" => {
+            Some("application/vnd.hydir.pcode-observed-path-comparison+json;version=1")
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct GhidraCallTraceSelector {
     binary_sha256: String,
     max_operations: usize,
@@ -2131,8 +2221,18 @@ struct GhidraCallTraceSelector {
 }
 
 const GHIDRA_CALL_TRACE_MEDIA_TYPE: &str = "application/vnd.hydir.pcode-call-trace+json;version=2";
+const GHIDRA_CALL_ALLOCATED_TRACE_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-call-trace+json;version=3";
+const GHIDRA_CALL_IMPORT_CONTRACT_TRACE_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-call-trace+json;version=4";
 const GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE: &str =
     "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=1";
+const GHIDRA_CALL_ALLOCATED_CFG_LLVM_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=2";
+const GHIDRA_CALL_IMPORT_CONTRACT_CFG_LLVM_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-interprocedural-cfg-llvm+json;version=3";
+const GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE: &str =
+    "application/vnd.hydir.pcode-function-assessment+json;version=1";
 
 fn pack_ghidra_call_trace_input(seed: &[u8], snapshots: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     if seed.is_empty() || seed.len() > MAX_PCODE_SEED_BYTES {
@@ -2294,6 +2394,79 @@ fn unpack_ghidra_call_image_input(bytes: &[u8]) -> Result<(&[u8], &[u8], Vec<&[u
     Ok((binary, seed, snapshots))
 }
 
+fn pack_ghidra_call_allocated_input(
+    binary: &[u8],
+    seed: &[u8],
+    snapshots: &[Vec<u8>],
+    allocation: &[u8],
+) -> Result<Vec<u8>, String> {
+    if allocation.is_empty() || allocation.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+        return Err("Ghidra call allocation declaration must be 1..=4 KiB".to_owned());
+    }
+    let image = pack_ghidra_call_image_input(binary, seed, snapshots)?;
+    let size = 12usize
+        .checked_add(image.len())
+        .and_then(|size| size.checked_add(allocation.len()))
+        .ok_or("Ghidra allocated call input length overflow")?;
+    if size > MAX_CALL_TRACE_ALLOCATED_INPUT {
+        return Err("Ghidra allocated call input exceeds service limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend_from_slice(GHIDRA_CALL_ALLOCATED_MAGIC);
+    bytes.extend_from_slice(&(image.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(allocation.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&image);
+    bytes.extend_from_slice(allocation);
+    Ok(bytes)
+}
+
+fn unpack_ghidra_call_allocated_input(
+    bytes: &[u8],
+) -> Result<(&[u8], &[u8], Vec<&[u8]>, &[u8]), String> {
+    if bytes.len() > MAX_CALL_TRACE_ALLOCATED_INPUT
+        || bytes.get(..4) != Some(GHIDRA_CALL_ALLOCATED_MAGIC)
+    {
+        return Err("Ghidra allocated call envelope header is invalid".to_owned());
+    }
+    let image_size = u32::from_le_bytes(
+        bytes
+            .get(4..8)
+            .ok_or("Ghidra allocated call header is truncated")?
+            .try_into()
+            .map_err(|_| "Ghidra allocated image size is invalid")?,
+    ) as usize;
+    let allocation_size = u32::from_le_bytes(
+        bytes
+            .get(8..12)
+            .ok_or("Ghidra allocated call header is truncated")?
+            .try_into()
+            .map_err(|_| "Ghidra allocated declaration size is invalid")?,
+    ) as usize;
+    if !(1..=MAX_CALL_TRACE_IMAGE_INPUT).contains(&image_size)
+        || !(1..=MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES).contains(&allocation_size)
+    {
+        return Err("Ghidra allocated call envelope exceeds service limits".to_owned());
+    }
+    let image_end = 12usize
+        .checked_add(image_size)
+        .ok_or("Ghidra allocated call image length overflow")?;
+    let end = image_end
+        .checked_add(allocation_size)
+        .ok_or("Ghidra allocated call declaration length overflow")?;
+    if end != bytes.len() {
+        return Err("Ghidra allocated call envelope is truncated or has trailing bytes".to_owned());
+    }
+    let (binary, seed, snapshots) = unpack_ghidra_call_image_input(
+        bytes
+            .get(12..image_end)
+            .ok_or("Ghidra allocated call image is truncated")?,
+    )?;
+    let allocation = bytes
+        .get(image_end..end)
+        .ok_or("Ghidra allocated call declaration is truncated")?;
+    Ok((binary, seed, snapshots, allocation))
+}
+
 /// Worker-only envelope carrying one snapshot and the uploaded ELF bytes.
 /// The digest is checked against the selector inside the isolated worker.
 fn pack_ghidra_snapshot_image_input(snapshot: &[u8], binary: &[u8]) -> Result<Vec<u8>, String> {
@@ -2362,11 +2535,230 @@ fn unpack_ghidra_snapshot_image_input(bytes: &[u8]) -> Result<(&[u8], &[u8]), St
     Ok((snapshot, binary))
 }
 
+fn pack_ghidra_allocated_process_input(
+    snapshot: &[u8],
+    allocation: &[u8],
+    binary: &[u8],
+) -> Result<Vec<u8>, String> {
+    if snapshot.is_empty()
+        || snapshot.len() > MAX_GHIDRA_SNAPSHOT_BYTES
+        || allocation.is_empty()
+        || allocation.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES
+        || binary.is_empty()
+        || binary.len() > MAX_BINARY_BYTES
+    {
+        return Err("allocated process input is empty or exceeds its limit".to_owned());
+    }
+    let size = 12usize
+        .checked_add(snapshot.len())
+        .and_then(|size| size.checked_add(allocation.len()))
+        .and_then(|size| size.checked_add(binary.len()))
+        .ok_or("allocated process input length overflow")?;
+    if size > MAX_GHIDRA_ALLOCATED_PROCESS_INPUT {
+        return Err("allocated process input exceeds service limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(size);
+    for part in [snapshot, allocation, binary] {
+        bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    }
+    for part in [snapshot, allocation, binary] {
+        bytes.extend_from_slice(part);
+    }
+    Ok(bytes)
+}
+
+fn unpack_ghidra_allocated_process_input(bytes: &[u8]) -> Result<[&[u8]; 3], String> {
+    if bytes.len() < 12 || bytes.len() > MAX_GHIDRA_ALLOCATED_PROCESS_INPUT {
+        return Err("allocated process envelope exceeds service limit".to_owned());
+    }
+    let limits = [
+        MAX_GHIDRA_SNAPSHOT_BYTES,
+        MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES,
+        MAX_BINARY_BYTES,
+    ];
+    let mut parts = [&[][..]; 3];
+    let mut cursor = 12usize;
+    for (index, part) in parts.iter_mut().enumerate() {
+        let offset = index * 4;
+        let size = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .map_err(|_| "invalid allocated process part size")?,
+        ) as usize;
+        if size == 0 || size > limits[index] {
+            return Err("allocated process part is empty or exceeds its limit".to_owned());
+        }
+        let end = cursor
+            .checked_add(size)
+            .ok_or("allocated process length overflow")?;
+        *part = bytes
+            .get(cursor..end)
+            .ok_or("allocated process part is truncated")?;
+        cursor = end;
+    }
+    if cursor != bytes.len() {
+        return Err("allocated process envelope has trailing bytes".to_owned());
+    }
+    Ok(parts)
+}
+
+fn ghidra_allocated_process_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraSnapshotArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid allocated process selector: {error}"))?;
+    if selector.stage != "llvm-cfg-process-allocated" {
+        return Err("allocated process worker requires LLVM v5 stage".to_owned());
+    }
+    validate_ghidra_start_address(&selector.stage, &selector.start_address)?;
+    validate_ghidra_slice_target(
+        &selector.stage,
+        selector.instruction_index,
+        selector.operation_index,
+        selector.input_index,
+    )?;
+    let [snapshot_bytes, allocation_bytes, binary] = unpack_ghidra_allocated_process_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("allocated process binary digest disagrees with selector".to_owned());
+    }
+    let snapshot = parse_ghidra_snapshot(snapshot_bytes, &selector.binary_sha256)?;
+    let process =
+        PcodeElfProcessMemory::from_elf(binary, &snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let allocations =
+        PcodeProcessAllocations::parse_declared(allocation_bytes, &snapshot, &process)?;
+    let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
+        space: snapshot.selected_function.entry.space.clone(),
+        offset: selector.start_address,
+    });
+    let artifact =
+        emit_pcode_cfg_llvm_with_allocations(&snapshot, start.as_ref(), &process, &allocations)?;
+    serde_json::to_vec(&artifact).map_err(|error| error.to_string())
+}
+
+fn pack_ghidra_observation_input(parts: [&[u8]; 5]) -> Result<Vec<u8>, String> {
+    let limits = [
+        MAX_GHIDRA_SNAPSHOT_BYTES,
+        MAX_INPUT_SPEC_BYTES,
+        MAX_DYNAMIC_TRACE_JSON_BYTES,
+        MAX_PCODE_SEED_BYTES,
+        MAX_BINARY_BYTES,
+    ];
+    for (index, part) in parts.iter().enumerate() {
+        if part.len() > limits[index] || (index != 3 && part.is_empty()) {
+            return Err("Ghidra observation part is empty or exceeds its limit".to_owned());
+        }
+    }
+    let size = parts
+        .iter()
+        .try_fold(20usize, |size, part| size.checked_add(part.len()))
+        .ok_or("Ghidra observation length overflow")?;
+    if size > MAX_GHIDRA_OBSERVATION_INPUT {
+        return Err("Ghidra observation exceeds service limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(size);
+    for part in parts {
+        bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    }
+    for part in parts {
+        bytes.extend_from_slice(part);
+    }
+    Ok(bytes)
+}
+
+fn unpack_ghidra_observation_input(bytes: &[u8]) -> Result<[&[u8]; 5], String> {
+    if bytes.len() > MAX_GHIDRA_OBSERVATION_INPUT || bytes.len() < 20 {
+        return Err("Ghidra observation envelope exceeds service limit".to_owned());
+    }
+    let limits = [
+        MAX_GHIDRA_SNAPSHOT_BYTES,
+        MAX_INPUT_SPEC_BYTES,
+        MAX_DYNAMIC_TRACE_JSON_BYTES,
+        MAX_PCODE_SEED_BYTES,
+        MAX_BINARY_BYTES,
+    ];
+    let mut parts = [&[][..]; 5];
+    let mut cursor = 20usize;
+    for (index, part) in parts.iter_mut().enumerate() {
+        let offset = index * 4;
+        let size = u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .map_err(|_| "invalid Ghidra observation part size")?,
+        ) as usize;
+        if size > limits[index] || (index != 3 && size == 0) {
+            return Err("Ghidra observation part is empty or exceeds its limit".to_owned());
+        }
+        let end = cursor
+            .checked_add(size)
+            .ok_or("Ghidra observation length overflow")?;
+        *part = bytes
+            .get(cursor..end)
+            .ok_or("Ghidra observation part is truncated")?;
+        cursor = end;
+    }
+    if cursor != bytes.len() {
+        return Err("Ghidra observation has trailing bytes".to_owned());
+    }
+    Ok(parts)
+}
+
+fn ghidra_observation_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraObservationArtifactSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra observation selector: {error}"))?;
+    ghidra_observation_media_type(&selector.stage).ok_or("unsupported Ghidra observation stage")?;
+    let [snapshot_bytes, input_bytes, trace_bytes, seed_bytes, binary] =
+        unpack_ghidra_observation_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("Ghidra observation binary digest disagrees with selector".to_owned());
+    }
+    let input = parse_input_spec(input_bytes)?;
+    let trace = parse_dynamic_trace(trace_bytes)?;
+    validate_dynamic_trace(binary, &input, &trace)?;
+    if selector.stage == "observed-call-rediscovery" {
+        if !seed_bytes.is_empty() {
+            return Err("rediscovery plan does not accept a P-code seed".to_owned());
+        }
+        let plan =
+            hydir_ghidra_worker::plan_observed_calls(binary, &input, &trace, snapshot_bytes)?;
+        return serde_json::to_vec(&plan).map_err(|error| error.to_string());
+    }
+    if selector.stage == "observed-jump-rediscovery" {
+        if !seed_bytes.is_empty() {
+            return Err("rediscovery plan does not accept a P-code seed".to_owned());
+        }
+        let plan =
+            hydir_ghidra_worker::plan_observed_jumps(binary, &input, &trace, snapshot_bytes)?;
+        return serde_json::to_vec(&plan).map_err(|error| error.to_string());
+    }
+    let snapshot = hydir_ghidra_worker::validate_cached_snapshot(
+        snapshot_bytes,
+        &selector.binary_sha256,
+        Some(trace.selected_elf_vaddr),
+    )?;
+    let canonical = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+    if trace.ghidra_snapshot_sha256.as_deref() != Some(sha256(&canonical).as_str()) {
+        return Err("DynamicTrace does not bind the selected Ghidra snapshot".to_owned());
+    }
+    let seed = parse_pcode_seed(seed_bytes, &snapshot)?;
+    let memory =
+        PcodeElfProcessMemory::from_elf(binary, &snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let path = snapshot.execute_concrete_path_with_process_memory(
+        &seed,
+        &memory,
+        None,
+        MAX_OBSERVED_PATH_OPERATIONS,
+        MAX_OBSERVED_PATH_VISITS,
+    )?;
+    let comparison = compare_pcode_observed_path(binary, &input, &snapshot, &trace, &path)?;
+    serde_json::to_vec(&comparison).map_err(|error| error.to_string())
+}
+
 fn ghidra_snapshot_image_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
     let selector: GhidraSnapshotArtifactSelector = serde_json::from_str(selector_json)
         .map_err(|error| format!("invalid Ghidra image selector: {error}"))?;
-    if selector.stage != "llvm-cfg-image" {
-        return Err("Ghidra image worker requires llvm-cfg-image stage".to_owned());
+    if !matches!(
+        selector.stage.as_str(),
+        "llvm-cfg-image" | "llvm-cfg-process" | "process-memory" | "imports"
+    ) {
+        return Err("Ghidra image worker requires an ELF-backed stage".to_owned());
     }
     validate_ghidra_start_address(&selector.stage, &selector.start_address)?;
     validate_ghidra_slice_target(
@@ -2380,6 +2772,30 @@ fn ghidra_snapshot_image_artifact(bytes: &[u8], selector_json: &str) -> Result<V
         return Err("Ghidra image binary digest disagrees with selector".to_owned());
     }
     let snapshot = parse_ghidra_snapshot(snapshot_bytes, &selector.binary_sha256)?;
+    if selector.stage == "imports" {
+        let imports = PcodeElfImportIndex::from_elf(binary, &snapshot)?;
+        return serde_json::to_vec(&imports).map_err(|error| error.to_string());
+    }
+    if matches!(
+        selector.stage.as_str(),
+        "process-memory" | "llvm-cfg-process"
+    ) {
+        let memory =
+            PcodeElfProcessMemory::from_elf(binary, &snapshot, PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+        if selector.stage == "process-memory" {
+            return serde_json::to_vec(&memory).map_err(|error| error.to_string());
+        }
+        let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
+            space: snapshot.selected_function.entry.space.clone(),
+            offset: selector.start_address,
+        });
+        return serde_json::to_vec(&hydir_decompile::emit_pcode_cfg_llvm_with_process_memory(
+            &snapshot,
+            start.as_ref(),
+            &memory,
+        )?)
+        .map_err(|error| error.to_string());
+    }
     let image = PcodeReadOnlyElfImage::from_elf(binary, &snapshot)?;
     let window = image.materialize_window(hydir_decompile::PCODE_CFG_ELF_IMAGE_MAX_BYTES)?;
     let start = (!selector.start_address.is_empty()).then(|| PcodeAddress {
@@ -2446,6 +2862,97 @@ fn ghidra_call_trace_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u
     serde_json::to_vec(&trace).map_err(|error| error.to_string())
 }
 
+fn ghidra_call_trace_allocated_artifact(
+    bytes: &[u8],
+    selector_json: &str,
+    with_imports: bool,
+) -> Result<Vec<u8>, String> {
+    let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra allocated call selector: {error}"))?;
+    if selector.max_operations > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_visits > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_depth > 16
+    {
+        return Err("Ghidra allocated call budget exceeds service limit".to_owned());
+    }
+    let (binary, seed_bytes, raw_snapshots, allocation_bytes) =
+        unpack_ghidra_call_allocated_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("Ghidra allocated call ELF digest disagrees with selector".to_owned());
+    }
+    let snapshots = raw_snapshots
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, &selector.binary_sha256))
+        .collect::<Result<Vec<_>, _>>()?;
+    let seed = parse_pcode_seed(seed_bytes, &snapshots[0])?;
+    let process =
+        PcodeElfProcessMemory::from_elf(binary, &snapshots[0], PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let allocations =
+        PcodeProcessAllocations::parse_declared(allocation_bytes, &snapshots[0], &process)?;
+    let trace = if with_imports {
+        execute_concrete_call_path_with_imports(
+            &snapshots,
+            &seed,
+            binary,
+            &process,
+            &allocations,
+            selector.max_operations,
+            selector.max_visits,
+            selector.max_depth,
+        )?
+    } else {
+        execute_concrete_call_path_with_allocations(
+            &snapshots,
+            &seed,
+            &process,
+            &allocations,
+            selector.max_operations,
+            selector.max_visits,
+            selector.max_depth,
+        )?
+    };
+    serde_json::to_vec(&trace).map_err(|error| error.to_string())
+}
+
+fn ghidra_call_assessment_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
+    let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra assessment selector: {error}"))?;
+    if selector.max_operations > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_visits > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_depth > 16
+    {
+        return Err("Ghidra assessment budget exceeds service limit".to_owned());
+    }
+    let (binary, seed_bytes, raw_snapshots) = unpack_ghidra_call_image_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("Ghidra assessment ELF digest disagrees with selector".to_owned());
+    }
+    let snapshots = raw_snapshots
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, &selector.binary_sha256))
+        .collect::<Result<Vec<_>, _>>()?;
+    let image = if snapshots[0].memory_blocks.is_empty() {
+        None
+    } else {
+        Some(PcodeReadOnlyElfImage::from_elf(binary, &snapshots[0])?)
+    };
+    let mut assessment = assess_pcode_function(
+        &snapshots,
+        seed_bytes,
+        image.as_ref(),
+        selector.max_operations,
+        selector.max_visits,
+        selector.max_depth,
+    )?;
+    if image.is_none() {
+        assessment
+            .trace
+            .snapshot_diagnostics
+            .push(LEGACY_CALL_IMAGE_DIAGNOSTIC.to_owned());
+    }
+    serde_json::to_vec(&assessment).map_err(|error| error.to_string())
+}
+
 fn ghidra_call_cfg_llvm_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>, String> {
     let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
         .map_err(|error| format!("invalid Ghidra call LLVM selector: {error}"))?;
@@ -2465,6 +2972,52 @@ fn ghidra_call_cfg_llvm_artifact(bytes: &[u8], selector_json: &str) -> Result<Ve
     serde_json::to_vec(&artifact).map_err(|error| error.to_string())
 }
 
+fn ghidra_call_cfg_llvm_allocated_artifact(
+    bytes: &[u8],
+    selector_json: &str,
+    with_imports: bool,
+) -> Result<Vec<u8>, String> {
+    let selector: GhidraCallTraceSelector = serde_json::from_str(selector_json)
+        .map_err(|error| format!("invalid Ghidra allocated call LLVM selector: {error}"))?;
+    if selector.max_operations > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_visits > MAX_CALL_TRACE_OPERATIONS
+        || selector.max_depth > 16
+    {
+        return Err("Ghidra allocated call LLVM budget exceeds service limit".to_owned());
+    }
+    let (binary, seed_bytes, raw_snapshots, allocation_bytes) =
+        unpack_ghidra_call_allocated_input(bytes)?;
+    if sha256(binary) != selector.binary_sha256 {
+        return Err("Ghidra allocated call LLVM ELF digest disagrees with selector".to_owned());
+    }
+    let snapshots = raw_snapshots
+        .into_iter()
+        .map(|bytes| parse_ghidra_snapshot(bytes, &selector.binary_sha256))
+        .collect::<Result<Vec<_>, _>>()?;
+    parse_pcode_seed(seed_bytes, &snapshots[0])?;
+    let process =
+        PcodeElfProcessMemory::from_elf(binary, &snapshots[0], PCODE_ELF_PROCESS_MEMORY_MAX_BYTES)?;
+    let allocations =
+        PcodeProcessAllocations::parse_declared(allocation_bytes, &snapshots[0], &process)?;
+    let artifact = if with_imports {
+        emit_pcode_interprocedural_cfg_llvm_with_imports(
+            &snapshots,
+            binary,
+            selector.max_depth,
+            &process,
+            &allocations,
+        )?
+    } else {
+        emit_pcode_interprocedural_cfg_llvm_with_allocations(
+            &snapshots,
+            selector.max_depth,
+            &process,
+            &allocations,
+        )?
+    };
+    serde_json::to_vec(&artifact).map_err(|error| error.to_string())
+}
+
 fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
     match stage {
         "snapshot" => Some("application/vnd.hydir.ghidra-snapshot+json;version=2"),
@@ -2474,8 +3027,13 @@ fn ghidra_snapshot_artifact_media_type(stage: &str) -> Option<&'static str> {
         "state" => Some("application/vnd.hydir.pcode-state-ir+json;version=1"),
         "cfg" => Some("application/vnd.hydir.pcode-cfg-ir+json;version=1"),
         "coverage" => Some("application/vnd.hydir.pcode-coverage+json;version=1"),
+        "capability" => Some("application/vnd.hydir.pcode-capability+json;version=1"),
         "llvm-cfg" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=2"),
         "llvm-cfg-image" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=3"),
+        "llvm-cfg-process" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=4"),
+        "llvm-cfg-process-allocated" => Some("application/vnd.hydir.pcode-cfg-llvm+json;version=5"),
+        "process-memory" => Some("application/vnd.hydir.pcode-process-memory+json;version=1"),
+        "imports" => Some("application/vnd.hydir.pcode-elf-import-index+json;version=1"),
         "llvm-cfg-simplified" => {
             Some("application/vnd.hydir.pcode-simplified-cfg-llvm+json;version=1")
         }
@@ -2511,7 +3069,14 @@ fn validate_ghidra_start_address(stage: &str, address: &str) -> Result<(), Strin
     if address.is_empty() {
         return Ok(());
     }
-    if !matches!(stage, "llvm-cfg" | "llvm-cfg-image" | "llvm-cfg-simplified") {
+    if !matches!(
+        stage,
+        "llvm-cfg"
+            | "llvm-cfg-image"
+            | "llvm-cfg-process"
+            | "llvm-cfg-process-allocated"
+            | "llvm-cfg-simplified"
+    ) {
         return Err("start address is supported only for CFG LLVM stages".to_owned());
     }
     let digits = address
@@ -2573,6 +3138,132 @@ async fn automatic_ghidra_snapshot(
     .map_err(|error| {
         Status::failed_precondition(format!("automatic Ghidra analysis failed: {error}"))
     })
+}
+
+#[cfg(not(test))]
+async fn run_frida_observer(
+    elf: Vec<u8>,
+    input_json: Vec<u8>,
+    snapshot_json: Vec<u8>,
+    selected: u64,
+) -> Result<Vec<u8>, Status> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(Status::failed_precondition(
+            "Frida observation requires Linux x86-64",
+        ));
+    }
+    let (input, expected_snapshot) =
+        validate_frida_request(&elf, &input_json, &snapshot_json, selected)
+            .map_err(Status::invalid_argument)?;
+    let helper = env::var_os("HYDIR_FRIDA_OBSERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env::current_exe()
+                .unwrap_or_default()
+                .with_file_name("hydir-frida-observer")
+        });
+    if !helper.is_file() {
+        return Err(Status::failed_precondition(
+            "Frida observer is unavailable; install the Linux observer bundle",
+        ));
+    }
+    let scratch =
+        tempfile::tempdir().map_err(|_| Status::internal("cannot create Frida input scratch"))?;
+    let binary_path = scratch.path().join("binary.elf");
+    let input_path = scratch.path().join("input.json");
+    stage_frida_elf(&binary_path, &elf).map_err(Status::internal)?;
+    std::fs::write(&input_path, &input_json)
+        .map_err(|_| Status::internal("cannot stage Frida InputSpec"))?;
+    let mut command = Command::new(&helper);
+    command
+        .arg(&binary_path)
+        .arg(&input_path)
+        .arg(format!("{selected:x}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpgid is async-signal-safe between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| Status::failed_precondition("Frida observer could not start"))?;
+    #[cfg(target_os = "linux")]
+    let mut process_group = WorkerProcessGroup {
+        pid: i32::try_from(
+            child
+                .id()
+                .ok_or_else(|| Status::internal("observer PID unavailable"))?,
+        )
+        .map_err(|_| Status::internal("observer PID overflow"))?,
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Status::internal("observer stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Status::internal("observer stderr unavailable"))?;
+    let stdout_reader = async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take((MAX_DYNAMIC_TRACE_JSON_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let stderr_reader = async move {
+        let mut bytes = Vec::new();
+        stderr.take(8193).read_to_end(&mut bytes).await?;
+        Ok::<_, std::io::Error>(bytes)
+    };
+    let deadline = Duration::from_millis(input.budget.timeout_ms.saturating_add(8_000));
+    let (stdout, stderr, exit) = tokio::time::timeout(deadline, async {
+        tokio::try_join!(stdout_reader, stderr_reader, child.wait())
+    })
+    .await
+    .map_err(|_| Status::deadline_exceeded("Frida observer exceeded InputSpec timeout"))?
+    .map_err(|_| Status::internal("Frida observer output failed"))?;
+    #[cfg(target_os = "linux")]
+    process_group.disarm();
+    if stdout.len() > MAX_DYNAMIC_TRACE_JSON_BYTES || stderr.len() > 8192 {
+        return Err(Status::resource_exhausted(
+            "Frida observer output exceeds limit",
+        ));
+    }
+    if !exit.success() {
+        return Err(Status::failed_precondition(format!(
+            "Frida observer failed: {}",
+            String::from_utf8_lossy(&stderr)
+                .trim()
+                .chars()
+                .take(4096)
+                .collect::<String>()
+        )));
+    }
+    checked_frida_trace(&elf, &input, selected, expected_snapshot, &stdout)
+        .map_err(Status::data_loss)
+}
+
+#[cfg(test)]
+async fn run_frida_observer(
+    _elf: Vec<u8>,
+    _input_json: Vec<u8>,
+    _snapshot_json: Vec<u8>,
+    _selected: u64,
+) -> Result<Vec<u8>, Status> {
+    Err(Status::failed_precondition(
+        "Frida observer is not started in unit tests",
+    ))
 }
 
 async fn collect_ghidra_call_root_snapshot(
@@ -2712,6 +3403,7 @@ fn ghidra_snapshot_artifact(bytes: &[u8], selector_json: &str) -> Result<Vec<u8>
         "state" => serde_json::to_vec(&raw.lower_state()),
         "cfg" => serde_json::to_vec(&snapshot.pcode_cfg_ir()?),
         "coverage" => serde_json::to_vec(&snapshot.pcode_coverage_report()?),
+        "capability" => serde_json::to_vec(&snapshot.pcode_capability_report()?),
         "slice" => serde_json::to_vec(
             &snapshot
                 .backward_pcode_slice(slice_target.expect("slice selector validated above"))?,
@@ -3170,8 +3862,29 @@ fn worker_operation(action: &str, symbol: Option<&str>, bytes: &[u8]) -> Result<
         ("ghidra-snapshot-image-artifact", Some(selector)) => {
             ghidra_snapshot_image_artifact(bytes, selector)
         }
+        ("ghidra-allocated-process-artifact", Some(selector)) => {
+            ghidra_allocated_process_artifact(bytes, selector)
+        }
+        ("ghidra-observation-artifact", Some(selector)) => {
+            ghidra_observation_artifact(bytes, selector)
+        }
         ("ghidra-call-trace", Some(selector)) => ghidra_call_trace_artifact(bytes, selector),
+        ("ghidra-call-trace-allocated", Some(selector)) => {
+            ghidra_call_trace_allocated_artifact(bytes, selector, false)
+        }
+        ("ghidra-call-trace-imports", Some(selector)) => {
+            ghidra_call_trace_allocated_artifact(bytes, selector, true)
+        }
+        ("ghidra-call-assessment", Some(selector)) => {
+            ghidra_call_assessment_artifact(bytes, selector)
+        }
         ("ghidra-call-cfg-llvm", Some(selector)) => ghidra_call_cfg_llvm_artifact(bytes, selector),
+        ("ghidra-call-cfg-llvm-allocated", Some(selector)) => {
+            ghidra_call_cfg_llvm_allocated_artifact(bytes, selector, false)
+        }
+        ("ghidra-call-cfg-llvm-imports", Some(selector)) => {
+            ghidra_call_cfg_llvm_allocated_artifact(bytes, selector, true)
+        }
         ("inspect", None) => import_elf(bytes)
             .map_err(|error| error.to_string())
             .and_then(|spec| serde_json::to_vec(&spec).map_err(|error| error.to_string())),
@@ -3295,7 +4008,7 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
         Status::invalid_argument(format!("analysis worker rejected input: {error}"))
     })?;
     if output.len() > MAX_WORKER_OUTPUT {
-        return Err(Status::resource_exhausted("worker output exceeds 16 MiB"));
+        return Err(Status::resource_exhausted("worker output exceeds 24 MiB"));
     }
     Ok(output)
 }
@@ -3382,7 +4095,7 @@ async fn run_worker(action: &str, symbol: Option<&str>, bytes: Vec<u8>) -> Resul
             .await
             .map_err(|_| Status::internal("worker output read failed"))?;
         if output.len() > MAX_WORKER_OUTPUT {
-            return Err(Status::resource_exhausted("worker output exceeds 16 MiB"));
+            return Err(Status::resource_exhausted("worker output exceeds 24 MiB"));
         }
         let status = child
             .wait()
@@ -3417,8 +4130,15 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let limit = match arguments.first().map(String::as_str) {
         Some("native-artifact-model") => MAX_BINARY_BYTES + MAX_MODEL_BYTES + 4,
         Some("ghidra-call-trace") => MAX_CALL_TRACE_IMAGE_INPUT,
+        Some("ghidra-call-trace-allocated") => MAX_CALL_TRACE_ALLOCATED_INPUT,
+        Some("ghidra-call-trace-imports") => MAX_CALL_TRACE_ALLOCATED_INPUT,
         Some("ghidra-call-cfg-llvm") => MAX_CALL_TRACE_INPUT,
+        Some("ghidra-call-cfg-llvm-allocated") => MAX_CALL_TRACE_ALLOCATED_INPUT,
+        Some("ghidra-call-cfg-llvm-imports") => MAX_CALL_TRACE_ALLOCATED_INPUT,
+        Some("ghidra-call-assessment") => MAX_CALL_TRACE_IMAGE_INPUT,
         Some("ghidra-snapshot-image-artifact") => MAX_GHIDRA_SNAPSHOT_IMAGE_INPUT,
+        Some("ghidra-allocated-process-artifact") => MAX_GHIDRA_ALLOCATED_PROCESS_INPUT,
+        Some("ghidra-observation-artifact") => MAX_GHIDRA_OBSERVATION_INPUT,
         _ => MAX_BINARY_BYTES,
     };
     std::io::stdin()
@@ -3435,7 +4155,7 @@ fn worker_main(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match result {
         Ok(output) if output.len() <= MAX_WORKER_OUTPUT => std::io::stdout().write_all(&output)?,
         Ok(_) => {
-            std::io::stdout().write_all(b"worker output exceeds 16 MiB")?;
+            std::io::stdout().write_all(b"worker output exceeds 24 MiB")?;
             std::process::exit(1);
         }
         Err(error) => {
@@ -4236,7 +4956,7 @@ impl Hydir for Store {
             .await?;
         if binary.len() > MAX_WORKER_OUTPUT {
             return Err(Status::resource_exhausted(
-                "remote patch binary exceeds 16 MiB worker output limit",
+                "remote patch binary exceeds 24 MiB worker output limit",
             ));
         }
         let patch_length = u32::try_from(input.patch_json.len())
@@ -4615,10 +5335,146 @@ fn require_native_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
     Ok(v3_job_reply(job))
 }
 
+fn require_frida_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
+    if job.kind != "frida-observation" {
+        return Err(Status::not_found("Frida observation job not found"));
+    }
+    Ok(v3_job_reply(job))
+}
+
+fn require_v3_job(job: JobReply) -> Result<api_v3::JobReply, Status> {
+    if !matches!(job.kind.as_str(), "native-analysis" | "frida-observation") {
+        return Err(Status::not_found("analysis job not found"));
+    }
+    Ok(v3_job_reply(job))
+}
+
+fn frida_request_fingerprint(input: &api_v3::StartFridaObservationRequest) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"hydir-frida-observation-v1\0");
+    hash.update(input.selected_elf_vaddr.to_le_bytes());
+    for part in [&input.input_spec_json, &input.snapshot_json] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn stage_frida_elf(path: &Path, elf: &[u8]) -> Result<(), String> {
+    std::fs::write(path, elf).map_err(|error| format!("cannot stage Frida ELF: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot mark Frida ELF executable: {error}"))?;
+    }
+    Ok(())
+}
+
+fn frida_snapshot_digest(
+    elf: &[u8],
+    input: &InputSpec,
+    snapshot_json: &[u8],
+    selected: u64,
+) -> Result<Option<String>, String> {
+    if snapshot_json.is_empty() {
+        return Ok(None);
+    }
+    let snapshot = parse_ghidra_snapshot(snapshot_json, &input.binary_sha256)?;
+    let parse_address = |value: &str| -> Result<u64, String> {
+        let digits = value
+            .strip_prefix("0x")
+            .ok_or("Ghidra address is not 0x-prefixed")?;
+        u64::from_str_radix(digits, 16).map_err(|_| "Ghidra address is invalid".to_owned())
+    };
+    let elf_base = import_elf(elf)
+        .map_err(|error| error.to_string())?
+        .mapped_segments
+        .iter()
+        .filter(|segment| segment.address_space == 0 && segment.memory_size > 0)
+        .map(|segment| segment.virtual_address.0)
+        .min()
+        .ok_or("ELF has no mapped RAM segment")?;
+    let snapshot_base = parse_address(&snapshot.program.image_base.offset)?;
+    let entry = parse_address(&snapshot.selected_function.entry.offset)?;
+    let linked = entry
+        .checked_sub(snapshot_base)
+        .and_then(|offset| elf_base.checked_add(offset))
+        .ok_or("Ghidra function entry cannot be normalized to ELF")?;
+    if snapshot.selected_function.entry.space != "ram"
+        || snapshot.program.image_base.space != "ram"
+        || linked != selected
+    {
+        return Err("Ghidra snapshot entry differs from observed ELF address".to_owned());
+    }
+    Ok(Some(sha256(
+        &serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?,
+    )))
+}
+
+fn validate_frida_request(
+    elf: &[u8],
+    input_json: &[u8],
+    snapshot_json: &[u8],
+    selected: u64,
+) -> Result<(InputSpec, Option<String>), String> {
+    if selected == 0 || input_json.is_empty() || input_json.len() > MAX_INPUT_SPEC_BYTES {
+        return Err("Frida observation requires a selected address and bounded InputSpec".into());
+    }
+    if snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES {
+        return Err("Ghidra snapshot exceeds 16 MiB".into());
+    }
+    let input = parse_input_spec(input_json)?;
+    validate_input_spec(elf, &input)?;
+    if !input.stdin_hex.is_empty() || input.budget.memory_bytes < 1024 * 1024 * 1024 {
+        return Err(
+            "Frida observation currently requires argv/files and a 1 GiB memory budget".into(),
+        );
+    }
+    let program = import_elf(elf).map_err(|error| error.to_string())?;
+    if !program.mapped_segments.iter().any(|segment| {
+        segment.address_space == 0
+            && segment.executable
+            && selected >= segment.virtual_address.0
+            && selected - segment.virtual_address.0 < segment.file_size
+    }) {
+        return Err("selected Frida address is outside file-backed executable ELF code".into());
+    }
+    let expected_snapshot = frida_snapshot_digest(elf, &input, snapshot_json, selected)?;
+    Ok((input, expected_snapshot))
+}
+
+fn checked_frida_trace(
+    elf: &[u8],
+    input: &InputSpec,
+    selected: u64,
+    expected_snapshot: Option<String>,
+    content: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut trace = parse_dynamic_trace(content)?;
+    if trace.schema_version != DYNAMIC_TRACE_V2_VERSION
+        || trace.selected_elf_vaddr != selected
+        || trace.ghidra_snapshot_sha256.is_some()
+    {
+        return Err("Frida observer returned a mismatched trace".into());
+    }
+    validate_dynamic_trace(elf, input, &trace)?;
+    trace.ghidra_snapshot_sha256 = expected_snapshot;
+    validate_dynamic_trace(elf, input, &trace)?;
+    serde_json::to_vec(&trace).map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy)]
+enum GhidraCallArtifactKind {
+    Trace,
+    Llvm,
+    Assessment,
+}
+
 async fn ghidra_call_artifact(
     store: &Store,
     request: Request<api_v3::GhidraCallTraceRequest>,
-    llvm: bool,
+    kind: GhidraCallArtifactKind,
 ) -> Result<Response<api_v3::ArtifactReply>, Status> {
     let principal = store.principal(&request)?;
     let input = request.into_inner();
@@ -4642,6 +5498,23 @@ async fn ghidra_call_artifact(
     if input.seed_json.is_empty() || input.seed_json.len() > MAX_PCODE_SEED_BYTES {
         return Err(Status::resource_exhausted(
             "Ghidra call seed must be 1..=1 MiB",
+        ));
+    }
+    if input.allocation_json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+        return Err(Status::resource_exhausted(
+            "Ghidra call allocation declaration exceeds 4 KiB",
+        ));
+    }
+    let allocated = !input.allocation_json.is_empty();
+    let with_imports = input.assume_import_contracts;
+    if with_imports && (!allocated || matches!(kind, GhidraCallArtifactKind::Assessment)) {
+        return Err(Status::invalid_argument(
+            "import contracts require call tracing or LLVM and declared process allocations",
+        ));
+    }
+    if allocated && matches!(kind, GhidraCallArtifactKind::Assessment) {
+        return Err(Status::invalid_argument(
+            "Ghidra function assessment does not support declared process allocations",
         ));
     }
     let project = store.project(&principal, &input.project_id)?;
@@ -4697,17 +5570,45 @@ async fn ghidra_call_artifact(
         })
         .collect::<BTreeSet<_>>();
     let mut trace = loop {
-        let envelope = pack_ghidra_call_image_input(&binary, &input.seed_json, &snapshots)
-            .map_err(Status::resource_exhausted)?;
-        let raw = run_worker("ghidra-call-trace", Some(&selector), envelope).await?;
+        let (action, envelope) = if allocated {
+            (
+                if with_imports {
+                    "ghidra-call-trace-imports"
+                } else {
+                    "ghidra-call-trace-allocated"
+                },
+                pack_ghidra_call_allocated_input(
+                    &binary,
+                    &input.seed_json,
+                    &snapshots,
+                    &input.allocation_json,
+                )
+                .map_err(Status::resource_exhausted)?,
+            )
+        } else {
+            (
+                "ghidra-call-trace",
+                pack_ghidra_call_image_input(&binary, &input.seed_json, &snapshots)
+                    .map_err(Status::resource_exhausted)?,
+            )
+        };
+        let raw = run_worker(action, Some(&selector), envelope).await?;
         let trace: PcodeInterproceduralTrace = serde_json::from_slice(&raw).map_err(|error| {
             Status::internal(format!(
                 "Ghidra call worker returned invalid artifact: {error}"
             ))
         })?;
-        if trace.schema_version != hydir_ir::pcode::PCODE_CALL_PATH_VERSION
+        if trace.schema_version
+            != if with_imports {
+                hydir_ir::pcode::PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION
+            } else if allocated {
+                hydir_ir::pcode::PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION
+            } else {
+                hydir_ir::pcode::PCODE_CALL_PATH_VERSION
+            }
             || trace.binary_sha256 != project.binary_sha256
             || trace.root_entry.offset != format!("0x{root_entry:x}")
+            || allocated != trace.process_binding.is_some()
         {
             return Err(Status::internal(
                 "Ghidra call worker returned mismatched binary or function",
@@ -4783,10 +5684,30 @@ async fn ghidra_call_artifact(
         snapshots.push(bytes);
         parsed.push(snapshot);
     };
-    let (content, media_type) = if llvm {
-        let envelope = pack_ghidra_call_trace_input(&input.seed_json, &snapshots)
-            .map_err(Status::resource_exhausted)?;
-        let raw = run_worker("ghidra-call-cfg-llvm", Some(&selector), envelope).await?;
+    let (content, media_type) = if matches!(kind, GhidraCallArtifactKind::Llvm) {
+        let (action, envelope) = if allocated {
+            (
+                if with_imports {
+                    "ghidra-call-cfg-llvm-imports"
+                } else {
+                    "ghidra-call-cfg-llvm-allocated"
+                },
+                pack_ghidra_call_allocated_input(
+                    &binary,
+                    &input.seed_json,
+                    &snapshots,
+                    &input.allocation_json,
+                )
+                .map_err(Status::resource_exhausted)?,
+            )
+        } else {
+            (
+                "ghidra-call-cfg-llvm",
+                pack_ghidra_call_trace_input(&input.seed_json, &snapshots)
+                    .map_err(Status::resource_exhausted)?,
+            )
+        };
+        let raw = run_worker(action, Some(&selector), envelope).await?;
         let mut artifact: PcodeInterproceduralCfgLlvmArtifact = serde_json::from_slice(&raw)
             .map_err(|_| Status::internal("Ghidra call LLVM worker returned invalid artifact"))?;
         let snapshot_sha256 = parsed
@@ -4797,10 +5718,37 @@ async fn ghidra_call_artifact(
                     .map_err(|_| Status::internal("Ghidra snapshot serialization failed"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if artifact.schema_version != 1
+        let expected_import_calls = if with_imports {
+            parsed
+                .iter()
+                .map(|snapshot| PcodeElfImportIndex::from_elf(&binary, snapshot))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Status::internal)?
+                .into_iter()
+                .flat_map(|index| index.calls)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if artifact.schema_version
+            != if with_imports {
+                3
+            } else if allocated {
+                2
+            } else {
+                1
+            }
             || artifact.binary_sha256 != project.binary_sha256
-            || artifact.llvm.schema_version != 2
+            || artifact.llvm.schema_version
+                != if with_imports {
+                    6
+                } else if allocated {
+                    5
+                } else {
+                    2
+                }
             || artifact.llvm.binary_sha256 != project.binary_sha256
+            || allocated != artifact.llvm.allocations.is_some()
             || artifact.llvm.start != parsed[0].selected_function.entry
             || artifact.max_call_depth != max_depth
             || artifact
@@ -4814,6 +5762,7 @@ async fn ghidra_call_artifact(
                     .map(|snapshot| snapshot.selected_function.entry.clone())
                     .collect::<Vec<_>>()
             || artifact.snapshot_sha256 != snapshot_sha256
+            || artifact.import_calls != expected_import_calls
         {
             return Err(Status::internal(
                 "Ghidra call LLVM worker returned mismatched binary or function",
@@ -4823,19 +5772,63 @@ async fn ghidra_call_artifact(
         (
             serde_json::to_vec(&artifact)
                 .map_err(|_| Status::internal("Ghidra call LLVM serialization failed"))?,
-            GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE,
+            if with_imports {
+                GHIDRA_CALL_IMPORT_CONTRACT_CFG_LLVM_MEDIA_TYPE
+            } else if allocated {
+                GHIDRA_CALL_ALLOCATED_CFG_LLVM_MEDIA_TYPE
+            } else {
+                GHIDRA_CALL_CFG_LLVM_MEDIA_TYPE
+            },
+        )
+    } else if matches!(kind, GhidraCallArtifactKind::Assessment) {
+        let envelope = pack_ghidra_call_image_input(&binary, &input.seed_json, &snapshots)
+            .map_err(Status::resource_exhausted)?;
+        let raw = run_worker("ghidra-call-assessment", Some(&selector), envelope).await?;
+        let mut artifact: PcodeFunctionAssessment = serde_json::from_slice(&raw)
+            .map_err(|_| Status::internal("Ghidra assessment worker returned invalid artifact"))?;
+        let expected_snapshots = parsed
+            .iter()
+            .map(|snapshot| {
+                serde_json::to_vec(snapshot)
+                    .map(|content| sha256(&content))
+                    .map_err(|_| Status::internal("Ghidra snapshot serialization failed"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if artifact.schema_version != 1
+            || artifact.binary_sha256 != project.binary_sha256
+            || artifact.entry != parsed[0].selected_function.entry
+            || artifact.seed_sha256 != sha256(&input.seed_json)
+            || artifact.snapshot_sha256 != expected_snapshots
+            || artifact.static_capability.binary_sha256 != project.binary_sha256
+            || artifact.trace.binary_sha256 != project.binary_sha256
+        {
+            return Err(Status::internal(
+                "Ghidra assessment worker returned mismatched identity",
+            ));
+        }
+        artifact.trace.snapshot_diagnostics.extend(diagnostics);
+        (
+            serde_json::to_vec(&artifact)
+                .map_err(|_| Status::internal("Ghidra assessment serialization failed"))?,
+            GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE,
         )
     } else {
         trace.snapshot_diagnostics.extend(diagnostics);
         (
             serde_json::to_vec(&trace)
                 .map_err(|_| Status::internal("Ghidra call trace serialization failed"))?,
-            GHIDRA_CALL_TRACE_MEDIA_TYPE,
+            if with_imports {
+                GHIDRA_CALL_IMPORT_CONTRACT_TRACE_MEDIA_TYPE
+            } else if allocated {
+                GHIDRA_CALL_ALLOCATED_TRACE_MEDIA_TYPE
+            } else {
+                GHIDRA_CALL_TRACE_MEDIA_TYPE
+            },
         )
     };
     if content.len() > MAX_WORKER_OUTPUT {
         return Err(Status::resource_exhausted(
-            "Ghidra call trace exceeds 16 MiB",
+            "Ghidra call trace exceeds 24 MiB",
         ));
     }
     let current = store.project(&principal, &input.project_id)?;
@@ -4898,6 +5891,10 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             revisioned_analysis_model_edits: true,
             ghidra_call_tracing: true,
             ghidra_call_cfg_llvm: true,
+            ghidra_function_assessment: true,
+            frida_observation_jobs: cfg!(all(target_os = "linux", target_arch = "x86_64")),
+            ghidra_observation_artifacts: true,
+            ghidra_process_allocations: true,
         }))
     }
 
@@ -5039,7 +6036,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
     ) -> Result<Response<api_v3::JobReply>, Status> {
         let principal = self.principal(&request)?;
         let input = request.into_inner();
-        Ok(Response::new(require_native_job(self.job(
+        Ok(Response::new(require_v3_job(self.job(
             &principal,
             &input.project_id,
             &input.job_id,
@@ -5058,7 +6055,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         });
         *legacy.metadata_mut() = metadata;
         let principal = self.principal(&legacy)?;
-        require_native_job(self.job(
+        require_v3_job(self.job(
             &principal,
             &legacy.get_ref().project_id,
             &legacy.get_ref().job_id,
@@ -5066,7 +6063,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         let job = <Store as Hydir>::cancel_job(self, legacy)
             .await?
             .into_inner();
-        Ok(Response::new(require_native_job(job)?))
+        Ok(Response::new(require_v3_job(job)?))
     }
 
     type StreamAnalysisEventsStream = ReceiverStream<Result<api_v3::JobEvent, Status>>;
@@ -5084,7 +6081,7 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         });
         *legacy.metadata_mut() = metadata;
         let principal = self.principal(&legacy)?;
-        require_native_job(self.job(
+        require_v3_job(self.job(
             &principal,
             &legacy.get_ref().project_id,
             &legacy.get_ref().job_id,
@@ -5348,7 +6345,21 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
             input.input_index,
         )
         .map_err(Status::invalid_argument)?;
-        let image_stage = input.stage == "llvm-cfg-image";
+        let image_stage = matches!(
+            input.stage.as_str(),
+            "llvm-cfg-image" | "llvm-cfg-process" | "process-memory" | "imports"
+        );
+        let allocated_stage = input.stage == "llvm-cfg-process-allocated";
+        if allocated_stage != !input.allocation_json.is_empty() {
+            return Err(Status::invalid_argument(
+                "allocated process LLVM requires allocation_json; other stages must omit it",
+            ));
+        }
+        if input.allocation_json.len() > MAX_PCODE_PROCESS_ALLOCATIONS_JSON_BYTES {
+            return Err(Status::resource_exhausted(
+                "process allocation declaration exceeds 4 KiB",
+            ));
+        }
         let automatic = input.automatic;
         if automatic && !input.snapshot_json.is_empty() {
             return Err(Status::invalid_argument(
@@ -5420,7 +6431,18 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         } else {
             input.snapshot_json
         };
-        let (action, worker_input) = if image_stage {
+        let (action, worker_input) = if allocated_stage {
+            let binary = self
+                .current_binary(&principal, &input.project_id, input.expected_revision)
+                .await?;
+            let envelope = pack_ghidra_allocated_process_input(
+                &snapshot_json,
+                &input.allocation_json,
+                &binary,
+            )
+            .map_err(Status::resource_exhausted)?;
+            ("ghidra-allocated-process-artifact", envelope)
+        } else if image_stage {
             let binary = self
                 .current_binary(&principal, &input.project_id, input.expected_revision)
                 .await?;
@@ -5470,18 +6492,317 @@ impl api_v3::hydir_v3_server::HydirV3 for Store {
         }))
     }
 
+    async fn analyze_ghidra_observation(
+        &self,
+        request: Request<api_v3::GhidraObservationArtifactRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Analyst)?;
+        let media_type = ghidra_observation_media_type(&input.stage)
+            .ok_or_else(|| Status::invalid_argument("unsupported Ghidra observation stage"))?;
+        if (input.stage == "observed-path-comparison") != !input.seed_json.is_empty() {
+            return Err(Status::invalid_argument(
+                "comparison requires a P-code seed; plan must omit it",
+            ));
+        }
+        if input.snapshot_json.is_empty()
+            || input.snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES
+            || input.input_spec_json.is_empty()
+            || input.input_spec_json.len() > MAX_INPUT_SPEC_BYTES
+            || input.trace_json.is_empty()
+            || input.trace_json.len() > MAX_DYNAMIC_TRACE_JSON_BYTES
+            || input.seed_json.len() > MAX_PCODE_SEED_BYTES
+        {
+            return Err(Status::resource_exhausted(
+                "Ghidra observation input exceeds limits",
+            ));
+        }
+        let project = self.project(&principal, &input.project_id)?;
+        if project.revision != input.expected_revision {
+            return Err(Status::aborted("stale project revision"));
+        }
+        if project.binary_sha256.is_empty() {
+            return Err(Status::failed_precondition(
+                "project has no uploaded binary",
+            ));
+        }
+        let binary = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        let selector = serde_json::to_string(&GhidraObservationArtifactSelector {
+            stage: input.stage,
+            binary_sha256: project.binary_sha256.clone(),
+        })
+        .map_err(|_| Status::internal("Ghidra observation selector serialization failed"))?;
+        let envelope = pack_ghidra_observation_input([
+            &input.snapshot_json,
+            &input.input_spec_json,
+            &input.trace_json,
+            &input.seed_json,
+            &binary,
+        ])
+        .map_err(Status::resource_exhausted)?;
+        let content = run_worker("ghidra-observation-artifact", Some(&selector), envelope).await?;
+        let current = self.project(&principal, &input.project_id)?;
+        if current.revision != input.expected_revision
+            || current.binary_sha256 != project.binary_sha256
+        {
+            return Err(Status::aborted("stale project revision"));
+        }
+        let staged = self.content_storage.stage(&content).await?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(internal)?;
+        let stored: (i64, String) = transaction
+            .query_row(
+                "SELECT p.current_revision,r.binary_sha256 FROM projects p \
+             JOIN project_revisions r ON r.project_id=p.id AND r.revision=p.current_revision \
+             WHERE p.id=?1",
+                params![input.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(internal)?;
+        if stored.0 != input.expected_revision as i64 || stored.1 != project.binary_sha256 {
+            return Err(Status::aborted("stale project revision"));
+        }
+        insert_artifact(
+            &transaction,
+            &input.project_id,
+            input.expected_revision as i64,
+            media_type,
+            &staged,
+        )?;
+        transaction.commit().map_err(internal)?;
+        Ok(Response::new(api_v3::ArtifactReply {
+            sha256: staged.digest,
+            media_type: media_type.to_owned(),
+            content,
+            project_revision: input.expected_revision,
+        }))
+    }
+
     async fn trace_ghidra_calls(
         &self,
         request: Request<api_v3::GhidraCallTraceRequest>,
     ) -> Result<Response<api_v3::ArtifactReply>, Status> {
-        ghidra_call_artifact(self, request, false).await
+        ghidra_call_artifact(self, request, GhidraCallArtifactKind::Trace).await
     }
 
     async fn build_ghidra_call_cfg_llvm(
         &self,
         request: Request<api_v3::GhidraCallTraceRequest>,
     ) -> Result<Response<api_v3::ArtifactReply>, Status> {
-        ghidra_call_artifact(self, request, true).await
+        ghidra_call_artifact(self, request, GhidraCallArtifactKind::Llvm).await
+    }
+
+    async fn assess_ghidra_function(
+        &self,
+        request: Request<api_v3::GhidraCallTraceRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        ghidra_call_artifact(self, request, GhidraCallArtifactKind::Assessment).await
+    }
+
+    async fn start_frida_observation(
+        &self,
+        request: Request<api_v3::StartFridaObservationRequest>,
+    ) -> Result<Response<api_v3::JobReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        self.require_project_role(&principal, &input.project_id, ProjectRole::Operator)?;
+        if !cfg!(all(target_os = "linux", target_arch = "x86_64")) && !cfg!(test) {
+            return Err(Status::failed_precondition(
+                "Frida observation requires Linux x86-64",
+            ));
+        }
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "job idempotency key must be 1..=128 non-control bytes",
+            ));
+        }
+        if input.selected_elf_vaddr == 0
+            || input.input_spec_json.is_empty()
+            || input.input_spec_json.len() > MAX_INPUT_SPEC_BYTES
+            || input.snapshot_json.len() > MAX_GHIDRA_SNAPSHOT_BYTES
+        {
+            return Err(Status::invalid_argument(
+                "Frida request exceeds its input bounds",
+            ));
+        }
+        let expected = i64::try_from(input.expected_revision)
+            .map_err(|_| Status::invalid_argument("revision too large"))?;
+        let fingerprint = frida_request_fingerprint(&input);
+        self.project(&principal, &input.project_id)?;
+        let prior: Option<(String, i64, String, String)> = self.connection()?.query_row(
+            "SELECT id,revision,kind,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+            params![input.project_id, input.idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(internal)?;
+        if let Some((id, revision, kind, symbol)) = prior {
+            if revision != expected || kind != "frida-observation" || symbol != fingerprint {
+                return Err(Status::already_exists(
+                    "idempotency key belongs to another request",
+                ));
+            }
+            return Ok(Response::new(require_frida_job(self.job(
+                &principal,
+                &input.project_id,
+                &id,
+            )?)?));
+        }
+        let elf = self
+            .current_binary(&principal, &input.project_id, input.expected_revision)
+            .await?;
+        validate_frida_request(
+            &elf,
+            &input.input_spec_json,
+            &input.snapshot_json,
+            input.selected_elf_vaddr,
+        )
+        .map_err(Status::invalid_argument)?;
+        let id = Uuid::new_v4().to_string();
+        {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction().map_err(internal)?;
+            require_project_role_in(&tx, &principal, &input.project_id, ProjectRole::Operator)?;
+            let retry: Option<(String, i64, String, String)> = tx.query_row(
+                "SELECT id,revision,kind,symbol FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+                params![input.project_id, input.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional().map_err(internal)?;
+            if let Some((existing, revision, kind, symbol)) = retry {
+                drop(tx);
+                drop(conn);
+                if revision != expected || kind != "frida-observation" || symbol != fingerprint {
+                    return Err(Status::already_exists(
+                        "idempotency key belongs to another request",
+                    ));
+                }
+                return Ok(Response::new(require_frida_job(self.job(
+                    &principal,
+                    &input.project_id,
+                    &existing,
+                )?)?));
+            }
+            let current: i64 = tx
+                .query_row(
+                    "SELECT current_revision FROM projects WHERE id=?1",
+                    params![input.project_id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if current != expected {
+                return Err(Status::aborted("stale project revision"));
+            }
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE requested_by=?1 AND state IN ('queued','running')",
+                [principal.as_str()], |row| row.get(0),
+            ).map_err(internal)?;
+            if active >= MAX_ACTIVE_JOBS_PER_IDENTITY {
+                return Err(Status::resource_exhausted("identity has two active jobs"));
+            }
+            tx.execute(
+                "INSERT INTO jobs(id,project_id,revision,kind,symbol,idempotency_key,state,requested_by) \
+                 VALUES(?1,?2,?3,'frida-observation',?4,?5,'queued',?6)",
+                params![id, input.project_id, expected, fingerprint, input.idempotency_key, principal],
+            ).map_err(internal)?;
+            insert_event(&tx, &id, "queued", "Frida observation queued", "")?;
+            tx.commit().map_err(internal)?;
+        }
+        let (start_sender, start_receiver) = oneshot::channel();
+        let runner = self.clone();
+        let runner_id = id.clone();
+        let project_id = input.project_id.clone();
+        let handle = tokio::spawn(async move {
+            if start_receiver.await.is_ok() {
+                runner
+                    .execute_frida_observation_job(
+                        runner_id,
+                        project_id,
+                        input.expected_revision,
+                        elf,
+                        input.input_spec_json,
+                        input.snapshot_json,
+                        input.selected_elf_vaddr,
+                    )
+                    .await;
+            }
+        });
+        self.workers
+            .lock()
+            .map_err(|_| Status::internal("worker registry lock poisoned"))?
+            .insert(id.clone(), handle);
+        let _ = start_sender.send(());
+        Ok(Response::new(require_frida_job(self.job(
+            &principal,
+            &input.project_id,
+            &id,
+        )?)?))
+    }
+
+    async fn get_frida_observation(
+        &self,
+        request: Request<api_v3::FridaObservationArtifactRequest>,
+    ) -> Result<Response<api_v3::ArtifactReply>, Status> {
+        let principal = self.principal(&request)?;
+        let input = request.into_inner();
+        let job = self.job(&principal, &input.project_id, &input.job_id)?;
+        require_frida_job(job.clone())?;
+        if job.state != "succeeded" || job.artifact_sha256.is_empty() {
+            return Err(Status::failed_precondition(
+                "Frida observation artifact is not ready",
+            ));
+        }
+        let record: Option<(String, Vec<u8>, String, String, i64)> = self
+            .connection()?
+            .query_row(
+                "SELECT media_type,content,storage_kind,storage_key,content_size FROM artifacts \
+             WHERE project_id=?1 AND revision=?2 AND sha256=?3",
+                params![
+                    input.project_id,
+                    job.project_revision as i64,
+                    job.artifact_sha256
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?;
+        let (media_type, inline, storage_kind, storage_key, content_size) =
+            record.ok_or_else(|| Status::data_loss("Frida artifact record is missing"))?;
+        if media_type != FRIDA_TRACE_MEDIA_TYPE {
+            return Err(Status::data_loss(
+                "Frida artifact media type differs from job",
+            ));
+        }
+        let content = self
+            .content_storage
+            .load(
+                &job.artifact_sha256,
+                inline,
+                &storage_kind,
+                &storage_key,
+                content_size,
+            )
+            .await?;
+        if sha256(&content) != job.artifact_sha256 {
+            return Err(Status::data_loss("Frida artifact digest differs from job"));
+        }
+        Ok(Response::new(api_v3::ArtifactReply {
+            sha256: job.artifact_sha256,
+            media_type,
+            content,
+            project_revision: job.project_revision,
+        }))
     }
 
     async fn update_analyst_fact(
@@ -6064,6 +7385,302 @@ async fn async_main(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    fn frida_test_input(elf: &[u8]) -> InputSpec {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "binary_sha256": sha256(elf),
+            "argv_hex": ["30"],
+            "stdin_hex": "",
+            "files": [],
+            "origins": [],
+            "goal": {"exit_code": 0},
+            "budget": {"timeout_ms": 10000, "memory_bytes": 1073741824, "output_bytes": 4096}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn frida_elf_staging_preserves_bytes_and_is_executable_on_unix() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("binary.elf");
+        let elf = include_bytes!("../../../demo/hydir-prism.elf");
+        stage_frida_elf(&path, elf).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), elf);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn frida_trace_requires_bound_v2_evidence_and_preserves_unknown_exit_code() {
+        use hydir_execution::{
+            DynamicTrace, TraceBudget, TraceEvent, TraceEventKind, TraceStatus, TraceWitness,
+            input_sha256,
+        };
+        let elf = include_bytes!("../../../demo/hydir-prism.elf");
+        let address = 0x201388;
+        let input = frida_test_input(elf);
+        let program = import_elf(elf).unwrap();
+        let segment = program
+            .mapped_segments
+            .iter()
+            .find(|segment| {
+                segment.executable
+                    && segment.address_space == 0
+                    && address >= segment.virtual_address.0
+                    && address - segment.virtual_address.0 < segment.file_size
+            })
+            .unwrap();
+        let byte_offset = (segment.file_offset.0 + address - segment.virtual_address.0) as usize;
+        let witness = TraceWitness {
+            runtime_address: address,
+            elf_vaddr: Some(address),
+            original_bytes_hex: Some(format!("{:02x}", elf[byte_offset])),
+        };
+        let image_base = program
+            .mapped_segments
+            .iter()
+            .filter(|segment| segment.file_offset.0 == 0)
+            .map(|segment| segment.virtual_address.0 & !4095)
+            .min()
+            .unwrap();
+        let trace = DynamicTrace {
+            schema_version: 2,
+            binary_sha256: sha256(elf),
+            input_sha256: input_sha256(&input).unwrap(),
+            selected_elf_vaddr: address,
+            ghidra_snapshot_sha256: None,
+            observer: "test-frida".into(),
+            frida_version: "17.9.5".into(),
+            agent_sha256: sha256(b"test-agent"),
+            runtime_module_base: Some(image_base),
+            elf_load_bias: Some(0),
+            budget: TraceBudget {
+                max_events: 8,
+                timeout_ms: 1000,
+            },
+            status: TraceStatus::Completed,
+            lost_events: 0,
+            stdout_hex: String::new(),
+            stderr_hex: String::new(),
+            diagnostics: vec![],
+            jump_evidence: vec![],
+            events: vec![
+                TraceEvent {
+                    sequence: 0,
+                    thread_id: 1,
+                    kind: TraceEventKind::Entry,
+                    source: witness.clone(),
+                    target: None,
+                    registers: Some(std::collections::BTreeMap::from([
+                        ("RIP".into(), address),
+                        ("RSP".into(), 0x700000),
+                    ])),
+                },
+                TraceEvent {
+                    sequence: 1,
+                    thread_id: 1,
+                    kind: TraceEventKind::Exit,
+                    source: witness,
+                    target: None,
+                    registers: None,
+                },
+            ],
+        };
+        let content = serde_json::to_vec(&trace).unwrap();
+        let checked =
+            checked_frida_trace(elf, &input, address, Some("b".repeat(64)), &content).unwrap();
+        let checked: serde_json::Value = serde_json::from_slice(&checked).unwrap();
+        assert_eq!(checked["ghidra_snapshot_sha256"], "b".repeat(64));
+        assert!(checked.get("exit_code").is_none());
+        let mut forged = checked;
+        forged["exit_code"] = json!(0);
+        assert!(
+            checked_frida_trace(
+                elf,
+                &input,
+                address,
+                None,
+                &serde_json::to_vec(&forged).unwrap()
+            )
+            .is_err()
+        );
+        assert!(checked_frida_trace(elf, &input, address + 1, None, &content).is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_frida_job_checks_revision_replay_and_artifact_readiness() {
+        use api_v3::hydir_v3_server::HydirV3;
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("frida-operator").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Frida job".into(),
+                    idempotency_key: "frida-project".into(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../demo/hydir-prism.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let input_json = serde_json::to_vec(&frida_test_input(&binary)).unwrap();
+        let request = api_v3::StartFridaObservationRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            idempotency_key: "frida-once".into(),
+            input_spec_json: input_json,
+            selected_elf_vaddr: 0x201388,
+            snapshot_json: vec![],
+        };
+        let job = HydirV3::start_frida_observation(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(job.kind, "frida-observation");
+        assert_eq!(job.project_revision, uploaded.revision);
+        let replay = HydirV3::start_frida_observation(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.job_id, job.job_id);
+        let mut collision = request.clone();
+        collision.selected_elf_vaddr += 1;
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(collision, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::AlreadyExists
+        );
+        let mut stale = request.clone();
+        stale.expected_revision = 0;
+        stale.idempotency_key = "frida-stale".into();
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let mut wrong_binary = request.clone();
+        wrong_binary.idempotency_key = "frida-wrong".into();
+        let mut bad: serde_json::Value =
+            serde_json::from_slice(&wrong_binary.input_spec_json).unwrap();
+        bad["binary_sha256"] = json!("0".repeat(64));
+        wrong_binary.input_spec_json = serde_json::to_vec(&bad).unwrap();
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(wrong_binary, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut outside = request.clone();
+        outside.idempotency_key = "frida-outside".into();
+        outside.selected_elf_vaddr = 1;
+        assert_eq!(
+            HydirV3::start_frida_observation(&store, authorized(outside, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            HydirV3::get_frida_observation(
+                &store,
+                authorized(
+                    api_v3::FridaObservationArtifactRequest {
+                        project_id: project.project_id.clone(),
+                        job_id: job.job_id.clone(),
+                    },
+                    &token,
+                )
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = HydirV3::get_analysis_job(
+                    &store,
+                    authorized(
+                        api_v3::JobRequest {
+                            project_id: project.project_id.clone(),
+                            job_id: job.job_id.clone(),
+                        },
+                        &token,
+                    ),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                if current.state == "failed" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Seed storage directly to exercise exact job-revision artifact lookup.
+        let content = b"retrieval-fixture";
+        let staged = store.content_storage.stage(content).await.unwrap();
+        let conn = store.connection().unwrap();
+        insert_artifact(
+            &conn,
+            &project.project_id,
+            uploaded.revision as i64,
+            FRIDA_TRACE_MEDIA_TYPE,
+            &staged,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET state='succeeded',artifact_sha256=?1 WHERE id=?2",
+            params![staged.digest, job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+        let artifact = HydirV3::get_frida_observation(
+            &store,
+            authorized(
+                api_v3::FridaObservationArtifactRequest {
+                    project_id: project.project_id,
+                    job_id: job.job_id,
+                },
+                &token,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(artifact.project_revision, uploaded.revision);
+        assert_eq!(artifact.media_type, FRIDA_TRACE_MEDIA_TYPE);
+        assert_eq!(artifact.sha256, sha256(content));
+        assert_eq!(artifact.content, content);
+    }
+
     #[tokio::test]
     #[ignore = "requires HYDIR_GHIDRA_HOME pointing to Ghidra 12.1.4 or Docker"]
     async fn automatic_ghidra_worker_exports_selected_real_elf() {
@@ -6107,6 +7724,7 @@ mod tests {
             input_index: None,
             selected_function_entry: "0x101320".to_owned(),
             automatic: true,
+            allocation_json: Vec::new(),
         };
         let result = HydirV3::analyze_ghidra_snapshot(&store, authorized(request.clone(), &token))
             .await
@@ -6180,6 +7798,8 @@ mod tests {
             max_operations: Some(128),
             max_visits: Some(16),
             max_depth: Some(4),
+            allocation_json: Vec::new(),
+            assume_import_contracts: false,
         };
         let first = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -6299,6 +7919,8 @@ mod tests {
             max_operations: Some(128),
             max_visits: Some(16),
             max_depth: Some(4),
+            allocation_json: Vec::new(),
+            assume_import_contracts: false,
         };
         let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -6344,6 +7966,182 @@ mod tests {
             hydir_ir::pcode::PcodeCallPathStop::CallBoundary { .. }
         ));
         assert_eq!(trace.snapshot_diagnostics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn allocated_call_rpc_binds_revision_elf_and_retrieves_v3_trace_and_v2_llvm() {
+        use api_v3::hydir_v3_server::HydirV3;
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("allocated-call-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "Allocated call fixture".to_owned(),
+                    idempotency_key: "allocated-call-fixture".to_owned(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let binary = include_bytes!("../../../tests/fixtures/ghidra_choose_calls.elf").to_vec();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(&binary),
+                    content: binary,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        for (entry, bytes) in [
+            (
+                0x201174,
+                include_bytes!("../../../tests/fixtures/ghidra_choose_root_v2.json").as_slice(),
+            ),
+            (
+                0x201185,
+                include_bytes!("../../../tests/fixtures/ghidra_choose_right_v2.json").as_slice(),
+            ),
+        ] {
+            let key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, Some(entry));
+            save_ghidra_snapshot(
+                &store.connection().unwrap(),
+                &project.project_id,
+                &uploaded.binary_sha256,
+                uploaded.revision,
+                &key,
+                Some(entry),
+                bytes,
+            )
+            .unwrap();
+        }
+        let declaration = br#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":7340024,"byte_len":16}]}"#.to_vec();
+        let request = api_v3::GhidraCallTraceRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            function_entry: "0x201174".to_owned(),
+            seed_json: include_bytes!("../../../tests/fixtures/ghidra_choose_right_seed_v1.json")
+                .to_vec(),
+            max_functions: Some(2),
+            max_operations: Some(128),
+            max_visits: Some(16),
+            max_depth: Some(4),
+            allocation_json: declaration.clone(),
+            assume_import_contracts: false,
+        };
+        let traced = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(traced.media_type, GHIDRA_CALL_ALLOCATED_TRACE_MEDIA_TYPE);
+        let trace: PcodeInterproceduralTrace = serde_json::from_slice(&traced.content).unwrap();
+        assert_eq!(
+            trace.schema_version,
+            hydir_ir::pcode::PCODE_CALL_PATH_ALLOCATED_PROCESS_VERSION
+        );
+        assert_eq!(trace.calls[0].callee_entry.offset, "0x201185");
+        assert_eq!(
+            trace
+                .process_binding
+                .as_ref()
+                .unwrap()
+                .allocations
+                .regions()[0]
+                .base,
+            7340024
+        );
+        let stored = store
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: traced.sha256.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stored.content, traced.content);
+
+        let mut import_request = request.clone();
+        import_request.assume_import_contracts = true;
+        let assumed =
+            HydirV3::trace_ghidra_calls(&store, authorized(import_request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            assumed.media_type,
+            GHIDRA_CALL_IMPORT_CONTRACT_TRACE_MEDIA_TYPE
+        );
+        let assumed_trace: PcodeInterproceduralTrace =
+            serde_json::from_slice(&assumed.content).unwrap();
+        assert_eq!(
+            assumed_trace.schema_version,
+            hydir_ir::pcode::PCODE_CALL_PATH_IMPORT_CONTRACT_VERSION
+        );
+        assert!(assumed_trace.contracted_imports.is_empty());
+        let assumed_llvm =
+            HydirV3::build_ghidra_call_cfg_llvm(&store, authorized(import_request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            assumed_llvm.media_type,
+            GHIDRA_CALL_IMPORT_CONTRACT_CFG_LLVM_MEDIA_TYPE
+        );
+        let assumed_module: PcodeInterproceduralCfgLlvmArtifact =
+            serde_json::from_slice(&assumed_llvm.content).unwrap();
+        assert_eq!(assumed_module.schema_version, 3);
+        assert_eq!(assumed_module.llvm.schema_version, 6);
+        assert!(assumed_module.import_calls.is_empty());
+        import_request.allocation_json.clear();
+        assert_eq!(
+            HydirV3::trace_ghidra_calls(&store, authorized(import_request, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let lifted =
+            HydirV3::build_ghidra_call_cfg_llvm(&store, authorized(request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(lifted.media_type, GHIDRA_CALL_ALLOCATED_CFG_LLVM_MEDIA_TYPE);
+        let llvm: PcodeInterproceduralCfgLlvmArtifact =
+            serde_json::from_slice(&lifted.content).unwrap();
+        assert_eq!(llvm.schema_version, 2);
+        assert_eq!(llvm.llvm.schema_version, 5);
+        assert_eq!(
+            llvm.llvm.allocations.as_ref().unwrap().regions()[0].base,
+            7340024
+        );
+        let mut stale = request.clone();
+        stale.expected_revision = 0;
+        assert_eq!(
+            HydirV3::trace_ghidra_calls(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let mut invalid = request;
+        invalid.allocation_json = br#"{"schema_version":1,"regions":[{"kind":"stack","space":"ram","base":2097152,"byte_len":16}]}"#.to_vec();
+        assert_eq!(
+            HydirV3::trace_ghidra_calls(&store, authorized(invalid, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test]
@@ -6429,6 +8227,8 @@ mod tests {
                 max_operations: Some(128),
                 max_visits: Some(16),
                 max_depth: Some(4),
+                allocation_json: Vec::new(),
+                assume_import_contracts: false,
             };
             let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request, &token))
                 .await
@@ -7086,6 +8886,7 @@ mod tests {
             input_index: None,
             selected_function_entry: String::new(),
             automatic: false,
+            allocation_json: Vec::new(),
         };
         let worker_key = hydir_ghidra_worker::analysis_cache_key(&uploaded.binary_sha256, None);
         {
@@ -7191,6 +8992,7 @@ mod tests {
             "state",
             "cfg",
             "coverage",
+            "capability",
             "llvm-cfg",
             "llvm-cfg-simplified",
             "slice",
@@ -7463,6 +9265,8 @@ mod tests {
             max_operations: Some(128),
             max_visits: Some(16),
             max_depth: Some(4),
+            allocation_json: Vec::new(),
+            assume_import_contracts: false,
         };
         let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request.clone(), &token))
             .await
@@ -7492,6 +9296,30 @@ mod tests {
                 })
                 .unwrap(),
             Some(12)
+        );
+
+        let assessed = HydirV3::assess_ghidra_function(&store, authorized(request.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(assessed.media_type, GHIDRA_FUNCTION_ASSESSMENT_MEDIA_TYPE);
+        assert_eq!(assessed.sha256, sha256(&assessed.content));
+        let assessment: PcodeFunctionAssessment =
+            serde_json::from_slice(&assessed.content).unwrap();
+        assert_eq!(assessment.binary_sha256, uploaded.binary_sha256);
+        assert_eq!(assessment.seed_sha256, sha256(seed));
+        assert_eq!(assessment.snapshot_sha256.len(), 2);
+        assert!(
+            assessment
+                .calls
+                .iter()
+                .any(|call| call.snapshot_loaded && call.reached)
+        );
+        assert!(!assessment.memory_witnesses.is_empty());
+        assert!(assessment.llvm.emitted);
+        assert_eq!(
+            assessment.verification,
+            hydir_ir::VerificationStatus::NotRun
         );
 
         let llvm_reply =
@@ -7651,6 +9479,7 @@ mod tests {
                 String::new()
             },
             automatic,
+            allocation_json: Vec::new(),
         };
 
         let v2 = HydirV3::analyze_ghidra_snapshot(
@@ -7712,7 +9541,146 @@ mod tests {
                     .unwrap()
                     .contains("@hydir_elf_image_bytes")
             );
+
+            let mut memory_request = request("process-memory", automatic);
+            memory_request.start_address.clear();
+            let memory_artifact =
+                HydirV3::analyze_ghidra_snapshot(&store, authorized(memory_request, &token))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(
+                memory_artifact.media_type,
+                "application/vnd.hydir.pcode-process-memory+json;version=1"
+            );
+            assert_eq!(memory_artifact.project_revision, uploaded.revision);
+            assert_eq!(memory_artifact.sha256, sha256(&memory_artifact.content));
+            let parsed_snapshot = parse_ghidra_snapshot(snapshot, &uploaded.binary_sha256).unwrap();
+            let memory = PcodeElfProcessMemory::parse_bound(
+                &memory_artifact.content,
+                binary,
+                &parsed_snapshot,
+                PCODE_ELF_PROCESS_MEMORY_MAX_BYTES,
+            )
+            .unwrap();
+            assert_eq!(memory.binary_sha256(), uploaded.binary_sha256);
+            assert!(memory.known().iter().any(|value| *value != 0));
+            let mut imports_request = request("imports", automatic);
+            imports_request.start_address.clear();
+            let imports_artifact =
+                HydirV3::analyze_ghidra_snapshot(&store, authorized(imports_request, &token))
+                    .await
+                    .unwrap()
+                    .into_inner();
+            assert_eq!(
+                imports_artifact.media_type,
+                "application/vnd.hydir.pcode-elf-import-index+json;version=1"
+            );
+            PcodeElfImportIndex::parse_bound(&imports_artifact.content, binary, &parsed_snapshot)
+                .unwrap();
+
+            let process_artifact = HydirV3::analyze_ghidra_snapshot(
+                &store,
+                authorized(request("llvm-cfg-process", automatic), &token),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(
+                process_artifact.media_type,
+                "application/vnd.hydir.pcode-cfg-llvm+json;version=4"
+            );
+            assert_eq!(process_artifact.project_revision, uploaded.revision);
+            assert_eq!(process_artifact.sha256, sha256(&process_artifact.content));
+            let process_json: serde_json::Value =
+                serde_json::from_slice(&process_artifact.content).unwrap();
+            assert_eq!(process_json["schema_version"], 4);
+            assert_eq!(process_json["binary_sha256"], uploaded.binary_sha256);
+            assert_eq!(process_json["process_memory"]["space"], "ram");
+            assert_eq!(process_json["start"]["offset"], "0x2016d0");
+            assert!(
+                process_json["llvm_ir"]
+                    .as_str()
+                    .unwrap()
+                    .contains("@hydir_process_initial_bytes")
+            );
         }
+
+        let declared = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "regions": [
+                {"kind": "stack", "space": "ram", "base": 7340032, "byte_len": 16},
+                {"kind": "heap", "space": "ram", "base": 8388608, "byte_len": 16}
+            ]
+        }))
+        .unwrap();
+        let mut allocated = request("llvm-cfg-process-allocated", false);
+        allocated.allocation_json = declared.clone();
+        let v5 = HydirV3::analyze_ghidra_snapshot(&store, authorized(allocated.clone(), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            v5.media_type,
+            "application/vnd.hydir.pcode-cfg-llvm+json;version=5"
+        );
+        assert_eq!(v5.sha256, sha256(&v5.content));
+        let v5_json: serde_json::Value = serde_json::from_slice(&v5.content).unwrap();
+        assert_eq!(v5_json["schema_version"], 5);
+        assert_eq!(
+            v5_json["allocations"]["binary_sha256"],
+            uploaded.binary_sha256
+        );
+        assert_eq!(v5_json["allocations"]["regions"][0]["kind"], "stack");
+        assert!(
+            v5_json["state_abi"]
+                .as_str()
+                .unwrap()
+                .starts_with("hydir-pcode-cfg-state-v5:")
+        );
+        let stored = store
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: v5.sha256,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stored.content, v5.content);
+        let mut invalid = allocated.clone();
+        invalid.allocation_json = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "regions": [{"kind":"stack","space":"ram","base":2097152,"byte_len":16}]
+        }))
+        .unwrap();
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(invalid, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut wrong_stage = allocated.clone();
+        wrong_stage.stage = "llvm-cfg-process".into();
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(wrong_stage, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut stale_allocated = allocated;
+        stale_allocated.expected_revision = 0;
+        assert_eq!(
+            HydirV3::analyze_ghidra_snapshot(&store, authorized(stale_allocated, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
 
         let mut stale = request("llvm-cfg-image", false);
         stale.expected_revision = 0;
@@ -7755,6 +9723,263 @@ mod tests {
                 .unwrap_err()
                 .contains("digest disagrees")
         );
+    }
+
+    #[tokio::test]
+    async fn v3_observation_artifacts_bind_revision_and_are_retrievable() {
+        use api_v3::hydir_v3_server::HydirV3;
+        use hydir_execution::input_sha256;
+
+        let binary = include_bytes!("../../../tests/fixtures/ghidra_indirect_call.elf");
+        let snapshot = include_bytes!("../../../tests/fixtures/ghidra_indirect_root_v2.json");
+        let seed = include_bytes!("../../../tests/fixtures/ghidra_indirect_seed_v1.json");
+        let snapshot_value = parse_ghidra_snapshot(snapshot, &sha256(binary)).unwrap();
+        let snapshot_digest = sha256(&serde_json::to_vec(&snapshot_value).unwrap());
+        let input: InputSpec = serde_json::from_value(json!({
+            "schema_version": 1, "binary_sha256": sha256(binary),
+            "argv_hex": [], "stdin_hex": "", "files": [], "origins": [],
+            "goal": {"exit_code": 0},
+            "budget": {"timeout_ms": 2000, "memory_bytes": 1073741824, "output_bytes": 1024}
+        }))
+        .unwrap();
+        let trace = json!({
+            "schema_version": 1, "binary_sha256": sha256(binary),
+            "input_sha256": input_sha256(&input).unwrap(),
+            "selected_elf_vaddr": 0x20117c,
+            "ghidra_snapshot_sha256": snapshot_digest,
+            "observer": "test", "frida_version": "17.9.5",
+            "agent_sha256": sha256(b"test"),
+            "runtime_module_base": 0x200000, "elf_load_bias": 0,
+            "budget": {"max_events": 8, "timeout_ms": 1000},
+            "status": "completed", "lost_events": 0,
+            "stdout_hex": "", "stderr_hex": "", "diagnostics": [],
+            "events": [
+                {"sequence":0,"thread_id":1,"kind":"entry",
+                 "source":{"runtime_address":0x20117c,"elf_vaddr":0x20117c,"original_bytes_hex":"ffd0"},"target":null},
+                {"sequence":1,"thread_id":1,"kind":"call",
+                 "source":{"runtime_address":0x20117c,"elf_vaddr":0x20117c,"original_bytes_hex":"ffd0"},
+                 "target":{"runtime_address":0x201174,"elf_vaddr":0x201174,"original_bytes_hex":"48c7c007000000"}},
+                {"sequence":2,"thread_id":1,"kind":"exit",
+                 "source":{"runtime_address":0x20117c,"elf_vaddr":0x20117c,"original_bytes_hex":"ffd0"},"target":null}
+            ]
+        });
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("observation-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "observed call".into(),
+                    idempotency_key: "observed-call-project".into(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(binary),
+                    content: binary.to_vec(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = |stage: &str, seed_bytes: Vec<u8>| api_v3::GhidraObservationArtifactRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            snapshot_json: snapshot.to_vec(),
+            input_spec_json: serde_json::to_vec(&input).unwrap(),
+            trace_json: serde_json::to_vec(&trace).unwrap(),
+            seed_json: seed_bytes,
+            stage: stage.into(),
+        };
+        let plan = HydirV3::analyze_ghidra_observation(
+            &store,
+            authorized(request("observed-call-rediscovery", Vec::new()), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let plan_json: serde_json::Value = serde_json::from_slice(&plan.content).unwrap();
+        assert_eq!(plan_json["schema_version"], 1);
+        assert_eq!(plan_json["input_sha256"], input_sha256(&input).unwrap());
+        assert_eq!(
+            plan_json["changed_targets"][0]["target"]["offset"],
+            "0x201174"
+        );
+        let stored = store
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: plan.sha256.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stored.content, plan.content);
+        let comparison = HydirV3::analyze_ghidra_observation(
+            &store,
+            authorized(request("observed-path-comparison", seed.to_vec()), &token),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let comparison_json: serde_json::Value =
+            serde_json::from_slice(&comparison.content).unwrap();
+        assert_eq!(comparison_json["schema_version"], 1);
+        assert_eq!(comparison_json["same_initial_state_proven"], false);
+        assert!(comparison_json.get("pcode_memory_mode").is_none());
+        let mut stale = request("observed-call-rediscovery", Vec::new());
+        stale.expected_revision = 0;
+        assert_eq!(
+            HydirV3::analyze_ghidra_observation(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let mut unbound = request("observed-call-rediscovery", Vec::new());
+        let mut unbound_trace = trace.clone();
+        unbound_trace["ghidra_snapshot_sha256"] = json!("0".repeat(64));
+        unbound.trace_json = serde_json::to_vec(&unbound_trace).unwrap();
+        assert_eq!(
+            HydirV3::analyze_ghidra_observation(&store, authorized(unbound, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_observed_jump_plan_is_revision_bound_and_retrievable() {
+        use api_v3::hydir_v3_server::HydirV3;
+        use hydir_execution::input_sha256;
+
+        let binary = include_bytes!("../../../tests/fixtures/ghidra_indirect_jump.elf");
+        let snapshot = include_bytes!("../../../tests/fixtures/ghidra_indirect_jump_v2.json");
+        let snapshot_value = parse_ghidra_snapshot(snapshot, &sha256(binary)).unwrap();
+        let snapshot_digest = sha256(&serde_json::to_vec(&snapshot_value).unwrap());
+        let input: InputSpec = serde_json::from_value(json!({
+            "schema_version":1,"binary_sha256":sha256(binary),
+            "argv_hex":[],"stdin_hex":"","files":[],"origins":[],
+            "goal":{"exit_code":0},
+            "budget":{"timeout_ms":2000,"memory_bytes":1073741824,"output_bytes":1024}
+        }))
+        .unwrap();
+        let entry = json!({"runtime_address":0x201174,"elf_vaddr":0x201174,
+            "original_bytes_hex":"4885ff"});
+        let trace = json!({
+            "schema_version":3,"binary_sha256":sha256(binary),
+            "input_sha256":input_sha256(&input).unwrap(),
+            "selected_elf_vaddr":0x201174,
+            "ghidra_snapshot_sha256":snapshot_digest,
+            "observer":"test","frida_version":"17.9.5","agent_sha256":sha256(b"test"),
+            "runtime_module_base":0x200000,"elf_load_bias":0,
+            "budget":{"max_events":8,"timeout_ms":1000},
+            "status":"completed","lost_events":0,
+            "stdout_hex":"","stderr_hex":"","diagnostics":[],
+            "events":[
+                {"sequence":0,"thread_id":1,"kind":"entry","source":entry,"target":null,
+                 "registers":{"RIP":0x201174,"RSP":0x700000}},
+                {"sequence":1,"thread_id":1,"kind":"exit","source":entry,"target":null}
+            ],
+            "jump_evidence":[{"sequence":0,"thread_id":1,"invocation_id":1,
+                "source":{"runtime_address":0x201179,"elf_vaddr":0x201179,
+                    "original_bytes_hex":"ffe0"},
+                "target":{"runtime_address":0x20117b,"elf_vaddr":0x20117b,
+                    "original_bytes_hex":"48c7c007000000"}}]
+        });
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let token = store.create_identity("jump-observation-analyst").unwrap();
+        let project = store
+            .create_project(authorized(
+                CreateProjectRequest {
+                    name: "observed jump".into(),
+                    idempotency_key: "observed-jump-project".into(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let uploaded = store
+            .upload_binary(authorized(
+                UploadBinaryRequest {
+                    project_id: project.project_id.clone(),
+                    expected_revision: 0,
+                    content_sha256: sha256(binary),
+                    content: binary.to_vec(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = api_v3::GhidraObservationArtifactRequest {
+            project_id: project.project_id.clone(),
+            expected_revision: uploaded.revision,
+            snapshot_json: snapshot.to_vec(),
+            input_spec_json: serde_json::to_vec(&input).unwrap(),
+            trace_json: serde_json::to_vec(&trace).unwrap(),
+            seed_json: Vec::new(),
+            stage: "observed-jump-rediscovery".into(),
+        };
+        let reply =
+            HydirV3::analyze_ghidra_observation(&store, authorized(request.clone(), &token))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            reply.media_type,
+            "application/vnd.hydir.observed-jump-rediscovery+json;version=1"
+        );
+        let plan: serde_json::Value = serde_json::from_slice(&reply.content).unwrap();
+        assert_eq!(
+            plan["changed_targets"][0]["jump_site"]["offset"],
+            "0x201179"
+        );
+        assert_eq!(plan["changed_targets"][0]["target"]["offset"], "0x20117b");
+        assert_eq!(plan["unresolved_jump_sites"][0]["offset"], "0x201179");
+        let stored = store
+            .get_artifact(authorized(
+                ArtifactRequest {
+                    project_id: project.project_id.clone(),
+                    sha256: reply.sha256,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stored.content, reply.content);
+        let mut stale = request;
+        stale.expected_revision = 0;
+        assert_eq!(
+            HydirV3::analyze_ghidra_observation(&store, authorized(stale, &token))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+    }
+
+    #[test]
+    fn observation_envelope_rejects_truncation_and_trailing_bytes() {
+        let parts: [&[u8]; 5] = [b"s", b"i", b"t", b"", b"e"];
+        let packed = pack_ghidra_observation_input(parts).unwrap();
+        assert_eq!(unpack_ghidra_observation_input(&packed).unwrap(), parts);
+        assert!(unpack_ghidra_observation_input(&packed[..packed.len() - 1]).is_err());
+        let mut trailing = packed;
+        trailing.push(0);
+        assert!(unpack_ghidra_observation_input(&trailing).is_err());
     }
 
     #[tokio::test]
@@ -7832,6 +10057,8 @@ mod tests {
                 max_operations: Some(2048),
                 max_visits: Some(128),
                 max_depth: Some(1),
+                allocation_json: Vec::new(),
+                assume_import_contracts: false,
             };
             let artifact = HydirV3::trace_ghidra_calls(&store, authorized(request, &token))
                 .await

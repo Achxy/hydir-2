@@ -3,6 +3,8 @@
 /fuzz/artifacts/
 /docs/*
 !/docs/HYDIR_LAUNCH_PLAN.md
+!/docs/LIFTING_ENGINE_PLAN.md
+!/docs/FRIDA_INTEGRATION_PLAN.md
 !/docs/HYDIR_CTF_WORKFLOW_PLAN.md
 !/docs/NATIVE_DECOMPILER.md
 !/docs/adr/

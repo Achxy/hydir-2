@@ -14,7 +14,7 @@ use std::sync::Arc;
 const MAX_LOAD_SEGMENTS: usize = 4096;
 const MAX_IMAGE_REGIONS: usize = 8192;
 
-fn snapshot_layout_sha256(snapshot: &GhidraSnapshot) -> Result<String, String> {
+pub(super) fn snapshot_layout_sha256(snapshot: &GhidraSnapshot) -> Result<String, String> {
     let layout = serde_json::to_vec(&(
         &snapshot.program.image_base,
         &snapshot.address_spaces,

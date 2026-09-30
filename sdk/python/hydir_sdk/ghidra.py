@@ -138,14 +138,118 @@ class LocalGhidra:
         binary: str | os.PathLike[str],
         snapshot: str | os.PathLike[str],
     ) -> dict[str, Any]:
-        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
-            raise ValueError("artifact kind must be pcode, simplify, semantics, state, cfg, coverage, llvm-prefix, llvm-standalone, llvm-cfg, or llvm-cfg-simplified")
+        if kind not in {"pcode", "simplify", "semantics", "state", "cfg", "coverage", "capability", "process-memory", "imports", "llvm-prefix", "llvm-standalone", "llvm-cfg", "llvm-cfg-simplified"}:
+            raise ValueError("unsupported Ghidra artifact kind")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         self._snapshot(snapshot_path, self._digest(binary_path))
         data = json.loads(self._run("ghidra-snapshot", kind, str(binary_path), str(snapshot_path)))
         if not isinstance(data, dict) or data.get("binary_sha256") != self._digest(binary_path):
             raise RuntimeError("Hydir artifact belongs to another binary")
+        return data
+
+    def rediscover_calls(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+        *,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Plan observed computed calls, or reanalyze a disposable Ghidra project."""
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        stage = "rediscover-apply" if apply else "rediscover-calls"
+        data = json.loads(self._run(
+            "ghidra-snapshot", stage, str(binary_path),
+            str(snapshot_path), str(input_path), str(trace_path),
+        ))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir rediscovery result belongs to another binary")
+        if apply:
+            if data.get("schema_version") != 2 or not isinstance(data.get("selected_function"), dict):
+                raise RuntimeError("Hydir rediscovery snapshot is malformed")
+        elif (data.get("schema_version") != 1
+              or not isinstance(data.get("changed_targets"), list)
+              or not isinstance(data.get("unresolved_call_sites"), list)):
+            raise RuntimeError("Hydir rediscovery plan is malformed")
+        return data
+
+    def rediscover_jumps(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+        *,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Plan byte-witnessed computed jumps, or reanalyze an isolated project copy."""
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        stage = "rediscover-jumps-apply" if apply else "rediscover-jumps"
+        data = json.loads(self._run(
+            "ghidra-snapshot", stage, str(binary_path),
+            str(snapshot_path), str(input_path), str(trace_path),
+        ))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir jump rediscovery result belongs to another binary")
+        if apply:
+            if data.get("schema_version") != 2 or not isinstance(data.get("selected_function"), dict):
+                raise RuntimeError("Hydir jump rediscovery snapshot is malformed")
+        elif (data.get("schema_version") != 1
+              or not isinstance(data.get("changed_targets"), list)
+              or not isinstance(data.get("unresolved_jump_sites"), list)):
+            raise RuntimeError("Hydir jump rediscovery plan is malformed")
+        return data
+
+    def compare_observed_path(
+        self,
+        binary: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        memory: str = "readonly",
+        allocations: str | os.PathLike[str] | None = None,
+    ) -> dict[str, Any]:
+        """Execute a bounded P-code path from a seed and compare observations."""
+        if memory not in {"readonly", "process", "allocated", "seed"}:
+            raise ValueError("memory must be readonly, process, allocated, or seed")
+        if (memory == "allocated") != (allocations is not None):
+            raise ValueError("allocated memory requires an allocations file")
+        binary_path = Path(binary).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        self._snapshot(snapshot_path, digest)
+        args = [
+            "ghidra-snapshot", "compare-observed-path", str(binary_path),
+            str(snapshot_path), str(input_path), str(trace_path), str(seed_path),
+            "--memory", memory,
+        ]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
+        data = json.loads(self._run(*args))
+        if (
+            not isinstance(data, dict)
+            or data.get("schema_version") != 1
+            or data.get("binary_sha256") != digest
+            or data.get("verdict") not in {"diverged", "matched_observed_path", "inconclusive"}
+        ):
+            raise RuntimeError("Hydir observed path comparison is malformed or belongs to another binary")
         return data
 
     def save_snapshot(
@@ -190,22 +294,31 @@ class LocalGhidra:
         start: int | None = None,
         simplified: bool = False,
         image: bool = False,
+        process: bool = False,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Emit bounded CFG-aware LLVM with explicit stop status and provenance.
 
-        ``image=True`` binds file-backed read-only ELF bytes into a version 3
-        module. The original version 2 ABI remains the default.
+        ``image=True`` binds read-only ELF bytes into v3. ``process=True``
+        adds checked writable globals and zero-filled ELF tails in v4.
+        Version 2 remains the default.
         """
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("start must be a 64-bit address")
-        if image and simplified:
-            raise ValueError("image and simplified LLVM modes cannot be combined")
+        if sum((image, process, simplified, allocations is not None)) > 1:
+            raise ValueError("LLVM modes cannot be combined")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         digest = self._digest(binary_path)
         self._snapshot(snapshot_path, digest)
-        stage = "llvm-cfg-image" if image else "llvm-cfg-simplified" if simplified else "llvm-cfg"
+        stage = (
+            "llvm-cfg-allocated" if allocations is not None else
+            "llvm-cfg-process" if process else "llvm-cfg-image" if image
+            else "llvm-cfg-simplified" if simplified else "llvm-cfg"
+        )
         args = ["ghidra-snapshot", stage, str(binary_path), str(snapshot_path)]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
         if start is not None:
             args.extend(["--start", hex(start)])
         data = json.loads(self._run(*args))
@@ -213,6 +326,17 @@ class LocalGhidra:
             raise RuntimeError("Hydir CFG LLVM artifact belongs to another binary")
         if image and data.get("schema_version") != 3:
             raise RuntimeError("Hydir image-backed CFG LLVM artifact has the wrong version")
+        if process and (
+            data.get("schema_version") != 4
+            or not isinstance(data.get("process_memory"), dict)
+        ):
+            raise RuntimeError("Hydir process-backed CFG LLVM artifact has the wrong version")
+        if allocations is not None and (
+            data.get("schema_version") != 5
+            or not isinstance(data.get("process_memory"), dict)
+            or not isinstance(data.get("allocations"), dict)
+        ):
+            raise RuntimeError("Hydir allocated CFG LLVM artifact has the wrong version")
         return data
 
     def llvm_cfg_calls(
@@ -222,6 +346,7 @@ class LocalGhidra:
         callees: tuple[str | os.PathLike[str], ...] = (),
         *,
         max_depth: int = 4,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Emit bounded LLVM across loaded, validated Ghidra call snapshots."""
         if not isinstance(max_depth, int) or not 0 <= max_depth <= 16:
@@ -238,6 +363,8 @@ class LocalGhidra:
         for path in paths[1:]:
             args.extend(["--callee", str(path)])
         args.extend(["--max-depth", str(max_depth)])
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
         data = json.loads(self._run(*args))
         if (not isinstance(data, dict) or data.get("schema_version") != 1
                 or data.get("binary_sha256") != digest
@@ -248,6 +375,11 @@ class LocalGhidra:
                 or not isinstance(data.get("function_entries"), list)
                 or len(data["function_entries"]) != len(paths)):
             raise RuntimeError("Hydir call CFG LLVM artifact is invalid or belongs to another binary")
+        if allocations is not None and (
+            data["llvm"].get("schema_version") != 5
+            or not isinstance(data["llvm"].get("allocations"), dict)
+        ):
+            raise RuntimeError("Hydir allocated call CFG LLVM artifact has the wrong version")
         return data
 
     def llvm_cfg_calls_auto(
@@ -260,6 +392,7 @@ class LocalGhidra:
         max_operations: int = 4096,
         max_visits: int = 1024,
         max_depth: int = 8,
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Analyze a binary and lift the callees reached by one concrete seed."""
         if not isinstance(function, int) or not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
@@ -271,17 +404,25 @@ class LocalGhidra:
         binary_path = Path(binary).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
         digest = self._digest(binary_path)
-        data = json.loads(self._run(
+        args = [
             "ghidra", "llvm-cfg-calls", str(binary_path), str(seed_path),
             "--function", hex(function), "--max-functions", str(max_functions),
             "--max-ops", str(max_operations), "--max-visits", str(max_visits),
             "--max-depth", str(max_depth),
-        ))
+        ]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
+        data = json.loads(self._run(*args))
         if (not isinstance(data, dict) or data.get("schema_version") != 1
                 or data.get("binary_sha256") != digest
                 or not isinstance(data.get("llvm"), dict)
                 or data["llvm"].get("binary_sha256") != digest):
             raise RuntimeError("Hydir automatic call CFG LLVM artifact belongs to another binary")
+        if allocations is not None and (
+            data["llvm"].get("schema_version") != 5
+            or not isinstance(data["llvm"].get("allocations"), dict)
+        ):
+            raise RuntimeError("Hydir automatic allocated call CFG LLVM artifact has the wrong version")
         return data
 
     def slice(
@@ -362,12 +503,18 @@ class LocalGhidra:
         start: int | None = None,
         max_operations: int = 4096,
         max_visits: int = 1024,
+        memory: str = "readonly",
+        allocations: str | os.PathLike[str] | None = None,
     ) -> dict[str, Any]:
         """Follow one bounded concrete path through selected Ghidra instructions."""
         if start is not None and not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("P-code start must be a 64-bit address")
         if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
             raise ValueError("P-code path budgets must be 0..262144")
+        if memory not in {"readonly", "process", "allocated", "seed"}:
+            raise ValueError("P-code memory mode must be readonly, process, allocated, or seed")
+        if (memory == "allocated") != (allocations is not None):
+            raise ValueError("allocated memory requires an allocations file")
         binary_path = Path(binary).resolve(strict=True)
         snapshot_path = Path(snapshot).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
@@ -377,6 +524,10 @@ class LocalGhidra:
             "ghidra-snapshot", "trace-path", str(binary_path), str(snapshot_path), str(seed_path),
             "--max-ops", str(max_operations), "--max-visits", str(max_visits),
         ]
+        if memory != "readonly":
+            args.extend(["--memory", memory])
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
         if start is not None:
             args.extend(["--start", hex(start)])
         data = json.loads(self._run(*args))
@@ -394,6 +545,8 @@ class LocalGhidra:
         max_operations: int = 4096,
         max_visits: int = 1024,
         max_depth: int = 8,
+        allocations: str | os.PathLike[str] | None = None,
+        imports: bool = False,
     ) -> dict[str, Any]:
         """Ask Hydir's managed Ghidra worker for direct callees and trace one path."""
         if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
@@ -402,15 +555,130 @@ class LocalGhidra:
             raise ValueError("call-path function or depth limit is invalid")
         if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
             raise ValueError("call-path operation or visit budget is invalid")
+        if imports and allocations is None:
+            raise ValueError("checked import calls require allocations")
         binary_path = Path(binary).resolve(strict=True)
         seed_path = Path(seed).resolve(strict=True)
         digest = self._digest(binary_path)
+        args = [
+            "ghidra", "trace-calls-imports" if imports else "trace-calls",
+            str(binary_path), str(seed_path),
+            "--function", hex(function), "--max-functions", str(max_functions),
+            "--max-ops", str(max_operations), "--max-visits", str(max_visits),
+            "--max-depth", str(max_depth),
+        ]
+        if allocations is not None:
+            args.extend(["--allocations", str(Path(allocations).resolve(strict=True))])
+        data = json.loads(self._run(*args))
+        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
+            raise RuntimeError("Hydir call trace belongs to another binary")
+        if imports and (data.get("schema_version") != 4
+                        or not isinstance(data.get("contracted_imports", []), list)):
+            raise RuntimeError("Hydir checked import trace has the wrong version")
+        if allocations is not None and not imports and data.get("schema_version") != 3:
+            raise RuntimeError("Hydir allocated call trace has the wrong version")
+        return data
+
+    def assess(
+        self,
+        binary: str | os.PathLike[str],
+        seed: str | os.PathLike[str],
+        *,
+        function: int,
+        max_functions: int = 8,
+        max_operations: int = 4096,
+        max_visits: int = 1024,
+        max_depth: int = 8,
+    ) -> dict[str, Any]:
+        """Assess a seeded Ghidra lift with the managed worker."""
+        if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("function entry must be a 64-bit address")
+        if not 1 <= max_functions <= 32 or not 0 <= max_depth <= 16:
+            raise ValueError("assessment function or depth limit is invalid")
+        if not 0 <= max_operations <= 262144 or not 0 <= max_visits <= 262144:
+            raise ValueError("assessment operation or visit budget is invalid")
+        binary_path = Path(binary).resolve(strict=True)
+        seed_path = Path(seed).resolve(strict=True)
+        digest = self._digest(binary_path)
+        seed_digest = hashlib.sha256(seed_path.read_bytes()).hexdigest()
         data = json.loads(self._run(
-            "ghidra", "trace-calls", str(binary_path), str(seed_path),
+            "ghidra", "assess", str(binary_path), str(seed_path),
             "--function", hex(function), "--max-functions", str(max_functions),
             "--max-ops", str(max_operations), "--max-visits", str(max_visits),
             "--max-depth", str(max_depth),
         ))
-        if not isinstance(data, dict) or data.get("binary_sha256") != digest:
-            raise RuntimeError("Hydir call trace belongs to another binary")
+        if (
+            not isinstance(data, dict) or data.get("binary_sha256") != digest
+            or data.get("seed_sha256") != seed_digest
+            or data.get("entry", {}).get("offset") != hex(function)
+            or data.get("verification") != "not_run"
+        ):
+            raise RuntimeError("Hydir assessment belongs to another binary, seed, or function")
+        return data
+
+    def observe(
+        self,
+        binary: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        *,
+        function: int,
+        snapshot: str | os.PathLike[str] | None = None,
+    ) -> dict[str, Any]:
+        """Collect a bounded Frida path through Hydir's Linux observer.
+
+        A completed path is execution evidence; it is not an exit-code or CFG
+        completeness claim.
+        """
+        if not 0 <= function <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("observed function entry must be a 64-bit address")
+        binary_path = Path(binary).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        digest = self._digest(binary_path)
+        if not 0 < input_path.stat().st_size <= 2 * 1024 * 1024:
+            raise ValueError("InputSpec is empty or exceeds Hydir's size limit")
+        requested_input = json.loads(input_path.read_bytes())
+        if not isinstance(requested_input, dict) or requested_input.get("binary_sha256") != digest:
+            raise ValueError("InputSpec belongs to another binary")
+        args = ["observe", "frida", str(binary_path), str(input_path),
+                "--function", hex(function)]
+        if snapshot is not None:
+            snapshot_path = Path(snapshot).resolve(strict=True)
+            selected = self._snapshot(snapshot_path, digest).get("selected_function", {}).get("entry", {})
+            if selected.get("space") != "ram":
+                raise ValueError("Ghidra snapshot must select RAM code")
+            args.extend(["--snapshot", str(snapshot_path)])
+        data = json.loads(self._run(*args))
+        if (
+            not isinstance(data, dict) or data.get("schema_version") not in (1, 2)
+            or data.get("binary_sha256") != digest
+            or data.get("selected_elf_vaddr") != function
+            or not isinstance(data.get("input_sha256"), str)
+            or len(data["input_sha256"]) != 64
+        ):
+            raise RuntimeError("Hydir observation belongs to another binary, input, or function")
+        return data
+
+    def seed_from_observation(
+        self,
+        binary: str | os.PathLike[str],
+        input_spec: str | os.PathLike[str],
+        snapshot: str | os.PathLike[str],
+        trace: str | os.PathLike[str],
+    ) -> dict[str, Any]:
+        """Map one non-rebased Frida v2 entry context to a partial P-code seed."""
+        binary_path = Path(binary).resolve(strict=True)
+        input_path = Path(input_spec).resolve(strict=True)
+        snapshot_path = Path(snapshot).resolve(strict=True)
+        trace_path = Path(trace).resolve(strict=True)
+        digest = self._digest(binary_path)
+        selected = self._snapshot(snapshot_path, digest).get("selected_function", {}).get("entry")
+        data = json.loads(self._run(
+            "observe", "seed", str(binary_path), str(input_path),
+            str(snapshot_path), str(trace_path),
+        ))
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or data.get("binary_sha256") != digest or data.get("entry") != selected
+                or not isinstance(data.get("registers"), list)
+                or data.get("memory") != []):
+            raise RuntimeError("Frida-derived seed is invalid or belongs to another binary")
         return data
