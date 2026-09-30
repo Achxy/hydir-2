@@ -1,6 +1,6 @@
 # HydIR blog
 
-The site is static. The article index is `/blogs` and all seven posts live under `/articles/`. The two mathematics and compiler-theory articles use the same LaTeX.css fonts, shared styles, navigation, footer, light/dark themes, and reading width as the existing posts.
+The site is static. The article index is `/blogs` and all three posts live under `/articles/`. The two mathematics and compiler-theory articles use the same LaTeX.css fonts, shared styles, navigation, footer, light/dark themes, and reading width as the jump-table article.
 
 The two theory articles are authored in `content/` as Markdown with inline `$...$` and display `$$...$$` LaTeX. Display blocks can have a stable anchor, for example `$$ {#signed-comparison}`. `posts.json` holds their metadata. The renderer owns only those two article pages and their draft-URL redirects; it never replaces the shared blog index.
 

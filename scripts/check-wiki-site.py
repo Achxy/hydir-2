@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "blog"
-ROUTES = ("/", "/start", "/architecture", "/blogs", "/articles/recovering-jump-tables", "/articles/patchlang-patchir", "/articles/max2", "/articles/triton-api", "/articles/vm-handler-transfer-function", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code")
+ROUTES = ("/", "/start", "/architecture", "/blogs", "/articles/recovering-jump-tables", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code")
 
 
 class Page(HTMLParser):
@@ -105,17 +105,6 @@ if urls != expected_urls:
     errors.append(f"Sitemap mismatch: missing={expected_urls - urls}, extra={urls - expected_urls}")
 if "Sitemap: https://hydir.wiki/sitemap.xml" not in (SITE / "robots.txt").read_text(encoding="utf-8"):
     errors.append("robots.txt does not reference sitemap")
-
-source_copies = {
-    "vm_vadd.S": ROOT / "tests/fixtures/vm_vadd.S",
-    "vm_vadd_state.h": ROOT / "tests/fixtures/vm_vadd_state.h",
-    "vm_vadd.ll": ROOT / "tests/fixtures/vm_vadd.ll",
-    "demo-vm-handler.py": ROOT / "scripts/demo-vm-handler.py",
-}
-for name, source in source_copies.items():
-    published = SITE / "assets/vm-handler" / name
-    if not source.is_file() or not published.is_file() or source.read_bytes() != published.read_bytes():
-        errors.append(f"Published VM-handler source differs from repository source: {name}")
 
 if errors:
     raise SystemExit("\n".join(errors))

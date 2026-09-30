@@ -25,9 +25,9 @@ and imports source-linked raw P-code into its Rust analysis core. Its desktop
 workbench shows functions, bytes, control flow, P-code effects, bounded LLVM,
 and the evidence behind type hints. A native ELF frontend remains available
 for independent analysis and comparison. The CLI, Python SDK, and authenticated
-service expose the same artifacts. The checked-in
-[`hydir_max2` walkthrough](https://hydir.wiki/articles/max2) shows the native
-path on a 16-byte function.
+service expose the same artifacts. The [compiler theory
+article](https://hydir.wiki/articles/graphs-to-code) explains
+how HydIR connects control flow, SSA, and C output.
 
 The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
 GUI the entry point for automatic Ghidra analysis. Opening a local ELF now starts
@@ -489,10 +489,9 @@ cargo run --locked --bin hydirctl -- triton /path/to/program.elf function_name
 ```
 
 In the workbench, **Run Triton** operates on the selected function. The bottom
-console accepts a restricted statement set, one entry at a time. The
-[Triton walkthrough](https://hydir.wiki/articles/triton-api) gives an
-instruction-level example. Triton exploration is separate from the LLVM and
-native C paths; explored paths do not establish whole-program equivalence.
+console accepts a restricted statement set, one entry at a time. Triton
+exploration is separate from the LLVM and native C paths; explored paths do
+not establish whole-program equivalence.
 
 [![HydIR disassembly with decoded machine instructions and a docked Triton symbolic result](assets/screenshots/hydir-disassembly-triton.png)](assets/screenshots/hydir-disassembly-triton.png)
 

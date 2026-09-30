@@ -44,7 +44,7 @@ That distinction will matter later. A structurally conservative graph can cause 
 
 ## The maximum fixture as a graph
 
-Consider the same five-instruction unsigned maximum used in the [introductory walkthrough](/articles/max2):
+Consider a five-instruction unsigned maximum fixture:
 
 ~~~asm
 movq %rdi, %rax

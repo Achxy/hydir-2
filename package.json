@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "render:blog": "node scripts/render-theory-articles.mjs",
-    "check:blog": "node scripts/render-theory-articles.mjs --check && html-validate 'blog/**/*.html' && node scripts/check-blog.mjs",
+    "check:blog": "node scripts/render-theory-articles.mjs --check && html-validate \"blog/**/*.html\" && node scripts/check-blog.mjs",
     "build:blog": "npm run render:blog && node scripts/build-blog-pages.mjs"
   },
   "devDependencies": {
