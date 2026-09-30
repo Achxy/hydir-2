@@ -4,6 +4,16 @@ This article is a field guide to reading that representation. We will unpack var
 
 The best reference while reading is Ghidra's own [SLEIGH manual](https://ghidra.re/ghidra_docs/languages/html/sleigh.html), [P-code operation reference](https://ghidra.re/ghidra_docs/languages/html/pcodedescription.html), and [additional operation reference](https://ghidra.re/ghidra_docs/languages/html/additionalpcode.html). The manual defines the model; the operation pages settle questions that a printed line of P-code often leaves ambiguous.
 
+<nav class="lesson-map" aria-label="Visual lessons in this article">
+<strong>Learn by changing one thing at a time</strong>
+<ol>
+<li><a href="#pcode-register-map">Register bytes</a><span>See which storage views overlap.</span></li>
+<li><a href="#pcode-test-lab">Nine raw operations</a><span>Step from inputs to flags and branch.</span></li>
+<li><a href="#pcode-load-lab">Memory load</a><span>Remove one byte and watch certainty disappear.</span></li>
+<li><a href="#pcode-phi-lab">SSA merge</a><span>Choose the predecessor that supplies a value.</span></li>
+</ol>
+</nav>
+
 ## Why Ghidra has P-code
 
 Ghidra needs to analyze many instruction sets. The bytes for an x86-64 `TEST`, an ARM comparison, and a MIPS branch differ, but the analyses behind decompilation repeatedly ask similar questions: Which bytes of state were read? Which were written? What value reaches this comparison? Where can control flow go?
@@ -56,6 +66,29 @@ A **varnode** is a region within a space: `(space, offset, size)`. The size is i
 The `const` case is special: its offset supplies the **value** of the literal. `(const, 0xff, 8)` does not ask an emulator to read eight bytes from address `0xff`. Conversely, a `ram` varnode names storage at a RAM address; it does not automatically mean “the constant numeric value of this address.” Confusing an address with the bytes stored there is one of the fastest ways to misread a P-code listing.
 
 Varnodes are **typeless storage**. They do not inherently say “signed integer,” “pointer,” or “C struct.” The operation using the bytes supplies an interpretation. `INT_LESS` compares unsigned values; `INT_SLESS` compares signed values. Both may read the same two varnodes. Ghidra's [SLEIGH manual](https://ghidra.re/ghidra_docs/languages/html/sleigh.html) also allows varnodes to overlap. In a typical x86-64 Ghidra register layout, the eight-byte `RAX`, four-byte `EAX`, and one-byte `AL` views all begin at register offset zero. A write to the low byte changes one of the bytes seen through the wider view. If a machine instruction also clears the upper half of `RAX` when writing `EAX`, its P-code must express that behavior; overlap alone does not invent the clearing. These are views of storage, not three independent source variables.
+
+<figure class="pcode-visual" id="pcode-register-map">
+<figcaption><strong>One register space, several windows.</strong> The columns run from the most significant byte at left to the least significant byte at right. Each bar covers the bytes named by that register view.</figcaption>
+<div class="register-ranges" tabindex="0" aria-label="Overlapping x86-64 register byte ranges">
+<div class="register-track"><span class="register-track-label">offset</span><span>+7</span><span>+6</span><span>+5</span><span>+4</span><span>+3</span><span>+2</span><span>+1</span><span>+0</span></div>
+<div class="register-track"><span class="register-track-label">RAX</span><span class="register-range range-rax">eight bytes</span></div>
+<div class="register-track"><span class="register-track-label">EAX</span><span class="register-range range-eax">low four bytes</span></div>
+<div class="register-track"><span class="register-track-label">AX</span><span class="register-range range-ax">low two</span></div>
+<div class="register-track"><span class="register-track-label">AH</span><span class="register-range range-ah">+1</span></div>
+<div class="register-track"><span class="register-track-label">AL</span><span class="register-range range-al">+0</span></div>
+<div class="register-track register-byte-values"><span class="register-track-label">bytes</span><output data-register-byte="7">11</output><output data-register-byte="6">22</output><output data-register-byte="5">33</output><output data-register-byte="4">44</output><output data-register-byte="3">55</output><output data-register-byte="2">66</output><output data-register-byte="1">77</output><output data-register-byte="0">88</output></div>
+</div>
+<div class="lab-presets" id="pcode-register-controls" hidden>
+<button type="button" data-register-case="initial" aria-pressed="true">Initial RAX</button>
+<button type="button" data-register-case="al" aria-pressed="false">Write AL = aa</button>
+<button type="button" data-register-case="ah" aria-pressed="false">Write AH = bb</button>
+<button type="button" data-register-case="eax" aria-pressed="false">Write EAX = 12345678</button>
+</div>
+<p id="pcode-register-result" aria-live="polite"><code>RAX = 0x1122334455667788</code>. Select a write to see which bytes it changes.</p>
+<p class="visual-legend">A filled byte was written by the selected view. An outlined byte was cleared by the x86-64 32-bit register-write rule.</p>
+</figure>
+
+Try to predict the `AH` case before selecting it: byte `+1` changes, but `AL` at `+0` does not. The `EAX` case makes a different point. Writing a 32-bit x86-64 general-purpose register also clears its upper 32 bits. The four low bytes and the four cleared bytes have different reasons for changing. A varnode overlap check explains the first part; the instruction semantics explain the second. AMD's [architecture manual, section 3.4.5](https://docs.amd.com/api/khub/documents/sfvvekC9mDflu6vd3R0NXA/content), specifies the extension rule for 32-bit results and the preserved high bits for 8- and 16-bit results.
 
 Finally, a **P-code operation** has an opcode, zero or more input varnodes, and sometimes one output varnode. It can read and write those values, or change control flow. The [`PcodeOp` API](https://ghidra.re/ghidra_docs/api/ghidra/program/model/pcode/PcodeOp.html) represents that shape directly. One machine instruction can generate many operations because its behavior may include intermediate calculations, flags, memory effects, and a transfer of control.
 
@@ -246,6 +279,7 @@ assert test_flags(1 << 63, 1 << 63)["SF"] == 1
 <button type="button" data-pcode-preset="0x8000000000000000,0x8000000000000000">Sign bit</button>
 </div>
 <p id="pcode-test-error" role="status"></p>
+<h4>Final state for these inputs</h4>
 <p class="lab-result">Temporary <code>t0</code> = <output id="pcode-and">0x08</output></p>
 <dl class="flag-row">
 <div><dt>CF</dt><dd><output id="pcode-cf">0</output></dd></div>
@@ -255,6 +289,29 @@ assert test_flags(1 << 63, 1 << 63)["SF"] == 1
 <div><dt>PF</dt><dd><output id="pcode-pf">0</output></dd></div>
 </dl>
 <p>At <code>0x2013d9</code>, <output id="pcode-branch">JE falls through</output>.</p>
+<div class="pcode-stepper">
+<h4>Step through the raw operations</h4>
+<p>The first nine entries share source address <code>0x2013d6</code>; the last is the next machine instruction at <code>0x2013d9</code>. The list uses one-based teaching numbers; the exported operation sequence times start at zero.</p>
+<div class="lab-presets">
+<button type="button" id="pcode-step-prev">Previous</button>
+<button type="button" id="pcode-step-next">Next operation</button>
+<button type="button" id="pcode-step-reset">Start again</button>
+<output id="pcode-step-count">Before operation 1 of 10</output>
+</div>
+<ol class="pcode-operation-list">
+<li data-pcode-op="1"><code>CF = COPY 0</code></li>
+<li data-pcode-op="2"><code>OF = COPY 0</code></li>
+<li data-pcode-op="3"><code>t0 = INT_AND RDI, RSI</code></li>
+<li data-pcode-op="4"><code>SF = INT_SLESS t0, 0</code></li>
+<li data-pcode-op="5"><code>ZF = INT_EQUAL t0, 0</code></li>
+<li data-pcode-op="6"><code>t1 = INT_AND t0, 0xff</code></li>
+<li data-pcode-op="7"><code>t2 = POPCOUNT t1</code></li>
+<li data-pcode-op="8"><code>t3 = INT_AND t2, 1</code></li>
+<li data-pcode-op="9"><code>PF = INT_EQUAL t3, 0</code></li>
+<li data-pcode-op="10"><code>CBRANCH 0x2013e2, ZF</code></li>
+</ol>
+<p class="step-explanation" id="pcode-step-explanation" aria-live="polite">Before operation 1, these flags have not yet been written by this instruction.</p>
+</div>
 </section>
 
 This little experiment is intentionally narrower than running an ELF. It computes the raw `TEST` effect on supplied register values. It does not claim anything about where a larger program obtained those values.
@@ -284,6 +341,32 @@ The raw `RET` in our fixture makes the two roles of `const` unusually clear. Her
 ~~~
 
 Read the first line slowly. `(register,0x20,8)` holds the stack pointer value. `(const,0x1b1,8)` is the special **space ID operand** to `LOAD`; it selects RAM. `(register,0x288,8)` receives the eight bytes loaded from that stack address. In the next line, `(const,0x8,8)` is an ordinary numeric eight, and the stack pointer advances. The final operation transfers control to the value just loaded. The same `const` space appears in both lines, but the opcode and operand position determine whether its offset is a space selector or a literal arithmetic input.
+
+<figure class="pcode-visual" id="pcode-load-lab">
+<figcaption><strong>Trace the two inputs to <code>LOAD</code>.</strong> This is a teaching seed with <code>RSP = 0x700000</code> and supplied little-endian stack bytes. It is not a claim that these bytes occur in the fixture ELF.</figcaption>
+<div class="load-inputs">
+<div><span>Input 0 · space selector</span><code>(const, 0x1b1, 8)</code><strong>RAM</strong></div>
+<div><span>Input 1 · pointer value</span><code>(register, 0x20, 8)</code><strong>0x700000</strong></div>
+</div>
+<p class="load-action"><code>LOAD</code> reads eight bytes from <code>ram[0x700000]</code> ↓</p>
+<div class="load-byte-row" tabindex="0" aria-label="Eight consecutive stack bytes, lowest address first">
+<div><span>+0</span><output data-load-byte="0">ef</output></div>
+<div><span>+1</span><output data-load-byte="1">be</output></div>
+<div><span>+2</span><output data-load-byte="2">ad</output></div>
+<div><span>+3</span><output data-load-byte="3">de</output></div>
+<div><span>+4</span><output data-load-byte="4">00</output></div>
+<div><span>+5</span><output data-load-byte="5">00</output></div>
+<div><span>+6</span><output data-load-byte="6">00</output></div>
+<div><span>+7</span><output data-load-byte="7">00</output></div>
+</div>
+<div class="lab-presets" id="pcode-load-controls" hidden>
+<button type="button" data-load-case="known" aria-pressed="true">All bytes supplied</button>
+<button type="button" data-load-case="missing" aria-pressed="false">Byte +3 unknown</button>
+</div>
+<p id="pcode-load-result" aria-live="polite">The loaded value is <code>0x00000000deadbeef</code>. A separate mapping check would be needed before treating it as an executable return target.</p>
+</figure>
+
+Remove byte `+3` in the diagram. Seven known bytes cannot determine the eight-byte value: the unknown byte occupies bits 24 through 31. Filling it with zero would turn a missing observation into a made-up return address. The `LOAD` operation defines the read, but the initial state defines whether that read has a known result.
 
 For a word-addressed space, the pointer conversion is:
 
@@ -374,6 +457,34 @@ merge block:       x3 = MULTIEQUAL x1, x2
 ~~~
 
 The operation means “select the input associated with the predecessor actually taken.” It does **not** mean add `4 + 9`, pick either value at random, or execute a new instruction at the merge. The incoming edge determines the selection. In SSA notation, we write $x_3=\phi(x_1,x_2)$. That explicit definition is why a backward slice can follow `x3` to both possible sources. This example is schematic; the exact printed high P-code for a compiled function depends on Ghidra's analysis and simplification style.
+
+<figure class="pcode-visual pcode-phi" id="pcode-phi-lab">
+<figcaption><strong>Follow the edge into the merge.</strong> The selected predecessor supplies the value of <code>x3</code>. The phi belongs to the analyzed dataflow graph; it is not another machine instruction.</figcaption>
+<div class="diagram">
+<svg viewBox="0 0 600 500" role="img" aria-labelledby="phi-title phi-desc">
+<title id="phi-title">Two paths feed one MULTIEQUAL operation</title>
+<desc id="phi-desc">A condition leads to a true block defining x1 as 4 or a false block defining x2 as 9. The selected predecessor flows into a merge block that defines x3 using MULTIEQUAL, then returns x3.</desc>
+<defs><marker id="phi-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" class="phi-arrowhead"/></marker></defs>
+<path id="phi-edge-true" class="phi-edge is-active" d="M250 85 L150 175" marker-end="url(#phi-arrow)"/>
+<path id="phi-edge-false" class="phi-edge" d="M350 85 L450 175" marker-end="url(#phi-arrow)"/>
+<path id="phi-merge-true" class="phi-edge is-active" d="M150 250 L240 335" marker-end="url(#phi-arrow)"/>
+<path id="phi-merge-false" class="phi-edge" d="M450 250 L360 335" marker-end="url(#phi-arrow)"/>
+<path class="phi-edge" d="M300 415 L300 450" marker-end="url(#phi-arrow)"/>
+<g class="phi-node"><rect x="200" y="20" width="200" height="65"/><text x="300" y="60" text-anchor="middle">condition?</text></g>
+<g id="phi-node-true" class="phi-node is-active"><rect x="55" y="180" width="190" height="70"/><text x="150" y="222" text-anchor="middle">x1 = 4</text></g>
+<g id="phi-node-false" class="phi-node"><rect x="355" y="180" width="190" height="70"/><text x="450" y="222" text-anchor="middle">x2 = 9</text></g>
+<g class="phi-node"><rect x="180" y="340" width="240" height="75"/><text x="300" y="370" text-anchor="middle">x3 = MULTIEQUAL</text><text x="300" y="397" text-anchor="middle">(x1, x2)</text></g>
+<text x="300" y="483" text-anchor="middle">return x3</text>
+<text class="annotation" x="72" y="134">true edge</text>
+<text class="annotation" x="438" y="134">false edge</text>
+</svg>
+</div>
+<div class="lab-presets" id="pcode-phi-controls" hidden>
+<button type="button" data-phi-path="true" aria-pressed="true">Take true edge</button>
+<button type="button" data-phi-path="false" aria-pressed="false">Take false edge</button>
+</div>
+<p id="pcode-phi-result" aria-live="polite">Arrived from the true block: <code>x3 = 4</code>.</p>
+</figure>
 
 Now consider a different high-level clue: `PTRADD(base, i, 12)`. Its numeric calculation is `base + i * 12`, but its opcode says more: analysis currently treats `base` as an array pointer with twelve-byte elements. `PTRSUB(element, 8)` computes `element + 8` and expresses a proposed field offset inside a structured value. A decompiler might combine them into `array[i].field`. The raw P-code may show only multiplies, additions, and a `LOAD`. Those richer pointer operations help explain recovered C, while the numeric offsets remain worth checking against the original accesses. [Ghidra's additional-opcode reference](https://ghidra.re/ghidra_docs/languages/html/additionalpcode.html) spells out both calculations.
 
