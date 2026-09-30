@@ -238,8 +238,23 @@ def observe(binary, entry, native_stdout, directory):
                        and event["source"]["elf_vaddr"] == entry
                        for event in trace["events"])):
         raise RuntimeError("Frida evidence is incomplete or differs from native output")
+    linked_blocks = sorted({event["source"]["elf_vaddr"]
+                            for event in trace["events"] if event["kind"] == "block"
+                            and event["source"]["elf_vaddr"] is not None
+                            and event["source"]["original_bytes_hex"]})
+    if not linked_blocks:
+        raise RuntimeError("Frida found no block with checked ELF source bytes")
+    linked_calls = [{"source": event["source"]["elf_vaddr"],
+                     "target": (event.get("target") or {}).get("elf_vaddr")}
+                    for event in trace["events"] if event["kind"] == "call"
+                    and event["source"]["elf_vaddr"] is not None
+                    and event["source"]["original_bytes_hex"]]
+    unlinked_events = sum((event.get("source") or {}).get("elf_vaddr") is None
+                          for event in trace["events"])
     return {"status": trace["status"], "events": len(trace["events"]),
             "lost_events": trace["lost_events"],
+            "linked_block_sources": linked_blocks, "linked_calls": linked_calls,
+            "unlinked_events": unlinked_events,
             "trace_sha256": sha(trace_path), "metrics": measure}
 
 
@@ -332,6 +347,9 @@ def run_case(case, directory, full):
                                 "source": trace["stop"].get("source", {}).get("source_address")}
     if full:
         result["frida"] = observe(binary, entry, native, directory)
+        result["observation_alignment"] = {
+            "verdict": "inconclusive", "source": hex(entry),
+            "reason": "the Frida entry state was not proven identical to the synthetic static seed"}
     return result
 
 
