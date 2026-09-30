@@ -23,6 +23,8 @@ on:
       - scripts/check-ghidra-recursion.py
       - scripts/check-ghidra-relative-reloc.py
       - scripts/check-ghidra-import-index.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
       - tests/fixtures/ghidra_relative_reloc.S
       - 'tests/fixtures/ghidra_import_calls*'
       - scripts/check-ghidra-aggregate-walk.py
@@ -76,6 +78,8 @@ on:
       - scripts/check-ghidra-recursion.py
       - scripts/check-ghidra-relative-reloc.py
       - scripts/check-ghidra-import-index.py
+      - scripts/demo-heldout-musl.py
+      - tests/holdout/musl/**
       - tests/fixtures/ghidra_relative_reloc.S
       - 'tests/fixtures/ghidra_import_calls*'
       - scripts/check-ghidra-aggregate-walk.py
@@ -229,6 +233,13 @@ jobs:
         run: |
           python3 scripts/check-ghidra-import-index.py \
             --output-dir "$RUNNER_TEMP/ghidra-import-index"
+      - name: Run two upstream ELF functions through Ghidra Rust LLVM and native
+        env:
+          HYDIR_GHIDRA_HOME: ${{ runner.temp }}/ghidra
+          HYDIRCTL: ${{ github.workspace }}/target/debug/hydirctl
+        run: |
+          python3 scripts/demo-heldout-musl.py --static-only \
+            --output-dir "$RUNNER_TEMP/hydir-heldout-musl"
       - name: Import and lift a stripped demo ELF without manual Ghidra work
         run: |
           cargo run --locked -p hydir-cli -- ghidra analyze \
@@ -404,6 +415,7 @@ jobs:
             ${{ runner.temp }}/ghidra-recursion/report.json
             ${{ runner.temp }}/ghidra-relative-reloc/report.json
             ${{ runner.temp }}/ghidra-import-index/
+            ${{ runner.temp }}/hydir-heldout-musl/
 
   differential-fixtures:
     runs-on: ubuntu-24.04
