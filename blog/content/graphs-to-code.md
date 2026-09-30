@@ -36,7 +36,7 @@ p\ne q
 [p,p+\ell_p)\cap[q,q+\ell_q)=\varnothing.
 $$
 
-This rejects a branch into the middle of an already recovered instruction, regardless of which decoding is encountered first. Indirect edges cannot be resolved by this successor rule, so the scalar path rejects them. The native pipeline can recover some bounded indirect target sets; the [jump-table article](/articles/recovering-jump-tables) explains why it also preserves an unresolved default.
+This rejects a branch into the middle of an already recovered instruction, regardless of which decoding is encountered first. Indirect edges cannot be resolved by this successor rule, so the scalar path rejects them. The native pipeline can recover some bounded indirect target sets, but it retains unresolved flow when a finite target set is not justified.
 
 The result is a directed graph $G=(V,E)$ with instruction addresses as vertices. “Reachable” here means reachable by traversing recovered edges. The pass follows both conditional successors without first proving that their branch predicates are satisfiable. It can therefore include paths that no input will actually take.
 
