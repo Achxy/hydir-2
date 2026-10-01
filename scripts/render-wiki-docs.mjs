@@ -108,7 +108,7 @@ ${rendered}
 <h2>Related documentation</h2>
 <ul>${docs.filter(other => other.slug !== doc.slug).map(other => `<li><a href="/docs/${other.slug}">${escape(other.title)}</a></li>`).join('')}</ul>
 </main>
-<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="${sourceUrl(doc.source)}">Edit the source on GitHub</a></p></footer>
+<footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="${sourceUrl(doc.source)}">Edit the source on GitHub</a></p></footer>
 </body>
 </html>
 `;

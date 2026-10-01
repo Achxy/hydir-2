@@ -115,7 +115,7 @@ function head(post, redirect = false) {
 const nav = '  <a class="skip" href="#article">Skip to article</a>\n' +
   wikiNavigation('/blogs') + '\n';
 const footer = '  <footer class="site-footer"><p><a href="/">HydIR</a> · ' +
-  '<a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/start">Start locally</a></p></footer>\n';
+  '<a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/start">Start locally</a></p></footer>\n';
 
 function output(name, html) {
   const target = path.join(site, name);
