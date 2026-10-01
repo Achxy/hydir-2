@@ -12,14 +12,14 @@
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
-<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-logo.jpg" width="112" height="112" alt="HydIR dragon logo"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
 <main class="site-main prose" id="content">
 <p class="eyebrow"><a href="/guides">Docs</a> / Native analysis: ELF to C</p>
 <h1 id="native-elf-decompiler">Native ELF decompiler</h1>
-<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/native-analysis.md">blog/content/guides/native-analysis.md</a> · source digest <code>98bac7f988b4</code></p>
 <p>Function discovery, machine effects, SSA, ABI recovery, C views, coverage, and batch output.</p>
-<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#native-pipeline-explainer">The native artifact pipeline</a></li><li><a href="#pipeline-and-artifact-contracts">Pipeline and artifact contracts</a></li><li><a href="#elf-loading-and-function-discovery">ELF loading and function discovery</a></li><li><a href="#instruction-and-state-semantics">Instruction and state semantics</a></li><li><a href="#abi-recovery-and-c-generation">ABI recovery and C generation</a></li><li><a href="#native-cli-and-evidence">Native CLI and evidence</a></li></ul></nav>
-<section id="native-pipeline-explainer"><h2>The native artifact pipeline</h2><figure class="technical-figure"><div class="technical-diagram" tabindex="0" aria-label="Scrollable native pipeline"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 255" role="img" aria-labelledby="native-pipeline-title"><title id="native-pipeline-title">ELF bytes through native analysis and C views</title><rect x="25" y="20" width="140" height="56" class="diagram-box"/><text x="95" y="54" text-anchor="middle">ELF bytes</text><rect x="195" y="20" width="140" height="56" class="diagram-box"/><text x="265" y="54" text-anchor="middle">ProgramSpec</text><rect x="365" y="20" width="140" height="56" class="diagram-box"/><text x="435" y="54" text-anchor="middle">FunctionIndex</text><rect x="535" y="20" width="140" height="56" class="diagram-box"/><text x="605" y="54" text-anchor="middle">MachineIR</text><rect x="535" y="125" width="140" height="56" class="diagram-box"/><text x="605" y="159" text-anchor="middle">StateIR</text><rect x="365" y="125" width="140" height="56" class="diagram-box"/><text x="435" y="159" text-anchor="middle">FunctionIR</text><rect x="195" y="125" width="140" height="56" class="diagram-box"/><text x="265" y="159" text-anchor="middle">CIR</text><rect x="25" y="125" width="140" height="56" class="diagram-box"/><text x="95" y="159" text-anchor="middle">C views / unit</text><path d="M165 48 H195 M335 48 H365 M505 48 H535 M605 76 V125 M535 153 H505 M365 153 H335 M195 153 H165" class="diagram-line"/><text x="25" y="224" class="diagram-small">FunctionIR can also export LLVM. Each stage retains evidence and uncertainty.</text></svg></div><figcaption>Conceptual stage order. Machine decoding uses the ELF bytes and function extent evidence; generated views remain independently scoped artifacts.</figcaption></figure><p>The index answers where a candidate function begins and why. MachineIR answers which instructions and edges were decoded. StateIR versions machine components across joins. FunctionIR and CIR support ABI facts and C rendering. These are different contracts, so a successful early stage does not imply success at every later stage.</p></section>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#the-native-artifact-pipeline">The native artifact pipeline</a></li><li><a href="#pipeline-and-artifact-contracts">Pipeline and artifact contracts</a></li><li><a href="#elf-loading-and-function-discovery">ELF loading and function discovery</a></li><li><a href="#instruction-and-state-semantics">Instruction and state semantics</a></li><li><a href="#abi-recovery-and-c-generation">ABI recovery and C generation</a></li><li><a href="#native-cli-and-evidence">Native CLI and evidence</a></li><li><a href="#related-documentation">Related documentation</a></li></ul></nav>
+<section id="native-pipeline-explainer"><h2 id="the-native-artifact-pipeline">The native artifact pipeline<a class="heading-anchor" href="#the-native-artifact-pipeline" aria-label="Link to The native artifact pipeline">#</a></h2><figure class="technical-figure"><div class="technical-diagram sketch-diagram" tabindex="0" aria-label="Scrollable native pipeline"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 255" role="img" aria-labelledby="native-pipeline-title"><title id="native-pipeline-title">ELF bytes through native analysis and C views</title><path d="M40 22 Q95 18 150 21 Q166 22 165 38 L164 61 Q164 78 149 76 Q95 73 40 77 Q23 76 26 60 L25 38 Q25 20 40 22 Z" class="diagram-box"/><text x="95" y="54" text-anchor="middle">ELF bytes</text><path d="M210 22 Q265 18 320 21 Q336 22 335 38 L334 61 Q334 78 319 76 Q265 73 210 77 Q193 76 196 60 L195 38 Q195 20 210 22 Z" class="diagram-box"/><text x="265" y="54" text-anchor="middle">ProgramSpec</text><path d="M380 22 Q435 18 490 21 Q506 22 505 38 L504 61 Q504 78 489 76 Q435 73 380 77 Q363 76 366 60 L365 38 Q365 20 380 22 Z" class="diagram-box"/><text x="435" y="54" text-anchor="middle">FunctionIndex</text><path d="M550 22 Q605 18 660 21 Q676 22 675 38 L674 61 Q674 78 659 76 Q605 73 550 77 Q533 76 536 60 L535 38 Q535 20 550 22 Z" class="diagram-box"/><text x="605" y="54" text-anchor="middle">MachineIR</text><path d="M550 127 Q605 123 660 126 Q676 127 675 143 L674 166 Q674 183 659 181 Q605 178 550 182 Q533 181 536 165 L535 143 Q535 125 550 127 Z" class="diagram-box"/><text x="605" y="159" text-anchor="middle">StateIR</text><path d="M380 127 Q435 123 490 126 Q506 127 505 143 L504 166 Q504 183 489 181 Q435 178 380 182 Q363 181 366 165 L365 143 Q365 125 380 127 Z" class="diagram-box"/><text x="435" y="159" text-anchor="middle">FunctionIR</text><path d="M210 127 Q265 123 320 126 Q336 127 335 143 L334 166 Q334 183 319 181 Q265 178 210 182 Q193 181 196 165 L195 143 Q195 125 210 127 Z" class="diagram-box"/><text x="265" y="159" text-anchor="middle">CIR</text><path d="M40 127 Q95 123 150 126 Q166 127 165 143 L164 166 Q164 183 149 181 Q95 178 40 182 Q23 181 26 165 L25 143 Q25 125 40 127 Z" class="diagram-box"/><text x="95" y="159" text-anchor="middle">C views / unit</text><path d="M165 48 H195 M335 48 H365 M505 48 H535 M605 76 V125 M535 153 H505 M365 153 H335 M195 153 H165" class="diagram-line"/><text x="25" y="224" class="diagram-small">FunctionIR → LLVM export. Every stage retains evidence and limits.</text></svg></div><figcaption>Conceptual stage order. Machine decoding uses the ELF bytes and function extent evidence; generated views remain independently scoped artifacts.</figcaption></figure><p>The index answers where a candidate function begins and why. MachineIR answers which instructions and edges were decoded. StateIR versions machine components across joins. FunctionIR and CIR support ABI facts and C rendering. These are different contracts, so a successful early stage does not imply success at every later stage.</p></section>
 
 <p>The native path analyzes bounded, compiler-generated Linux x86-64 ELF files.
 It does not execute the input or invoke Ghidra or another external decompiler.
@@ -27,7 +27,7 @@ Versioned intermediate artifacts retain the binary SHA-256, machine
 locations, evidence, and uncertainties needed to inspect their output. The
 implementation record contains the full
 instruction inventory and outstanding release gates.</p>
-<h2 id="pipeline-and-artifact-contracts">Pipeline and artifact contracts</h2>
+<h2 id="pipeline-and-artifact-contracts">Pipeline and artifact contracts<a class="heading-anchor" href="#pipeline-and-artifact-contracts" aria-label="Link to Pipeline and artifact contracts">#</a></h2>
 <div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
 <thead>
 <tr>
@@ -73,7 +73,7 @@ machine and environment model; it is not a claim of whole-program equivalence.
 The native path currently sets <code>rewrite_ready</code> to false, including when it can
 emit C. Legacy scalar patch and rebuild operations require their own explicit
 proofs and assertions.</p>
-<h2 id="elf-loading-and-function-discovery">ELF loading and function discovery</h2>
+<h2 id="elf-loading-and-function-discovery">ELF loading and function discovery<a class="heading-anchor" href="#elf-loading-and-function-discovery" aria-label="Link to ELF loading and function discovery">#</a></h2>
 <p>The loader accepts linked executables, PIE/shared objects, stripped images,
 and relocatable ELF objects. It inventories static and GNU-versioned dynamic
 symbols; program headers; PLT, GOT, TLS, and unwind ranges; init/fini pointer
@@ -100,7 +100,7 @@ most 16,384 candidate entries. Explicit <code>discover</code> enriches block mem
 for at most 256 candidates under an 8 MiB decode budget; interactive selection
 can decode a chosen candidate lazily. Exceeding a bound produces a diagnostic
 or explicit refusal rather than silently treating omitted bytes as analyzed.</p>
-<h2 id="instruction-and-state-semantics">Instruction and state semantics</h2>
+<h2 id="instruction-and-state-semantics">Instruction and state semantics<a class="heading-anchor" href="#instruction-and-state-semantics" aria-label="Link to Instruction and state semantics">#</a></h2>
 <div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
 <thead>
 <tr>
@@ -140,7 +140,7 @@ known architectural read/write footprint, and a diagnostic. The unknown
 behavior is carried through subsequent IRs and emitted as a visible helper
 call in low-level C. This allows a compilable diagnostic view without
 claiming that the function's behavior was recovered exactly.</p>
-<h2 id="abi-recovery-and-c-generation">ABI recovery and C generation</h2>
+<h2 id="abi-recovery-and-c-generation">ABI recovery and C generation<a class="heading-anchor" href="#abi-recovery-and-c-generation" aria-label="Link to ABI recovery and C generation">#</a></h2>
 <p>FunctionIR starts with SysV AMD64 register and stack locations. It recovers
 integer and evidenced pointer inputs, XMM/YMM inputs, RAX:RDX and vector
 returns, and scalar or packed floating types only when evidence is unique.
@@ -160,7 +160,7 @@ remain available. C compilation establishes syntax and type consistency for
 the helper contract; it does not establish behavioral equivalence.</p>
 <p><a href="https://github.com/Achxy/hydir-2/blob/main/assets/screenshots/hydir-low-level-c.png"><span>HydIR low-level C view showing generated helpers and the function's fidelity and rewrite-readiness claims</span></a></p>
 <p><em>The Low-level C view displays generated helper contracts alongside the artifact's fidelity and rewrite-readiness claims. The displayed C is an inspectable analysis output, not a verified replacement for the input function.</em></p>
-<h2 id="native-cli-and-evidence">Native CLI and evidence</h2>
+<h2 id="native-cli-and-evidence">Native CLI and evidence<a class="heading-anchor" href="#native-cli-and-evidence" aria-label="Link to Native CLI and evidence">#</a></h2>
 <p>The local CLI exposes the intermediate stages and reports directly:</p>
 <pre><code class="language-bash">cargo run --locked --bin hydirctl -- lift program.elf --function symbol --ir machine
 cargo run --locked --bin hydirctl -- lift program.elf --function symbol --ir function
@@ -189,9 +189,9 @@ workflow exercises the stripped Go fixture. See the
 remaining gates.</p>
 
 <hr>
-<h2>Related documentation</h2>
-<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+<h2 id="related-documentation">Related documentation<a class="heading-anchor" href="#related-documentation" aria-label="Link to Related documentation">#</a></h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li></ul>
 </main>
-<footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+<footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/native-analysis.md">Edit this page</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a></p></footer>
 </body>
 </html>

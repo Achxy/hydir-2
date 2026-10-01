@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "blog"
-ROUTES = ("/", "/features", "/tools", "/research", "/start", "/guides", "/architecture", "/blogs", "/articles/ghidra-pcode-explained", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code")
+ROUTES = ("/", "/features", "/tools", "/start", "/guides", "/architecture", "/blogs", "/articles/ghidra-pcode-explained", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code")
 ROUTES += tuple("/docs/" + doc["slug"] for doc in json.loads((SITE / "docs.json").read_text(encoding="utf-8")))
 
 

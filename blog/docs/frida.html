@@ -12,14 +12,14 @@
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
-<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-logo.jpg" width="112" height="112" alt="HydIR dragon logo"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
 <main class="site-main prose" id="content">
 <p class="eyebrow"><a href="/guides">Docs</a> / Frida observation on Windows</p>
 <h1 id="frida-on-windows">Frida on Windows</h1>
 <p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/frida/README.md">integrations/frida/README.md</a> · source digest <code>a3c839e2e7a3</code></p>
 <p>WSL2 worker installation, argv and file sessions, isolation checks, source builds, packaging, and execution verification.</p>
-<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#observed-target-explainer">What one observed indirect target establishes</a></li><li><a href="#first-use">First use</a></li><li><a href="#testing-a-source-checkout">Testing a source checkout</a></li><li><a href="#execution-boundary">Execution boundary</a></li><li><a href="#building-the-release">Building the release</a></li></ul></nav>
-<section id="observed-target-explainer"><h2>What one observed indirect target establishes</h2><p>Static analysis may identify a computed call while leaving its destination unknown. Frida can witness one target for the selected input. HydIR checks binary and input bindings and relevant bytes before treating that witness as a candidate.</p><figure class="technical-figure"><div class="technical-diagram" tabindex="0" aria-label="Scrollable Observation-guided recovery"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 440" role="img" aria-labelledby="observation-title"><title id="observation-title">Observation-guided recovery</title><rect x="225" y="10" width="250" height="72" class="diagram-box"/><text x="350" y="38" text-anchor="middle">Static computed edge</text><text x="350" y="63" text-anchor="middle" class="diagram-small">target remains unknown</text><path d="M350 82 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><rect x="225" y="120" width="250" height="72" class="diagram-box"/><text x="350" y="148" text-anchor="middle">Frida witness for one input</text><text x="350" y="173" text-anchor="middle" class="diagram-small">observed target T</text><path d="M350 192 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><rect x="225" y="230" width="250" height="72" class="diagram-box"/><text x="350" y="258" text-anchor="middle">Byte-verified candidate plan</text><text x="350" y="283" text-anchor="middle" class="diagram-small">T supplements the unknown edge</text><path d="M350 302 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><rect x="225" y="340" width="250" height="72" class="diagram-box"/><text x="350" y="368" text-anchor="middle">Isolated reanalysis</text><text x="350" y="393" text-anchor="middle" class="diagram-small">original snapshot retained</text></svg></div><figcaption>This shows the evidence flow, not a proof that T is the only possible destination.</figcaption></figure>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#what-one-observed-indirect-target-establishes">What one observed indirect target establishes</a></li><li><a href="#first-use">First use</a></li><li><a href="#testing-a-source-checkout">Testing a source checkout</a></li><li><a href="#execution-boundary">Execution boundary</a></li><li><a href="#building-the-release">Building the release</a></li><li><a href="#related-documentation">Related documentation</a></li></ul></nav>
+<section id="observed-target-explainer"><h2 id="what-one-observed-indirect-target-establishes">What one observed indirect target establishes<a class="heading-anchor" href="#what-one-observed-indirect-target-establishes" aria-label="Link to What one observed indirect target establishes">#</a></h2><p>Static analysis may identify a computed call while leaving its destination unknown. Frida can witness one target for the selected input. HydIR checks binary and input bindings and relevant bytes before treating that witness as a candidate.</p><figure class="technical-figure"><div class="technical-diagram sketch-diagram" tabindex="0" aria-label="Scrollable Observation-guided recovery"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 440" role="img" aria-labelledby="observation-title"><title id="observation-title">Observation-guided recovery</title><path d="M135 12 Q350 8 565 11 Q581 12 580 28 L579 67 Q579 84 564 82 Q350 79 135 83 Q118 82 121 66 L120 28 Q120 10 135 12 Z" class="diagram-box"/><text x="350" y="38" text-anchor="middle">Static computed edge</text><text x="350" y="63" text-anchor="middle" class="diagram-small">target remains unknown</text><path d="M350 82 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><path d="M135 122 Q350 118 565 121 Q581 122 580 138 L579 177 Q579 194 564 192 Q350 189 135 193 Q118 192 121 176 L120 138 Q120 120 135 122 Z" class="diagram-box"/><text x="350" y="148" text-anchor="middle">Frida witness for one input</text><text x="350" y="173" text-anchor="middle" class="diagram-small">observed target T</text><path d="M350 192 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><path d="M135 232 Q350 228 565 231 Q581 232 580 248 L579 287 Q579 304 564 302 Q350 299 135 303 Q118 302 121 286 L120 248 Q120 230 135 232 Z" class="diagram-box"/><text x="350" y="258" text-anchor="middle">Byte-verified candidate plan</text><text x="350" y="283" text-anchor="middle" class="diagram-small">T supplements the unknown edge</text><path d="M350 302 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><path d="M135 342 Q350 338 565 341 Q581 342 580 358 L579 397 Q579 414 564 412 Q350 409 135 413 Q118 412 121 396 L120 358 Q120 340 135 342 Z" class="diagram-box"/><text x="350" y="368" text-anchor="middle">Isolated reanalysis</text><text x="350" y="393" text-anchor="middle" class="diagram-small">original snapshot retained</text></svg></div><figcaption>This shows the evidence flow, not a proof that T is the only possible destination.</figcaption></figure>
 <h3>Observed, recovered, and complete</h3><ul><li><strong>Observed:</strong> an event occurred in the recorded run.</li><li><strong>Candidate:</strong> validated evidence can guide bounded static analysis.</li><li><strong>Complete:</strong> all possible targets are accounted for. One run does not establish this.</li></ul><p>A comparison may be inconclusive because the executor stops before the event, state is missing, or a path diverges. Inconclusive does not mean matched. Inspect the Session input, Events, source addresses, and stop reasons together.</p></section><p class="doc-source">Implementation references: <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/hydir_sdk/ghidra.py">Observation and rediscovery SDK</a></p>
 
 <p>The Windows release packages a dedicated Linux worker for the existing x86-64
@@ -28,7 +28,7 @@ the Linux userland are in <code>workers/frida/rootfs.tar.gz</code>. Docker, Pyth
 devkit and a separate Ubuntu installation are not required on the analyst's PC.
 WSL2 is a Windows prerequisite, installed separately with administrator rights.
 This does not add native PE/.exe observation.</p>
-<h2 id="first-use">First use</h2>
+<h2 id="first-use">First use<a class="heading-anchor" href="#first-use" aria-label="Link to First use">#</a></h2>
 <ol>
 <li>If WSL2 is absent, run <code>wsl --install --no-distribution</code> in Administrator
 PowerShell and restart if requested by Windows.</li>
@@ -66,7 +66,7 @@ interactive PRISM demo requires stdin and is not a Frida observation fixture.</p
 <p><code>hydirctl doctor</code> reports the same Frida readiness. Development builds can set
 <code>HYDIR_FRIDA_WORKER_BUNDLE</code> to the directory containing the two worker files.
 The GUI checks asynchronously and offers an explicit installation action.</p>
-<h2 id="testing-a-source-checkout">Testing a source checkout</h2>
+<h2 id="testing-a-source-checkout">Testing a source checkout<a class="heading-anchor" href="#testing-a-source-checkout" aria-label="Link to Testing a source checkout">#</a></h2>
 <p>A source checkout does not include the generated Linux rootfs. Installing WSL2
 alone does not install the Frida worker. After the <strong>Frida observer gate</strong> workflow
 succeeds for this source revision, download its <code>hydir-frida-wsl-rootfs</code> artifact
@@ -83,7 +83,7 @@ $env:HYDIR_FRIDA_WORKER_BUNDLE = (Resolve-Path .\frida-worker).Path
 If you have a local Ghidra installation, keep <code>HYDIR_GHIDRA_HOME</code> configured as
 before. The complete <code>hydir-windows-x86_64-frida</code> workflow artifact instead ships
 the Windows executables and worker together and needs no bundle-path override.</p>
-<h2 id="execution-boundary">Execution boundary</h2>
+<h2 id="execution-boundary">Execution boundary<a class="heading-anchor" href="#execution-boundary" aria-label="Link to Execution boundary">#</a></h2>
 <p>Windows passes bounded ELF/InputSpec bytes through stdin, without translating
 paths, mounting host drives, or constructing shell commands. The worker runs as
 an unprivileged user. WSL automount and Windows executable interop are disabled
@@ -95,7 +95,7 @@ snapshot checks remain on the Windows side too.</p>
 An independent Linux timeout bounds the job if the Windows client disappears.
 No operation terminates other WSL distributions. Installed worker state is
 retained on a failed readiness probe so it can be diagnosed.</p>
-<h2 id="building-the-release">Building the release</h2>
+<h2 id="building-the-release">Building the release<a class="heading-anchor" href="#building-the-release" aria-label="Link to Building the release">#</a></h2>
 <p>On Linux x86-64, first build and verify the existing Frida release using
 <code>scripts/package-frida-linux.py</code>. Then, with Docker available:</p>
 <pre><code class="language-sh">python3 scripts/package-frida-windows.py build-rootfs \
@@ -118,9 +118,9 @@ real ELF observation through the installed worker.</p>
 </code></pre>
 
 <hr>
-<h2>Related documentation</h2>
-<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+<h2 id="related-documentation">Related documentation<a class="heading-anchor" href="#related-documentation" aria-label="Link to Related documentation">#</a></h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li></ul>
 </main>
-<footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/frida/README.md">Edit the source on GitHub</a></p></footer>
+<footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/frida/README.md">Edit this page</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a></p></footer>
 </body>
 </html>

@@ -1,3 +1,4 @@
+import { polishWikiPage } from './wiki-page-layout.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -137,17 +138,18 @@ for (const post of posts) {
     '  <main class="site-main prose" id="article">\n    <article>\n' +
     '      <p class="eyebrow"><a href="/blogs">Blogs</a> / ' + escape(post.category) + '</p>\n' +
     '      <h1>' + escape(post.title + ': ' + post.subtitle) + '</h1>\n' +
+    '      <p class="article-meta"><time datetime="' + post.date + '">' + post.date + '</time><span>' + escape(post.category) + '</span><span>About ' + Math.ceil(source.replace(/<[^>]+>/g, '').split(/\s+/).length / 220) + ' minutes to read</span></p>\n' +
     '      <p class="lead">' + escape(post.lead) + '</p>\n' + content +
     '<p class="small muted"><a href="/content/' + post.slug + '.md">' +
       escape(post.source_label || 'Download the Markdown and LaTeX source') + '</a></p>\n' +
     '    </article>\n  </main>\n' + footer +
     '  <script type="module" src="/assets/theory.js?v=' + theoryJsVersion + '"></script>\n</body>\n</html>\n';
-  output('articles/' + post.slug + '.html', html);
+  output('articles/' + post.slug + '.html', polishWikiPage(html, {source: 'blog/content/' + post.slug + '.md'}));
   // Preserve draft preview bookmarks while keeping one canonical article URL.
-  output(post.slug + '.html', head(post, true) + '<body>\n' + nav +
+  output(post.slug + '.html', polishWikiPage(head(post, true) + '<body>\n' + nav +
     '  <main class="site-main prose" id="article"><h1>' + escape(post.title) + '</h1>' +
     '<p>This article is now in <a href="/articles/' + post.slug + '">the HydIR blog</a>.</p></main>\n' +
-    footer + '</body>\n</html>\n');
+    footer + '</body>\n</html>\n', {toc:false, source:'blog/content/' + post.slug + '.md'}));
   console.log(post.slug + ': ' + env.equations + ' display equations, ' + env.inlineMath + ' inline expressions');
 }
 console.log((checking ? 'Checked ' : 'Rendered ') + posts.length +

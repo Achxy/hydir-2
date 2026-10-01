@@ -12,17 +12,17 @@
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
-<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-logo.jpg" width="112" height="112" alt="HydIR dragon logo"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
 <main class="site-main prose" id="content">
 <p class="eyebrow"><a href="/guides">Docs</a> / Typed models and analyst evidence</p>
 <h1 id="typed-models-from-evidence-to-c">Typed models: from evidence to C</h1>
 <p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/models.md">blog/content/guides/models.md</a> · source digest <code>0268ffe263e9</code></p>
 <p>Create, import, infer, verify, and save digest-bound analysis models; inspect typed C locally and remotely.</p>
-<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#build-and-verify-a-model">Build and verify a model</a></li><li><a href="#import-ghidra-prototype-evidence">Import Ghidra prototype evidence</a></li><li><a href="#understand-evidence-and-conflicts">Understand evidence and conflicts</a></li><li><a href="#inspect-high-level-artifacts">Inspect high-level artifacts</a></li><li><a href="#save-analyst-edits-in-a-local-project">Save analyst edits in a local project</a></li><li><a href="#remote-model-lifecycle">Remote model lifecycle</a></li><li><a href="#implementation-references">Implementation references</a></li></ul></nav>
-
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#how-evidence-becomes-a-typed-view">How evidence becomes a typed view</a></li><li><a href="#build-and-verify-a-model">Build and verify a model</a></li><li><a href="#import-ghidra-prototype-evidence">Import Ghidra prototype evidence</a></li><li><a href="#understand-evidence-and-conflicts">Understand evidence and conflicts</a></li><li><a href="#inspect-high-level-artifacts">Inspect high-level artifacts</a></li><li><a href="#save-analyst-edits-in-a-local-project">Save analyst edits in a local project</a></li><li><a href="#remote-model-lifecycle">Remote model lifecycle</a></li><li><a href="#implementation-references">Implementation references</a></li><li><a href="#related-documentation">Related documentation</a></li></ul></nav>
+<section id="model-flow"><h2 id="how-evidence-becomes-a-typed-view">How evidence becomes a typed view<a class="heading-anchor" href="#how-evidence-becomes-a-typed-view" aria-label="Link to How evidence becomes a typed view">#</a></h2><figure class="technical-figure"><div class="technical-diagram sketch-diagram" tabindex="0" aria-label="Scrollable How evidence becomes a typed view"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 524" role="img" aria-labelledby="model-flow-title"><title id="model-flow-title">How evidence becomes a typed view</title><path d="M456 106 C450 134 456 124 456 144 m-6 -9 l6 9 5 -10" class="diagram-line"/><text x="93" y="53" class="sketch-number">1</text><path d="M125 26 Q440 22 755 25 Q771 26 770 42 L769 91 Q769 108 754 106 Q440 103 125 107 Q108 106 111 90 L110 42 Q110 24 125 26 Z" class="diagram-box diagram-region-0"/><text x="130" y="56">ELF digest + AnalysisModel v1</text><text x="130" y="84" class="diagram-small">Bind names, prototypes, objects, and types to the bytes</text><path d="M456 226 C450 254 456 244 456 264 m-6 -9 l6 9 5 -10" class="diagram-line"/><text x="93" y="173" class="sketch-number">2</text><path d="M125 146 Q440 142 755 145 Q771 146 770 162 L769 211 Q769 228 754 226 Q440 223 125 227 Q108 226 111 210 L110 162 Q110 144 125 146 Z" class="diagram-box diagram-region-1"/><text x="130" y="176">DWARF / Ghidra / inference / analyst edits</text><text x="130" y="204" class="diagram-small">Keep the provenance of each proposed fact</text><path d="M456 346 C450 374 456 364 456 384 m-6 -9 l6 9 5 -10" class="diagram-line"/><text x="93" y="293" class="sketch-number">3</text><path d="M125 266 Q440 262 755 265 Q771 266 770 282 L769 331 Q769 348 754 346 Q440 343 125 347 Q108 346 111 330 L110 282 Q110 264 125 266 Z" class="diagram-box diagram-region-2"/><text x="130" y="296">Verify model and revision</text><text x="130" y="324" class="diagram-small">Validate layout and identity before saving</text><text x="93" y="413" class="sketch-number">4</text><path d="M125 386 Q440 382 755 385 Q771 386 770 402 L769 451 Q769 468 754 466 Q440 463 125 467 Q108 466 111 450 L110 402 Q110 384 125 386 Z" class="diagram-box diagram-region-0"/><text x="130" y="416">Typed CIR / C output</text><text x="130" y="444" class="diagram-small">Interpret machine effects using the selected model</text></svg></div><figcaption>Type edits affect the analysis view; they do not modify the executable or prove a prototype correct.</figcaption></figure></section>
 
 <p>An AnalysisModel v1 is tied to one ELF SHA-256. It records names, prototypes, stack objects, and named types alongside evidence. A type edit changes the interpretation used by typed output; it does not change the executable.</p>
-<h2 id="build-and-verify-a-model">Build and verify a model</h2>
+<h2 id="build-and-verify-a-model">Build and verify a model<a class="heading-anchor" href="#build-and-verify-a-model" aria-label="Link to Build and verify a model">#</a></h2>
 <p>Use fresh output paths at each stage. The following commands assume <code>hydirctl</code> is on PATH; from a checkout, prefix them with <code>cargo run --locked --bin hydirctl --</code>.</p>
 <pre><code class="language-text">hydirctl model init program.elf --output model.json
 hydirctl model import-dwarf program.elf model.json --output model-dwarf.json
@@ -31,13 +31,13 @@ hydirctl model verify program.elf model-inferred.json
 hydirctl decompile program.elf --function some_function --view typed --model model-inferred.json
 </code></pre>
 <p>DWARF import requires usable debug information. A stripped binary may have no DWARF to import. Keep the initial model and inspect the import report before inference. Function selectors identify a real discovered function; <code>some_function</code> is a placeholder, not a built-in example.</p>
-<h2 id="import-ghidra-prototype-evidence">Import Ghidra prototype evidence</h2>
+<h2 id="import-ghidra-prototype-evidence">Import Ghidra prototype evidence<a class="heading-anchor" href="#import-ghidra-prototype-evidence" aria-label="Link to Import Ghidra prototype evidence">#</a></h2>
 <p>A validated snapshot can contribute function/type evidence:</p>
 <pre><code class="language-text">hydirctl model import-ghidra program.elf model.json snapshot.json --output model-ghidra.json
 hydirctl model verify program.elf model-ghidra.json
 </code></pre>
 <p>The snapshot must match the ELF. A calling-convention spelling alone is not an ABI proof. A prototype must have unambiguous supported types and a convention compatible with the binary. Raw P-code remains the semantic input; decompiler hints remain evidence.</p>
-<h2 id="understand-evidence-and-conflicts">Understand evidence and conflicts</h2>
+<h2 id="understand-evidence-and-conflicts">Understand evidence and conflicts<a class="heading-anchor" href="#understand-evidence-and-conflicts" aria-label="Link to Understand evidence and conflicts">#</a></h2>
 <p>Model evidence distinguishes ELF metadata, DWARF, Ghidra analysis, native analysis, analyst assertions, and legacy typed models. An address can connect a fact to its source instruction. Inference must not silently overwrite analyst assertions or turn an unresolved observation into proof.</p>
 <div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
 <thead>
@@ -71,7 +71,7 @@ hydirctl model verify program.elf model-ghidra.json
 </tbody>
 </table></div>
 <p>Named primitives, pointers, arrays, structs, unions, enums, and aliases let the model describe layouts while retaining unresolved facts. The parser limits model JSON to 16 MiB; named types, functions, fields, and imported hints have additional caps.</p>
-<h2 id="inspect-high-level-artifacts">Inspect high-level artifacts</h2>
+<h2 id="inspect-high-level-artifacts">Inspect high-level artifacts<a class="heading-anchor" href="#inspect-high-level-artifacts" aria-label="Link to Inspect high-level artifacts">#</a></h2>
 <pre><code class="language-text">hydirctl lift program.elf --function some_function --ir high-level --model model-inferred.json
 hydirctl lift program.elf --function some_function --ir high-level-cfg --model model-inferred.json
 </code></pre>
@@ -80,17 +80,17 @@ hydirctl lift program.elf --function some_function --ir high-level-cfg --model m
 hydirctl decompile program.elf --function some_function --view unit
 </code></pre>
 <p>Read instruction provenance, diagnostics, semantic fidelity, and rewrite readiness with the C. A successful C rendering is not authorization to replace the original function.</p>
-<h2 id="save-analyst-edits-in-a-local-project">Save analyst edits in a local project</h2>
+<h2 id="save-analyst-edits-in-a-local-project">Save analyst edits in a local project<a class="heading-anchor" href="#save-analyst-edits-in-a-local-project" aria-label="Link to Save analyst edits in a local project">#</a></h2>
 <pre><code class="language-text">hydirctl local project program.elf
 hydirctl local model-put program.elf REVISION UNIQUE_REQUEST_KEY model-inferred.json
 hydirctl local model program.elf
 hydirctl local decompile-typed program.elf some_function
 </code></pre>
 <p>Replace <code>REVISION</code> with the revision returned by the project command and choose a unique request key. Stale revisions are rejected. A different ELF digest starts a different model view. In the desktop, Types and Typed C provide the same evidence-oriented navigation; selecting a statement or evidence address links back to machine instructions.</p>
-<h2 id="remote-model-lifecycle">Remote model lifecycle</h2>
+<h2 id="remote-model-lifecycle">Remote model lifecycle<a class="heading-anchor" href="#remote-model-lifecycle" aria-label="Link to Remote model lifecycle">#</a></h2>
 <p>The SDK exposes <code>get_analysis_model</code> and <code>save_analysis_model</code>. Read the current project revision, increment the model's own revision as required, and save with an idempotency key. A retry of an uncertain save reuses that key. After the saved revision is read back, request typed C for that revision.</p>
 <p>See the <a href="/docs/python-sdk">SDK guide</a> for method contracts and the <a href="/docs/service">service guide</a> for project revisions.</p>
-<h2 id="implementation-references">Implementation references</h2>
+<h2 id="implementation-references">Implementation references<a class="heading-anchor" href="#implementation-references" aria-label="Link to Implementation references">#</a></h2>
 <ul>
 <li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-model/src/lib.rs">Model schema and validation</a></li>
 <li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-cli/src/main.rs">CLI commands</a></li>
@@ -98,9 +98,9 @@ hydirctl local decompile-typed program.elf some_function
 <p>These references identify the implementation behind the guide; the workflow above is available entirely on this site.</p>
 
 <hr>
-<h2>Related documentation</h2>
-<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+<h2 id="related-documentation">Related documentation<a class="heading-anchor" href="#related-documentation" aria-label="Link to Related documentation">#</a></h2>
+<ul><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li></ul>
 </main>
-<footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/models.md">Edit the source on GitHub</a></p></footer>
+<footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/models.md">Edit this page</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a></p></footer>
 </body>
 </html>

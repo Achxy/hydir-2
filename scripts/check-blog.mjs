@@ -58,8 +58,9 @@ for (const page of pages) {
       ids.add(attributes.id);
     }
     const name = /^<([\w-]+)/.exec(tag)?.[1]?.toLowerCase();
-    if (!['a', 'img', 'link'].includes(name)) continue;
-    const ref = name === 'img' ? attributes.src : attributes.href;
+    if (!['a', 'img', 'link', 'script'].includes(name)) continue;
+    if (name === 'script' && !attributes.src) continue;
+    const ref = ['img', 'script'].includes(name) ? attributes.src : attributes.href;
     if (!ref) {
       errors.push(`${relative(repo, page)}: ${name} has no ${name === 'img' ? 'src' : 'href'}`);
       continue;

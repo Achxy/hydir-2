@@ -12,14 +12,14 @@
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
-<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-logo.jpg" width="112" height="112" alt="HydIR dragon logo"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
 <main class="site-main prose" id="content">
 <p class="eyebrow"><a href="/guides">Docs</a> / First run and the PRISM showcase</p>
 <h1 id="quick-start">Quick start</h1>
-<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/first-run.md">blog/content/guides/first-run.md</a> · source digest <code>6bdb9febab2b</code></p>
 <p>Desktop and CLI first run, automatic Ghidra analysis, call traces, stripped inputs, LLVM variants, and PRISM functions.</p>
-<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#showcase-elf">Showcase ELF</a></li></ul></nav>
-
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#from-setup-to-an-inspectable-artifact">From setup to an inspectable artifact</a></li><li><a href="#showcase-elf">Showcase ELF</a></li><li><a href="#related-documentation">Related documentation</a></li></ul></nav>
+<section id="first-run-flow"><h2 id="from-setup-to-an-inspectable-artifact">From setup to an inspectable artifact<a class="heading-anchor" href="#from-setup-to-an-inspectable-artifact" aria-label="Link to From setup to an inspectable artifact">#</a></h2><figure class="technical-figure"><div class="technical-diagram sketch-diagram" tabindex="0" aria-label="Scrollable From setup to an inspectable artifact"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 524" role="img" aria-labelledby="first-run-flow-title"><title id="first-run-flow-title">From setup to an inspectable artifact</title><path d="M456 106 C450 134 456 124 456 144 m-6 -9 l6 9 5 -10" class="diagram-line"/><text x="93" y="53" class="sketch-number">1</text><path d="M125 26 Q440 22 755 25 Q771 26 770 42 L769 91 Q769 108 754 106 Q440 103 125 107 Q108 106 111 90 L110 42 Q110 24 125 26 Z" class="diagram-box diagram-region-0"/><text x="130" y="56">hydirctl doctor</text><text x="130" y="84" class="diagram-small">Check the tools required by your chosen workflow</text><path d="M456 226 C450 254 456 244 456 264 m-6 -9 l6 9 5 -10" class="diagram-line"/><text x="93" y="173" class="sketch-number">2</text><path d="M125 146 Q440 142 755 145 Q771 146 770 162 L769 211 Q769 228 754 226 Q440 223 125 227 Q108 226 111 210 L110 162 Q110 144 125 146 Z" class="diagram-box diagram-region-1"/><text x="130" y="176">Open PRISM / select a function</text><text x="130" y="204" class="diagram-small">GUI or CLI starts managed Ghidra analysis</text><path d="M456 346 C450 374 456 364 456 384 m-6 -9 l6 9 5 -10" class="diagram-line"/><text x="93" y="293" class="sketch-number">3</text><path d="M125 266 Q440 262 755 265 Q771 266 770 282 L769 331 Q769 348 754 346 Q440 343 125 347 Q108 346 111 330 L110 282 Q110 264 125 266 Z" class="diagram-box diagram-region-2"/><text x="130" y="296">Inspect snapshot + coverage</text><text x="130" y="324" class="diagram-small">Check addresses, effects, and unsupported operations</text><text x="93" y="413" class="sketch-number">4</text><path d="M125 386 Q440 382 755 385 Q771 386 770 402 L769 451 Q769 468 754 466 Q440 463 125 467 Q108 466 111 450 L110 402 Q110 384 125 386 Z" class="diagram-box diagram-region-0"/><text x="130" y="416">Choose a bounded trace or LLVM artifact</text><text x="130" y="444" class="diagram-small">Supply a seed and explicit budgets when required</text></svg></div><figcaption>A first-run sequence. Tool availability and operation support are checked independently.</figcaption></figure></section>
 
 <p>Open the checked-in PRISM ELF for a tour of the workbench. Use the smaller
 <code>max2.elf</code> for a focused command-line walkthrough. Run these commands from the
@@ -83,7 +83,7 @@ until a path is compared with Rust, Ghidra, or native execution.
 Native CLI commands
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.</p>
-<h2 id="showcase-elf">Showcase ELF</h2>
+<h2 id="showcase-elf">Showcase ELF<a class="heading-anchor" href="#showcase-elf" aria-label="Link to Showcase ELF">#</a></h2>
 <p><a href="https://github.com/Achxy/hydir-2/blob/main/demo/hydir-prism.elf"><code>demo/hydir-prism.elf</code></a> is a ready-to-open, 3.2 KB
 Linux x86-64 executable with 13 named functions. Its source is
 <a href="https://github.com/Achxy/hydir-2/blob/main/tests/fixtures/hydir_prism_showcase.S"><code>hydir_prism_showcase.S</code></a>. Select
@@ -99,16 +99,15 @@ keeps those instructions as explicit opaque effects. Region Studio and the
 C output tab show that low-level C and its fidelity status when structured C
 is unavailable. Select <code>hydir_stage_patch_portal</code> for the PatchLang
 demonstration.</p>
-<p>The PRISM presenter guide gives a short GUI route,
-commands, and the expected evidence. The binary can be inspected on Windows;
+<p>The <a href="/start">on-site quick start</a> provides a GUI route, commands, and result interpretation. The binary can be inspected on Windows;
 native execution and whole-executable rebuild require Linux x86-64. Triton
 requires its optional Python dependency, and remote features require a running
 authenticated service.</p>
 
 <hr>
-<h2>Related documentation</h2>
-<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+<h2 id="related-documentation">Related documentation<a class="heading-anchor" href="#related-documentation" aria-label="Link to Related documentation">#</a></h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li></ul>
 </main>
-<footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+<footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/first-run.md">Edit this page</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a></p></footer>
 </body>
 </html>

@@ -7,13 +7,13 @@
 .equation.is-scrollable { padding-bottom: 1.2rem; }
 .equation-hint { position: absolute; bottom: 0; left: 0; font: .7rem system-ui, sans-serif; color: var(--site-muted); }
 .equation-scroll:focus-visible, .lab :focus-visible, .pcode-visual :focus-visible, pre:focus-visible { outline: 2px solid var(--site-accent); outline-offset: 3px; }
-.diagram { overflow-x: auto; border: 1px solid var(--site-rule); padding: .75rem; }
+.diagram { overflow-x: auto; border: 1px solid #555; padding: .75rem; background: #232323; }
 .diagram svg { display: block; width: 100%; min-width: 32rem; height: auto; }
-.diagram text { fill: var(--body-color); font-family: monospace; }
-.diagram .annotation { fill: var(--site-muted); }
-.diagram .nodes { fill: var(--site-panel); stroke: var(--site-rule); }
-.diagram .edges { stroke: var(--site-muted); }
-.diagram .arrow { fill: var(--site-muted); }
+.diagram text { fill: #d4d4d3; font-family: Consolas, monospace; }
+.diagram .annotation { fill: #bfc1c4; }
+.diagram .nodes { fill: #293947; stroke: #bfc1c4; }
+.diagram .edges { stroke: #bfc1c4; }
+.diagram .arrow { fill: #bfc1c4; }
 .lesson-map { margin: 2rem 0; padding: 1rem; border: 1px solid var(--site-rule); font: .88rem/1.45 system-ui, sans-serif; }
 .lesson-map strong { display: block; margin-bottom: .7rem; }
 .lesson-map ol { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .7rem; margin: 0; padding: 0; list-style: none; }
@@ -48,11 +48,11 @@
 .load-byte-row output { padding: .45rem 0; border: 1px solid var(--site-rule); background: var(--body-bg-color); font: 1rem/1.4 monospace; }
 .load-byte-row output[data-known="false"] { outline: 2px solid var(--site-accent); outline-offset: -3px; }
 .pcode-phi .diagram svg { min-width: 28rem; }
-.pcode-phi .phi-edge { fill: none; stroke: var(--site-rule); stroke-width: 2; }
-.pcode-phi .phi-edge.is-active { stroke: var(--site-accent); stroke-width: 3; }
-.pcode-phi .phi-arrowhead { fill: var(--site-muted); }
-.pcode-phi .phi-node rect { fill: var(--body-bg-color); stroke: var(--site-rule); stroke-width: 1.5; }
-.pcode-phi .phi-node.is-active rect { stroke: var(--site-accent); stroke-width: 3; }
+.pcode-phi .phi-edge { fill: none; stroke: #bfc1c4; stroke-width: 2; }
+.pcode-phi .phi-edge.is-active { stroke: #ff9292; stroke-width: 3; }
+.pcode-phi .phi-arrowhead { fill: #bfc1c4; }
+.pcode-phi .phi-node rect { fill: #293947; stroke: #bfc1c4; stroke-width: 1.5; }
+.pcode-phi .phi-node.is-active rect { fill: #344b35; stroke: #ff9292; stroke-width: 3; }
 .pcode-phi .phi-node text { font-size: 20px; }
 .lab { margin: 2rem 0; padding: 1rem; background: var(--site-panel); border-left: 3px solid var(--site-accent); }
 .lab h3 { margin-top: 0; }

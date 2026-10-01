@@ -12,20 +12,20 @@
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
-<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-logo.jpg" width="112" height="112" alt="HydIR dragon logo"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
 <main class="site-main prose" id="content">
 <p class="eyebrow"><a href="/guides">Docs</a> / Python SDK and artifact APIs</p>
 <h1 id="hydir-python-sdk-compatible-v1-v2-plus-additive-v3">HydIR Python SDK (compatible v1/v2 plus additive v3)</h1>
 <p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">sdk/python/README.md</a> · source digest <code>6447efaa557d</code></p>
 <p>LocalGhidra and HydirClient examples, allocated memory, call tracing, observed-path comparison, typed models, and remote artifacts.</p>
-<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#known-memory-explainer">Why allocated memory can still be unknown</a></li><li><a href="#local-worker-and-snapshot-artifacts">Local worker and snapshot artifacts</a></li><li><a href="#process-bytes-and-declared-allocations">Process bytes and declared allocations</a></li><li><a href="#observed-targets-and-path-comparisons">Observed targets and path comparisons</a></li></ul></nav>
-<section id="known-memory-explainer"><h2>Why allocated memory can still be unknown</h2><p>An allocation declaration answers whether an address belongs to a modeled range. The seed answers whether its bytes have known values. Declaring stack memory establishes an extent; it does not fill the region with zeroes.</p><figure class="technical-figure"><div class="technical-diagram" tabindex="0" aria-label="Scrollable Load validation before value construction"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 440" role="img" aria-labelledby="memory-title"><title id="memory-title">Load validation before value construction</title><rect x="225" y="10" width="250" height="72" class="diagram-box"/><text x="350" y="38" text-anchor="middle">Requested LOAD</text><text x="350" y="63" text-anchor="middle" class="diagram-small">address and width</text><path d="M350 82 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><rect x="225" y="120" width="250" height="72" class="diagram-box"/><text x="350" y="148" text-anchor="middle">Inside modeled range?</text><text x="350" y="173" text-anchor="middle" class="diagram-small">ELF mapping or declared allocation</text><path d="M350 192 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><rect x="225" y="230" width="250" height="72" class="diagram-box"/><text x="350" y="258" text-anchor="middle">All required bytes known?</text><text x="350" y="283" text-anchor="middle" class="diagram-small">missing bytes → explicit stop</text><path d="M350 302 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><rect x="225" y="340" width="250" height="72" class="diagram-box"/><text x="350" y="368" text-anchor="middle">Assemble value</text><text x="350" y="393" text-anchor="middle" class="diagram-small">little-endian byte order</text></svg></div><figcaption>Conceptual load checks. An invalid range or missing byte stops the operation rather than fabricating a value.</figcaption></figure>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#why-allocated-memory-can-still-be-unknown">Why allocated memory can still be unknown</a></li><li><a href="#local-worker-and-snapshot-artifacts">Local worker and snapshot artifacts</a></li><li><a href="#process-bytes-and-declared-allocations">Process bytes and declared allocations</a></li><li><a href="#observed-targets-and-path-comparisons">Observed targets and path comparisons</a></li><li><a href="#automatic-bounded-call-lifts">Automatic bounded call lifts</a></li><li><a href="#remote-projects-and-api-negotiation">Remote projects and API negotiation</a></li><li><a href="#revisioned-analysis-models">Revisioned analysis models</a></li><li><a href="#remote-ghidra-artifact-requests">Remote Ghidra artifact requests</a></li><li><a href="#scalar-c-and-transformation-requests">Scalar C and transformation requests</a></li><li><a href="#remote-observation-jobs">Remote observation jobs</a></li><li><a href="#installation-and-smoke-workflow">Installation and smoke workflow</a></li><li><a href="#regenerating-protobuf-bindings">Regenerating protobuf bindings</a></li><li><a href="#related-documentation">Related documentation</a></li></ul></nav>
+<section id="known-memory-explainer"><h2 id="why-allocated-memory-can-still-be-unknown">Why allocated memory can still be unknown<a class="heading-anchor" href="#why-allocated-memory-can-still-be-unknown" aria-label="Link to Why allocated memory can still be unknown">#</a></h2><p>An allocation declaration answers whether an address belongs to a modeled range. The seed answers whether its bytes have known values. Declaring stack memory establishes an extent; it does not fill the region with zeroes.</p><figure class="technical-figure"><div class="technical-diagram sketch-diagram" tabindex="0" aria-label="Scrollable Load validation before value construction"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 440" role="img" aria-labelledby="memory-title"><title id="memory-title">Load validation before value construction</title><path d="M135 12 Q350 8 565 11 Q581 12 580 28 L579 67 Q579 84 564 82 Q350 79 135 83 Q118 82 121 66 L120 28 Q120 10 135 12 Z" class="diagram-box"/><text x="350" y="38" text-anchor="middle">Requested LOAD</text><text x="350" y="63" text-anchor="middle" class="diagram-small">address and width</text><path d="M350 82 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><path d="M135 122 Q350 118 565 121 Q581 122 580 138 L579 177 Q579 194 564 192 Q350 189 135 193 Q118 192 121 176 L120 138 Q120 120 135 122 Z" class="diagram-box"/><text x="350" y="148" text-anchor="middle">Inside modeled range?</text><text x="350" y="173" text-anchor="middle" class="diagram-small">ELF mapping or declared allocation</text><path d="M350 192 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><path d="M135 232 Q350 228 565 231 Q581 232 580 248 L579 287 Q579 304 564 302 Q350 299 135 303 Q118 302 121 286 L120 248 Q120 230 135 232 Z" class="diagram-box"/><text x="350" y="258" text-anchor="middle">All required bytes known?</text><text x="350" y="283" text-anchor="middle" class="diagram-small">missing bytes → explicit stop</text><path d="M350 302 v32 m-5 -8 l5 8 5 -8" class="diagram-line"/><path d="M135 342 Q350 338 565 341 Q581 342 580 358 L579 397 Q579 414 564 412 Q350 409 135 413 Q118 412 121 396 L120 358 Q120 340 135 342 Z" class="diagram-box"/><text x="350" y="368" text-anchor="middle">Assemble value</text><text x="350" y="393" text-anchor="middle" class="diagram-small">little-endian byte order</text></svg></div><figcaption>Conceptual load checks. An invalid range or missing byte stops the operation rather than fabricating a value.</figcaption></figure>
 <h3>Worked example: a two-byte load</h3><p>Suppose the modeled range contains <code>0x700000</code> and <code>0x700001</code>. The first byte is known as <code>0x41</code>; the second is absent. A two-byte load cannot return <code>0x0041</code>, because that would assume the missing byte is zero. Supplying <code>0x42</code> at the second address permits <code>0x4241</code>.</p><div class="memory-example"><p><strong>Illustrative known-byte mask</strong></p><pre><code>address    initial value    known
 0x700000   0x41             yes
 0x700001   ??               no</code></pre><button type="button" data-memory-toggle aria-pressed="false">Supply second byte 0x42</button><p><output aria-live="polite">LOAD stops: byte at 0x700001 is unknown.</output></p></div><p>This example explains the model; it does not execute an ELF. LLVM v4 includes checked process bytes and writable globals; v5 adds declared stack and heap ranges. Unknown relocations, undeclared addresses, and missing bytes remain source-linked boundaries.</p>
 <h3>Calls share machine state</h3><p><code>trace_calls</code> and <code>llvm_cfg_calls</code> share registers and modeled RAM across validated caller and callee snapshots. Function and depth budgets bound collection and execution. A concrete indirect target must identify a supported loaded callee. Unknown imports and missing callees stop explicitly.</p><p>Returns are checked against their modeled targets. Inspect the operation log and stop record before interpreting an emitted module as a complete function. Its fidelity stays unknown until the relevant path is compared with an execution oracle.</p></section><p class="doc-source">Implementation references: <a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-ir/src/pcode/execution.rs">Concrete execution</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-ir/src/pcode/interprocedural.rs">Call and return handling</a></p>
 
-<h2 id="local-worker-and-snapshot-artifacts">Local worker and snapshot artifacts</h2>
+<h2 id="local-worker-and-snapshot-artifacts">Local worker and snapshot artifacts<a class="heading-anchor" href="#local-worker-and-snapshot-artifacts" aria-label="Link to Local worker and snapshot artifacts">#</a></h2>
 <p>For local Ghidra-backed lifting, <code>LocalGhidra</code> calls the same <code>hydirctl</code>
 worker as the desktop app. It needs no service credentials:</p>
 <pre><code class="language-python">from hydir_sdk import LocalGhidra
@@ -58,7 +58,7 @@ provides the same artifact through the authenticated v3 service.
 emits one bounded LLVM state machine across validated loaded callees. Its
 fidelity claim remains unknown until a concrete path is compared with an
 execution oracle.</p>
-<h2 id="process-bytes-and-declared-allocations">Process bytes and declared allocations</h2>
+<h2 id="process-bytes-and-declared-allocations">Process bytes and declared allocations<a class="heading-anchor" href="#process-bytes-and-declared-allocations" aria-label="Link to Process bytes and declared allocations">#</a></h2>
 <p><code>LocalGhidra.llvm_cfg(binary, snapshot, process=True)</code> emits LLVM v4 with
 checked ELF process bytes, zero-filled tails, and writable globals. Its
 mapping and known-byte masks keep unresolved relocations explicit.
@@ -71,7 +71,7 @@ Declaring a range does not initialize its bytes; put known input bytes in the
 seed. An access outside the ELF mappings and declared ranges stops explicitly.
 The service exposes the same v5 artifact through
 <code>analyze_ghidra_binary(project_id, revision, &quot;llvm-cfg-process-allocated&quot;, allocations=&quot;allocations.json&quot;)</code>.</p>
-<h2 id="observed-targets-and-path-comparisons">Observed targets and path comparisons</h2>
+<h2 id="observed-targets-and-path-comparisons">Observed targets and path comparisons<a class="heading-anchor" href="#observed-targets-and-path-comparisons" aria-label="Link to Observed targets and path comparisons">#</a></h2>
 <p><code>LocalGhidra.rediscover_calls(binary, snapshot, input_spec, trace)</code> returns
 bounded, byte-verified candidate targets from one observed input while
 retaining unresolved static call edges. Pass <code>apply=True</code> to reanalyze an
@@ -84,8 +84,9 @@ computed-jump witnesses for already analyzed instructions inside the selected
 function. Its plan and isolated <code>apply=True</code> route keep the unresolved branch
 visible alongside observed targets.
 The revision-checked service exposes the same read-only jump plan through
-<code>HydirClient.analyze_ghidra_observation(..., &quot;observed-jump-rediscovery&quot;)</code>.
-<code>LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)</code> runs the
+<code>HydirClient.analyze_ghidra_observation(..., &quot;observed-jump-rediscovery&quot;)</code>.</p>
+<h2 id="automatic-bounded-call-lifts">Automatic bounded call lifts<a class="heading-anchor" href="#automatic-bounded-call-lifts" aria-label="Link to Automatic bounded call lifts">#</a></h2>
+<p><code>LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)</code> runs the
 managed worker and collects only callees reached by the seed before lifting.
 Add <code>allocations=&quot;allocations.json&quot;</code> to <code>trace_calls</code>, <code>llvm_cfg_calls</code>, or
 <code>llvm_cfg_calls_auto</code> to share validated ELF process bytes and declared stack
@@ -97,6 +98,7 @@ relocations, and undeclared memory still stop at their source instruction.
 <code>HydirClient.build_ghidra_call_cfg_llvm(project_id, revision, seed, function_entry=...)</code> runs that bounded lift for an uploaded ELF through the
 v3 service and returns a revision-bound LLVM artifact. The returned module
 exposes source operations and explicit stops; it is not a whole-program lift.</p>
+<h2 id="remote-projects-and-api-negotiation">Remote projects and API negotiation<a class="heading-anchor" href="#remote-projects-and-api-negotiation" aria-label="Link to Remote projects and API negotiation">#</a></h2>
 <p>This SDK is backed by the same protobuf schema as <code>hydirctl remote</code> and
 <code>hydird</code>. It supports authenticated loopback or TLS discovery, project creation,
 explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
@@ -110,6 +112,7 @@ digest/media/schema/revision-checked ProgramSpec, FunctionIndex, coverage,
 MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
 artifacts. <code>get_program_artifact(...)</code> never executes the input and requires a
 FunctionIndex selector for function-scoped stages.</p>
+<h2 id="revisioned-analysis-models">Revisioned analysis models<a class="heading-anchor" href="#revisioned-analysis-models" aria-label="Link to Revisioned analysis models">#</a></h2>
 <p><code>get_analysis_model(project_id, revision)</code> returns the current validated
 AnalysisModel v1 as JSON. Edit that document and call
 <code>save_analysis_model(project_id, revision, model, idempotency_key=...)</code> with
@@ -118,6 +121,7 @@ The server checks the binary digest and layout, retains machine evidence,
 persists the edit, and returns the new project revision. Later typed C and
 high-level CIR artifact requests use the saved model. Reuse the same
 idempotency key when retrying an uncertain save.</p>
+<h2 id="remote-ghidra-artifact-requests">Remote Ghidra artifact requests<a class="heading-anchor" href="#remote-ghidra-artifact-requests" aria-label="Link to Remote Ghidra artifact requests">#</a></h2>
 <p><code>analyze_ghidra_snapshot(project_id, revision, snapshot, stage)</code> sends an
 exported Ghidra snapshot as bytes or a file path to the v3 service. The
 project must already contain the same binary. The server checks the snapshot
@@ -148,6 +152,7 @@ until a separate execution gate supplies evidence.</p>
 register/flag/memory effects, boundary locations, and unresolved proof facts.
 Its <code>lowering_ready</code> field must be true before a caller treats it as patchable;
 successful decoding alone is not a C or replacement-safety claim.</p>
+<h2 id="scalar-c-and-transformation-requests">Scalar C and transformation requests<a class="heading-anchor" href="#scalar-c-and-transformation-requests" aria-label="Link to Scalar C and transformation requests">#</a></h2>
 <p><code>decompile(project_id, revision, symbol, assume_u64x2=True)</code> returns C11
 from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
 decompiler. <code>get_source()</code> retrieves the exact source tar advertised by a
@@ -186,6 +191,7 @@ hex-encoded stdin cases, and a new report path. It compares stdout, stderr,
 and exit status under no-network, read-only, CPU/memory/process/time controls.
 This does not establish hostile-input isolation or general equivalence. A ready case list is
 <code>../../tests/fixtures/whole_choice_cases.json</code>.</p>
+<h2 id="remote-observation-jobs">Remote observation jobs<a class="heading-anchor" href="#remote-observation-jobs" aria-label="Link to Remote observation jobs">#</a></h2>
 <p>On a Linux x86-64 server with the separately bundled Frida observer,
 <code>start_frida_observation(project_id, revision, input_spec, selected_elf_vaddr)</code>
 queues an explicit operator-only job for the uploaded ELF. Use
@@ -194,6 +200,7 @@ job's revision and artifact digest, the InputSpec binary digest, and the
 selected address to <code>get_frida_observation</code>. The SDK checks the artifact hash,
 revision, schema, binary, and address. DynamicTrace v2 records bounded path
 events and output; process exit code remains unknown.</p>
+<h2 id="installation-and-smoke-workflow">Installation and smoke workflow<a class="heading-anchor" href="#installation-and-smoke-workflow" aria-label="Link to Installation and smoke workflow">#</a></h2>
 <p>Install Python 3.10+ in a private virtual environment:</p>
 <pre><code class="language-sh">python3 -m venv .venv
 .venv/bin/python -m pip install .
@@ -220,6 +227,7 @@ using a private CA may pass its PEM bytes as <code>root_certificates</code>.
 Credential files may contain either a local 64-character static token or a
 bounded compact OIDC JWT; the server remains responsible for signature and
 claim validation.</p>
+<h2 id="regenerating-protobuf-bindings">Regenerating protobuf bindings<a class="heading-anchor" href="#regenerating-protobuf-bindings" aria-label="Link to Regenerating protobuf bindings">#</a></h2>
 <p>Generated <code>hydir*_pb2.py</code> and <code>hydir*_pb2_grpc.py</code> correspond to the v1, v2, and v3
 schemas in <code>crates/hydir-api/proto/</code>, produced with <code>grpcio-tools==1.84.0</code>.
 Regenerate after API changes with:</p>
@@ -233,9 +241,9 @@ Regenerate after API changes with:</p>
 example, <code>from . import hydir_v2_pb2</code>) so the package imports correctly.</p>
 
 <hr>
-<h2>Related documentation</h2>
-<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+<h2 id="related-documentation">Related documentation<a class="heading-anchor" href="#related-documentation" aria-label="Link to Related documentation">#</a></h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li></ul>
 </main>
-<footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Edit the source on GitHub</a></p></footer>
+<footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Edit this page</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a></p></footer>
 </body>
 </html>

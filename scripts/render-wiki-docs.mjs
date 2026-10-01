@@ -5,6 +5,8 @@ import { createHash } from 'node:crypto';
 import MarkdownIt from 'markdown-it';
 import { wikiNavigation } from './wiki-navigation.mjs';
 import { explainers } from './wiki-explainers.mjs';
+import { homeDiagram } from './wiki-home-diagram.mjs';
+import { polishWikiPage } from './wiki-page-layout.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const site = path.join(repo, 'blog');
@@ -18,7 +20,15 @@ const sections = {
   'python-sdk': [
     ['For local Ghidra-backed lifting', 'Local worker and snapshot artifacts'],
     ['`LocalGhidra.llvm_cfg(binary, snapshot, process=True)`', 'Process bytes and declared allocations'],
-    ['`LocalGhidra.rediscover_calls', 'Observed targets and path comparisons']
+    ['`LocalGhidra.rediscover_calls', 'Observed targets and path comparisons'],
+    ['`LocalGhidra.llvm_cfg_calls_auto', 'Automatic bounded call lifts'],
+    ['This SDK is backed', 'Remote projects and API negotiation'],
+    ['`get_analysis_model', 'Revisioned analysis models'],
+    ['`analyze_ghidra_snapshot', 'Remote Ghidra artifact requests'],
+    ['`decompile(project_id', 'Scalar C and transformation requests'],
+    ['On a Linux x86-64 server', 'Remote observation jobs'],
+    ['Install Python 3.10+', 'Installation and smoke workflow'],
+    ['Generated `hydir*_pb2.py`', 'Regenerating protobuf bindings']
   ]
 };
 
@@ -57,6 +67,22 @@ md.core.ruler.push('doc-headings', state => {
   }
 });
 
+const relatedGuides = {
+  ghidra: ['python-sdk','frida','first-run','native-analysis'],
+  frida: ['ghidra','investigation','first-run','python-sdk'],
+  'python-sdk': ['service','ghidra','models','transformation'],
+  transformation: ['scalar-validation','models','service','native-analysis'],
+  service: ['python-sdk','models','ghidra','transformation'],
+  'native-analysis': ['desktop','models','scalar-validation','ghidra'],
+  desktop: ['first-run','native-analysis','models','frida'],
+  'scalar-validation': ['native-analysis','transformation','first-run','models'],
+  symbolic: ['investigation','vm-exploration','desktop','first-run'],
+  'first-run': ['desktop','ghidra','native-analysis','symbolic'],
+  models: ['native-analysis','service','python-sdk','desktop'],
+  investigation: ['frida','symbolic','ghidra','vm-exploration'],
+  'vm-exploration': ['symbolic','investigation','models','native-analysis']
+};
+
 for (const doc of docs) {
   const original = fs.readFileSync(path.join(repo, doc.source), 'utf8').replace(/\r\n/g, '\n');
   let content = original;
@@ -70,6 +96,7 @@ for (const doc of docs) {
     if (!content.includes(prefix)) throw new Error('Missing topic boundary: ' + doc.slug + ': ' + prefix);
     content = content.replace(prefix, '\n\n## ' + heading + '\n\n' + prefix);
   }
+  if (doc.slug === 'first-run') content = content.replace('The PRISM presenter guide gives a short GUI route,\ncommands, and the expected evidence.', 'The [on-site quick start](/start) provides a GUI route, commands, and result interpretation.');
   if (doc.slug === 'native-analysis') content = content.replace(/```mermaid[\s\S]*?```/g, '');
   const env = { source: doc.source };
   let rendered = md.render(content, env);
@@ -81,7 +108,7 @@ for (const doc of docs) {
   if (explainerHeading) env.headings.unshift({ id: explainerHeading[1], title: explainerHeading[2] });
   const digest = createHash('sha256').update(original).digest('hex').slice(0, 12);
   const toc = env.headings.length ? '<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul>' + env.headings.map(h => `<li><a href="#${h.id}">${escape(h.title)}</a></li>`).join('') + '</ul></nav>' : '';
-  const html = `<!DOCTYPE html>
+  let html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -106,12 +133,13 @@ ${explainer}
 ${rendered}
 <hr>
 <h2>Related documentation</h2>
-<ul>${docs.filter(other => other.slug !== doc.slug).map(other => `<li><a href="/docs/${other.slug}">${escape(other.title)}</a></li>`).join('')}</ul>
+<ul>${docs.filter(other => relatedGuides[doc.slug].includes(other.slug)).map(other => `<li><a href="/docs/${other.slug}">${escape(other.title)}</a></li>`).join('')}</ul>
 </main>
 <footer class="site-footer"><p><a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="${sourceUrl(doc.source)}">Edit the source on GitHub</a></p></footer>
 </body>
 </html>
 `;
+  html = polishWikiPage(html, { source: doc.source });
   const output = path.join(site, 'docs', doc.slug + '.html');
   if (checking) {
     if (!fs.existsSync(output) || fs.readFileSync(output, 'utf8') !== html) throw new Error('Stale wiki documentation: ' + doc.slug);
@@ -121,3 +149,30 @@ ${rendered}
   }
 }
 console.log(`${checking ? 'Checked' : 'Rendered'} ${docs.length} repository-backed technical references.`);
+
+const homePath = path.join(site, 'index.html');
+const home = fs.readFileSync(homePath, 'utf8');
+const updatedHome = home.replace(/<section id="how-hydir-works">[\s\S]*?<\/section>/, polishWikiPage(homeDiagram, {toc:false}));
+if (!home.includes('id="how-hydir-works"')) throw new Error('Homepage diagram section is missing');
+if (checking && updatedHome !== home) throw new Error('Stale homepage diagram');
+if (!checking) fs.writeFileSync(homePath, updatedHome);
+
+// Architecture and homepage share the same dependency map and controls.
+const architecturePath = path.join(site, 'architecture.html');
+const architecture = fs.readFileSync(architecturePath, 'utf8');
+const architectureDiagram = homeDiagram
+  .replace('id="how-hydir-works"', 'id="architecture-workflow"')
+  .replace('<h2>How HydIR works</h2>', '<h2>The whole project on one map</h2>')
+  .replace('href="/architecture">Explore the full architecture', 'href="/guides">Explore the workflow guides');
+const updatedArchitecture = architecture.replace(/<section id="architecture-workflow">[\s\S]*?<\/section>/, polishWikiPage(architectureDiagram, {toc:false}));
+if (!architecture.includes('id="architecture-workflow"')) throw new Error('Architecture diagram section is missing');
+if (checking && updatedArchitecture !== architecture) throw new Error('Stale architecture diagram');
+if (!checking) fs.writeFileSync(architecturePath, updatedArchitecture);
+
+for (const name of ['index','start','guides','architecture','features','tools','blogs']) {
+  const file = path.join(site, name + '.html');
+  const current = fs.readFileSync(file, 'utf8');
+  const polished = polishWikiPage(current, { toc: !['index','blogs'].includes(name), source: 'blog/' + name + '.html' });
+  if (checking && polished !== current) throw new Error('Stale page layout: ' + name);
+  if (!checking) fs.writeFileSync(file, polished);
+}

@@ -9,7 +9,7 @@ import json
 
 
 SITE = Path(__file__).resolve().parents[1] / "blog"
-ROUTES = {"/features", "/tools", "/research", "/start", "/guides", "/architecture", "/blogs", "/articles/ghidra-pcode-explained", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code"}
+ROUTES = {"/features", "/tools", "/start", "/guides", "/architecture", "/blogs", "/articles/ghidra-pcode-explained", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code"}
 ROUTES.update("/docs/" + doc["slug"] for doc in json.loads((SITE / "docs.json").read_text(encoding="utf-8")))
 
 

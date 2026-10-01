@@ -14,26 +14,24 @@
 </head>
 <body>
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-logo.jpg" width="112" height="112" alt="HydIR dragon logo"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
   <main class="site-main prose" id="content">
     <p class="eyebrow">Quick start</p>
     <h1>Start with a local ELF</h1>
     <p class="lead">Open the checked-in PRISM ELF for a tour of the workbench, or use the smaller <code>max2</code> fixture for a focused CLI walkthrough. Analysis reads the ELF locally; execution comparisons are separate, explicit operations.</p>
-
-    <nav class="site-nav" aria-label="Quick start sections"><a href="#prerequisites">Prerequisites</a><a href="#open-workbench">Open the workbench</a><a href="#cli-tour">CLI tour</a><a href="#ghidra-path">Ghidra path</a><a href="#frida-gui">Frida in the GUI</a><a href="#results">Read results</a></nav>
-
-    <h2 id="prerequisites">Prerequisites</h2>
+<!-- page-toc --><nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#prerequisites">Prerequisites</a></li><li><a href="#open-workbench">Open the workbench</a></li><li><a href="#cli-tour">CLI tour</a></li><li><a href="#ghidra-path">Inspect the Ghidra path</a></li><li><a href="#frida-gui">Start a Frida session</a></li><li><a href="#results">Read results and reproduce a comparison</a></li><li><a href="#further-reference">Further reference</a></li></ul></nav><!-- /page-toc -->
+<h2 id="prerequisites">Prerequisites<a class="heading-anchor" href="#prerequisites" aria-label="Link to Prerequisites">#</a></h2>
     <p>Clone the <a href="https://github.com/Achxy/hydir-2">repository</a> with its submodules. Rust 1.96 is pinned by <code>rust-toolchain.toml</code>, and <code>Cargo.lock</code> fixes Rust dependencies. The managed Ghidra path provisions a pinned container image; developers can use <code>HYDIR_GHIDRA_HOME</code> with a local Ghidra 12.1.4 installation. Native execution comparisons require Linux x86-64.</p>
     <pre><code class="language-bash">cargo run --locked --bin hydirctl -- doctor</code></pre>
     <p><code>doctor</code> reports the relevant local setup before you begin. You can inspect the checked-in ELF on Windows; native execution and whole-executable rebuild use Linux x86-64.</p>
 
-    <h2 id="open-workbench">Open the workbench</h2>
+    <h2 id="open-workbench">Open the workbench<a class="heading-anchor" href="#open-workbench" aria-label="Link to Open the workbench">#</a></h2>
     <pre><code class="language-bash">cargo run --locked --bin hydir -- \
   --open-local demo/hydir-prism.elf hydir_stage_decision</code></pre>
     <p>The overview inventories the program and shows pipeline status. Select <code>hydir_stage_decision</code> to inspect a branch, <code>hydir_stage_call_chain</code> for a direct call, or <code>hydir_stage_loop_sum</code> for a loop. Select a function, then use the disassembly and CFG views to orient yourself before opening P-code, IR, or C output.</p>
     <p class="note">Opening an ELF starts bounded analysis. It does not run the input. A generated C view may still contain opaque operations or unresolved control flow; read its diagnostics and fidelity claim.</p>
 
-    <h2 id="cli-tour">CLI tour</h2>
+    <h2 id="cli-tour">CLI tour<a class="heading-anchor" href="#cli-tour" aria-label="Link to CLI tour">#</a></h2>
     <p>Run the native workflow on the same showcase. <code>discover</code> returns function candidates and stable IDs, including entries without usable names. <code>lift</code> requests one IR stage; <code>decompile</code> requests a unit with C views and diagnostics.</p>
     <pre><code class="language-bash">cargo run --locked --bin hydirctl -- discover demo/hydir-prism.elf
 cargo run --locked --bin hydirctl -- lift demo/hydir-prism.elf \
@@ -42,7 +40,7 @@ cargo run --locked --bin hydirctl -- decompile demo/hydir-prism.elf \
   --function hydir_stage_decision --view unit</code></pre>
     <p>The <a href="/guides#artifact-reference">artifact reference</a> maps each IR to its purpose. The older scalar LLVM compatibility path uses an explicit <code>--assume-u64x2</code> assertion for a restricted function; that prototype is supplied by the analyst.</p>
 
-    <h2 id="ghidra-path">Inspect the Ghidra path</h2>
+    <h2 id="ghidra-path">Inspect the Ghidra path<a class="heading-anchor" href="#ghidra-path" aria-label="Link to Inspect the Ghidra path">#</a></h2>
     <p>The GUI starts managed Ghidra analysis when opening a local ELF. The CLI can save and verify a raw P-code snapshot bound to the ELF, then report which operations the modeled subset covers.</p>
     <pre><code class="language-bash">cargo run --locked -p hydir-cli -- ghidra analyze demo/hydir-prism.elf \
   --output target/prism-ghidra.json --function 0x20137c
@@ -52,18 +50,18 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot coverage \
   demo/hydir-prism.elf target/prism-ghidra.json</code></pre>
     <p>Coverage describes the selected snapshot and modeled operations. It is not a whole-program equivalence result. The <a href="/architecture">architecture guide</a> shows how this Ghidra lane relates to native IR and output generation.</p>
 
-    <h2 id="frida-gui">Start a Frida session</h2><p>Open an argv- or file-driven local ELF, select an analyzed function, and choose <strong>Frida → Session</strong>. Enter one argument per line and select <strong>Observe selected function</strong> after readiness checks complete. An InputSpec file is optional for custom limits and file inputs. Events open after a successful observation.</p><p>For the Windows release, install WSL2 separately, retain the bundled <code>workers/frida</code> files, and use <strong>Recheck runtime → Install packaged worker</strong>. A source checkout needs a generated worker bundle. See the <a href="/guides#frida-observation">Frida setup guide</a>.</p><p class="note">The interactive PRISM demo needs stdin, which Frida currently rejects. Use it for static analysis and choose an argv/file fixture for observation. Native replay and GDB capture have separate Linux requirements.</p>
+    <h2 id="frida-gui">Start a Frida session<a class="heading-anchor" href="#frida-gui" aria-label="Link to Start a Frida session">#</a></h2><p>Open an argv- or file-driven local ELF, select an analyzed function, and choose <strong>Frida → Session</strong>. Enter one argument per line and select <strong>Observe selected function</strong> after readiness checks complete. An InputSpec file is optional for custom limits and file inputs. Events open after a successful observation.</p><p>For the Windows release, install WSL2 separately, retain the bundled <code>workers/frida</code> files, and use <strong>Recheck runtime → Install packaged worker</strong>. A source checkout needs a generated worker bundle. See the <a href="/guides#frida-observation">Frida setup guide</a>.</p><p class="note">The interactive PRISM demo needs stdin, which Frida currently rejects. Use it for static analysis and choose an argv/file fixture for observation. Native replay and GDB capture have separate Linux requirements.</p>
 
-    <h2 id="results">Read results and reproduce a comparison</h2>
+    <h2 id="results">Read results and reproduce a comparison<a class="heading-anchor" href="#results" aria-label="Link to Read results and reproduce a comparison">#</a></h2>
     <p>Read the source location, diagnostics, and coverage with each artifact. A successful import can be followed by a stopped lift when an operation, memory effect, or control target is outside the supported model. HydIR records that boundary rather than silently treating it as recovered.</p>
     <p>For a reproducible first run on Linux x86-64, use the checked-in demo scripts. They build controlled inputs, save artifacts under <code>target/</code>, and compare finite cases with native execution.</p>
     <pre><code class="language-bash">bash scripts/demo-local.sh
 bash scripts/demo-corpus.sh</code></pre>
     <p>The validation path executes its original fixture and requires <code>--trusted-fixture</code>. Use these scripts only with the repository's trusted samples. The <a href="/articles/graphs-to-code">compiler theory article</a> explains how HydIR represents function control flow.</p>
 
-    <h2>Further reference</h2>
+    <h2 id="further-reference">Further reference<a class="heading-anchor" href="#further-reference" aria-label="Link to Further reference">#</a></h2>
     <p>Continue with the <a href="/guides">guide map</a>, the <a href="/docs/first-run">detailed first-run guide</a>, or the <a href="/docs/python-sdk">Python SDK reference</a> for local and authenticated service clients.</p>
   </main>
-  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="/blogs">Blogs</a></p></footer>
+  <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">GitHub</a> · <a href="/#maintainers">Maintainers</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/start.html">Edit this page</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a></p></footer>
 </body>
 </html>
