@@ -16,7 +16,7 @@
 <main class="site-main prose" id="content">
 <p class="eyebrow"><a href="/guides">Docs</a> / Ghidra snapshots and execution</p>
 <h1 id="ghidra-snapshot-exporter">Ghidra snapshot exporter</h1>
-<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/ghidra/README.md">integrations/ghidra/README.md</a> · source digest <code>701323eb18b0</code></p>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/ghidra/README.md">integrations/ghidra/README.md</a> · source digest <code>2c3dbf6b2365</code></p>
 <p>Raw P-code snapshots, managed projects, seed validation, concrete paths, LLVM state ABI, and independent execution oracles.</p>
 <nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#byte-state-explainer">How overlapping varnodes share byte state</a></li><li><a href="#independent-ghidra-execution-oracle">Independent Ghidra execution oracle</a></li><li><a href="#import-a-saved-ghidra-project">Import a saved Ghidra project</a></li></ul></nav>
 <section id="byte-state-explainer"><h2>How overlapping varnodes share byte state</h2><p>A varnode names an address space, byte offset, and width. The width does not allocate a separate register. When two intervals overlap in the same space, a narrow write changes the bytes visible to a wider read. HydIR's standalone prefix maps those intervals into a compact buffer.</p>
