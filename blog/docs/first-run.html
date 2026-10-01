@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Desktop and CLI first run, automatic Ghidra analysis, call traces, stripped inputs, LLVM variants, and PRISM functions.">
+<link rel="canonical" href="https://hydir.wiki/docs/first-run">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
+<title>First run and the PRISM showcase — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / First run and the PRISM showcase</p>
+<h1 id="quick-start">Quick start</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p>Desktop and CLI first run, automatic Ghidra analysis, call traces, stripped inputs, LLVM variants, and PRISM functions.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#showcase-elf">Showcase ELF</a></li></ul></nav>
+
+
+<p>Open the checked-in PRISM ELF for a tour of the workbench. Use the smaller
+<code>max2.elf</code> for a focused command-line walkthrough. Run these commands from the
+repository root with Rust 1.96:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydirctl -- doctor
+cargo run --locked --bin hydir -- --open-local demo/hydir-prism.elf hydir_stage_decision
+cargo run --locked --bin hydirctl -- discover fuzz/corpus/elf_import/max2.elf
+cargo run --locked --bin hydirctl -- lift fuzz/corpus/elf_import/max2.elf --function hydir_max2 --ir state
+cargo run --locked --bin hydirctl -- decompile fuzz/corpus/elf_import/max2.elf --function hydir_max2 --view unit
+</code></pre>
+<p>To reproduce the Ghidra-backed path from the CLI, run the following commands.
+HydIR provisions its pinned container on the first analysis; no Ghidra project
+setup is required. The GUI starts the same analysis when you open the ELF.</p>
+<pre><code class="language-bash">cargo run --locked -p hydir-cli -- ghidra analyze demo/hydir-prism.elf --output target/prism-ghidra.json --function 0x20137c
+cargo run --locked -p hydir-cli -- ghidra-snapshot verify demo/hydir-prism.elf target/prism-ghidra.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot coverage demo/hydir-prism.elf target/prism-ghidra.json
+cargo run --locked -p hydir-cli -- ghidra trace-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_call_seed_v1.json --function 0x2013a9
+cargo run --locked -p hydir-cli -- ghidra trace-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c
+cargo run --locked -p hydir-cli -- ghidra llvm-cfg-calls tests/fixtures/ghidra_indirect_call.elf tests/fixtures/ghidra_indirect_seed_v1.json --function 0x20117c --max-functions 2
+cargo run --locked -p hydir-cli -- ghidra-snapshot trace-calls tests/fixtures/ghidra_choose_calls.elf tests/fixtures/ghidra_choose_root_v2.json tests/fixtures/ghidra_choose_right_seed_v1.json --callee tests/fixtures/ghidra_choose_right_v2.json --callee tests/fixtures/ghidra_choose_left_v2.json --allocations allocations.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg tests/fixtures/ghidra_indirect_jump.elf tests/fixtures/ghidra_indirect_jump_v2.json
+cargo run --locked -p hydir-cli -- ghidra llvm-cfg-image tests/fixtures/hydir-password-gate-stripped.elf --function 0x2016d0 --output target/password-image-llvm.json
+cargo run --locked -p hydir-cli -- ghidra-snapshot llvm-cfg-calls demo/hydir-prism.elf tests/fixtures/ghidra_prism_calls_flow_v2.json --callee tests/fixtures/ghidra_prism_leaf_add_v2.json --max-depth 4
+</code></pre>
+<p>For the declared-stack example, create <code>allocations.json</code> containing
+<code>{&quot;schema_version&quot;:1,&quot;regions&quot;:[{&quot;kind&quot;:&quot;stack&quot;,&quot;space&quot;:&quot;ram&quot;,&quot;base&quot;:7340024,&quot;byte_len&quot;:16}]}</code>.
+The declaration bounds memory; the seed supplies any known initial bytes.
+For a completed DynamicTrace v3, <code>ghidra-snapshot rediscover-jumps</code> produces a
+byte-verified, input-specific candidate plan. <code>rediscover-jumps-apply</code> runs
+targeted Ghidra reanalysis in an isolated project copy and keeps the unknown
+computed branch edge in the resulting snapshot.</p>
+<p>For a stripped ELF with no function names, open
+<code>tests/fixtures/hydir-password-gate-stripped.elf</code> in the GUI and select the
+recovered function at <code>0x2016d0</code>. The P-code view links its loop, <code>.rodata</code>
+load, and bounded trace to disassembly. On Linux, run
+<code>bash scripts/demo-ghidra-password-lift.sh</code> to reproduce a fresh automatic
+Ghidra export, coverage and CFG LLVM artifacts, and matching versus mismatching
+password traces. The script writes its artifacts under
+<code>target/demo-ghidra-password-lift/</code> and reports both return values. It uses the
+same pinned worker as the GUI; <code>HYDIR_GHIDRA_HOME</code> can select a local Ghidra
+12.1.4 installation for development. <code>llvm-cfg-image</code> emits a version 3 module
+with up to 64 KiB of validated read-only ELF bytes embedded beside a separate
+mutable guest-memory window. Unknown bytes and unsupported effects still stop
+explicitly; the existing version 2 LLVM path remains available.</p>
+<p>Replace the ELF path and function selector with your own. <code>discover</code> returns
+FunctionIndex IDs for entries without usable names. The GUI also opens an ELF
+through its local file control. The call trace uses a concrete seed and stops
+explicitly at unsupported or unresolved call boundaries. In the GUI, open
+<code>hydir_stage_call_chain</code> and use the Call trace panel with the seed JSON.
+The indirect call command exercises bounded automatic export for a concrete
+callee. Unknown indirect targets stop without guessing a function.
+Automatic call tracing exports the function reached by the seed before spending
+its function budget on other static call targets.
+The indirect-jump command emits a bounded LLVM path module that dispatches a known
+indirect jump to an instruction in the selected function. The call LLVM
+commands emit one state machine over the loaded caller and callee snapshots.
+The automatic form collects functions reached by the seed; the snapshot form
+accepts saved exports. Both share register and RAM state, check return targets, and leave unsupported
+effects and missing callees as explicit stops. Its fidelity is still unknown
+until a path is compared with Rust, Ghidra, or native execution.
+Native CLI commands
+cover every IR stage, low-level and structured C, whole-file batch output,
+coverage, and per-address explanations.</p>
+<h2 id="showcase-elf">Showcase ELF</h2>
+<p><a href="https://github.com/Achxy/hydir-2/blob/main/demo/hydir-prism.elf"><code>demo/hydir-prism.elf</code></a> is a ready-to-open, 3.2 KB
+Linux x86-64 executable with 13 named functions. Its source is
+<a href="https://github.com/Achxy/hydir-2/blob/main/tests/fixtures/hydir_prism_showcase.S"><code>hydir_prism_showcase.S</code></a>. Select
+<code>hydir_stage_decision</code> for a branching CFG and C output, <code>hydir_stage_stack_mix</code>
+for physical stack state, <code>hydir_stage_call_chain</code> for a direct call,
+<code>hydir_stage_loop_sum</code> for a back edge, and <code>hydir_stage_record_parent</code> for
+mapped-global effects. <code>hydir_stage_leaf_add</code> is a compact Triton example;
+<code>hydir_stage_patch_portal</code> is sized to demonstrate a verified entry trampoline
+into a new ELF copy.</p>
+<p>Seven functions have exact native instruction coverage. The Linux entry point
+and three <code>prism_write_*</code> runtime helpers contain <code>syscall</code>; their native C
+keeps those instructions as explicit opaque effects. Region Studio and the
+C output tab show that low-level C and its fidelity status when structured C
+is unavailable. Select <code>hydir_stage_patch_portal</code> for the PatchLang
+demonstration.</p>
+<p>The PRISM presenter guide gives a short GUI route,
+commands, and the expected evidence. The binary can be inspected on Windows;
+native execution and whole-executable rebuild require Linux x86-64. Triton
+requires its optional Python dependency, and remote features require a running
+authenticated service.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

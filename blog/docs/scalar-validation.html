@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="The asserted scalar prototype, supported stack and call subset, region boundaries, and fixture comparisons.">
+<link rel="canonical" href="https://hydir.wiki/docs/scalar-validation">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
+<title>Scalar lifting and validation — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Scalar lifting and validation</p>
+<h1 id="verified-scalar-lift">Verified scalar lift</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p>The asserted scalar prototype, supported stack and call subset, region boundaries, and fixture comparisons.</p>
+
+
+
+<p>The earlier scalar lift is a separate, narrower path for explicitly asserted
+<code>u64(u64,u64)</code> functions. Its checked-in demos emit LLVM IR and C for 20
+distinct scalar fixtures, run the LLVM verifier where the required tools are
+available, and compare output with native execution on 1,008 input pairs.</p>
+<pre><code class="language-bash">bash scripts/demo-local.sh
+bash scripts/demo-corpus.sh
+</code></pre>
+<p>The bounded scalar contract now also covers proven balanced frames, initialized
+nonoverlapping 32/64-bit stack locals (including the SysV leaf red zone),
+32-bit arithmetic/comparisons with explicit flags, <code>mov</code> zero-extension, and
+RIP-relative address formation, plus direct calls to uniquely bounded scalar
+leaf symbols. Other memory, unresolved calls, and unmodelled aliases remain
+explicit refusals.</p>
+<p>RegionSpec v3 CFG recovery is a separate structural stage. It requires decoded
+external edges to match the declared continuation exits exactly, records direct
+call targets with a distinct edge kind, and does not promote imported liveness
+or stack facts into semantic proof. MachineIR preserves mapped/TLS memory and
+non-frame register-save effects, while the scalar lift refuses them until a
+physical-state and memory contract is available.
+Imported call-site <code>stop</code>/<code>noreturn</code> facts are kept distinct, source-attributed,
+and may suppress a region fallthrough only at their exact instruction address.</p>
+<p>The scripts retain CFG, LLVM IR, C, and comparison reports. Their finite
+fixture results do not establish equivalence for arbitrary programs. A C
+generation refusal also does not discard an independently recovered CFG or
+LLVM lift; the workbench presents each stage's status separately.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

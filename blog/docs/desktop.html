@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Function navigation, disassembly, IR and C views, analyst facts, local persistence, and explicit remote upload.">
+<link rel="canonical" href="https://hydir.wiki/docs/desktop">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
+<title>Desktop workbench and local projects — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Desktop workbench and local projects</p>
+<h1 id="native-analysis-workbench">Native analysis workbench</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p>Function navigation, disassembly, IR and C views, analyst facts, local persistence, and explicit remote upload.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#gui-screenshots">GUI screenshots</a></li></ul></nav>
+
+
+<p>The <code>hydir</code> desktop application presents the program tree, analysis panes,
+inspector, and diagnostics in one workbench. Open an ELF with the local file
+control or <code>--open-local &lt;elf&gt; [function-symbol]</code>. Local opening reads the file
+on the host; transfer to an authenticated service requires the separate,
+explicit upload action.</p>
+<p>The program tree includes symbolized and anonymous FunctionIndex entries.
+Selecting one reveals its entry and extent evidence, reachable disassembly,
+machine bytes, CFG, and available native MachineIR, StateIR, FunctionIR, CIR,
+low-level C, structured C, and diagnostics. The workbench also exposes the
+legacy scalar LLVM/C path, named pass experiments, and conservative global
+effects. Linear-sweep candidates, undecodable gaps, and unresolved branches
+remain marked as uncertain instead of becoming confirmed functions.</p>
+<p>Local names, comments, and assumptions are analyst facts with a scope and
+binary identity; they do not become machine-derived evidence. A private SQLite
+store retains these facts, pane widths, and the recent local path. It does not
+persist credentials, binary bytes, or a remote session. Remote artifacts are
+checked against their project revision and digest before presentation. Local
+and remote pass, rebuild, and scalar-patch controls use the same bounded
+contracts as the CLI and write new output paths.</p>
+<h2 id="gui-screenshots">GUI screenshots</h2>
+<p>The overview at the top of this README shows the loaded ELF and native pipeline
+status. The following captures show individual analysis views of the desktop
+application.</p>
+<p><strong>Disassembly.</strong> Recovered instructions retain their addresses, original
+machine bytes, and decoded operations.</p>
+<p><a href="https://github.com/Achxy/hydir-2/blob/main/assets/screenshots/egui-disassembly.webp"><span>HydIR GUI disassembly view showing addresses, machine bytes, and decoded instructions for hydir_max2</span></a></p>
+<p><strong>Function inspector.</strong> The selected function's entry, byte extent, ELF symbol
+source, asserted ABI, and reachable CFG size appear beside the analysis views.</p>
+<p><a href="https://github.com/Achxy/hydir-2/blob/main/assets/screenshots/egui-inspector.webp"><span>HydIR GUI inspector showing the selected function's ELF facts, ABI assertion, and CFG size</span></a></p>
+<p><strong>C output and diagnostics.</strong> The GUI reports an unsupported call explicitly
+while retaining the independently recovered CFG and LLVM lift.</p>
+<p><a href="https://github.com/Achxy/hydir-2/blob/main/assets/screenshots/egui-refusal.webp"><span>HydIR GUI C output view reporting an unsupported call without discarding the CFG or LLVM lift</span></a></p>
+<p>Remote projects do not reconnect automatically. Plaintext service connections
+remain loopback-only; non-loopback connections require TLS.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

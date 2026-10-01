@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="InputSpec, replay reports, GDB capture, origin probes, bounded return solving, and reproducible investigation recipes.">
+<link rel="canonical" href="https://hydir.wiki/docs/investigation">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
+<title>Replay and captured-state investigation — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Replay and captured-state investigation</p>
+<h1 id="replay-and-captured-state-investigation">Replay and captured-state investigation</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/investigation.md">blog/content/guides/investigation.md</a> · source digest <code>08b2f1fe1fdd</code></p>
+<p>InputSpec, replay reports, GDB capture, origin probes, bounded return solving, and reproducible investigation recipes.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#prerequisites-and-first-replay">Prerequisites and first replay</a></li><li><a href="#interpret-the-replay-report">Interpret the replay report</a></li><li><a href="#capture-a-bounded-stop">Capture a bounded stop</a></li><li><a href="#probe-a-declared-input-origin">Probe a declared input origin</a></li><li><a href="#build-and-solve-a-return-plan">Build and solve a return plan</a></li><li><a href="#verify-and-reproduce-an-investigation">Verify and reproduce an investigation</a></li><li><a href="#implementation-references">Implementation references</a></li></ul></nav>
+
+
+<p>Static analysis describes a program model. Native replay observes the original ELF for one declared input. Captured-state solving explores a bounded function window. Keep the evidence from these operations separate.</p>
+<h2 id="prerequisites-and-first-replay">Prerequisites and first replay</h2>
+<p>Native replay requires Linux x86-64 and Bubblewrap with working isolation probes. Capture also needs GDB. The bounded return solver needs the optional Triton Python bridge. Start with <code>hydirctl doctor</code>; a Windows Frida worker does not imply that these separate replay/capture operations are available.</p>
+<pre><code class="language-text">hydirctl replay init program.elf --output input.json
+hydirctl replay verify program.elf input.json
+hydirctl replay program.elf input.json --output replay.json
+</code></pre>
+<p>Edit the generated InputSpec before verification. It binds the ELF digest and records raw hex-encoded arguments, stdin, relative input files, optional named origin ranges, output goals, and budgets. Use the generated schema rather than guessing field names. Present goal predicates are combined with AND.</p>
+<div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
+<thead>
+<tr>
+<th>InputSpec field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>argv_hex</code></td>
+<td>Argument bytes excluding argv0</td>
+</tr>
+<tr>
+<td><code>stdin_hex</code></td>
+<td>Bytes supplied on standard input</td>
+</tr>
+<tr>
+<td><code>files</code></td>
+<td>Relative file paths and hex contents</td>
+</tr>
+<tr>
+<td><code>origins</code></td>
+<td>Named byte ranges with encoding and optional alphabet</td>
+</tr>
+<tr>
+<td><code>goal</code></td>
+<td>Optional exit, stdout-substring, and stderr-substring predicates</td>
+</tr>
+<tr>
+<td><code>budget</code></td>
+<td>Timeout, memory, and captured-output limits</td>
+</tr>
+</tbody>
+</table></div>
+<p>Input limits include 32 arguments, 16 files, 256 origins, and 1 MiB combined input bytes. JSON is bounded separately and rejects unknown fields. Read the report's status rather than treating any produced JSON as a successful run.</p>
+<h2 id="interpret-the-replay-report">Interpret the replay report</h2>
+<p><code>NativeReplayReport</code> binds the binary and canonical input digests and records the runner, status, exit/signal fields, hex output, elapsed time, and diagnostic. Statuses distinguish <code>goal_matched</code>, <code>goal_mismatched</code>, <code>timed_out</code>, <code>output_limit</code>, <code>runner_error</code>, and <code>unsupported_host</code>.</p>
+<p>The Linux runner stages inputs, clears the environment, isolates namespaces, and applies resource limits. A setup error or unsupported host does not become a matched goal. One successful replay is an observation under that environment, not whole-program equivalence.</p>
+<h2 id="capture-a-bounded-stop">Capture a bounded stop</h2>
+<pre><code class="language-text">hydirctl capture program.elf input.json --function validator --output snapshot.json
+hydirctl snapshot verify program.elf input.json snapshot.json
+</code></pre>
+<p>Use <code>--address 0x...</code> instead of <code>--function</code> for a file-backed executable address, including a stripped PIE. The runner resolves the runtime load bias before continuing to the selected address. <code>validator</code> and the address must identify your binary's actual target.</p>
+<p>An ExecutionSnapshot v1 records one thread's observed registers, mappings, stop point, and selected pages. The artifact allows at most 32 pages; capture currently selects up to eight. A register or page can be unavailable. Missing memory is not zero-filled. Stopping at a function does not automatically recover the relationship between its buffer and the original input channel.</p>
+<h2 id="probe-a-declared-input-origin">Probe a declared input origin</h2>
+<pre><code class="language-text">hydirctl snapshot probe-origin program.elf input.json snapshot.json ORIGIN_ID --register rdi --output probe.json
+hydirctl snapshot verify-origin program.elf input.json snapshot.json probe.json
+</code></pre>
+<p>Choose <code>ORIGIN_ID</code> from the InputSpec and a register that points to the suspected buffer. The probe compares captured memory with origin bytes and reports matched, different, or unavailable. Its scope is byte equality only. Equality is not causal provenance: using it as a solver mapping is an analyst assumption.</p>
+<h2 id="build-and-solve-a-return-plan">Build and solve a return plan</h2>
+<pre><code class="language-text">hydirctl snapshot plan-return program.elf input.json snapshot.json probe.json --code-bytes 64 --return 1 --output plan.json
+hydirctl snapshot verify-plan program.elf input.json snapshot.json probe.json plan.json
+hydirctl solve snapshot-return program.elf input.json snapshot.json probe.json plan.json --candidate-output candidate.json --slice-output slice.json --claim-output claim.json --recipe-output recipe.json --output solve.json
+</code></pre>
+<p>The example's 64-byte window and return value 1 are analyst-selected goals. They must fit your captured function. Plan validation requires a stopped snapshot, matched probe, captured code in an executable mapping, all 16 GPRs plus RIP and EFLAGS, and at most eight present pages. Code is bounded to 1–4096 bytes; a symbolic origin is bounded to 1–32 bytes.</p>
+<p>The current plan fixes 16 seeds, 1,024 instructions per seed, 32 solver queries, a 1-second query timeout, and a 20-second overall timeout. Unsupported effects or exhausted search budgets do not prove global unreachability. Missing state, calls, syscalls, and flow outside the supported window remain boundaries.</p>
+<p>A function witness satisfies the bounded return condition in the model. Only fresh original-ELF replay can promote a candidate to a native-validated result for the declared InputSpec goal. If native replay is unavailable, that stronger claim remains unavailable.</p>
+<h2 id="verify-and-reproduce-an-investigation">Verify and reproduce an investigation</h2>
+<pre><code class="language-text">hydirctl recipe verify program.elf recipe.json
+hydirctl recipe replay program.elf recipe.json
+</code></pre>
+<p>Recipe export requires the appropriate failing-seed dependency slice, witness, and before/after native replay evidence. It is not emitted merely because a solver returned a value. Verification checks digest bindings and internal consistency; replay performs fresh native observations.</p>
+<p>The slice records structural input dependencies for one trace. It can overapproximate causal relevance and does not prove minimality. Recipes can contain captured memory and input bytes, so their contents matter when sharing an investigation.</p>
+<h2 id="implementation-references">Implementation references</h2>
+<ul>
+<li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-execution/src/lib.rs">InputSpec and replay statuses</a></li>
+<li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-execution/src/snapshot.rs">Snapshot representation</a></li>
+<li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-execution/src/snapshot_resume.rs">Return-plan validation and budgets</a></li>
+</ul>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/investigation.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

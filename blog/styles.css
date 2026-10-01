@@ -164,3 +164,60 @@ pre .token.string, pre .token.char, pre .token.variable { color: #b0c975; }
 .doc-toc ul { margin: 0; padding-left: 20px; }
 .doc-toc a { font-weight: normal; }
 .doc-toc li { margin: 4px 0; }
+
+/* Explicit themes follow V8's charcoal and yellow dark palette. */
+.theme-toggle { align-self: flex-start; margin-top: 12px; padding: 6px 8px; background: #fff; color: #000; border: 1px solid #d6d6d6; font: 12px Arial, sans-serif; cursor: pointer; }
+.theme-toggle:focus-visible, .memory-example button:focus-visible { outline: 3px solid var(--site-accent); outline-offset: 3px; }
+html[data-theme="dark"] { color-scheme: dark; background: #000; --site-accent: #fad956; --site-rule: #a6a6a6; --site-muted: #bcbcbc; --site-panel: #333; --body-color: #fefefe; --body-bg-color: #232323; }
+body { color: var(--body-color); }
+.site-main { background: var(--body-bg-color); }
+a, a:visited, a:not([class]) { color: var(--site-accent); }
+.eyebrow, .doc-source, .post-meta, .post-list p, .link-list span { color: var(--site-muted); }
+.doc-toc { background: var(--site-panel); }
+.site-main a:hover, .site-footer a:hover { background: var(--site-accent); color: var(--body-bg-color); }
+html[data-theme="dark"] .site-footer { background: #464646; color: #fefefe; }
+html[data-theme="dark"] .post-meta span { background: #464646; color: #fefefe; }
+html[data-theme="dark"] .site-header .site-nav a { color: #000; }
+html[data-theme="dark"] .site-header .site-nav a[aria-current="page"] { background: #232323; color: #fefefe; }
+html[data-theme="dark"] .site-header .site-nav a:hover { background: #464646; color: #fff; }
+html[data-theme="dark"] .theme-toggle { background: #232323; color: #fad956; border-color: #a6a6a6; }
+html[data-theme="dark"] .note { background: #fad956; color: #232323; }
+html[data-theme="dark"] .note a { color: #0a50c2; }
+html[data-theme="dark"] .tok-directive, html[data-theme="dark"] .tok-keyword { color: #fad956; }
+html[data-theme="dark"] .tok-var, html[data-theme="dark"] .tok-label { color: #e4afd6; }
+html[data-theme="dark"] .tok-type, html[data-theme="dark"] .tok-number, html[data-theme="dark"] .tok-const { color: #e9bd7d; }
+html[data-theme="dark"] .tok-string { color: #b0c975; }
+.technical-figure { margin: 24px 0; }
+.technical-diagram { border: 1px solid var(--site-rule); overflow-x: auto; background: var(--body-bg-color); }
+.technical-diagram svg { display: block; width: 100%; min-width: 540px; height: auto; }
+.technical-diagram text { fill: var(--body-color); font: 18px Arial, sans-serif; }
+.technical-diagram .diagram-small { fill: var(--site-muted); font-size: 15px; }
+.diagram-box { fill: var(--site-panel); stroke: var(--site-rule); }
+.diagram-highlight { fill: var(--site-panel); stroke: var(--site-accent); stroke-width: 2; }
+.diagram-line { stroke: var(--site-accent); stroke-width: 2; fill: none; }
+.technical-figure figcaption { margin-top: 8px; font-size: 13px; color: var(--site-muted); }
+.memory-example { padding: 16px; border: 1px solid var(--site-rule); }
+.memory-example button { background: var(--site-panel); color: var(--body-color); border: 1px solid var(--site-rule); padding: 10px; cursor: pointer; }
+@media (max-width: 480px) { .theme-toggle { margin-top: 10px; } }
+
+/* Denser reading layout with less padding around guides and figures. */
+body { max-width: 1040px; padding-inline: 10px; }
+.site-header { min-height: 84px; padding-inline: 12px; gap: 10px; }
+.site-header .site-nav { gap: 5px; }
+.site-header .site-nav a { padding: 10px; }
+.site-main { padding: 18px 20px 24px; }
+.site-footer { padding: 14px 20px; }
+h1 { margin-bottom: 12px; }
+h2 { margin: 24px 0 10px; }
+h3 { margin: 18px 0 8px; }
+p { margin-block: 10px; }
+.doc-toc { margin: 12px 0; padding: 8px 12px; }
+.doc-toc li { margin: 2px 0; }
+.doc-toc ul { columns: 2; column-gap: 20px; }
+.doc-toc li { break-inside: avoid; }
+.technical-figure, .hero-image { margin: 16px 0; }
+.memory-example { padding: 10px; }
+.link-list li { padding: 4px 0; }
+pre { padding: 12px; }
+@media (max-width: 819px) { body { padding: 0; } .site-main { padding: 14px; } .site-header { padding: 12px; } .site-footer { padding: 12px 14px; } }
+@media (max-width: 560px) { .doc-toc ul { columns: 1; } }

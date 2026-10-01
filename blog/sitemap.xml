@@ -11,9 +11,18 @@
   <url><loc>https://hydir.wiki/features</loc></url>
   <url><loc>https://hydir.wiki/tools</loc></url>
   <url><loc>https://hydir.wiki/research</loc></url>
+
   <url><loc>https://hydir.wiki/docs/ghidra</loc></url>
   <url><loc>https://hydir.wiki/docs/frida</loc></url>
   <url><loc>https://hydir.wiki/docs/python-sdk</loc></url>
   <url><loc>https://hydir.wiki/docs/transformation</loc></url>
   <url><loc>https://hydir.wiki/docs/service</loc></url>
+  <url><loc>https://hydir.wiki/docs/native-analysis</loc></url>
+  <url><loc>https://hydir.wiki/docs/desktop</loc></url>
+  <url><loc>https://hydir.wiki/docs/scalar-validation</loc></url>
+  <url><loc>https://hydir.wiki/docs/symbolic</loc></url>
+  <url><loc>https://hydir.wiki/docs/first-run</loc></url>
+  <url><loc>https://hydir.wiki/docs/models</loc></url>
+  <url><loc>https://hydir.wiki/docs/investigation</loc></url>
+  <url><loc>https://hydir.wiki/docs/vm-exploration</loc></url>
 </urlset>

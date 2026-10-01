@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Analyst-scoped VM facts, profile validation, virtual-PC-sensitive node identities, effect declarations, and explicit graph limits.">
+<link rel="canonical" href="https://hydir.wiki/docs/vm-exploration">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
+<title>VM profiles and host/VPC exploration — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / VM profiles and host/VPC exploration</p>
+<h1 id="virtual-machine-profiles-and-bounded-exploration">Virtual-machine profiles and bounded exploration</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/vm.md">blog/content/guides/vm.md</a> · source digest <code>5ffcf5316dd3</code></p>
+<p>Analyst-scoped VM facts, profile validation, virtual-PC-sensitive node identities, effect declarations, and explicit graph limits.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#describe-the-interpreter">Describe the interpreter</a></li><li><a href="#validate-before-exploring">Validate before exploring</a></li><li><a href="#interpret-the-graph">Interpret the graph</a></li><li><a href="#implementation-references">Implementation references</a></li></ul></nav>
+
+
+<p>HydIR can validate an analyst-scoped VM profile and explore host instructions with a virtual program counter (VPC) in the node identity. This is experimental host/VPC graph recovery, not automatic devirtualization.</p>
+<h2 id="describe-the-interpreter">Describe the interpreter</h2>
+<p>VmProfile v1 binds the binary digest and records an entry, exits, VPC storage, bytecode ranges, context layout, and permitted guest effects. Each fact carries analyst, static-inference, or trace-observation evidence.</p>
+<div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
+<thead>
+<tr>
+<th>Profile fact</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Entry and exits</td>
+<td>Scope the interpreter region</td>
+</tr>
+<tr>
+<td>VPC</td>
+<td>Register or context-offset storage, with optional initial value</td>
+</tr>
+<tr>
+<td>Bytecode ranges</td>
+<td>Bound the bytes treated as VM instruction data</td>
+</tr>
+<tr>
+<td>Context</td>
+<td>Entry register, base register, and extent</td>
+</tr>
+<tr>
+<td>Guest effects</td>
+<td>Declared register/context effects, calls, returns, or disjoint memory</td>
+</tr>
+</tbody>
+</table></div>
+<p>An assertion that external memory writes are disjoint from VM state is an analyst assumption. It is not evidence that self-modifying bytecode is absent.</p>
+<h2 id="validate-before-exploring">Validate before exploring</h2>
+<pre><code class="language-text">hydirctl vm-profile program.elf profile.json
+hydirctl vm-explore program.elf profile.json
+</code></pre>
+<p>Construct the profile from the actual binary; addresses and the SHA-256 must match. The CLI bounds the profile JSON to 1 MiB. The <a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-vm/tests/profile.rs">profile tests</a> show a complete fixture-backed profile construction using discovered ELF locations rather than hard-coded reusable addresses.</p>
+<h2 id="interpret-the-graph">Interpret the graph</h2>
+<p>A node key contains a host PC and an optional VPC. Two visits to the same host instruction with different known VPCs can therefore be different nodes. Nodes retain the decoded mnemonic and machine bytes. Edges distinguish next, taken, fallthrough, jump, call, call-return, exit, and unresolved flow.</p>
+<p>The current explorer caps the graph at 10,000 nodes and the modeled context at 65,536 bytes. Unsupported instructions and addresses end edges explicitly. Inspect <code>unresolved_edges</code>, <code>hit_node_limit</code>, diagnostics, and observed guest effects with the graph.</p>
+<p><code>profile_validated</code> means the declared profile is internally consistent with the ELF. It does not mean a guest CFG was recovered or that rewriting is safe. The separate <code>guest_cfg_recovered</code> and <code>rewrite_ready</code> fields make those limits visible.</p>
+<h2 id="implementation-references">Implementation references</h2>
+<ul>
+<li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-vm/src/lib.rs">Profile types and validation</a></li>
+<li><a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-vm/src/explore.rs">VPC-sensitive exploration</a></li>
+</ul>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/native-analysis">Native analysis: ELF to C</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/blog/content/guides/vm.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import MarkdownIt from 'markdown-it';
 import { wikiNavigation } from './wiki-navigation.mjs';
+import { explainers } from './wiki-explainers.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const site = path.join(repo, 'blog');
@@ -24,6 +25,7 @@ const sections = {
 // Repository references keep their original source context. Dedicated wiki pages
 // replace matching document links while source anchors remain on GitHub.
 function resolveLink(ref, source) {
+  if (ref.startsWith('/')) return ref;
   if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(ref)) return ref;
   const [file, fragment] = ref.split('#');
   if (!file) return sourceUrl(source) + '#' + fragment;
@@ -62,17 +64,21 @@ for (const doc of docs) {
     const start = content.indexOf(doc.start);
     const end = content.indexOf(doc.end, start);
     if (start < 0 || end < 0) throw new Error('Missing document section: ' + doc.slug);
-    content = content.slice(start, end).replace(/^## /, '# ');
+    content = content.slice(start, end).replace(/^## /, '# ').replace(/^### /gm, '## ');
   }
   for (const [prefix, heading] of sections[doc.slug] || []) {
     if (!content.includes(prefix)) throw new Error('Missing topic boundary: ' + doc.slug + ': ' + prefix);
     content = content.replace(prefix, '\n\n## ' + heading + '\n\n' + prefix);
   }
+  if (doc.slug === 'native-analysis') content = content.replace(/```mermaid[\s\S]*?```/g, '');
   const env = { source: doc.source };
   let rendered = md.render(content, env);
   const heading = rendered.match(/<h1\b[^>]*>.*?<\/h1>/)?.[0];
   if (!heading) throw new Error('Missing document heading: ' + doc.slug);
   rendered = rendered.replace(heading, '');
+  const explainer = explainers[doc.slug] || '';
+  const explainerHeading = explainer.match(/<section id="([^"]+)"><h2>([^<]+)<\/h2>/);
+  if (explainerHeading) env.headings.unshift({ id: explainerHeading[1], title: explainerHeading[2] });
   const digest = createHash('sha256').update(original).digest('hex').slice(0, 12);
   const toc = env.headings.length ? '<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul>' + env.headings.map(h => `<li><a href="#${h.id}">${escape(h.title)}</a></li>`).join('') + '</ul></nav>' : '';
   const html = `<!DOCTYPE html>
@@ -84,6 +90,7 @@ for (const doc of docs) {
 <link rel="canonical" href="https://hydir.wiki/docs/${doc.slug}">
 <link rel="stylesheet" href="/vendor/latex.css/style.css">
 <link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
 <title>${escape(doc.title)} — HydIR</title>
 </head>
 <body>
@@ -95,6 +102,7 @@ ${heading}
 <p class="doc-source">Repository reference · <a href="${sourceUrl(doc.source)}">${escape(doc.source)}</a> · source digest <code>${digest}</code></p>
 <p>${escape(doc.description)}</p>
 ${toc}
+${explainer}
 ${rendered}
 <hr>
 <h2>Related documentation</h2>

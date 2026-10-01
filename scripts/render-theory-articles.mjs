@@ -107,6 +107,7 @@ function head(post, redirect = false) {
     '  <link rel="stylesheet" href="/vendor/latex.css/style.css">\n' +
     '  <link rel="stylesheet" href="/vendor/katex/katex.min.css">\n' +
     '  <link rel="stylesheet" href="/styles.css">\n' +
+    '  <script src="/assets/theme.js"></script>\n' +
     '  <link rel="stylesheet" href="/assets/theory.css?v=' + theoryCssVersion + '">\n' +
     '  <title>' + escape(post.title + ': ' + post.subtitle) + ' — HydIR</title>\n</head>\n';
 }

@@ -7,11 +7,12 @@
   <link rel="canonical" href="https://hydir.wiki/architecture">
   <link rel="stylesheet" href="/vendor/latex.css/style.css">
   <link rel="stylesheet" href="/styles.css">
+  <script src="/assets/theme.js"></script>
   <title>Architecture — HydIR</title>
 </head>
 <body>
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
+  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
   <main class="site-main prose" id="content">
     <p class="eyebrow">From bytes to artifacts</p>
     <h1>Follow the bytes through HydIR</h1>
@@ -52,7 +53,7 @@
     <h2>Typed models and artifact revisions</h2><p>Digest-bound AnalysisModel facts feed bounded HighLevelCIR and HighLevelCfgCir views. Local model edits create revisions, and selective caches retain unaffected typed output. The v3 API exposes analysis models, high-level artifacts, and typed C with revision and digest checks. <a href="/features#typed-models">Typed model contracts</a> describe inference limits and provenance.</p>
     <h2>Interfaces and ownership</h2>
     <p>The egui workbench and <code>hydirctl</code> expose native analysis and can start the automatic Ghidra worker for a local ELF. <code>hydird</code> exposes authenticated projects with immutable revisions and artifacts; the Python SDK covers the implemented remote subset. Local ELF opening stays local until a separate upload action. Local analyst facts live in a private on-device ledger; remote project facts live in the service ledger and do not automatically sync.</p>
-    <p>Read the <a href="/articles/graphs-to-code">compiler theory article</a> in the blogs, or inspect the <a href="https://github.com/Achxy/hydir-2">source tree</a> and <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">SDK reference</a>.</p>
+    <p>Read the <a href="/articles/graphs-to-code">compiler theory article</a> in the blogs, or inspect the <a href="https://github.com/Achxy/hydir-2">source tree</a> and <a href="/docs/python-sdk">SDK reference</a>.</p>
   </main>
   <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/blogs">Blogs</a></p></footer>
 </body>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Function discovery, machine effects, SSA, ABI recovery, C views, coverage, and batch output.">
+<link rel="canonical" href="https://hydir.wiki/docs/native-analysis">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<script src="/assets/theme.js"></script>
+<title>Native analysis: ELF to C — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false">Dark mode</button></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Native analysis: ELF to C</p>
+<h1 id="native-elf-decompiler">Native ELF decompiler</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p>Function discovery, machine effects, SSA, ABI recovery, C views, coverage, and batch output.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#native-pipeline-explainer">The native artifact pipeline</a></li><li><a href="#pipeline-and-artifact-contracts">Pipeline and artifact contracts</a></li><li><a href="#elf-loading-and-function-discovery">ELF loading and function discovery</a></li><li><a href="#instruction-and-state-semantics">Instruction and state semantics</a></li><li><a href="#abi-recovery-and-c-generation">ABI recovery and C generation</a></li><li><a href="#native-cli-and-evidence">Native CLI and evidence</a></li></ul></nav>
+<section id="native-pipeline-explainer"><h2>The native artifact pipeline</h2><figure class="technical-figure"><div class="technical-diagram" tabindex="0" aria-label="Scrollable native pipeline"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 255" role="img" aria-labelledby="native-pipeline-title"><title id="native-pipeline-title">ELF bytes through native analysis and C views</title><rect x="25" y="20" width="140" height="56" class="diagram-box"/><text x="95" y="54" text-anchor="middle">ELF bytes</text><rect x="195" y="20" width="140" height="56" class="diagram-box"/><text x="265" y="54" text-anchor="middle">ProgramSpec</text><rect x="365" y="20" width="140" height="56" class="diagram-box"/><text x="435" y="54" text-anchor="middle">FunctionIndex</text><rect x="535" y="20" width="140" height="56" class="diagram-box"/><text x="605" y="54" text-anchor="middle">MachineIR</text><rect x="535" y="125" width="140" height="56" class="diagram-box"/><text x="605" y="159" text-anchor="middle">StateIR</text><rect x="365" y="125" width="140" height="56" class="diagram-box"/><text x="435" y="159" text-anchor="middle">FunctionIR</text><rect x="195" y="125" width="140" height="56" class="diagram-box"/><text x="265" y="159" text-anchor="middle">CIR</text><rect x="25" y="125" width="140" height="56" class="diagram-box"/><text x="95" y="159" text-anchor="middle">C views / unit</text><path d="M165 48 H195 M335 48 H365 M505 48 H535 M605 76 V125 M535 153 H505 M365 153 H335 M195 153 H165" class="diagram-line"/><text x="25" y="224" class="diagram-small">FunctionIR can also export LLVM. Each stage retains evidence and uncertainty.</text></svg></div><figcaption>Conceptual stage order. Machine decoding uses the ELF bytes and function extent evidence; generated views remain independently scoped artifacts.</figcaption></figure><p>The index answers where a candidate function begins and why. MachineIR answers which instructions and edges were decoded. StateIR versions machine components across joins. FunctionIR and CIR support ABI facts and C rendering. These are different contracts, so a successful early stage does not imply success at every later stage.</p></section>
+
+<p>The native path analyzes bounded, compiler-generated Linux x86-64 ELF files.
+It does not execute the input or invoke Ghidra or another external decompiler.
+Versioned intermediate artifacts retain the binary SHA-256, machine
+locations, evidence, and uncertainties needed to inspect their output. The
+implementation record contains the full
+instruction inventory and outstanding release gates.</p>
+<h2 id="pipeline-and-artifact-contracts">Pipeline and artifact contracts</h2>
+<div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Contract and output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ELF import</td>
+<td><code>hydir-loader</code> creates a digest-bound <code>ProgramSpec</code> with file type, target and ABI, sections, mapped segments, program headers, symbols, imports, relocations, runtime ranges, and explicit recovery status. Linked files use process-image address space zero; relocatable sections have distinct address spaces. A PIE address is recorded without asserting its runtime load bias.</td>
+</tr>
+<tr>
+<td>Discovery</td>
+<td><code>FunctionIndex</code> records an entry, stable ID, optional name, evidence state (<code>confirmed</code>, <code>probable</code>, or <code>ambiguous</code>), candidate extents, block entries, control targets, tail-call evidence, and unresolved conflicts. An index row is a candidate, not proof that every byte in its extent belongs to the function.</td>
+</tr>
+<tr>
+<td>MachineIR</td>
+<td>Recursive decoding records each instruction's address, original bytes, operands, decorators, register/flag/memory effects, and typed control edges. Relocated control operands use ELF relocation evidence rather than encoded linker placeholders. Unknown operations retain bounded <code>OpaqueEffect</code> footprints.</td>
+</tr>
+<tr>
+<td>StateIR</td>
+<td>Component-level SSA versions registers, modeled flags, control, and stack/image/TLS/heap/unknown memory regions. Predecessor versions and phis represent joins and loop backedges; a store consumes and defines its memory region. Architecturally undefined flags remain explicit outputs.</td>
+</tr>
+<tr>
+<td>FunctionIR</td>
+<td>Adds evidenced SysV AMD64 parameters and returns, calls, stack and global objects, pointer origins, alias sets, and diagnostics to the state flow. An inferred type or prototype is labeled with its evidence.</td>
+</tr>
+<tr>
+<td>CIR and C</td>
+<td>CIR preserves operations, opaque effects, and explicit terminators before emitting deterministic low-level C11. A separate structurer emits C for supported control shapes; remaining regions retain labels and gotos. LLVM is an optional FunctionIR export and is not the input to native C generation.</td>
+</tr>
+<tr>
+<td>DecompilationUnit</td>
+<td>Version 2 bundles C views, artifact digests, statement provenance, diagnostics, and independent structural, semantic, verification, and rewrite-readiness claims. Older ProgramSpec v1-v4 and DecompilationUnit v1 files are read through in-memory compatibility migrations; reading them does not upgrade their evidence.</td>
+</tr>
+</tbody>
+</table></div>
+<p>The native IRs distinguish <code>partial</code> from <code>complete</code> control-flow recovery,
+<code>unknown</code>/<code>conservative</code> from <code>exact_under_model</code> semantics, and <code>not_run</code> from
+static or differential verification. Exactness is relative to the recorded
+machine and environment model; it is not a claim of whole-program equivalence.
+The native path currently sets <code>rewrite_ready</code> to false, including when it can
+emit C. Legacy scalar patch and rebuild operations require their own explicit
+proofs and assertions.</p>
+<h2 id="elf-loading-and-function-discovery">ELF loading and function discovery</h2>
+<p>The loader accepts linked executables, PIE/shared objects, stripped images,
+and relocatable ELF objects. It inventories static and GNU-versioned dynamic
+symbols; program headers; PLT, GOT, TLS, and unwind ranges; init/fini pointer
+arrays; and relocations. Bounded <code>.eh_frame</code> CIE/FDE decoding contributes
+function entry and extent evidence. Resolved init/fini pointers add probable
+entries; unresolved pointers remain recorded. For relocatable objects,
+section-relative identity and relocation-resolved control targets are retained.
+Defined Itanium RTTI, type-info, vtable, construction-vtable, and VTT symbols
+are recorded as bounded metadata ranges rather than promoted to recovered
+source types.</p>
+<p>Discovery combines symbol, ELF entry, unwind, direct-call, decoded PLT-stub,
+init/fini, and Go 1.18+ <code>.gopclntab</code> evidence. Rust, C++, and Go symbol
+spellings are retained as language evidence without inferring a source-level
+signature from a name alone. Standard PLT slots can receive imported names
+when relocation order supports the match. Candidate branch targets and
+possible terminal-branch tail calls stay separate from confirmed call facts.
+Recursive block recovery stops at known entries or its size bound. Absolute
+pointer tables and relocation-backed relative tables can add indirect CFG
+targets; recovery iterates when a newly reached block exposes another table.
+An unresolved switch default or indirect destination remains visible.</p>
+<p>The implementation bounds ELF input to 64 MiB, an extracted function to
+64 KiB, and a function decode to 16,384 instructions. Discovery retains at
+most 16,384 candidate entries. Explicit <code>discover</code> enriches block membership
+for at most 256 candidates under an 8 MiB decode budget; interactive selection
+can decode a chosen candidate lazily. Exceeding a bound produces a diagnostic
+or explicit refusal rather than silently treating omitted bytes as analyzed.</p>
+<h2 id="instruction-and-state-semantics">Instruction and state semantics</h2>
+<div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
+<thead>
+<tr>
+<th>Family</th>
+<th>Modeled behavior and boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scalar integer and control</td>
+<td>Width-aware moves, extension, arithmetic, ADC/SBB, comparisons, conditional moves and sets, LEA, shifts/rotates including BMI2 forms, bit counts/scans/tests, multiplication, and signed/unsigned divide normal paths. Partial registers, PF/AF/DF, and undefined results or flags have explicit state effects. Divide errors retain exception edges.</td>
+</tr>
+<tr>
+<td>Stack, strings, and calls</td>
+<td>Common stack operations and DF-aware MOVS/STOS/CMPS/SCAS with REP variants update implicit registers and flags. Direct, indirect, and tail-call evidence is retained. REP results remain conservative where interruption or fault-time partial progress is unresolved.</td>
+</tr>
+<tr>
+<td>SIMD and floating point</td>
+<td>Alias-aware XMM/YMM/ZMM state; supported SSE/AVX/AVX2 moves, integer lanes, shuffles, broadcasts, AESENC, scalar/packed arithmetic, conversions, and comparisons; selected AVX-512 bitwise, packed-floating, move, mask, permutation, popcount, GFNI, qword comparison, and compression forms. MXCSR-aware helpers model normal paths with explicit unresolved exception edges. Aligned accesses retain alignment-fault edges; masked memory accesses touch only active elements. Unsupported EVEX decorators remain conservative.</td>
+</tr>
+<tr>
+<td>Atomics and ordering</td>
+<td>Supported LOCK arithmetic, exchange, compare-exchange (including 8/16-byte forms), bit modification, and LFENCE/SFENCE/MFENCE use bounded helper contracts. Other atomic forms retain a conservative memory and register footprint.</td>
+</tr>
+<tr>
+<td>x87 and extended state</td>
+<td>Common 80-bit stack arithmetic, comparisons, conversions, transcendental operations, and environment/state-image save/restore use explicit x87 registers and control/status/tag state. FXSAVE/FXRSTOR and MXCSR transfers have a bounded legacy image. Dynamic XSAVE/XRSTOR-family layouts retain request-mask, XCR0/XSS, memory-direction, state, and exception effects without inventing component offsets.</td>
+</tr>
+<tr>
+<td>System and environment</td>
+<td>CPUID, time counters, XCR access, and hardware randomness have bounded environment-helper effects; analysis does not execute them. Linux <code>syscall</code> remains opaque but records ABI inputs, clobbers, unknown-memory effects, and control flow so wrapper analysis can continue.</td>
+</tr>
+</tbody>
+</table></div>
+<p>For an unsupported instruction, the decoder retains its bytes, address,
+known architectural read/write footprint, and a diagnostic. The unknown
+behavior is carried through subsequent IRs and emitted as a visible helper
+call in low-level C. This allows a compilable diagnostic view without
+claiming that the function's behavior was recovered exactly.</p>
+<h2 id="abi-recovery-and-c-generation">ABI recovery and C generation</h2>
+<p>FunctionIR starts with SysV AMD64 register and stack locations. It recovers
+integer and evidenced pointer inputs, XMM/YMM inputs, RAX:RDX and vector
+returns, and scalar or packed floating types only when evidence is unique.
+Audited version-aware libc, POSIX, pthread, and loader prototypes can supply
+fixed argument/result locations, variadic markers, and <code>noreturn</code> facts for
+external calls. Unknown indirect targets, aliases, and call effects remain
+conservative. Entry-RSP stack normalization handles common frame-pointer and
+frame-pointer-omitted prologues; accesses stay raw where a join or dynamic
+stack change prevents a proof.</p>
+<p>Low-level C11 uses explicit machine state, memory helpers, labels, and
+opaque-effect helpers. The structured view handles straight-line code,
+nested acyclic <code>if</code>/<code>else</code>, guarded jump-table <code>switch</code>, and proven pre-tested
+or post-tested single-loop shapes. Other reducible or irreducible control flow
+keeps explicit labels and gotos. A structured view is optional; if unavailable,
+<code>--view structured</code> reports that condition while <code>--view low</code> and <code>--view unit</code>
+remain available. C compilation establishes syntax and type consistency for
+the helper contract; it does not establish behavioral equivalence.</p>
+<p><a href="https://github.com/Achxy/hydir-2/blob/main/assets/screenshots/hydir-low-level-c.png"><span>HydIR low-level C view showing generated helpers and the function's fidelity and rewrite-readiness claims</span></a></p>
+<p><em>The Low-level C view displays generated helper contracts alongside the artifact's fidelity and rewrite-readiness claims. The displayed C is an inspectable analysis output, not a verified replacement for the input function.</em></p>
+<h2 id="native-cli-and-evidence">Native CLI and evidence</h2>
+<p>The local CLI exposes the intermediate stages and reports directly:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydirctl -- lift program.elf --function symbol --ir machine
+cargo run --locked --bin hydirctl -- lift program.elf --function symbol --ir function
+cargo run --locked --bin hydirctl -- lift program.elf --function symbol --ir cir
+cargo run --locked --bin hydirctl -- lift program.elf --function symbol --ir llvm
+cargo run --locked --bin hydirctl -- decompile program.elf --function symbol --view low
+cargo run --locked --bin hydirctl -- decompile program.elf --function symbol --view structured
+cargo run --locked --bin hydirctl -- coverage program.elf
+cargo run --locked --bin hydirctl -- explain program.elf --function symbol --address 0x401000
+cargo run --locked --bin hydirctl -- decompile-all program.elf --output-dir new-output-directory
+</code></pre>
+<p><code>--function</code> accepts an unambiguous name or a FunctionIndex ID. <code>explain</code>
+reports recovered instruction effects and diagnostics, optionally narrowed to
+one address. <code>coverage</code> counts exact and opaque instruction occurrences by
+family and includes bounded opaque-site samples. <code>decompile-all</code> requires a
+new output directory and refuses to merge with or overwrite an existing one.</p>
+<p>On the pinned stripped Go fixture, a whole-file pass lifted 1,481 pclntab
+functions with 116,592 exact and 37 opaque instruction occurrences (99.968%
+exact for that fixture). All 1,481 low-level C views and 165 structured views
+strict-compiled to objects. This is fixture evidence, not a broad-corpus or
+differential-correctness result. On Linux x86-64,
+<code>bash scripts/demo-native-decompiler.sh</code> checks discovery, deterministic batch
+emission, and strict C compilation. Dedicated native-pipeline and IR JSON
+fuzz targets check crashes and refusals; a manual/weekly real-ELF stress
+workflow exercises the stripped Go fixture. See the
+remaining gates.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li><li><a href="/docs/desktop">Desktop workbench and local projects</a></li><li><a href="/docs/scalar-validation">Scalar lifting and validation</a></li><li><a href="/docs/symbolic">Symbolic exploration with Triton</a></li><li><a href="/docs/first-run">First run and the PRISM showcase</a></li><li><a href="/docs/models">Typed models and analyst evidence</a></li><li><a href="/docs/investigation">Replay and captured-state investigation</a></li><li><a href="/docs/vm-exploration">VM profiles and host/VPC exploration</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

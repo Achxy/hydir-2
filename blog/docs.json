@@ -32,5 +32,63 @@
     "start": "## Authenticated service",
     "end": "## Documentation site",
     "description": "Immutable uploads, v3 jobs, artifact retrieval, revision checks, role-based authorization, TLS, and content storage."
+  },
+  {
+    "slug": "native-analysis",
+    "title": "Native analysis: ELF to C",
+    "source": "README.md",
+    "start": "## Native ELF decompiler",
+    "end": "## Native analysis workbench",
+    "description": "Function discovery, machine effects, SSA, ABI recovery, C views, coverage, and batch output."
+  },
+  {
+    "slug": "desktop",
+    "title": "Desktop workbench and local projects",
+    "source": "README.md",
+    "start": "## Native analysis workbench",
+    "end": "## Verified scalar lift",
+    "description": "Function navigation, disassembly, IR and C views, analyst facts, local persistence, and explicit remote upload."
+  },
+  {
+    "slug": "scalar-validation",
+    "title": "Scalar lifting and validation",
+    "source": "README.md",
+    "start": "## Verified scalar lift",
+    "end": "## Analysis, transformation, and rewrite contracts",
+    "description": "The asserted scalar prototype, supported stack and call subset, region boundaries, and fixture comparisons."
+  },
+  {
+    "slug": "symbolic",
+    "title": "Symbolic exploration with Triton",
+    "source": "README.md",
+    "start": "## Symbolic exploration with Triton",
+    "end": "## Authenticated service",
+    "description": "Optional runtime setup, symbolic expressions, path conditions, candidate models, and desktop exploration."
+  },
+  {
+    "slug": "first-run",
+    "title": "First run and the PRISM showcase",
+    "source": "README.md",
+    "start": "## Quick start",
+    "end": "## Native ELF decompiler",
+    "description": "Desktop and CLI first run, automatic Ghidra analysis, call traces, stripped inputs, LLVM variants, and PRISM functions."
+  },
+  {
+    "slug": "models",
+    "title": "Typed models and analyst evidence",
+    "source": "blog/content/guides/models.md",
+    "description": "Create, import, infer, verify, and save digest-bound analysis models; inspect typed C locally and remotely."
+  },
+  {
+    "slug": "investigation",
+    "title": "Replay and captured-state investigation",
+    "source": "blog/content/guides/investigation.md",
+    "description": "InputSpec, replay reports, GDB capture, origin probes, bounded return solving, and reproducible investigation recipes."
+  },
+  {
+    "slug": "vm-exploration",
+    "title": "VM profiles and host/VPC exploration",
+    "source": "blog/content/guides/vm.md",
+    "description": "Analyst-scoped VM facts, profile validation, virtual-PC-sensitive node identities, effect declarations, and explicit graph limits."
   }
 ]
