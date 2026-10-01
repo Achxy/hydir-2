@@ -1,79 +1,28 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="HydIR is an integrated binary analysis workbench for program recovery, semantic exploration, artifact generation, and controlled evaluation.">
-  <link rel="canonical" href="https://hydir.wiki/">
-  <link rel="stylesheet" href="/vendor/latex.css/style.css">
-  <link rel="stylesheet" href="/styles.css">
-  <title>HydIR — binary analysis workbench</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="HydIR is a Rust binary analysis workbench with Ghidra P-code, native decompilation, bounded traces, typed models, and reproducible artifacts.">
+<link rel="canonical" href="https://hydir.wiki/">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<title>Ghidra-backed binary analysis — HydIR</title>
 </head>
-<body class="latex-dark-auto">
-  <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header">
-    <a class="brand" href="/">HydIR</a>
-    <nav class="site-nav" aria-label="Main navigation">
-      <a href="/" aria-current="page">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture">Architecture</a><a href="/blogs">Articles</a>
-    </nav>
-  </header>
-  <main class="site-main" id="content">
-    <div class="hero">
-      <p class="eyebrow">Binary analysis and transformation</p>
-      <h1>From executable bytes to analyzable program representations.</h1>
-      <p class="lead">HydIR connects executable bytes to structured program representations and reproducible analysis artifacts. Examine disassembly and control flow, inspect LLVM IR and C output, explore symbolic behavior with Triton, and evaluate transformations against observed execution.</p>
-      <div class="actions"><a href="/start">Get started</a><a href="/guides">Explore guides</a><a href="https://github.com/Achxy/hydir-2">Source code</a></div>
-    </div>
-    <figure class="hero-image">
-      <a href="/assets/studio-lift.png"><img src="/assets/studio-lift.png" width="2800" height="1764" alt="HydIR egui workbench with a selected ELF function, lifted LLVM IR, function inspector, diagnostics, and console"></a>
-      <figcaption>The workbench displays the selected <code>hydir_max2</code> function, its disassembly, lifted LLVM IR, and analysis context.</figcaption>
-    </figure>
-    <div class="prose">
-      <h2>Analysis workflow</h2>
-      <p>HydIR links recovered program facts, derived representations, and evaluation results to the binary under analysis. Addresses, machine bytes, analyst assertions, and generated artifacts remain available for inspection throughout the workflow.</p>
-      <div class="feature-grid">
-        <section><h3>Program recovery</h3><p>Inspect ELF structure, symbols, instructions, control-flow graphs, call relationships, and effect summaries.</p></section>
-        <section><h3>Semantic analysis</h3><p>Examine lifted LLVM IR and C output. Use Triton expressions and path conditions to analyze relationships between inputs and results.</p></section>
-        <section><h3>Transformation and evaluation</h3><p>Generate patch and rebuild artifacts, compare their behavior with the original, and retain the associated reports.</p></section>
-      </div>
-      <hr class="section-rule">
-      <h2>Documentation paths</h2>
-      <p>Choose a route based on what you want to inspect. The guides explain the interfaces and artifact contracts; the articles work through specific functions and algorithms.</p>
-      <div class="docs-card-grid">
-        <section class="docs-card"><p class="eyebrow">First run</p><h3><a href="/start">Open the PRISM ELF</a></h3><p>Launch the desktop app, inspect a branch, and save function-scoped IR from the CLI.</p></section>
-        <section class="docs-card"><p class="eyebrow">Reference</p><h3><a href="/guides">Find your workflow</a></h3><p>Map the workbench, CLI, Ghidra snapshots, native IR stages, and result claims.</p></section>
-        <section class="docs-card"><p class="eyebrow">System design</p><h3><a href="/architecture">Trace the architecture</a></h3><p>See how input bytes become source-linked analysis and versioned artifacts.</p></section>
-      </div>
-      <h2>What a result means</h2>
-      <p>HydIR records uncertainty beside its output. A recovered CFG can remain partial, an instruction can have a conservative effect, and a C view can preserve an opaque operation. Structural recovery, semantic modeling, execution comparison, and rewrite readiness are reported as separate claims. Read the <a href="/guides#read-the-result">guide to result status</a> before treating an artifact as a proof.</p>
-      <h2>Observe one path with Frida</h2>
-      <p>The desktop has a top-level <strong>Frida observation</strong> tab that opens the <strong>Observe with Frida</strong> panel. On Linux x86-64 with the optional observer bundle, it can run a selected local ELF function against an InputSpec and record byte-checked blocks and calls for that input. See <a href="/start#frida-gui">where to find the panel</a> and <a href="/guides#frida-observation">how to read the observation</a>.</p>
-      <hr class="section-rule">
-      <h2>Technical articles</h2>
-      <div class="story-grid">
-        <article>
-          <p class="eyebrow">Binary lifting</p>
-          <h3><a href="/articles/ghidra-pcode-explained">Ghidra P-code, Explained</a></h3>
-          <p>Read varnodes, address spaces, raw and high P-code, and the nine operations behind one x86 instruction.</p>
-        </article>
-        <article>
-          <p class="eyebrow">Compiler theory</p>
-          <h3><a href="/articles/graphs-to-code">From Graphs to Code</a></h3>
-          <p>Follow control-flow recovery through dataflow analysis, SSA, memory effects, and C output.</p>
-        </article>
-        <article>
-          <p class="eyebrow">Bitvector semantics</p>
-          <h3><a href="/articles/bitvectors-to-behavior">From Bitvectors to Behavior</a></h3>
-          <p>Derive machine arithmetic, flags, and path behavior from the bit patterns a binary actually stores.</p>
-        </article>
-      </div>
-      <p class="more-link"><a href="/blogs">View all articles →</a></p>
-      <hr class="section-rule">
-      <h2>Interfaces</h2>
-      <p>The desktop workbench supports interactive analysis of a local ELF. The CLI produces artifacts for scripted workflows and controlled comparisons. A Python SDK offers local Ghidra operations; the authenticated service and SDK also expose revisioned project operations. Start with the <a href="/guides">workflow guide</a> or follow the components through the <a href="/architecture">architecture guide</a>.</p>
-      <p><a href="/start">Run the quick start →</a></p>
-    </div>
-  </main>
-  <footer class="site-footer"><p>HydIR is open source under <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a>. <a href="https://github.com/Achxy/hydir-2">Explore the source</a>.</p></footer>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/" aria-current="page">Home</a><a href="/blogs">Articles</a><a href="/guides">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow">The HydIR project</p><h1>What is HydIR?</h1>
+<p class="lead">HydIR is an open-source binary analysis and transformation workbench written in Rust. It connects executable bytes to Ghidra P-code, native intermediate representations, C views, and the evidence behind each result.</p>
+<p>Open a little-endian x86-64 ELF in the desktop app, inspect functions and control flow, trace a bounded path, or produce artifacts from the command line. The Python SDK and authenticated service expose revisioned analysis for scripted workflows.</p>
+<p class="text-actions"><a href="/start">Get started →</a><a href="/guides">Browse documentation →</a></p>
+<h2>Latest articles and explainers</h2><ol class="post-list"><li><a href="/articles/ghidra-pcode-explained">Ghidra P-code, Explained</a><div class="post-meta"><time datetime="2026-09-30">2026-09-30</time><span>Binary lifting</span></div><p>An illustrated guide to Ghidra P-code with a register-byte map, an operation stepper, a memory-load experiment, an SSA diagram, and runnable examples.</p></li><li><a href="/articles/bitvectors-to-behavior">From Bitvectors to Behavior</a><div class="post-meta"><time datetime="2026-09-21">2026-09-21</time><span>Mathematics</span></div><p>Deriving machine arithmetic, condition flags, path semantics, and the proof obligations behind HydIR's bounded x86-64 lift.</p></li><li><a href="/articles/graphs-to-code">From Graphs to Code</a><div class="post-meta"><time datetime="2026-09-21">2026-09-21</time><span>Compiler theory</span></div><p>A detailed walk through bounded CFG recovery, fixed-point dataflow analysis, explicit SSA, parallel phi copies, and conservative effect summaries.</p></li></ol><p><a href="/blogs">All articles →</a></p>
+<h2>Explore the workbench</h2>
+<figure class="hero-image"><a href="/assets/studio-lift.png"><img src="/assets/studio-lift.png" width="2800" height="1764" alt="HydIR workbench displaying an ELF function, disassembly, LLVM IR, and diagnostics"></a><figcaption>Source addresses, machine bytes, output artifacts, and diagnostics in one workspace.</figcaption></figure>
+<ul class="link-list"><li><a href="/features#ghidra">Ghidra analysis and call tracing</a><span>Raw P-code, saved projects, slices, and bounded LLVM.</span></li><li><a href="/features#typed-models">Native decompilation and typed models</a><span>MachineIR through CIR, DWARF evidence, and editable analysis facts.</span></li><li><a href="/features#observation">Frida observation and native replay</a><span>Input-specific events, Windows WSL worker, captured state, and recipes.</span></li><li><a href="/features#transformation">Transformation and patch artifacts</a><span>LLVM experiments, restricted replacement, and rebuild contracts.</span></li><li><a href="/tools#service">CLI, Python SDK, and authenticated service</a><span>Digest-checked artifacts and revisioned project operations.</span></li></ul>
+<h2>Know what the output establishes</h2><p>HydIR keeps recovery, semantic fidelity, observed execution, and rewrite readiness separate. Unknown targets and opaque effects remain visible. Read the <a href="/research">evidence and release gates</a> alongside generated code.</p>
+</main>
+<footer class="site-footer"><p>HydIR · <a href="https://github.com/Achxy/hydir-2/blob/main/LICENSE">AGPL-3.0-only</a> · <a href="/start">Start locally</a> · <a href="/architecture">Architecture</a></p></footer>
 </body>
 </html>

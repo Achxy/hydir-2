@@ -5,10 +5,12 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 import argparse
+import json
 
 
 SITE = Path(__file__).resolve().parents[1] / "blog"
-ROUTES = {"/start", "/guides", "/architecture", "/blogs", "/articles/ghidra-pcode-explained", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code"}
+ROUTES = {"/features", "/tools", "/research", "/start", "/guides", "/architecture", "/blogs", "/articles/ghidra-pcode-explained", "/articles/bitvectors-to-behavior", "/articles/graphs-to-code"}
+ROUTES.update("/docs/" + doc["slug"] for doc in json.loads((SITE / "docs.json").read_text(encoding="utf-8")))
 
 
 class WikiHandler(SimpleHTTPRequestHandler):

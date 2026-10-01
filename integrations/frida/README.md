@@ -13,13 +13,29 @@ This does not add native PE/.exe observation.
    PowerShell and restart if requested by Windows.
 2. Extract the entire HydIR Windows release, keeping `workers/frida` beside
    `hydir.exe` and `hydirctl.exe`.
-3. Open **Frida → Session**, click **Recheck runtime**, then **Install packaged
+3. Open **Frida**, click **Recheck**, then **Install packaged
    worker**. Installation verifies the rootfs hash and imports `HydIR-Frida-v1`
    under `%LOCALAPPDATA%\HydIR\workers\frida-v1`. Existing distributions and
    existing worker directories are never overwritten or unregistered.
-4. Open a local ELF, select an analyzed function and enter its InputSpec JSON
-   path. **Observe selected function** becomes available when the worker's
-   version, WSL2 kernel and Bubblewrap isolation probes pass.
+4. Open a local ELF, select an analyzed function, and open **Frida**.
+   Click **Run with Frida** to launch the binary without arguments and record the
+   selected function when execution reaches it. **Run settings** supplies optional
+   arguments (one per line) or an advanced InputSpec JSON file. **Stop** cancels a run.
+5. Inspect **Trace**: filter by event type or address, select a row to see event
+   details and captured entry registers, or double-click a verified address to
+   open disassembly. **Program output** stays below the trace; **Diagnostics**
+   explains incomplete runs. The event and output panes can be resized.
+6. **Recover targets** plans Ghidra reanalysis from observed indirect flow.
+   **Compare P-code** holds the captured-register seed and path comparison actions.
+   These views use the same recording and do not require a second Frida run.
+
+The workspace follows iaito's compact debug toolbar, register dock and console
+organization. Worker setup is in the **Worker** menu; raw JSON export, clearing
+results, and the optional HydIR analysis console are in **Actions**.
+
+The current observer supports inputs supplied through argv and files. Nonempty
+stdin inputs are rejected, so use an argv/file-driven ELF for observation; the
+interactive PRISM demo requires stdin and is not a Frida observation fixture.
 
 CLI equivalents:
 

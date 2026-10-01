@@ -2,8 +2,8 @@
   "name": "hydir-blog-checks",
   "private": true,
   "scripts": {
-    "render:blog": "node scripts/render-theory-articles.mjs",
-    "check:blog": "node scripts/render-theory-articles.mjs --check && html-validate \"blog/**/*.html\" && node scripts/check-blog.mjs",
+    "render:blog": "node scripts/render-theory-articles.mjs && node scripts/render-wiki-docs.mjs",
+    "check:blog": "node scripts/render-theory-articles.mjs --check && node scripts/render-wiki-docs.mjs --check && html-validate \"blog/**/*.html\" && node scripts/check-blog.mjs",
     "build:blog": "npm run render:blog && node scripts/build-blog-pages.mjs"
   },
   "devDependencies": {

@@ -1,0 +1,36 @@
+[
+  {
+    "slug": "ghidra",
+    "title": "Ghidra snapshots and execution",
+    "source": "integrations/ghidra/README.md",
+    "description": "Raw P-code snapshots, managed projects, seed validation, concrete paths, LLVM state ABI, and independent execution oracles."
+  },
+  {
+    "slug": "frida",
+    "title": "Frida observation on Windows",
+    "source": "integrations/frida/README.md",
+    "description": "WSL2 worker installation, argv and file sessions, isolation checks, source builds, packaging, and execution verification."
+  },
+  {
+    "slug": "python-sdk",
+    "title": "Python SDK and artifact APIs",
+    "source": "sdk/python/README.md",
+    "description": "LocalGhidra and HydirClient examples, allocated memory, call tracing, observed-path comparison, typed models, and remote artifacts."
+  },
+  {
+    "slug": "transformation",
+    "title": "Transformation, patching, and region contracts",
+    "source": "README.md",
+    "start": "## Analysis, transformation, and rewrite contracts",
+    "end": "## Symbolic exploration with Triton",
+    "description": "LLVM experiments, scalar replacement, PatchBundle checks, freestanding rebuilds, protobuf interchange, and physical region boundaries."
+  },
+  {
+    "slug": "service",
+    "title": "Authenticated service and project lifecycle",
+    "source": "README.md",
+    "start": "## Authenticated service",
+    "end": "## Documentation site",
+    "description": "Immutable uploads, v3 jobs, artifact retrieval, revision checks, role-based authorization, TLS, and content storage."
+  }
+]

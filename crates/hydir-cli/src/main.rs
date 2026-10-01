@@ -187,7 +187,7 @@ and works on stripped linked ELF files. --assume-u64x2 explicitly
 asserts a u64(u64,u64) SysV prototype. Validation runs the original binary
 and generated code without a sandbox; use only trusted fixtures.
 Replay uses an experimental local Linux Bubblewrap runner. Other hosts return
-an unsupported-host report. See docs/REPLAY_PROTOCOL.md for its current scope.
+an unsupported-host report. Use replay --help to inspect the supported options.
 Capture uses GDB/MI in the same Linux isolation and stops at a simple C symbol
 or a file-backed executable ELF virtual address, including stripped PIE code.
 It currently supports one thread and emits a sparse snapshot.

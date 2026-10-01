@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="LLVM experiments, scalar replacement, PatchBundle checks, freestanding rebuilds, protobuf interchange, and physical region boundaries.">
+<link rel="canonical" href="https://hydir.wiki/docs/transformation">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<title>Transformation, patching, and region contracts — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Transformation, patching, and region contracts</p>
+<h1 id="analysis-transformation-and-rewrite-contracts">Analysis, transformation, and rewrite contracts</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p>LLVM experiments, scalar replacement, PatchBundle checks, freestanding rebuilds, protobuf interchange, and physical region boundaries.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#hydir-interchange-and-region-contracts">HydIR interchange and region contracts</a></li></ul></nav>
+
+<p>The following operations are separate from native decompilation. Each has its
+own supported input subset, output artifact, and acceptance conditions.</p>
+<div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Input and result</th>
+<th>Required boundary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Global effects</td>
+<td><code>analyze</code> and <code>analyze-spec</code> recover bounded direct-call and mapped-global read/write evidence, with provenance in the report and ProgramSpec. Unresolved calls or memory effects remain conservative.</td>
+<td>This is a partial interprocedural analysis, not a complete call graph or alias proof.</td>
+</tr>
+<tr>
+<td>LLVM pass experiment</td>
+<td>The legacy scalar lift is passed to LLVM 14 with a sequence of at most four unique names from <code>instcombine</code>, <code>sccp</code>, <code>simplifycfg</code>, and <code>dce</code>. The operation saves raw, canonical-before, after, report, and digest evidence.</td>
+<td>Requires an asserted scalar prototype and trusted fixture; LLVM verification does not establish equivalent behavior. Remote experiments create a new immutable revision while retaining the original ELF bytes.</td>
+</tr>
+<tr>
+<td>Scalar patch</td>
+<td>A versioned JSON document binds the source ELF SHA-256, sized <code>.text</code> symbol, asserted <code>u64(u64,u64)</code> prototype, and C-like return expression. Compilation checks the original scalar lift, region bytes, exits, stack restoration, interior-entry evidence, and relocations. A <code>PatchBundle</code> records typed PatchIR, byte differences, placement, hashes, and structural verification.</td>
+<td>Requires explicit trusted-fixture, prototype, and entry-only assertions. A fitting replacement is written in place within a new ELF copy; a larger supported replacement uses an entry jump into a new executable segment. Neither path overwrites the original or claims behavioral verification.</td>
+</tr>
+<tr>
+<td>Whole-executable rebuild</td>
+<td>The separate freestanding path lifts a static ELF with sized <code>_start</code> and complete, non-overlapping <code>.text</code> symbol coverage into stateful LLVM IR, then links a bounded read/write/exit runtime. It emits a new ELF, IR, and report.</td>
+<td>Requires direct control flow, supported instructions, definite state initialization, and a bounded data image. Stack accesses, indirect edges, and unsupported syscalls are refused. This worker is not an arbitrary-binary sandbox.</td>
+</tr>
+</tbody>
+</table></div>
+<p><a href="https://github.com/Achxy/hydir-2/blob/main/assets/screenshots/hydir-region-provenance.png"><span>HydIR Region Studio showing artifact provenance, verification checks, release-gate warnings, and analyst annotations</span></a></p>
+<p><em>Region Studio keeps source provenance, patch verification checks, release-gate warnings, and analyst annotations visible with the selected region. Warnings identify unmet conditions; they do not constitute approval to rewrite the binary.</em></p>
+<p>The scalar patch document has this minimal form; the digest must match the
+input ELF exactly:</p>
+<pre><code class="language-json">{
+  &quot;schema_version&quot;: 1,
+  &quot;binary_sha256&quot;: &quot;&lt;64 lowercase hexadecimal characters&gt;&quot;,
+  &quot;function_symbol&quot;: &quot;hydir_max2&quot;,
+  &quot;prototype&quot;: &quot;u64(u64,u64)&quot;,
+  &quot;replacement&quot;: &quot;return arg0 - arg1;&quot;
+}
+</code></pre>
+<p>For local operations, the corresponding commands are:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydirctl -- analyze program.elf
+cargo run --locked --bin hydirctl -- analyze-spec program.elf
+cargo run --locked --bin hydirctl -- transform program.elf symbol --assume-u64x2 --trusted-fixture --passes instcombine,sccp --output-dir new-pass-directory
+cargo run --locked --bin hydirctl -- patch program.elf patch.json --trusted-fixture --assume-u64x2 --assume-entry-only --output patched.elf
+cargo run --locked --bin hydirctl -- rebuild program.elf --trusted-fixture --output-dir new-rebuild-directory
+</code></pre>
+<p>The patch output is a separate ELF and can be reverted using its matching
+bundle when the recorded byte and hash checks pass. Remote mutations require
+the current project revision and an idempotency key; the service does not
+execute the result.</p>
+<h2 id="hydir-interchange-and-region-contracts">HydIR interchange and region contracts</h2>
+<p>HydIR owns its protobuf contracts under the <code>hydir.interchange</code> and
+<code>hydir.patch</code> namespaces. The interchange importer retains the original
+protobuf bytes for lossless forwarding, including fields unknown to the
+decoded view. Decoding limits the document to 64 MiB, 8,192 functions,
+65,536 blocks, 4,096 memory ranges, 65,536 symbols and call sites each,
+4,096-byte names, and a type nesting depth of 64; individual value and type
+graphs have separate node budgets. The streaming convention uses bounded
+2,000,000-byte chunks. A decoded specification is bound to matching ELF bytes
+before a selected block can become RegionSpec v3:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydirctl -- hydir-spec-inspect program.proto
+cargo run --locked --bin hydirctl -- hydir-spec-region \
+  program.proto program.elf 26 --output region.json
+cargo run --locked --bin hydirctl -- hydir-spec-lift \
+  program.proto program.elf 26 --output physical-region-ir.json
+cargo run --locked --bin hydirctl -- hydir-spec-decompile \
+  program.proto program.elf 35 --output decompilation-unit.json
+cargo run --locked --bin hydirctl -- hydir-spec-report \
+  program.proto program.elf
+</code></pre>
+<p><code>hydir-spec-inspect</code> validates the bounded document; <code>hydir-spec-region</code>
+constructs the selected CFG contract; <code>hydir-spec-lift</code> emits
+<code>PhysicalRegionIR</code> v1; <code>hydir-spec-decompile</code> requests a unit only where its
+proof obligations hold; and <code>hydir-spec-report</code> summarizes compatibility.
+<code>PhysicalRegionIR</code> v1 covers every instruction in the pinned 23-region corpus.
+It records typed operations and operands, exact successors, register/flag and
+memory effects, physical boundary locations, stack deltas, unresolved facts,
+and byte/digest provenance. Decoding alone does not imply lowering or
+replacement safety. The narrower structured-decision form binds imported flag
+inputs, both exact continuations, and unchanged live outputs before emitting
+LLVM-compatible text and deterministic C.</p>
+<p>The local server mounts the interchange and patch services and accepts the
+bounded streaming convention. For non-empty programs it currently returns a
+precondition error where physical adapters are incomplete; it does not
+fabricate C or PatchIR. The pinned external reference repository is a
+test-only submodule and is not linked into HydIR:</p>
+<pre><code class="language-bash">git submodule update --init third_party/hydir-reference
+</code></pre>
+<p>The current compatibility boundary is recorded in
+ADR 0018. The native
+decompiler's remaining gates are listed in the
+implementation record.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

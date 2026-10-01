@@ -1,4 +1,6 @@
-# HydIR blog
+# HydIR wiki
+
+The site is static. The V8-inspired shell has Home, Articles, Docs, Tools, Features, and Research navigation, with a blue top navigation, charcoal page surround, white reading area, and wrapping mobile header. `/features` summarizes implemented workflows and limits; `/tools` indexes first-party repository documentation; `/research` maps evidence and release gates. The logo is a replaceable SVG at `assets/hydir-placeholder.svg`. Shared generated-article navigation lives in `scripts/wiki-navigation.mjs`; authored HTML pages use the same markup. Keep both synchronized when changing navigation.
 
 The site is static. The article index is `/blogs` and all three posts live under `/articles/`. The P-code guide and the mathematics and compiler-theory articles use the same LaTeX.css fonts, shared styles, navigation, footer, light/dark themes, and reading width.
 
@@ -23,3 +25,11 @@ The mathematics and compiler-theory articles checked implementation claims again
 `examples/signed-branch.smt2` is a standalone bitvector identity check. `examples/arithmetic-identities.smt2` contains six additional checks of carry, overflow, borrow, signed comparison, and sign-bit biasing. Z3 4.16.0 returned `unsat` for all seven queries. These queries do not execute or certify HydIR.
 
 Building the site does not push, deploy, or change DNS.
+
+Content reviewed on 1 October 2026 against the current checkout, including ongoing Windows Frida changes. Older capability, bridge, remote, and patch documents are dated contracts; current README and integration references take precedence for current behavior. Adding a public route requires updating the sitemap, Python route checker, and local preview server.
+
+## Repository-backed technical documentation
+
+`docs.json` selects the references published under `/docs/`. `scripts/render-wiki-docs.mjs` renders full repository Markdown or explicitly selected README sections, with section navigation and source digests. Edit the repository source rather than generated HTML. Both normal rendering and stale-output checks include these references. Relative source links retain their repository context; matching whole-document links resolve to wiki pages. Source images link to the repository. The preview server and route checker load routes from the manifest. Add corresponding sitemap entries when adding a document.
+
+The repository docs/ folder has been removed. The on-site references now use only integration, SDK, and README sources; the native, typed-model, and replay manuals formerly generated from that folder are removed.

@@ -9,9 +9,9 @@
   <link rel="stylesheet" href="/styles.css">
   <title>Guides and reference — HydIR</title>
 </head>
-<body class="latex-dark-auto">
+<body>
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/guides" aria-current="page">Guides</a><a href="/architecture">Architecture</a><a href="/blogs">Articles</a></nav></header>
+  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
   <main class="site-main prose" id="content">
     <nav class="site-nav" aria-label="On this page">
       <a href="#choose-a-path">Choose a path</a>
@@ -32,6 +32,7 @@
         <article><p class="eyebrow">03 / Deep dives</p><h3><a href="/blogs">Read technical articles</a></h3><p>Study Ghidra P-code, bitvector behavior, and the compiler theory behind HydIR's IRs.</p></article>
       </div>
 
+<h2 id="technical-reference">Technical reference</h2><p>Detailed contracts and reproduction workflows from the repository. These pages retain command examples, supported subsets, artifact versions, and known limits.</p><ul class="link-list"><li><a href="/docs/ghidra">Ghidra snapshots and execution</a><span>Raw P-code snapshots, managed projects, seed validation, concrete paths, LLVM state ABI, and independent execution oracles.</span></li><li><a href="/docs/frida">Frida observation on Windows</a><span>WSL2 worker installation, argv and file sessions, isolation checks, source builds, packaging, and execution verification.</span></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a><span>LocalGhidra and HydirClient examples, allocated memory, call tracing, observed-path comparison, typed models, and remote artifacts.</span></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a><span>LLVM experiments, scalar replacement, PatchBundle checks, freestanding rebuilds, protobuf interchange, and physical region boundaries.</span></li><li><a href="/docs/service">Authenticated service and project lifecycle</a><span>Immutable uploads, v3 jobs, artifact retrieval, revision checks, role-based authorization, TLS, and content storage.</span></li></ul>
       <h2 id="desktop-workbench">Desktop workbench</h2>
       <p>Open a local little-endian x86-64 ELF in the <code>hydir</code> app. The overview shows the program inventory and analysis status. Select a function to connect its machine address and bytes to disassembly, control flow, P-code effects, and generated views. The Ghidra worker starts automatically for local ELF analysis and its project is cached for later selections.</p>
       <ol>
@@ -42,9 +43,10 @@
       <p>The <a href="/articles/ghidra-pcode-explained">Ghidra P-code article</a> explains the imported operations behind one x86 instruction. For the native pipeline's control flow and SSA, see <a href="/articles/graphs-to-code">From Graphs to Code</a>.</p>
 
       <h2 id="frida-observation">Observe a selected function with Frida</h2>
-      <p>In the desktop app, open an ELF and select a function, then choose the top-level <strong>Frida observation</strong> tab. Its <strong>Observe with Frida</strong> panel opens automatically. Enter an <code>InputSpec</code> JSON path and choose <strong>Observe selected function</strong>. The same panel is available in <strong>Ghidra P-code</strong>. This runs that ELF with the specified input and records observed blocks and calls for the selected function. The panel can copy the observation JSON, use captured entry registers as a P-code seed, and plan observed indirect calls.</p>
-      <aside class="note" aria-label="Frida availability"><strong>Availability:</strong> the observation action requires Linux x86-64, a local ELF, a Ghidra snapshot with a mapped selected function, a nonempty InputSpec path, and the optional Linux Frida observer bundle. It is disabled when those conditions are not met. Ordinary Windows builds can still inspect the ELF and its static analysis.</aside>
-      <p>Frida evidence is tied to that binary and input. Observed blocks and calls are byte checked; unobserved paths remain unknown. A completed trace does not prove the process exit code or whole-program equivalence.</p>
+      <p>Open a local ELF and select an analyzed function, then choose <strong>Frida → Session</strong>. Enter one program argument per line, or leave the editor empty. Use <strong>Observe selected function</strong> when analysis and runtime checks finish; successful observations open <strong>Events</strong>. Choose <strong>InputSpec file</strong> for file inputs or custom limits.</p>
+      <p>On Windows, install WSL2 separately and keep the release's <code>workers/frida</code> directory beside the executables. In Session, choose <strong>Recheck runtime</strong> then <strong>Install packaged worker</strong>. Source builds require a generated worker bundle; WSL2 alone is insufficient.</p>
+      <aside class="note" aria-label="Frida input contract">Frida currently supports argv and file inputs. Nonempty stdin is rejected, so the interactive PRISM program is not a Frida observation fixture. The Linux observer and Windows WSL worker analyze x86-64 ELF. Observed blocks and calls are byte checked; other paths remain unknown.</aside>
+      <p><a href="/features#observation">Observation and replay features</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/frida/README.md">Setup, packaging, and diagnostics</a></p>
 
       <h2 id="command-line">Command line</h2>
       <p><code>hydirctl</code> makes the same analysis useful in scripts. Start with <code>doctor</code> to check the local toolchain, use <code>discover</code> to enumerate function candidates, and request a specific stage with <code>lift</code> or a C view with <code>decompile</code>. Ghidra commands can save a binary-bound snapshot for later verification and coverage inspection.</p>
@@ -52,7 +54,7 @@
 cargo run --locked --bin hydirctl -- discover demo/hydir-prism.elf
 cargo run --locked --bin hydirctl -- lift demo/hydir-prism.elf --function hydir_stage_decision --ir state
 cargo run --locked --bin hydirctl -- decompile demo/hydir-prism.elf --function hydir_stage_decision --view unit</code></pre>
-      <p>The <a href="https://github.com/Achxy/hydir-2/blob/main/docs/NATIVE_DECOMPILER.md">native decompiler reference</a> lists stage contracts, limits, supported instruction families, and reproduction commands. The <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Python SDK reference</a> covers local Ghidra operations and authenticated service workflows.</p>
+      <p>The native decompiler reference lists stage contracts, limits, supported instruction families, and reproduction commands. The <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Python SDK reference</a> covers local Ghidra operations and authenticated service workflows.</p>
 
       <h2 id="artifact-reference">Artifact reference</h2>
       <div class="table-scroll" tabindex="0" aria-label="Scrollable HydIR artifact reference">
@@ -71,6 +73,7 @@ cargo run --locked --bin hydirctl -- decompile demo/hydir-prism.elf --function h
       <aside class="note" aria-label="Reading stopped stages"><strong>When a stage stops:</strong> keep the diagnostic and the source location with the artifact. An explicit refusal or opaque effect identifies the unmodeled boundary; it does not invalidate earlier, independently recovered facts.</aside>
       <p>For the distinction between native C generation and the restricted scalar LLVM path, read the <a href="/architecture">architecture guide</a>. The <a href="/articles/graphs-to-code">compiler-theory article</a> explains why control-flow joins, memory effects, and SSA matter to both paths.</p>
 
+      <h2 id="more-workflows">More workflows</h2><p>Browse the <a href="/features">full feature inventory</a> for typed analysis models, DWARF import, call tracing, slices, replay and recipes, patch bundles, region interchange, and saved projects. The <a href="/tools">tools reference</a> indexes all first-party documentation, and <a href="/research">Research</a> maps evidence and release gates.</p>
       <h2 id="next-steps">Next steps</h2>
       <div class="story-grid">
         <article><h3><a href="/articles/ghidra-pcode-explained">Ghidra P-code</a></h3><p>See how one instruction expands into typed varnode operations and explicit effects.</p></article>

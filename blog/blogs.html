@@ -9,32 +9,11 @@
   <link rel="stylesheet" href="/styles.css">
   <title>Technical articles — HydIR</title>
 </head>
-<body class="latex-dark-auto">
+<body>
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture">Architecture</a><a href="/blogs" aria-current="page">Articles</a></nav></header>
+  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs" aria-current="page">Articles</a><a href="/guides">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
   <main class="site-main prose" id="content">
-    <p class="eyebrow">Documentation / Deep dives</p>
-    <h1>Technical articles</h1>
-    <p class="lead">Three deep dives explain the representations behind HydIR's recovery and analysis. For commands, the GUI's Frida panel, and artifact definitions, start with the <a href="/guides">guides</a>.</p>
-    <nav class="site-nav" aria-label="Article topics"><a href="#pcode">P-code</a><a href="#semantics">Bitvectors</a><a href="#control-flow">Control flow</a></nav>
-    <hr class="section-rule">
-    <article id="pcode">
-      <h2><a href="/articles/ghidra-pcode-explained">Ghidra P-code, Explained: Varnodes, State, and the Decompiler</a></h2>
-      <p>Learn to read address spaces, varnodes, widths, memory operations, branches, and the raw and high forms of P-code. A real x86-64 function shows how one instruction becomes nine operations.</p>
-      <p><a href="/articles/ghidra-pcode-explained">Read the P-code guide →</a></p>
-    </article>
-    <hr class="section-rule">
-    <article id="semantics">
-      <h2><a href="/articles/bitvectors-to-behavior">From Bitvectors to Behavior: The Mathematics of a Binary Lift</a></h2>
-      <p>Derive modular arithmetic, carry and overflow, signed branch conditions, and the obligations behind a faithful lift. Work through the equations with an interactive flag example and reproducible SMT queries.</p>
-      <p><a href="/articles/bitvectors-to-behavior">Read the mathematics deep dive →</a></p>
-    </article>
-    <hr class="section-rule">
-    <article id="control-flow">
-      <h2><a href="/articles/graphs-to-code">From Graphs to Code: The Compiler Theory Inside HydIR</a></h2>
-      <p>Follow control-flow recovery through fixed-point analysis, SSA, memory effects, and C output. See how these ideas connect the scalar backend to HydIR's native compiler pipeline.</p>
-      <p><a href="/articles/graphs-to-code">Read the compiler theory deep dive →</a></p>
-    </article>
+<p class="eyebrow">Articles / Archive</p><h1>Technical articles</h1><p class="lead">Implementation explainers, mathematics, and compiler theory behind binary analysis.</p><p>For commands and setup, visit <a href="/guides">Docs</a>. For finite comparisons and open gates, visit <a href="/research">Research</a>.</p><ol class="post-list"><li id="pcode"><a href="/articles/ghidra-pcode-explained">Ghidra P-code, Explained: Varnodes, State, and the Decompiler</a><div class="post-meta"><time datetime="2026-09-30">2026-09-30</time><span>Binary lifting</span></div><p>An illustrated guide to Ghidra P-code with a register-byte map, an operation stepper, a memory-load experiment, an SSA diagram, and runnable examples.</p></li><li id="semantics"><a href="/articles/bitvectors-to-behavior">From Bitvectors to Behavior: The Mathematics of a Binary Lift</a><div class="post-meta"><time datetime="2026-09-21">2026-09-21</time><span>Mathematics</span></div><p>Deriving machine arithmetic, condition flags, path semantics, and the proof obligations behind HydIR's bounded x86-64 lift.</p></li><li id="control-flow"><a href="/articles/graphs-to-code">From Graphs to Code: The Compiler Theory Inside HydIR</a><div class="post-meta"><time datetime="2026-09-21">2026-09-21</time><span>Compiler theory</span></div><p>A detailed walk through bounded CFG recovery, fixed-point dataflow analysis, explicit SSA, parallel phi copies, and conservative effect summaries.</p></li></ol>
   </main>
   <footer class="site-footer"><p><a href="/">HydIR</a> · <a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/start">Start locally</a></p></footer>
 </body>

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Immutable uploads, v3 jobs, artifact retrieval, revision checks, role-based authorization, TLS, and content storage.">
+<link rel="canonical" href="https://hydir.wiki/docs/service">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<title>Authenticated service and project lifecycle — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Authenticated service and project lifecycle</p>
+<h1 id="authenticated-service">Authenticated service</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">README.md</a> · source digest <code>375ee4c2cf16</code></p>
+<p>Immutable uploads, v3 jobs, artifact retrieval, revision checks, role-based authorization, TLS, and content storage.</p>
+
+
+<p><code>hydird</code> stores revisioned projects and provides explicit ELF upload,
+inspection, CFG and global-effect analysis, scalar lift/C artifacts, named
+pass experiments, annotations, restricted rebuild/patch operations, and
+durable jobs. The mounted <code>hydir.v1</code> and <code>hydir.v2</code> services retain existing
+operations. <code>hydir.v3</code> adds native program-analysis jobs and per-stage artifact
+retrieval. The remote CLI covers the established v1/v2 commands; the
+<a href="/docs/python-sdk">Python SDK</a> negotiates v3, then v2 or v1 when a newer
+service is unavailable. The service never executes uploaded binaries.</p>
+<pre><code class="language-bash"># Create an identity once; save the one-time credential in a private 0600 file.
+cargo run --locked --bin hydird -- identity create /path/to/hydird.sqlite analyst
+
+# Start the service in a separate terminal.
+cargo run --locked --bin hydird -- serve /path/to/hydird.sqlite 127.0.0.1:50051
+
+# Point the CLI at the service and the saved credential.
+export HYDIR_ENDPOINT=http://127.0.0.1:50051
+export HYDIR_TOKEN_FILE=/private/path/analyst.token
+cargo run --locked --bin hydirctl -- remote discover
+cargo run --locked --bin hydirctl -- remote create demo unique-request-key
+cargo run --locked --bin hydirctl -- remote upload &lt;project-id&gt; &lt;expected-revision&gt; /path/to/program.elf
+</code></pre>
+<h3 id="project-and-native-analysis-lifecycle">Project and native-analysis lifecycle</h3>
+<p>Project creation returns an ID and revision. Upload is the explicit transfer
+boundary and creates a new immutable binary revision. Subsequent reads and
+mutations supply the expected revision so an artifact cannot silently be
+associated with a different ELF. The v3 native interface has these operations:</p>
+<div class="table-scroll" tabindex="0" aria-label="Scrollable reference table"><table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Contract</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Discover</code></td>
+<td>Reports API version and the supported ProgramSpec, FunctionIndex, IR, and DecompilationUnit schema versions.</td>
+</tr>
+<tr>
+<td><code>StartProgramAnalysis</code></td>
+<td>Starts an isolated analysis job for a project revision. An idempotency key identifies retries of the same request; the job records its project and revision.</td>
+</tr>
+<tr>
+<td><code>GetAnalysisJob</code>, <code>CancelAnalysisJob</code>, <code>StreamAnalysisEvents</code></td>
+<td>Read status, request cancellation, or replay sequenced events from an <code>after_sequence</code> cursor.</td>
+</tr>
+<tr>
+<td><code>GetProgramArtifact</code></td>
+<td>Retrieves <code>program_spec</code>, <code>function_index</code>, or <code>coverage</code> for the program, or <code>machine</code>, <code>state</code>, <code>function</code>, <code>cir</code>, <code>llvm</code>, or <code>unit</code> for a FunctionIndex ID or unambiguous name. Each response includes bytes, media type, SHA-256, and project revision.</td>
+</tr>
+<tr>
+<td><code>UpdateAnalystFact</code></td>
+<td>Appends a revision-checked, idempotent name, comment, or assumption with analyst provenance. A fact does not become an ELF-derived proof.</td>
+</tr>
+</tbody>
+</table></div>
+<p>The Python SDK checks returned revision, content digest, media type, and JSON
+schema version before exposing a native artifact. Its
+<code>get_program_artifact(...)</code> method requires a selector for function-scoped
+stages and rejects one for program-scoped stages. The remote CLI currently
+provides the established v1/v2 operations; use the SDK or v3 gRPC contract
+for these native methods. See the <a href="/docs/python-sdk">SDK reference</a> and
+<a href="https://github.com/Achxy/hydir-2/blob/main/crates/hydir-api/proto/hydir_v3.proto">v3 schema</a>.</p>
+<h3 id="authorization-and-transport">Authorization and transport</h3>
+<p>Projects use ordered <code>viewer</code>, <code>analyst</code>, <code>operator</code>, and <code>admin</code> roles. Existing
+owners migrate to <code>admin</code>; new projects create their owner ACL atomically.
+Administrative access changes are offline database-owner operations and append
+an audit event:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydird -- identity create /path/to/hydird.sqlite reviewer
+cargo run --locked --bin hydird -- access grant /path/to/hydird.sqlite &lt;project-id&gt; analyst reviewer viewer
+cargo run --locked --bin hydird -- access list /path/to/hydird.sqlite &lt;project-id&gt; analyst
+cargo run --locked --bin hydird -- access revoke /path/to/hydird.sqlite &lt;project-id&gt; analyst reviewer
+</code></pre>
+<p>Roles are checked per operation. Analysts can start v3 analysis, retrieve v3
+artifacts, and append analyst facts; operators can mutate binaries, and admins
+can manage project access. The project owner cannot be downgraded or removed.</p>
+<p>Plaintext service mode is restricted to loopback. The additive <code>serve-tls</code>
+mode accepts non-loopback connections through TLS. Certificate and key paths
+must be absolute, the key must be private on Unix, and clients validate the
+certificate against configured trust roots:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydird -- serve-tls /path/to/hydird.sqlite 0.0.0.0:50051 /run/secrets/tls.crt /run/secrets/tls.key
+export HYDIR_ENDPOINT=https://hydir.example:50051
+</code></pre>
+<p><code>serve-oidc</code> replaces static-token authentication with a pinned RS256 JWKS while
+retaining mandatory TLS. Tokens must carry a matching issuer and audience plus
+valid <code>exp</code>, optional <code>nbf</code>, and non-empty <code>sub</code> claims. The JWKS path is
+absolute and bounded; unknown keys or algorithms fail closed:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydird -- serve-oidc \
+  /path/to/hydird.sqlite 0.0.0.0:50051 \
+  /run/secrets/tls.crt /run/secrets/tls.key \
+  https://identity.example/tenant hydir-api /run/config/oidc-jwks.json
+export HYDIR_ENDPOINT=https://hydir.example:50051
+export HYDIR_TOKEN_FILE=/private/path/access.jwt
+</code></pre>
+<p>OIDC subjects are registered as deterministic opaque HydIR principals on first
+successful authentication. A database operator can resolve those principals
+for ACL administration with <code>hydird identity list-oidc &lt;database.sqlite&gt;</code>.</p>
+<h3 id="content-storage">Content storage</h3>
+<p>The additive content-storage migration keeps existing inline SQLite objects
+readable and allows new binary/artifact payloads to be written to a verified,
+content-addressed filesystem store. Metadata remains revisioned in SQLite;
+each read rechecks both the recorded size and SHA-256 digest. The object root
+must be an absolute real directory and must not be group/world writable on
+Unix:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydird -- serve-oidc-cas \
+  /path/to/hydird.sqlite 0.0.0.0:50051 \
+  /run/secrets/tls.crt /run/secrets/tls.key \
+  https://identity.example/tenant hydir-api /run/config/oidc-jwks.json \
+  /var/lib/hydir/objects
+</code></pre>
+<p>Filesystem objects are written through same-directory temporary files and an
+atomic rename. A failed database transaction can leave an unreferenced object,
+which is harmless in the immutable CAS and may be reclaimed by future storage
+maintenance tooling. Back up the SQLite database and object root together.</p>
+<p><code>serve-oidc-s3</code> stores the same digest-derived immutable keys in AWS S3 or an
+S3-compatible HTTPS service. It uses the standard AWS credential provider
+chain, streams reads through a 64 MiB hard bound, and verifies SHA-256 after
+every read. Pass <code>-</code> for the AWS-managed endpoint and/or an empty object prefix;
+custom endpoints must be origin-only HTTPS URLs:</p>
+<pre><code class="language-bash">cargo run --locked --bin hydird -- serve-oidc-s3 \
+  /path/to/hydird.sqlite 0.0.0.0:50051 \
+  /run/secrets/tls.crt /run/secrets/tls.key \
+  https://identity.example/tenant hydir-api /run/config/oidc-jwks.json \
+  - us-east-1 hydir-artifacts production
+</code></pre>
+<p>HydIR records only the S3 key, backend kind, digest, and size in metadata. It
+never stores cloud credentials in the project database or command line.</p>
+<h3 id="deployment-boundary">Deployment boundary</h3>
+<p>The TLS/OIDC/SQLite/filesystem-CAS mode is a secure deployment foundation, not
+the completed production profile. Automatic discovery/key refresh, PostgreSQL,
+quotas, audit export, and Kubernetes packaging remain required before that
+profile is release-ready.</p>
+<p>Upload is never implicit: the last command is the transfer boundary. Use the project ID and revision returned by the preceding commands for subsequent <code>remote inspect</code>, <code>cfg</code>, <code>lift</code>, <code>decompile</code>, <code>artifact</code>, or <code>job-*</code> operations. Credential files must not be group- or world-readable.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

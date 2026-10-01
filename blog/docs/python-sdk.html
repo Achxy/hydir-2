@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="LocalGhidra and HydirClient examples, allocated memory, call tracing, observed-path comparison, typed models, and remote artifacts.">
+<link rel="canonical" href="https://hydir.wiki/docs/python-sdk">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<title>Python SDK and artifact APIs — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Python SDK and artifact APIs</p>
+<h1 id="hydir-python-sdk-compatible-v1-v2-plus-additive-v3">HydIR Python SDK (compatible v1/v2 plus additive v3)</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">sdk/python/README.md</a> · source digest <code>6447efaa557d</code></p>
+<p>LocalGhidra and HydirClient examples, allocated memory, call tracing, observed-path comparison, typed models, and remote artifacts.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#local-worker-and-snapshot-artifacts">Local worker and snapshot artifacts</a></li><li><a href="#process-bytes-and-declared-allocations">Process bytes and declared allocations</a></li><li><a href="#observed-targets-and-path-comparisons">Observed targets and path comparisons</a></li></ul></nav>
+
+<h2 id="local-worker-and-snapshot-artifacts">Local worker and snapshot artifacts</h2>
+<p>For local Ghidra-backed lifting, <code>LocalGhidra</code> calls the same <code>hydirctl</code>
+worker as the desktop app. It needs no service credentials:</p>
+<pre><code class="language-python">from hydir_sdk import LocalGhidra
+
+client = LocalGhidra(&quot;hydirctl&quot;)
+snapshot = client.analyze(&quot;sample.elf&quot;, &quot;snapshot.json&quot;)
+state = client.artifact(&quot;state&quot;, &quot;sample.elf&quot;, &quot;snapshot.json&quot;)
+</code></pre>
+<p><code>analyze(..., function=0x...)</code> selects another function from the managed
+Ghidra project. <code>artifact</code> also accepts <code>pcode</code>, <code>simplify</code>, <code>semantics</code>, <code>cfg</code>,
+<code>process-memory</code>, <code>llvm-prefix</code>, and <code>llvm-standalone</code>;
+<code>llvm_operation</code> emits LLVM for one exact P-code operation. Artifacts are
+checked against the binary SHA-256, and a function-level state artifact is
+an effect inventory rather than an executable lift. <code>llvm-standalone</code> provides
+a runnable byte-state module for the supported straight-line prefix, with an
+explicit stop reason; it does not claim whole-function equivalence.
+<code>import_project(binary, project_gpr, &quot;folder/program.elf&quot;, snapshot, function=0x...)</code> exports one program from a closed, analyst-edited Ghidra
+project. The CLI stages an isolated copy, checks that the selected program
+matches the original ELF, and runs fresh on each call so later analyst edits
+are visible.
+<code>trace_prefix(binary, snapshot, seed, max_operations=4096)</code> runs the bounded
+concrete interpreter against a binary-bound JSON seed and returns its trace.
+<code>trace_path(...)</code> follows a bounded path through selected instructions and
+returns source-linked branch events and its explicit stop reason.
+<code>LocalGhidra.trace_calls(binary, seed, function=...)</code> follows bounded direct
+calls and automatically collects callee snapshots. For an uploaded project,
+<code>HydirClient.trace_ghidra_calls(project_id, revision, seed, function_entry=...)</code>
+provides the same artifact through the authenticated v3 service.
+<code>LocalGhidra.llvm_cfg_calls(binary, root_snapshot, (callee_snapshot,))</code>
+emits one bounded LLVM state machine across validated loaded callees. Its
+fidelity claim remains unknown until a concrete path is compared with an
+execution oracle.</p>
+<h2 id="process-bytes-and-declared-allocations">Process bytes and declared allocations</h2>
+<p><code>LocalGhidra.llvm_cfg(binary, snapshot, process=True)</code> emits LLVM v4 with
+checked ELF process bytes, zero-filled tails, and writable globals. Its
+mapping and known-byte masks keep unresolved relocations explicit.
+For explicit stack or heap ranges, supply a small declaration file:</p>
+<pre><code class="language-json">{&quot;schema_version&quot;:1,&quot;regions&quot;:[{&quot;kind&quot;:&quot;stack&quot;,&quot;space&quot;:&quot;ram&quot;,&quot;base&quot;:7340032,&quot;byte_len&quot;:4096}]}
+</code></pre>
+<p><code>LocalGhidra.llvm_cfg(binary, snapshot, allocations=&quot;allocations.json&quot;)</code>
+emits LLVM v5. <code>trace_path(..., memory=&quot;allocated&quot;, allocations=&quot;allocations.json&quot;)</code> uses the same bounds in the Rust executor.
+Declaring a range does not initialize its bytes; put known input bytes in the
+seed. An access outside the ELF mappings and declared ranges stops explicitly.
+The service exposes the same v5 artifact through
+<code>analyze_ghidra_binary(project_id, revision, &quot;llvm-cfg-process-allocated&quot;, allocations=&quot;allocations.json&quot;)</code>.</p>
+<h2 id="observed-targets-and-path-comparisons">Observed targets and path comparisons</h2>
+<p><code>LocalGhidra.rediscover_calls(binary, snapshot, input_spec, trace)</code> returns
+bounded, byte-verified candidate targets from one observed input while
+retaining unresolved static call edges. Pass <code>apply=True</code> to reanalyze an
+isolated copy of the managed Ghidra project; the original static snapshot
+remains available. <code>compare_observed_path(binary, snapshot, input_spec, trace, seed, memory=&quot;process&quot;)</code> executes a bounded P-code path from the supplied seed
+and compares it with one Frida trace; <code>inconclusive</code> does
+not mean the paths match.
+<code>LocalGhidra.rediscover_jumps(...)</code> uses the independent DynamicTrace v3
+computed-jump witnesses for already analyzed instructions inside the selected
+function. Its plan and isolated <code>apply=True</code> route keep the unresolved branch
+visible alongside observed targets.
+The revision-checked service exposes the same read-only jump plan through
+<code>HydirClient.analyze_ghidra_observation(..., &quot;observed-jump-rediscovery&quot;)</code>.
+<code>LocalGhidra.llvm_cfg_calls_auto(binary, seed, function=0x...)</code> runs the
+managed worker and collects only callees reached by the seed before lifting.
+Add <code>allocations=&quot;allocations.json&quot;</code> to <code>trace_calls</code>, <code>llvm_cfg_calls</code>, or
+<code>llvm_cfg_calls_auto</code> to share validated ELF process bytes and declared stack
+or heap ranges across those calls. The strict trace is v3 and the call CFG
+contains LLVM v5. The remote <code>trace_ghidra_calls</code> and
+<code>build_ghidra_call_cfg_llvm</code> methods accept the same declaration as bytes or
+a file path, bound to the uploaded ELF and project revision. Unknown imports,
+relocations, and undeclared memory still stop at their source instruction.
+<code>HydirClient.build_ghidra_call_cfg_llvm(project_id, revision, seed, function_entry=...)</code> runs that bounded lift for an uploaded ELF through the
+v3 service and returns a revision-bound LLVM artifact. The returned module
+exposes source operations and explicit stops; it is not a whole-program lift.</p>
+<p>This SDK is backed by the same protobuf schema as <code>hydirctl remote</code> and
+<code>hydird</code>. It supports authenticated loopback or TLS discovery, project creation,
+explicit ELF upload, inspect/CFG/lift/scalar-C, bounded global-effect analysis,
+durable lift jobs and event streams, a named allowlisted LLVM 14 pass
+experiment, restricted whole-executable rebuilding, and verified artifact
+download. There is no remote execution endpoint.</p>
+<p><code>negotiate_api()</code> prefers <code>hydir.v3</code>, then falls back through v2 to v1 only
+when the newer endpoint reports <code>UNIMPLEMENTED</code>. v3 exposes isolated native
+whole-program jobs, replayable events, revision-checked analyst facts, and
+digest/media/schema/revision-checked ProgramSpec, FunctionIndex, coverage,
+MachineIR, StateIR, FunctionIR, CIR, LLVM-export, and DecompilationUnit
+artifacts. <code>get_program_artifact(...)</code> never executes the input and requires a
+FunctionIndex selector for function-scoped stages.</p>
+<p><code>get_analysis_model(project_id, revision)</code> returns the current validated
+AnalysisModel v1 as JSON. Edit that document and call
+<code>save_analysis_model(project_id, revision, model, idempotency_key=...)</code> with
+the project revision you read. The model's own <code>revision</code> must increase by one.
+The server checks the binary digest and layout, retains machine evidence,
+persists the edit, and returns the new project revision. Later typed C and
+high-level CIR artifact requests use the saved model. Reuse the same
+idempotency key when retrying an uncertain save.</p>
+<p><code>analyze_ghidra_snapshot(project_id, revision, snapshot, stage)</code> sends an
+exported Ghidra snapshot as bytes or a file path to the v3 service. The
+project must already contain the same binary. The server checks the snapshot
+digest against that binary and runs a bounded worker. Supported stages are
+<code>snapshot</code>, <code>pcode</code>, <code>simplify</code>, <code>semantics</code>, <code>state</code>, <code>cfg</code>, <code>coverage</code>,
+<code>process-memory</code>, <code>llvm-cfg</code>, <code>llvm-cfg-image</code>, <code>llvm-cfg-process</code>,
+<code>llvm-cfg-process-allocated</code>, and <code>slice</code>. The
+<code>simplify</code> stage returns original and rewritten raw P-code with per-operation
+preconditions; its local bitvector identities do not claim native equivalence. For
+<code>llvm-cfg</code>, pass <code>start_address=0x...</code> to select a CFG entry. For <code>slice</code>, pass
+<code>instruction_index</code> and <code>operation_index</code>, plus optional <code>input_index</code>. The SDK checks the
+artifact hash, media type, schema version, and project revision before
+returning JSON.
+<code>analyze_ghidra_binary(project_id, revision, &quot;snapshot&quot;)</code> asks the service to
+run its managed Ghidra worker on the already uploaded ELF, returning the
+validated function index and selected function snapshot. Pass
+<code>selected_function_entry=0x...</code> for another Ghidra function, then request
+<code>pcode</code>, <code>state</code>, <code>llvm-cfg</code>, or <code>slice</code>. The explicit automatic flag prevents an
+empty legacy snapshot request from starting analysis.
+For local snapshots, <code>LocalGhidra.slice(binary, snapshot, instruction_index, operation_index, input_index=None)</code> returns a bounded backward P-code value
+slice with source operations and explicit unresolved boundaries.</p>
+<p>v2 methods expose digest-checked
+<code>RegionSpec</code> v3, <code>PhysicalRegionIR</code> v1, and <code>DecompilationUnit</code> v1 JSON, compile scalar patch v1 into
+reversible <code>PatchBundle</code> v2, apply it with revision/idempotency protection, and
+request structural bundle verification. Behavioral verification remains false
+until a separate execution gate supplies evidence.</p>
+<p><code>lift_region(...)</code> returns exact decoded operations, successors, physical
+register/flag/memory effects, boundary locations, and unresolved proof facts.
+Its <code>lowering_ready</code> field must be true before a caller treats it as patchable;
+successful decoding alone is not a C or replacement-safety claim.</p>
+<p><code>decompile(project_id, revision, symbol, assume_u64x2=True)</code> returns C11
+from the bounded scalar LLVM lift; it is not a general or Rellic-compatible
+decompiler. <code>get_source()</code> retrieves the exact source tar advertised by a
+matching-source build and verifies its SHA-256. Ordinary development builds
+do not embed such an archive, so <code>get_source()</code> then fails explicitly.
+<code>apply_patch(...)</code> accepts the versioned scalar patch v1
+document and requires three explicit assertions. It commits a new project
+revision and returns hash-checked ELF bytes; it does not execute them. The
+<code>examples/patch_scalar.py</code> script demonstrates an explicit trusted-fixture
+upload and patch, with a new output path.
+<code>transform(...)</code> requires explicit trusted-fixture and prototype assertions.
+It creates a new immutable project revision retaining the same ELF bytes,
+and returns a report plus hash-checked raw/before/after LLVM IR artifacts;
+LLVM verification is not
+behavioral equivalence. <code>examples/pass_experiment.py</code> demonstrates the
+explicit upload, named pass request, and no-overwrite artifact export.
+<code>examples/global_analysis.py</code> saves the conservative cross-function report
+and a partial <code>ProgramSpec</code> with provenance-bearing call/reference sites
+through the typed <code>Analyze</code> and <code>AnalyzeSpec</code> operations. It needs two new,
+distinct output paths and does not claim complete control-flow recovery.
+<code>examples/annotate_program.py</code> explicitly uploads a trusted ELF, adds a
+revisioned, scoped analyst name/comment/assumption, checks its binary-bound
+ledger, and exports JSON to a new file. Analyst facts are unverified;
+assumptions appear in remote inspected/analyzed specifications but do not
+satisfy explicit prototype/trust flags for other operations. The SDK checks
+the returned project, revision, and binary identity.
+<code>rebuild(...)</code> requires an explicit trusted-fixture assertion. It creates a
+new immutable binary revision and returns digest-checked ELF/IR/report
+artifacts without executing the ELF. <code>examples/rebuild_program.py</code> shows
+explicit upload and new-file-only export. Use only the documented static
+freestanding Linux x86-64 subset; the service worker is not a hostile-input
+sandbox.
+<code>examples/validate_program.py</code> is an opt-in, client-side Docker comparison
+for trusted static ELFs. It requires <code>--trusted-fixture</code>, a JSON list of
+hex-encoded stdin cases, and a new report path. It compares stdout, stderr,
+and exit status under no-network, read-only, CPU/memory/process/time controls.
+This does not establish hostile-input isolation or general equivalence. A ready case list is
+<code>../../tests/fixtures/whole_choice_cases.json</code>.</p>
+<p>On a Linux x86-64 server with the separately bundled Frida observer,
+<code>start_frida_observation(project_id, revision, input_spec, selected_elf_vaddr)</code>
+queues an explicit operator-only job for the uploaded ELF. Use
+<code>get_analysis_job</code> or <code>analysis_events</code> to follow it, then pass the completed
+job's revision and artifact digest, the InputSpec binary digest, and the
+selected address to <code>get_frida_observation</code>. The SDK checks the artifact hash,
+revision, schema, binary, and address. DynamicTrace v2 records bounded path
+events and output; process exit code remains unknown.</p>
+<p>Install Python 3.10+ in a private virtual environment:</p>
+<pre><code class="language-sh">python3 -m venv .venv
+.venv/bin/python -m pip install .
+</code></pre>
+<p>For the runnable smoke example, first run an authenticated <code>hydird</code> service
+and create a private credential file as described in
+remote operation.
+Then supply a trusted x86-64 ELF and a symbol with the asserted
+<code>u64(u64,u64)</code> prototype:</p>
+<pre><code class="language-sh">.venv/bin/python examples/smoke.py http://127.0.0.1:50051 /private/token.txt /path/to/fixture.elf hydir_max2 /new/output/directory
+</code></pre>
+<p>On a Docker-equipped host, <code>bash ../../scripts/demo-sdk-linux-docker.sh</code>
+builds a pinned Linux SDK image and runs the separate-process smoke and
+rebuild examples. The scripts retain private fixture artifacts under
+<code>target/demo-sdk/</code>; do not publish credentials or that directory.</p>
+<p><code>examples/batch_lift.py</code> accepts only the symbols explicitly named on its
+command line. Passing a symbol asserts the same prototype for it; the SDK
+does not infer signatures. No sample is uploaded without a call to
+<code>upload_binary</code>. Artifact bytes are SHA-256 checked before being returned,
+and <code>export_artifact</code> refuses to overwrite an existing path. The client
+rejects plaintext non-loopback endpoints and non-private credential files.
+<code>https://host:port</code> endpoints use gRPC TLS with its default trust roots; callers
+using a private CA may pass its PEM bytes as <code>root_certificates</code>.
+Credential files may contain either a local 64-character static token or a
+bounded compact OIDC JWT; the server remains responsible for signature and
+claim validation.</p>
+<p>Generated <code>hydir*_pb2.py</code> and <code>hydir*_pb2_grpc.py</code> correspond to the v1, v2, and v3
+schemas in <code>crates/hydir-api/proto/</code>, produced with <code>grpcio-tools==1.84.0</code>.
+Regenerate after API changes with:</p>
+<pre><code class="language-sh">python -m grpc_tools.protoc -I../../crates/hydir-api/proto \
+  --python_out=hydir_sdk --grpc_python_out=hydir_sdk \
+  ../../crates/hydir-api/proto/hydir.proto \
+  ../../crates/hydir-api/proto/hydir_v2.proto \
+  ../../crates/hydir-api/proto/hydir_v3.proto
+</code></pre>
+<p>After regeneration, change generated sibling imports to relative imports (for
+example, <code>from . import hydir_v2_pb2</code>) so the package imports correctly.</p>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/frida">Frida observation on Windows</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

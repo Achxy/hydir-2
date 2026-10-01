@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="WSL2 worker installation, argv and file sessions, isolation checks, source builds, packaging, and execution verification.">
+<link rel="canonical" href="https://hydir.wiki/docs/frida">
+<link rel="stylesheet" href="/vendor/latex.css/style.css">
+<link rel="stylesheet" href="/styles.css">
+<title>Frida observation on Windows — HydIR</title>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
+<main class="site-main prose" id="content">
+<p class="eyebrow"><a href="/guides">Docs</a> / Frida observation on Windows</p>
+<h1 id="frida-on-windows">Frida on Windows</h1>
+<p class="doc-source">Repository reference · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/frida/README.md">integrations/frida/README.md</a> · source digest <code>a3c839e2e7a3</code></p>
+<p>WSL2 worker installation, argv and file sessions, isolation checks, source builds, packaging, and execution verification.</p>
+<nav class="doc-toc" aria-label="On this page"><p><strong>On this page</strong></p><ul><li><a href="#first-use">First use</a></li><li><a href="#testing-a-source-checkout">Testing a source checkout</a></li><li><a href="#execution-boundary">Execution boundary</a></li><li><a href="#building-the-release">Building the release</a></li></ul></nav>
+
+<p>The Windows release packages a dedicated Linux worker for the existing x86-64
+ELF workflow. Frida 17.9.5 is statically linked into the worker; Bubblewrap and
+the Linux userland are in <code>workers/frida/rootfs.tar.gz</code>. Docker, Python, a Frida
+devkit and a separate Ubuntu installation are not required on the analyst's PC.
+WSL2 is a Windows prerequisite, installed separately with administrator rights.
+This does not add native PE/.exe observation.</p>
+<h2 id="first-use">First use</h2>
+<ol>
+<li>If WSL2 is absent, run <code>wsl --install --no-distribution</code> in Administrator
+PowerShell and restart if requested by Windows.</li>
+<li>Extract the entire HydIR Windows release, keeping <code>workers/frida</code> beside
+<code>hydir.exe</code> and <code>hydirctl.exe</code>.</li>
+<li>Open <strong>Frida</strong>, click <strong>Recheck</strong>, then <strong>Install packaged
+worker</strong>. Installation verifies the rootfs hash and imports <code>HydIR-Frida-v1</code>
+under <code>%LOCALAPPDATA%\HydIR\workers\frida-v1</code>. Existing distributions and
+existing worker directories are never overwritten or unregistered.</li>
+<li>Open a local ELF, select an analyzed function, and open <strong>Frida</strong>.
+Click <strong>Run with Frida</strong> to launch the binary without arguments and record the
+selected function when execution reaches it. <strong>Run settings</strong> supplies optional
+arguments (one per line) or an advanced InputSpec JSON file. <strong>Stop</strong> cancels a run.</li>
+<li>Inspect <strong>Trace</strong>: filter by event type or address, select a row to see event
+details and captured entry registers, or double-click a verified address to
+open disassembly. <strong>Program output</strong> stays below the trace; <strong>Diagnostics</strong>
+explains incomplete runs. The event and output panes can be resized.</li>
+<li><strong>Recover targets</strong> plans Ghidra reanalysis from observed indirect flow.
+<strong>Compare P-code</strong> holds the captured-register seed and path comparison actions.
+These views use the same recording and do not require a second Frida run.</li>
+</ol>
+<p>The workspace follows iaito's compact debug toolbar, register dock and console
+organization. Worker setup is in the <strong>Worker</strong> menu; raw JSON export, clearing
+results, and the optional HydIR analysis console are in <strong>Actions</strong>.</p>
+<p>The current observer supports inputs supplied through argv and files. Nonempty
+stdin inputs are rejected, so use an argv/file-driven ELF for observation; the
+interactive PRISM demo requires stdin and is not a Frida observation fixture.</p>
+<p>CLI equivalents:</p>
+<pre><code class="language-powershell">.\hydirctl.exe frida-worker status
+.\hydirctl.exe frida-worker install
+.\hydirctl.exe replay init .\demo.elf --output .\input.json
+# Set input.json budget.memory_bytes to at least 1073741824 for Frida injection.
+.\hydirctl.exe observe frida .\demo.elf .\input.json --function 0x20137c --output .\trace.json
+</code></pre>
+<p><code>hydirctl doctor</code> reports the same Frida readiness. Development builds can set
+<code>HYDIR_FRIDA_WORKER_BUNDLE</code> to the directory containing the two worker files.
+The GUI checks asynchronously and offers an explicit installation action.</p>
+<h2 id="testing-a-source-checkout">Testing a source checkout</h2>
+<p>A source checkout does not include the generated Linux rootfs. Installing WSL2
+alone does not install the Frida worker. After the <strong>Frida observer gate</strong> workflow
+succeeds for this source revision, download its <code>hydir-frida-wsl-rootfs</code> artifact
+and extract it so <code>manifest.json</code> and <code>rootfs.tar.gz</code> share a directory. Or build
+that directory using the release instructions below.</p>
+<p>From the repository root in PowerShell:</p>
+<pre><code class="language-powershell">cargo build --locked -p hydir-cli -p hydir-gui
+$env:HYDIR_FRIDA_WORKER_BUNDLE = (Resolve-Path .\frida-worker).Path
+.\target\debug\hydirctl.exe frida-worker install
+.\target\debug\hydirctl.exe frida-worker status
+.\target\debug\hydir.exe --open-local .\demo\hydir-prism.elf
+</code></pre>
+<p>Launch the GUI from the same PowerShell session so it inherits the bundle path.
+If you have a local Ghidra installation, keep <code>HYDIR_GHIDRA_HOME</code> configured as
+before. The complete <code>hydir-windows-x86_64-frida</code> workflow artifact instead ships
+the Windows executables and worker together and needs no bundle-path override.</p>
+<h2 id="execution-boundary">Execution boundary</h2>
+<p>Windows passes bounded ELF/InputSpec bytes through stdin, without translating
+paths, mounting host drives, or constructing shell commands. The worker runs as
+an unprivileged user. WSL automount and Windows executable interop are disabled
+for this distribution. Every target still runs inside the existing Bubblewrap
+user, PID, network, IPC and UTS namespaces with resource limits. A failed
+isolation probe disables observation. Trace, input, binary and optional Ghidra
+snapshot checks remain on the Windows side too.</p>
+<p>Each observation has a random job ID; cancellation addresses that job only.
+An independent Linux timeout bounds the job if the Windows client disappears.
+No operation terminates other WSL distributions. Installed worker state is
+retained on a failed readiness probe so it can be diagnosed.</p>
+<h2 id="building-the-release">Building the release</h2>
+<p>On Linux x86-64, first build and verify the existing Frida release using
+<code>scripts/package-frida-linux.py</code>. Then, with Docker available:</p>
+<pre><code class="language-sh">python3 scripts/package-frida-windows.py build-rootfs \
+  --linux-bundle hydir-linux-x86_64.tar.gz --output frida-worker
+</code></pre>
+<p>The rootfs uses a digest-pinned Ubuntu base and the already verified Frida
+bundle. It preserves the bundle's license files and the distribution's package
+copyright notices. The manifest records the final rootfs SHA-256. Build-time
+Ubuntu package updates mean separate rebuilds may produce different rootfs hashes.</p>
+<p>Copy <code>frida-worker</code> to Windows, then build the desktop release:</p>
+<pre><code class="language-powershell">python scripts/package-frida-windows.py package `
+  --worker-dir .\frida-worker --output .\hydir-windows-x86_64.zip
+</code></pre>
+<p>The Frida gate workflow produces both the worker artifact and the Windows ZIP.
+Package construction and Windows unit tests do not prove WSL execution. Run
+<code>scripts/test-frida-wsl.ps1</code> on a Windows x86-64 machine with WSL2 to verify a
+real ELF observation through the installed worker.</p>
+<pre><code class="language-powershell">.\scripts\test-frida-wsl.ps1 -Hydirctl .\hydirctl.exe `
+  -Binary .\demo.elf -InputSpec .\input.json -Function 0x20137c
+</code></pre>
+
+<hr>
+<h2>Related documentation</h2>
+<ul><li><a href="/docs/ghidra">Ghidra snapshots and execution</a></li><li><a href="/docs/python-sdk">Python SDK and artifact APIs</a></li><li><a href="/docs/transformation">Transformation, patching, and region contracts</a></li><li><a href="/docs/service">Authenticated service and project lifecycle</a></li></ul>
+</main>
+<footer class="site-footer"><p><a href="/guides">Documentation index</a> · <a href="/research">Evidence and release gates</a> · <a href="https://github.com/Achxy/hydir-2/blob/main/integrations/frida/README.md">Edit the source on GitHub</a></p></footer>
+</body>
+</html>

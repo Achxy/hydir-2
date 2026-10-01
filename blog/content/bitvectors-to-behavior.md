@@ -275,7 +275,7 @@ $$ {#partial-register-writes}
 \end{aligned}
 $$
 
-The second operation depends on the old full register; the first does not. Consequently, an SSA representation of a partial write may need the previous register version as an input even when the instruction seems to overwrite its destination. HydIR's native lowering preserves these width and merge rules in its register effects and C operations. The [native decompiler documentation](https://github.com/Achxy/hydir-2/blob/b00835d7568801738a2ee01e42f6bd11ae537e81/docs/NATIVE_DECOMPILER.md) describes the supported forms.
+The second operation depends on the old full register; the first does not. Consequently, an SSA representation of a partial write may need the previous register version as an input even when the instruction seems to overwrite its destination. HydIR's native lowering preserves these width and merge rules in its register effects and C operations. The native decompiler documentation describes the supported forms.
 
 Flags introduce another distinction. An instruction can preserve a flag, define it, or leave its architectural value undefined. Those cases cannot share one translation. If a flag becomes undefined, retaining its old SSA value would assert a relation the architecture does not guarantee.
 

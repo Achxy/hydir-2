@@ -9,13 +9,13 @@
   <link rel="stylesheet" href="/styles.css">
   <title>Architecture — HydIR</title>
 </head>
-<body class="latex-dark-auto">
+<body>
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture" aria-current="page">Architecture</a><a href="/blogs">Articles</a></nav></header>
+  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
   <main class="site-main prose" id="content">
     <p class="eyebrow">From bytes to artifacts</p>
     <h1>Follow the bytes through HydIR</h1>
-    <p class="lead">Open an ELF in HydIR and two static paths can examine it: an automatic Ghidra worker exports raw P-code, while HydIR's native frontend builds its own intermediate representations. For a selected function and bounded input, a separate Linux Frida observer can record one runtime path. Each result stays tied to the original bytes and addresses.</p>
+    <p class="lead">Open an ELF in HydIR and two static paths can examine it: an automatic Ghidra worker exports raw P-code, while HydIR's native frontend builds its own intermediate representations. For a selected function and bounded input, a separate Frida observer (Linux directly, or a packaged WSL2 worker on Windows) can record one runtime path. Each result stays tied to the original bytes and addresses.</p>
 
     <h2>The whole project on one map</h2>
     <p>Follow the ELF into either static lane. The third lane runs the original executable with a declared <code>InputSpec</code>; it records observed behavior for that input and can guide a later Ghidra reanalysis. It does not close unknown control-flow edges in the static result.</p>
@@ -30,7 +30,7 @@
     <p>Triton exploration and the restricted patch and rebuild routes have separate requirements and checks. Supported, bounded comparisons are not a claim that HydIR has proved an arbitrary executable equivalent to its lift.</p>
 
     <h2>Where runtime observation fits</h2>
-    <p>In the desktop workbench, open a local ELF, select a function, then choose the top-level <strong>Frida observation</strong> tab. It opens the existing <strong>Observe with Frida</strong> panel, which is also available in Ghidra P-code. Provide the path to a binary-bound <code>InputSpec</code> JSON file and choose <strong>Observe selected function</strong>. The control is enabled on Linux x86-64 when the selected Ghidra function maps to the local ELF. The Linux observer helper must also be installed; <code>hydirctl doctor</code> reports its readiness.</p>
+    <p>Open a local ELF, select an analyzed function, and choose <strong>Frida → Session</strong>. Supply program arguments directly or choose an InputSpec file for file inputs and custom limits. The current observer rejects nonempty stdin. Linux uses the observer bundle; Windows uses an explicitly installed, hash-verified WSL2 worker with isolation probes. A source checkout requires the generated bundle. <a href="/guides#frida-observation">Setup and runtime requirements</a> explain both paths.</p>
     <p>The observer returns a byte-checked <code>DynamicTrace</code> of blocks, calls, computed jumps, and captured entry registers for that one input. The GUI can use those registers as a P-code seed or plan observed indirect calls and jumps for isolated Ghidra reanalysis. A trace does not prove that unobserved paths are absent, that the static CFG is complete, or that the process exit code is known.</p>
 
     <h2>The native path in four steps</h2>
@@ -49,6 +49,7 @@
 
     <p class="note"><strong>Another path:</strong> whole-executable rebuilding is not a consequence of a successful scalar function lift. It requires complete supported text coverage in a static freestanding program, bounded mapped data, and checked read/write/exit syscall behavior. It emits a new executable and a separate report.</p>
 
+    <h2>Typed models and artifact revisions</h2><p>Digest-bound AnalysisModel facts feed bounded HighLevelCIR and HighLevelCfgCir views. Local model edits create revisions, and selective caches retain unaffected typed output. The v3 API exposes analysis models, high-level artifacts, and typed C with revision and digest checks. <a href="/features#typed-models">Typed model contracts</a> describe inference limits and provenance.</p>
     <h2>Interfaces and ownership</h2>
     <p>The egui workbench and <code>hydirctl</code> expose native analysis and can start the automatic Ghidra worker for a local ELF. <code>hydird</code> exposes authenticated projects with immutable revisions and artifacts; the Python SDK covers the implemented remote subset. Local ELF opening stays local until a separate upload action. Local analyst facts live in a private on-device ledger; remote project facts live in the service ledger and do not automatically sync.</p>
     <p>Read the <a href="/articles/graphs-to-code">compiler theory article</a> in the blogs, or inspect the <a href="https://github.com/Achxy/hydir-2">source tree</a> and <a href="https://github.com/Achxy/hydir-2/blob/main/sdk/python/README.md">SDK reference</a>.</p>

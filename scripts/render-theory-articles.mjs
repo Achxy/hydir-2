@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import MarkdownIt from 'markdown-it';
+import { wikiNavigation } from './wiki-navigation.mjs';
 
 const site = fileURLToPath(new URL('../blog/', import.meta.url));
 const require = createRequire(import.meta.url);
@@ -111,9 +112,7 @@ function head(post, redirect = false) {
 }
 
 const nav = '  <a class="skip" href="#article">Skip to article</a>\n' +
-  '  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation">' +
-  '<a href="/">Home</a><a href="/start">Start</a><a href="/guides">Guides</a><a href="/architecture">Architecture</a>' +
-  '<a href="/blogs" aria-current="page">Articles</a></nav></header>\n';
+  wikiNavigation('/blogs') + '\n';
 const footer = '  <footer class="site-footer"><p><a href="/">HydIR</a> · ' +
   '<a href="https://github.com/Achxy/hydir-2">Source</a> · <a href="/start">Start locally</a></p></footer>\n';
 
@@ -133,7 +132,7 @@ for (const post of posts) {
   const source = fs.readFileSync(path.join(site, 'content', post.slug + '.md'), 'utf8');
   const env = { equations: 0, inlineMath: 0, tables: 0 };
   const content = parser().render(source, env);
-  const html = head(post) + '<body class="latex-dark-auto">\n' + nav +
+  const html = head(post) + '<body>\n' + nav +
     '  <main class="site-main prose" id="article">\n    <article>\n' +
     '      <p class="eyebrow"><a href="/blogs">Blogs</a> / ' + escape(post.category) + '</p>\n' +
     '      <h1>' + escape(post.title + ': ' + post.subtitle) + '</h1>\n' +
@@ -144,7 +143,7 @@ for (const post of posts) {
     '  <script type="module" src="/assets/theory.js?v=' + theoryJsVersion + '"></script>\n</body>\n</html>\n';
   output('articles/' + post.slug + '.html', html);
   // Preserve draft preview bookmarks while keeping one canonical article URL.
-  output(post.slug + '.html', head(post, true) + '<body class="latex-dark-auto">\n' + nav +
+  output(post.slug + '.html', head(post, true) + '<body>\n' + nav +
     '  <main class="site-main prose" id="article"><h1>' + escape(post.title) + '</h1>' +
     '<p>This article is now in <a href="/articles/' + post.slug + '">the HydIR blog</a>.</p></main>\n' +
     footer + '</body>\n</html>\n');

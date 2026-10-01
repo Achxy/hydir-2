@@ -281,7 +281,7 @@ $$ {#native-pipeline}
 \end{aligned}
 $$
 
-MachineIR retains decoded instructions, locations, control flow, and effect footprints. StateIR assigns versions to state components. FunctionIR carries function and ABI facts into the next representation. CIR supplies statements and terminators for C emission. LLVM is an optional export, as recorded in [ADR 0019](https://github.com/Achxy/hydir-2/blob/b00835d7568801738a2ee01e42f6bd11ae537e81/docs/adr/0019-llvm-is-an-export-format.md).
+MachineIR retains decoded instructions, locations, control flow, and effect footprints. StateIR assigns versions to state components. FunctionIR carries function and ABI facts into the next representation. CIR supplies statements and terminators for C emission. LLVM is an optional export, as recorded in ADR 0019.
 
 The native component universe includes registers, flags, control state, and memory regions. In the inspected implementation, `machine_state_components` includes stack, image, TLS, heap, volatile, and unknown memory. These regions are a conservative way of recording dependencies, not a claim that every pointer has been resolved.
 

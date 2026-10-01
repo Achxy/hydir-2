@@ -29,7 +29,7 @@ service expose the same artifacts. The [compiler theory
 article](https://hydir.wiki/articles/graphs-to-code) explains
 how HydIR connects control flow, SSA, and C output.
 
-The [current product plan](docs/HYDIR_LAUNCH_PLAN.md) makes the existing Hydir
+The current product plan makes the existing Hydir
 GUI the entry point for automatic Ghidra analysis. Opening a local ELF now starts
 a headless worker and imports a bounded raw P-code snapshot with flow and call
 evidence into Hydir. The
@@ -120,7 +120,7 @@ The automatic form collects functions reached by the seed; the snapshot form
 accepts saved exports. Both share register and RAM state, check return targets, and leave unsupported
 effects and missing callees as explicit stops. Its fidelity is still unknown
 until a path is compared with Rust, Ghidra, or native execution.
-[Native CLI commands](docs/NATIVE_DECOMPILER.md#reproduction)
+Native CLI commands
 cover every IR stage, low-level and structured C, whole-file batch output,
 coverage, and per-address explanations.
 
@@ -143,7 +143,7 @@ C output tab show that low-level C and its fidelity status when structured C
 is unavailable. Select `hydir_stage_patch_portal` for the PatchLang
 demonstration.
 
-The [PRISM presenter guide](docs/PRISM_DEMO.md) gives a short GUI route,
+The PRISM presenter guide gives a short GUI route,
 commands, and the expected evidence. The binary can be inspected on Windows;
 native execution and whole-executable rebuild require Linux x86-64. Triton
 requires its optional Python dependency, and remote features require a running
@@ -155,7 +155,7 @@ The native path analyzes bounded, compiler-generated Linux x86-64 ELF files.
 It does not execute the input or invoke Ghidra or another external decompiler.
 Versioned intermediate artifacts retain the binary SHA-256, machine
 locations, evidence, and uncertainties needed to inspect their output. The
-[implementation record](docs/NATIVE_DECOMPILER.md) contains the full
+implementation record contains the full
 instruction inventory and outstanding release gates.
 
 ### Pipeline and artifact contracts
@@ -297,7 +297,7 @@ differential-correctness result. On Linux x86-64,
 emission, and strict C compilation. Dedicated native-pipeline and IR JSON
 fuzz targets check crashes and refusals; a manual/weekly real-ELF stress
 workflow exercises the stripped Go fixture. See the
-[remaining gates](docs/NATIVE_DECOMPILER.md#remaining-gated-work).
+remaining gates.
 
 ## Native analysis workbench
 
@@ -471,9 +471,9 @@ git submodule update --init third_party/hydir-reference
 ```
 
 The current compatibility boundary is recorded in
-[ADR 0018](docs/adr/0018-native-compatibility-boundary.md). The native
+ADR 0018. The native
 decompiler's remaining gates are listed in the
-[implementation record](docs/NATIVE_DECOMPILER.md#remaining-gated-work).
+implementation record.
 
 ## Symbolic exploration with Triton
 

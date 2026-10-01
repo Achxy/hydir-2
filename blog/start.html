@@ -11,9 +11,9 @@
   <script src="/vendor/prism/prism-bash.min.js" defer></script>
   <title>Start locally — HydIR</title>
 </head>
-<body class="latex-dark-auto">
+<body>
   <a class="skip" href="#content">Skip to content</a>
-  <header class="site-header"><a class="brand" href="/">HydIR</a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/start" aria-current="page">Start</a><a href="/guides">Guides</a><a href="/architecture">Architecture</a><a href="/blogs">Articles</a></nav></header>
+  <header class="site-header"><a class="brand" href="/" aria-label="HydIR home"><img src="/assets/hydir-placeholder.svg" width="112" height="112" alt="HydIR placeholder monogram"><span>HydIR</span></a><nav class="site-nav" aria-label="Main navigation"><a href="/">Home</a><a href="/blogs">Articles</a><a href="/guides" aria-current="page">Docs</a><a href="/tools">Tools</a><a href="/features">Features</a><a href="/research">Research</a></nav><p class="rail-caption">Binary analysis<br>and transformation</p><a class="rail-source" href="https://github.com/Achxy/hydir-2">Source on GitHub ↗</a></header>
   <main class="site-main prose" id="content">
     <p class="eyebrow">Quick start</p>
     <h1>Start with a local ELF</h1>
@@ -51,9 +51,7 @@ cargo run --locked -p hydir-cli -- ghidra-snapshot coverage \
   demo/hydir-prism.elf target/prism-ghidra.json</code></pre>
     <p>Coverage describes the selected snapshot and modeled operations. It is not a whole-program equivalence result. The <a href="/architecture">architecture guide</a> shows how this Ghidra lane relates to native IR and output generation.</p>
 
-    <h2 id="frida-gui">Find Frida in the GUI</h2>
-    <p>With a local ELF and function selected, choose the top-level <strong>Frida observation</strong> tab. Its <strong>Observe with Frida</strong> panel opens automatically; the same panel also appears in <strong>Ghidra P-code</strong>. Enter an <code>InputSpec</code> JSON path, then click <strong>Observe selected function</strong>. The panel reports observed events and verified jump pairs, and can copy the trace JSON or use captured entry registers as a P-code seed.</p>
-    <p class="note">The observation action is available in the Linux x86-64 release with the optional Frida observer bundle. It is disabled on Windows and without a Ghidra snapshot, selected mapped local function, and InputSpec. The trace describes one input; paths it did not visit remain unknown. See the <a href="/guides#frida-observation">Frida guide</a> for interpretation and availability details.</p>
+    <h2 id="frida-gui">Start a Frida session</h2><p>Open an argv- or file-driven local ELF, select an analyzed function, and choose <strong>Frida → Session</strong>. Enter one argument per line and select <strong>Observe selected function</strong> after readiness checks complete. An InputSpec file is optional for custom limits and file inputs. Events open after a successful observation.</p><p>For the Windows release, install WSL2 separately, retain the bundled <code>workers/frida</code> files, and use <strong>Recheck runtime → Install packaged worker</strong>. A source checkout needs a generated worker bundle. See the <a href="/guides#frida-observation">Frida setup guide</a>.</p><p class="note">The interactive PRISM demo needs stdin, which Frida currently rejects. Use it for static analysis and choose an argv/file fixture for observation. Native replay and GDB capture have separate Linux requirements.</p>
 
     <h2 id="results">Read results and reproduce a comparison</h2>
     <p>Read the source location, diagnostics, and coverage with each artifact. A successful import can be followed by a stopped lift when an operation, memory effect, or control target is outside the supported model. HydIR records that boundary rather than silently treating it as recovered.</p>
