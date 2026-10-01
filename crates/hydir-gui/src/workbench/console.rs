@@ -27,7 +27,9 @@ impl AnalystApp {
             self.triton_console_body(ui);
             return;
         }
-        let height = (ui.available_height() - 30.0).max(20.0);
+        let input_height = ui.spacing().interact_size.y
+            .max(ui.text_style_height(&egui::TextStyle::Monospace) + 8.0);
+        let height = (ui.available_height() - input_height - 2.0 * ui.spacing().item_spacing.y - 4.0).max(0.0);
         egui::ScrollArea::both()
             .id_salt("hydir_console_output")
             .max_height(height)
@@ -81,12 +83,14 @@ impl AnalystApp {
                 .monospace()
                 .color(ACCENT),
             );
-            let response = ui.add(
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            submit |= ui.small_button(">").on_hover_text("Run command").clicked();
+            let response = ui.add_sized([ui.available_width(), input_height],
                 egui::TextEdit::singleline(&mut self.shell.command)
                     .id_salt("hydir_command")
                     .hint_text("Type '?' for help")
                     .font(egui::TextStyle::Monospace)
-                    .desired_width((ui.available_width() - 38.0).max(60.0)),
+                    .desired_width(f32::INFINITY),
             );
             if response.has_focus() {
                 let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
@@ -108,10 +112,10 @@ impl AnalystApp {
                 }
             }
             submit |= response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            submit |= ui.small_button(">").on_hover_text("Run command").clicked();
             if submit {
                 response.request_focus();
             }
+            });
         });
         if submit {
             let command = std::mem::take(&mut self.shell.command);

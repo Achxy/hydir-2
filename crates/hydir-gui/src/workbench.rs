@@ -204,6 +204,8 @@ pub(super) struct Shell {
     pub(super) ghidra_open: bool,
     ghidra: ghidra::GhidraWorkspace,
     frida_runtime: frida_runtime::Runtime,
+    frida_session: frida_session::Session,
+    frida_workspace: frida_workspace::Workspace,
     about_open: bool,
     seek_input: String,
     seek_focus: bool,
@@ -242,6 +244,8 @@ impl Shell {
         self.hex_offset = 0;
         self.project_open = false;
         self.ghidra.clear_selection();
+        self.frida_session = frida_session::Session::default();
+        self.frida_workspace = frida_workspace::Workspace::default();
     }
 }
 
@@ -274,16 +278,16 @@ pub(super) fn apply_style(ctx: &egui::Context) {
     v.widgets.inactive.bg_fill = PANEL;
     v.widgets.hovered.bg_fill = Color32::from_rgb(61, 67, 73);
     v.widgets.active.bg_fill = SELECTED;
-    style.spacing.item_spacing = egui::vec2(5.0, 3.0);
-    style.spacing.button_padding = egui::vec2(7.0, 3.0);
-    style.spacing.interact_size = egui::vec2(24.0, 23.0);
+    style.spacing.item_spacing = egui::vec2(7.0, 5.0);
+    style.spacing.button_padding = egui::vec2(9.0, 4.0);
+    style.spacing.interact_size = egui::vec2(26.0, 26.0);
     style.spacing.scroll.floating = false;
     style.spacing.scroll.bar_width = 10.0;
     for (kind, size) in [
-        (egui::TextStyle::Body, 13.0),
-        (egui::TextStyle::Button, 13.0),
-        (egui::TextStyle::Small, 11.0),
-        (egui::TextStyle::Heading, 16.0),
+        (egui::TextStyle::Body, 14.0),
+        (egui::TextStyle::Button, 14.0),
+        (egui::TextStyle::Small, 12.0),
+        (egui::TextStyle::Heading, 18.0),
     ] {
         style
             .text_styles
@@ -291,7 +295,7 @@ pub(super) fn apply_style(ctx: &egui::Context) {
     }
     style
         .text_styles
-        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.0));
+        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
@@ -474,7 +478,7 @@ impl AnalystApp {
 
     fn open_function_row(&mut self, index: usize, target: Tab) {
         let ghidra_view = matches!(target, Tab::GhidraPcode | Tab::Frida);
-        if self.busy || (ghidra_view && self.ghidra_busy) {
+        if self.busy || (ghidra_view && (self.ghidra_busy || self.frida_busy)) {
             return;
         }
         let row = &self.shell.functions[index];
@@ -737,7 +741,7 @@ impl AnalystApp {
                                 *dock = if visible { Dock::Docked } else { Dock::Hidden };
                             }
                         }
-                        ui.checkbox(&mut self.console_visible, "Console");
+                        ui.checkbox(if self.tab == Tab::Frida { &mut self.shell.frida_workspace.show_log } else { &mut self.console_visible }, "Console");
                         ui.separator();
                         ui.menu_button("Add tab", |ui| {
                             for tab in Tab::ALL {
@@ -1149,18 +1153,18 @@ impl AnalystApp {
                     });
                 }
             });
-        ui.horizontal(|ui| {
-            let filter = ui.add(
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("×").on_hover_text("Clear filter").clicked() {
+                self.search.clear();
+            }
+            let filter = ui.add_sized([ui.available_width(), ui.spacing().interact_size.y],
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Quick Filter")
-                    .desired_width((ui.available_width() - 29.0).max(50.0)),
+                    .desired_width(f32::INFINITY),
             );
             if self.shell.filter_focus {
                 filter.request_focus();
                 self.shell.filter_focus = false;
-            }
-            if ui.small_button("×").on_hover_text("Clear filter").clicked() {
-                self.search.clear();
             }
         });
         ui.label(
@@ -1301,15 +1305,16 @@ impl AnalystApp {
                             .size(11.0),
                         );
                         ui.separator();
+                        let console_visible = if self.tab == Tab::Frida { &mut self.shell.frida_workspace.show_log } else { &mut self.console_visible };
                         if ui
-                            .small_button(if self.console_visible {
+                            .small_button(if *console_visible {
                                 "Console v"
                             } else {
                                 "Console ^"
                             })
                             .clicked()
                         {
-                            self.console_visible = !self.console_visible;
+                            *console_visible = !*console_visible;
                         }
                         let status = self.failure.as_deref().unwrap_or(&self.status);
                         ui.add(
@@ -1337,7 +1342,7 @@ impl AnalystApp {
             .show(ui, |ui| self.functions_dock(ui));
             self.workbench.navigator_width = panel.response.rect.width().clamp(180.0, 800.0);
         }
-        if self.shell.layout.inspector == Dock::Docked {
+        if self.tab != Tab::Frida && self.shell.layout.inspector == Dock::Docked {
             let panel = egui::Panel::right(egui::Id::new((
                 "inspector_dock",
                 self.shell.layout_generation,
@@ -1350,8 +1355,9 @@ impl AnalystApp {
             .show(ui, |ui| self.inspector_dock(ui));
             self.workbench.inspector_width = panel.response.rect.width().clamp(220.0, 800.0);
         }
-        if self.console_visible && !self.shell.layout.console_floating {
-            let maximum = (ui.available_height() - MAIN_VIEW_MIN_HEIGHT)
+        if (if self.tab == Tab::Frida { self.shell.frida_workspace.show_log } else { self.console_visible }) && !self.shell.layout.console_floating {
+            let maximum = (ui.available_height() * 0.4)
+                .min(ui.available_height() - MAIN_VIEW_MIN_HEIGHT)
                 .clamp(CONSOLE_MIN_HEIGHT, CONSOLE_MAX_HEIGHT);
             self.console_height = self.console_height.clamp(CONSOLE_MIN_HEIGHT, maximum);
             egui::Panel::bottom(egui::Id::new((
@@ -1420,13 +1426,13 @@ impl AnalystApp {
                 .default_size([320.0, 520.0])
                 .show(ctx, |ui| self.functions_dock(ui));
         }
-        if self.shell.layout.inspector == Dock::Floating {
+        if self.tab != Tab::Frida && self.shell.layout.inspector == Dock::Floating {
             egui::Window::new("Inspector")
                 .id(egui::Id::new("floating_inspector"))
                 .default_size([360.0, 550.0])
                 .show(ctx, |ui| self.inspector_dock(ui));
         }
-        if self.console_visible && self.shell.layout.console_floating {
+        if (if self.tab == Tab::Frida { self.shell.frida_workspace.show_log } else { self.console_visible }) && self.shell.layout.console_floating {
             egui::Window::new("Console")
                 .id(egui::Id::new("floating_console"))
                 .default_size([720.0, 240.0])
@@ -1532,6 +1538,8 @@ mod capture;
 mod console;
 mod data_views;
 mod frida_runtime;
+mod frida_session;
+mod frida_workspace;
 mod ghidra;
 mod ghidra_actions;
 pub(super) use data_views::source_code;

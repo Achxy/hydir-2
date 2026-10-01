@@ -77,7 +77,6 @@ pub(super) enum TracePane {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum FridaPane {
     #[default]
-    Session,
     Events,
     Rediscovery,
     Compare,
@@ -158,11 +157,12 @@ impl AnalystApp {
             11 => FridaPane::Events,
             12 => FridaPane::Rediscovery,
             13 => FridaPane::Compare,
-            _ => FridaPane::Session,
+            _ => FridaPane::Events,
         };
     }
 
     pub(crate) fn ghidra_workbench(&mut self, ui: &mut egui::Ui) {
+        if self.tab == Tab::Frida { self.frida_workbench(ui); return; }
         let frida = self.tab == Tab::Frida;
         let mut requested = None;
         let mut disassembly = None;
@@ -173,7 +173,7 @@ impl AnalystApp {
                 let name = snapshot.functions.iter()
                     .find(|f| f.entry == snapshot.selected_function.entry)
                     .map_or("Selected function", |f| f.name.as_str());
-                ui.add_enabled_ui(!self.ghidra_busy && !self.busy, |ui| {
+                ui.add_enabled_ui(!self.ghidra_busy && !self.busy && !self.frida_busy, |ui| {
                     egui::ComboBox::from_id_salt("ghidra_function")
                         .width(230.0).selected_text(name).show_ui(ui, |ui| {
                             for function in &snapshot.functions {
@@ -197,7 +197,7 @@ impl AnalystApp {
                 ui.menu_button("?", |ui| {
                     ui.set_max_width(350.0);
                     ui.label(if frida {
-                        "Create an InputSpec with hydirctl replay init <elf>, configure its argv/files, and enter its JSON path in Session. Observation executes the ELF using the Linux x86-64 Frida helper."
+                        "Run with Frida launches the open ELF and records the selected function when execution reaches it. Program arguments and advanced input files are optional in Run setup. Recorded events open automatically."
                     } else {
                         "Select a function in the dock or selector. Click a row to follow its address; double-click for disassembly. Right-click to copy or inspect dependencies. High P-code contains Ghidra's SSA and type evidence; raw P-code drives HydIR's lift."
                     });
@@ -205,27 +205,8 @@ impl AnalystApp {
             });
         });
         ui.separator();
-        if frida {
-            view_tabs(
-                ui,
-                "frida_views",
-                &mut self.shell.ghidra.frida,
-                &[
-                    (FridaPane::Session, "Session"),
-                    (FridaPane::Events, "Events"),
-                    (FridaPane::Rediscovery, "Rediscovery"),
-                    (FridaPane::Compare, "Path comparison"),
-                ],
-            );
-            self.shell.frida_runtime.show(ui);
-        } else {
-            view_tabs(
-                ui,
-                "pcode_views",
-                &mut self.shell.ghidra.pane,
-                &GhidraPane::ALL.map(|pane| (pane, pane.title())),
-            );
-        }
+        view_tabs(ui, "pcode_views", &mut self.shell.ghidra.pane,
+            &GhidraPane::ALL.map(|pane| (pane, pane.title())));
         ui.add_space(5.0);
         if self.ghidra_snapshot.is_none() {
             egui::Frame::new()
@@ -262,18 +243,11 @@ impl AnalystApp {
             self.selected_address = Some(address);
             self.open_tab(Tab::Bytes);
         }
-        if frida {
-            if self.frida_observation.is_none() && self.shell.ghidra.frida != FridaPane::Session {
-                ui.label(RichText::new("No observation recorded").strong());
-                ui.label("Configure an InputSpec and run observation from Session.");
-                if ui.button("Open Session").clicked() {
-                    self.shell.ghidra.frida = FridaPane::Session;
-                }
-            } else {
-                egui::ScrollArea::vertical()
-                    .id_salt(("frida_body", format!("{:?}", self.shell.ghidra.frida)))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.frida_action_view(ui));
+        if self.ghidra_busy {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| { ui.spinner(); ui.label("Loading the selected function's analysis…"); });
+            if let Some(task) = &self.ghidra_task {
+                ghidra_progress(ui, task, "Ghidra analysis");
             }
             return;
         }

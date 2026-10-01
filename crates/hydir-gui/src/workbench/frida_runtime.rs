@@ -47,7 +47,7 @@ impl Runtime {
         });
     }
 
-    pub(super) fn show(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn poll(&mut self, ctx: &egui::Context) {
         if let Some(receiver) = &self.pending {
             match receiver.try_recv() {
                 Ok(result) => {
@@ -62,9 +62,34 @@ impl Runtime {
             }
         }
         if self.result.is_none() && self.pending.is_none() {
-            self.start(ui.ctx(), false);
+            self.start(ctx, false);
         }
-        egui::Frame::new().fill(PANEL).inner_margin(7.0).show(ui, |ui| {
+        if self.pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    pub(super) fn compact(&mut self, ui: &mut egui::Ui) {
+        self.poll(ui.ctx());
+        ui.menu_button(
+            if self.ready() {
+                "Worker: ready"
+            } else if self.pending.is_some() {
+                "Worker: checking…"
+            } else {
+                "Worker: setup"
+            },
+            |ui| {
+                ui.set_width(360.0);
+                self.show(ui);
+            },
+        );
+    }
+
+    pub(super) fn show(&mut self, ui: &mut egui::Ui) {
+        self.poll(ui.ctx());
+        egui::Frame::new().fill(PANEL).inner_margin(8.0).show(ui, |ui| {
+            ui.set_min_width((ui.available_width() - 1.0).max(0.0));
             if self.pending.is_some() {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -78,15 +103,27 @@ impl Runtime {
                 Some(Err(error)) => (error.as_str(), false, false),
                 None => ("Frida runtime has not been checked", false, false),
             };
-            ui.label(RichText::new(detail).color(if ready { GOOD } else { ADDRESS }));
+            let detail = detail.to_owned();
             ui.horizontal(|ui| {
+                let (marker, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(marker.center(), 3.5, if ready { GOOD } else { ADDRESS });
+                ui.label(RichText::new(if ready { "Frida ready" } else { "Frida setup required" }).strong())
+                    .on_hover_text(&detail);
+                if ready { ui.label(RichText::new(if cfg!(windows) { "WSL2 · isolated worker" } else { "Linux · isolated worker" }).small().color(MUTED)); }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Recheck").on_hover_text(&detail).clicked() { self.start(ui.ctx(), false); }
+                });
+            });
+            if !ready { ui.label(RichText::new(detail).color(ADDRESS)); }
+            if can_install || (cfg!(windows) && !ready) {
+              ui.horizontal(|ui| {
                 if can_install && ui.button("Install packaged worker").clicked() { self.start(ui.ctx(), true); }
-                if ui.small_button("Recheck runtime").clicked() { self.start(ui.ctx(), false); }
                 if cfg!(windows) && !ready && ui.small_button("Copy WSL setup command")
                     .on_hover_text("Run once in Administrator PowerShell, then restart if Windows requests it.").clicked() {
                     ui.ctx().copy_text("wsl --install --no-distribution".into());
                 }
-            });
+              });
+            }
         });
     }
 }

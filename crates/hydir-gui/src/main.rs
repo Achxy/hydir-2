@@ -5686,6 +5686,10 @@ impl AnalystApp {
                     self.entry_only_assertion = false;
                     self.failure = None;
                     self.tab = Tab::Overview;
+                    let initial_ghidra_function = self.initial_symbol.as_ref().and_then(|name| {
+                        self.spec.as_ref()?.functions.iter().find(|function| &function.name == name)
+                            .map(|function| format!("0x{:x}", function.address.0))
+                    });
                     if let Some(symbol) = self.initial_symbol.take() {
                         self.select(symbol);
                     }
@@ -5708,7 +5712,7 @@ impl AnalystApp {
                         if !self.ghidra_busy
                             && let Some((binary, digest)) = self.pending_ghidra.take()
                         {
-                            self.enqueue_ghidra(binary, digest, None);
+                            self.enqueue_ghidra(binary, digest, initial_ghidra_function);
                         }
                         self.enqueue(
                             Task::Disassemble { automatic: true },
@@ -6090,6 +6094,7 @@ impl AnalystApp {
                         Err(_) => "Frida observation failed".to_owned(),
                     };
                     self.frida_observation = Some(result);
+                    self.reveal_frida_events();
                     self.frida_rediscovery_plan = None;
                     self.frida_jump_plan = None;
                     self.frida_rediscovered_snapshot = None;
@@ -7360,6 +7365,10 @@ impl AnalystApp {
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        if self.tab == Tab::Frida {
+            self.frida_inspector(ui);
+            return;
+        }
         if let Some(source_offer) = &self.source_offer {
             field(ui, "SOURCE OFFER", source_offer);
             ui.separator();

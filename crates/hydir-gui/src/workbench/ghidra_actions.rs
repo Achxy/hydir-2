@@ -1459,135 +1459,14 @@ impl AnalystApp {
         }
     }
     pub(super) fn frida_action_view(&mut self, ui: &mut egui::Ui) {
-        let Some(snapshot) = &self.ghidra_snapshot else {
-            return;
-        };
-        let address_map = self
-            .spec
-            .as_ref()
-            .and_then(|spec| GhidraAddressMap::new(snapshot, spec));
-        if self.shell.ghidra.frida == FridaPane::Session {
-            ui.label(RichText::new("Observation session").strong());
-            ui.label(RichText::new("Record blocks, calls and entry registers for one configured input.").size(12.0).color(MUTED))
-                .on_hover_text("Observed blocks and calls are byte checked. Other inputs and the process exit code remain unverified.");
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label("InputSpec");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.frida_input_path)
-                            .hint_text("Path to the input specification (.json)")
-                            .desired_width((ui.available_width() - 15.0).min(600.0)),
-                    )
-                    .changed()
-                {
-                    self.frida_observation = None;
-                    self.frida_rediscovery_plan = None;
-                    self.frida_jump_plan = None;
-                    self.frida_rediscovered_snapshot = None;
-                    if let Some(task) = &self.frida_rediscovery_task {
-                        task.cancel.store(true, Ordering::Release);
-                    }
-                    self.frida_path_comparison = None;
-                }
-            });
-            let linked_entry = address_map.as_ref().and_then(|map| {
-                map.to_linked(
-                    &snapshot.selected_function.entry.space,
-                    &snapshot.selected_function.entry.offset,
-                )
-            });
-            let can_observe = self.shell.frida_runtime.ready()
-                && self.current_local_path.is_some()
-                && linked_entry.is_some()
-                && !self.frida_input_path.trim().is_empty()
-                && !self.frida_busy;
-            if self.current_local_path.is_none() {
-                ui.label(
-                    RichText::new("Open a local ELF to observe it.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            } else if linked_entry.is_none() {
-                ui.label(
-                    RichText::new("Select a function with a linked ELF address.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            } else if self.frida_input_path.trim().is_empty() {
-                ui.label(
-                    RichText::new("Select an InputSpec JSON file to enable observation.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            }
-            if ui
-                .add_enabled(can_observe, egui::Button::new("Observe selected function"))
-                .on_disabled_hover_text("Requires a ready Frida runtime, a local ELF, a linked function and an InputSpec JSON path.")
-                .clicked()
-            {
-                let cancel = Arc::new(AtomicBool::new(false));
-                // Include WSL cold-start/readiness time as well as the bounded
-                // observation. The InputSpec still controls target execution.
-                let timeout = Duration::from_secs(75);
-                let task = Task::ObserveFrida {
-                    binary: self.current_local_path.clone().expect("checked above"),
-                    binary_sha256: snapshot.binary_sha256.clone(),
-                    function: linked_entry.expect("checked above"),
-                    snapshot: Box::new(snapshot.clone()),
-                    input_path: PathBuf::from(self.frida_input_path.trim()),
-                    cancel: Arc::clone(&cancel),
-                    timeout,
-                };
-                match self.tasks.try_send(task) {
-                    Ok(()) => {
-                        self.frida_busy = true;
-                        self.frida_task = Some(ActiveGhidraTask {
-                            cancel,
-                            started: Instant::now(),
-                            timeout,
-                        });
-                        self.frida_observation = None;
-                        self.frida_rediscovery_plan = None;
-                        self.frida_jump_plan = None;
-                        self.frida_rediscovered_snapshot = None;
-                        self.frida_path_comparison = None;
-                        self.status = "Observing selected ELF function…".to_owned();
-                    }
-                    Err(_) => {
-                        self.frida_observation =
-                            Some(Err("Analysis queue is full. Retry observation.".to_owned()))
-                    }
-                }
-            }
-            if self.frida_busy
-                && let Some(task) = &self.frida_task
-            {
-                ghidra_progress(ui, task, "Observing ELF path");
-                if ui
-                    .add_enabled(
-                        !task.cancel.load(Ordering::Acquire),
-                        egui::Button::new("Cancel observation"),
-                    )
-                    .clicked()
-                {
-                    task.cancel.store(true, Ordering::Release);
-                }
-            }
-        }
+        let Some(snapshot) = &self.ghidra_snapshot else { return; };
+        let address_map = self.spec.as_ref().and_then(|spec| GhidraAddressMap::new(snapshot, spec));
         match &self.frida_observation {
             Some(Ok(trace)) => {
-                ui.label(RichText::new(format!(
-                            "{:?} · {} events · {} verified jump pairs · {} lost · {} · process exit code unknown",
-                            trace.status, trace.events.len(), trace.jump_evidence.len(), trace.lost_events,
-                            trace.observer,
-                        )).size(11.0).color(ACCENT));
-                if ui.button("Copy observation JSON").clicked()
-                    && let Ok(json) = serde_json::to_string_pretty(trace)
-                {
-                    ui.ctx().copy_text(json);
+                if !super::frida_session::reached_selected_function(trace) {
+                    return;
                 }
-                if self.shell.ghidra.frida == FridaPane::Session {
+                if self.shell.ghidra.frida == FridaPane::Compare {
                     if ui
                         .button("Use captured entry registers as P-code seed")
                         .clicked()
@@ -1992,6 +1871,16 @@ impl AnalystApp {
                     }
                 }
                 if self.shell.ghidra.frida == FridaPane::Compare {
+                    if self.ghidra_path_trace.is_none() {
+                        ui.heading("Prepare a P-code path");
+                        ui.label("Path comparison needs both the runtime observation and a P-code execution from a matching initial state.");
+                        ui.label("Load the captured registers above, configure any required memory, then run a P-code trace.");
+                        if ui.button("Open P-code trace").clicked() {
+                            self.tab = Tab::GhidraPcode;
+                            self.shell.ghidra.pane = GhidraPane::Trace;
+                            self.shell.ghidra.trace = TracePane::Path;
+                        }
+                    }
                     if let Some(Ok(path)) = &self.ghidra_path_trace
                         && ui
                             .button("Compare observed path with P-code path")
@@ -2061,51 +1950,11 @@ impl AnalystApp {
                         None => {}
                     }
                 }
-                if self.shell.ghidra.frida == FridaPane::Events {
-                    egui::ScrollArea::vertical()
-                        .id_salt("frida_observed_events")
-                        .max_height(ui.available_height().max(120.0))
-                        .show_rows(ui, 18.0, trace.events.len(), |ui, range| {
-                            for index in range {
-                                let event = &trace.events[index];
-                                let source = event.source.elf_vaddr;
-                                let target =
-                                    event.target.as_ref().and_then(|witness| witness.elf_vaddr);
-                                ui.horizontal(|ui| {
-                                    let line = format!(
-                                        "#{} {:?} {}{}",
-                                        event.sequence,
-                                        event.kind,
-                                        source.map_or_else(
-                                            || "unknown".to_owned(),
-                                            |address| format!("0x{address:x}")
-                                        ),
-                                        target.map_or_else(String::new, |address| format!(
-                                            " → 0x{address:x}"
-                                        ))
-                                    );
-                                    if ui
-                                        .selectable_label(
-                                            source.is_some() && self.selected_address == source,
-                                            RichText::new(line).monospace().size(11.0),
-                                        )
-                                        .clicked()
-                                        && source.is_some()
-                                    {
-                                        self.selected_address = source;
-                                    }
-                                    if let Some(target) = target
-                                        && ui.small_button("Target").clicked()
-                                    {
-                                        self.selected_address = Some(target);
-                                    }
-                                });
-                            }
-                        });
-                }
+
             }
             Some(Err(error)) => {
-                ui.label(RichText::new(error).size(11.0).color(BAD));
+                ui.colored_label(BAD, RichText::new("Frida could not run").strong());
+                ui.colored_label(BAD, error);
             }
             None => {}
         }

@@ -269,3 +269,23 @@ fn all_analysis_views_render_in_the_workbench_without_a_project() {
         egui::__run_test_ui(|ui| app.workbench_ui(ui));
     }
 }
+
+#[test]
+fn dock_sizes_remain_stable_across_frames_at_readable_font_sizes() {
+    for size in [egui::vec2(1400.0, 850.0), egui::vec2(1024.0, 720.0)] {
+        let context = egui::Context::default();
+        let mut app = AnalystApp::new(&context);
+        app.workbench_loaded = true;
+        app.reset_shell_layout();
+        app.history.push("A long analysis log line with a Windows path C:/Users/Analyst/Documents/project/demo/example.elf".repeat(4));
+        for _ in 0..40 {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            }, |ui| app.workbench_ui(ui));
+            output.textures_delta.clear();
+        }
+        assert!(app.workbench.navigator_width <= 270.0, "function dock grew to {}", app.workbench.navigator_width);
+        assert!(app.console_height <= 190.0, "console grew to {}", app.console_height);
+    }
+}

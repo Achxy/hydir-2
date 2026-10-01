@@ -126,7 +126,8 @@ fn bundle_dir() -> Result<PathBuf, Box<dyn Error>> {
         None => env::current_exe()?
             .parent()
             .ok_or("No executable directory")?
-            .join("workers/frida"),
+            .join("workers")
+            .join("frida"),
     };
     // Management commands run from the temporary directory, so resolve a
     // developer's relative override before passing the archive to wsl.exe.
@@ -134,11 +135,13 @@ fn bundle_dir() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn absolute_bundle_dir(directory: PathBuf, working_directory: &Path) -> PathBuf {
-    if directory.is_absolute() {
+    let directory = if directory.is_absolute() {
         directory
     } else {
         working_directory.join(directory)
-    }
+    };
+    // wsl.exe --import rejects mixed separators even though Windows file I/O accepts them.
+    directory.components().collect()
 }
 
 #[derive(Deserialize)]
@@ -299,7 +302,10 @@ fn install() -> Result<(), Box<dyn Error>> {
     let directory = bundle_dir()?;
     verify_bundle(&directory)?;
     let local = env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
-    let destination = PathBuf::from(local).join("HydIR/workers/frida-v1");
+    let destination = PathBuf::from(local)
+        .join("HydIR")
+        .join("workers")
+        .join("frida-v1");
     // Never overwrite or unregister an existing distro or leftover installation.
     if destination.exists() {
         return Err(format!(
@@ -371,6 +377,21 @@ pub(super) fn cancel(token: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn wsl_import_bundle_paths_use_windows_separators() {
+        let working = Path::new(r"C:\HydIR checkout");
+        for directory in [
+            PathBuf::from("target/debug/workers/frida"),
+            PathBuf::from("C:/HydIR checkout/target/debug/workers/frida"),
+        ] {
+            assert_eq!(
+                absolute_bundle_dir(directory, working).as_os_str(),
+                std::ffi::OsStr::new(r"C:\HydIR checkout\target\debug\workers\frida")
+            );
+        }
+    }
+
     #[test]
     fn relative_bundle_override_keeps_the_callers_directory() {
         let working = env::current_dir().unwrap();
