@@ -1,0 +1,14 @@
+# Build-time container only. Windows imports the exported rootfs into WSL2;
+# Docker is not required on the analyst's Windows machine.
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bubblewrap ca-certificates libgcc-s1 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --shell /bin/sh hydir \
+    && install -d -m 0700 -o hydir -g hydir /home/hydir/.cache/hydir-frida
+COPY hydir-linux-x86_64/ /opt/hydir/
+COPY wsl.conf /etc/wsl.conf
+RUN chmod 0755 /opt/hydir/hydirctl /opt/hydir/hydir-frida-observer \
+    && /opt/hydir/hydir-frida-observer --doctor
+USER hydir
+WORKDIR /home/hydir

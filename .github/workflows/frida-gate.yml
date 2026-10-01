@@ -1,5 +1,6 @@
 name: Frida observer gate
 on:
+  workflow_dispatch:
   push:
     paths:
       - Cargo.toml
@@ -16,6 +17,10 @@ on:
       - tests/fixtures/frida_indirect_jump.c
       - tests/frida_observer_gate.py
       - scripts/package-frida-linux.py
+      - scripts/package-frida-windows.py
+      - scripts/test-frida-wsl.ps1
+      - integrations/frida/**
+      - crates/hydir-gui/**
       - scripts/demo-heldout-musl.py
       - tests/holdout/musl/**
       - .github/workflows/frida-gate.yml
@@ -35,6 +40,10 @@ on:
       - tests/fixtures/frida_indirect_jump.c
       - tests/frida_observer_gate.py
       - scripts/package-frida-linux.py
+      - scripts/package-frida-windows.py
+      - scripts/test-frida-wsl.ps1
+      - integrations/frida/**
+      - crates/hydir-gui/**
       - scripts/demo-heldout-musl.py
       - tests/holdout/musl/**
       - .github/workflows/frida-gate.yml
@@ -70,8 +79,7 @@ jobs:
           export CPATH="$RUNNER_TEMP/frida-devkit"
           export RUSTFLAGS="-L native=$RUNNER_TEMP/frida-devkit"
           cargo test --locked -p frida ordinary_send_dispatches_to_registered_handler
-          cargo test --locked -p hydir-frida-observer --features frida-runtime \
-            dropped_batches_count_observations_not_messages
+          cargo test --locked -p hydir-frida-observer --features frida-runtime
       - name: Build pinned Linux x86-64 release bundle
         run: |
           set -euo pipefail
@@ -90,6 +98,16 @@ jobs:
           export HYDIRCTL="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydirctl"
           export HYDIR_FRIDA_OBSERVER="$RUNNER_TEMP/frida-installed/hydir-linux-x86_64/hydir-frida-observer"
           python3 tests/frida_observer_gate.py
+      - name: Build packaged WSL2 rootfs for Windows
+        run: |
+          python3 scripts/package-frida-windows.py build-rootfs \
+            --linux-bundle "$RUNNER_TEMP/hydir-linux-x86_64.tar.gz" \
+            --output "$RUNNER_TEMP/frida-worker"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydir-frida-wsl-rootfs
+          path: ${{ runner.temp }}/frida-worker/
+          if-no-files-found: error
       - name: Run held-out ELFs through bundled CLI, automatic Ghidra, and Frida
         run: |
           set -euo pipefail
@@ -106,4 +124,31 @@ jobs:
         with:
           name: hydir-linux-x86_64-frida
           path: ${{ runner.temp }}/hydir-linux-x86_64.tar.gz
+          if-no-files-found: error
+  windows-package:
+    needs: linux-x86-64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: hydir-frida-wsl-rootfs
+          path: frida-worker
+      - name: Test Windows transport and GUI
+        run: |
+          cargo test --locked -p hydir-frida-observer
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p hydir-cli frida_worker -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p hydir-gui -- --test-threads=1
+          exit $LASTEXITCODE
+      - name: Package Windows desktop with Linux Frida runtime
+        run: python scripts/package-frida-windows.py package --worker-dir frida-worker --output hydir-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydir-windows-x86_64-frida
+          path: hydir-windows-x86_64.zip
           if-no-files-found: error

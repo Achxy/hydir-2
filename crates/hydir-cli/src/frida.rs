@@ -1,4 +1,4 @@
-//! Invoke the separately bundled Linux observer and check every returned claim.
+//! Invoke the bundled Linux observer, locally or through WSL2, and check every claim.
 
 use super::{parse_u64_auto, read_binary, read_bounded_json, read_limited, write_new_or_identical};
 use hydir_execution::{
@@ -91,11 +91,14 @@ pub(super) fn helper_ready(path: &PathBuf) -> bool {
 
 pub(super) fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let options = options(args)?;
-    if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
-        return Err("Frida observation requires the Linux x86-64 release".into());
+    if !matches!(env::consts::OS, "linux" | "windows") || env::consts::ARCH != "x86_64" {
+        return Err(
+            "Frida observation requires x86-64 Linux or Windows with the WSL2 worker".into(),
+        );
     }
     let elf = read_binary(&args[2])?;
-    let input = parse_input_spec(&read_bounded_json(&args[3], MAX_INPUT_SPEC_BYTES)?)?;
+    let input_json = read_bounded_json(&args[3], MAX_INPUT_SPEC_BYTES)?;
+    let input = parse_input_spec(&input_json)?;
     validate_input_spec(&elf, &input)?;
     let expected_snapshot = if let Some(path) = options.snapshot {
         let snapshot = parse_ghidra_snapshot(
@@ -130,19 +133,33 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let helper = helper_path()?;
-    if !helper.is_file() {
-        return Err(format!(
-            "Frida observer is unavailable at {}; install the Linux release bundle or set HYDIR_FRIDA_OBSERVER",
-            helper.display()
-        )
-        .into());
+    let (mut command, worker_token) = if cfg!(windows) {
+        let (command, token) = super::frida_worker::observation(
+            &elf,
+            &input_json,
+            options.function,
+            input.budget.timeout_ms,
+        )?;
+        (command, Some(token))
+    } else {
+        let helper = helper_path()?;
+        if !helper.is_file() {
+            return Err(format!("Frida observer is unavailable at {}; install the Linux release bundle or set HYDIR_FRIDA_OBSERVER", helper.display()).into());
+        }
+        let mut command = Command::new(&helper);
+        command
+            .arg(&args[2])
+            .arg(&args[3])
+            .arg(format!("{:x}", options.function))
+            .stdin(Stdio::null());
+        (command, None)
+    };
+    // A WSL cold-start probe can outlive the user's cancel click. Do not
+    // launch a target after that probe returns if cancellation is pending.
+    if env::var_os("HYDIR_GHIDRA_CANCEL_FILE").is_some_and(|path| PathBuf::from(path).exists()) {
+        return Err("Frida observation cancelled".into());
     }
-    let mut child = Command::new(&helper)
-        .arg(&args[2])
-        .arg(&args[3])
-        .arg(format!("{:x}", options.function))
-        .stdin(Stdio::null())
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -162,12 +179,22 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() >= deadline {
+        let cancelled = env::var_os("HYDIR_GHIDRA_CANCEL_FILE")
+            .is_some_and(|path| PathBuf::from(path).exists());
+        if cancelled || Instant::now() >= deadline {
+            if let Some(token) = &worker_token {
+                super::frida_worker::cancel(token);
+            }
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err("Frida observer exceeded the InputSpec wall-clock budget".into());
+            return Err(if cancelled {
+                "Frida observation cancelled"
+            } else {
+                "Frida observer exceeded the InputSpec wall-clock budget"
+            }
+            .into());
         }
         thread::sleep(Duration::from_millis(25));
     };

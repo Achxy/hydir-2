@@ -2297,6 +2297,7 @@ dependencies = [
  "hydir-core",
  "hydir-decompile",
  "hydir-execution",
+ "hydir-frida-observer",
  "hydir-ghidra-worker",
  "hydir-hlc",
  "hydir-interchange",
@@ -2315,6 +2316,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "uuid",
 ]
 
 [[package]]
@@ -2400,6 +2402,7 @@ dependencies = [
  "hydir-core",
  "hydir-decompile",
  "hydir-execution",
+ "hydir-frida-observer",
  "hydir-ghidra-worker",
  "hydir-hlc",
  "hydir-ir",

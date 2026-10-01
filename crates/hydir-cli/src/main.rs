@@ -44,6 +44,7 @@ use hydir_vm::{VmProfile, explore_profile, validate_profile};
 mod compare;
 mod frida;
 mod frida_seed;
+mod frida_worker;
 mod ghidra_calls;
 mod local;
 mod passes;
@@ -147,6 +148,7 @@ Usage:
   hydirctl model infer <elf> <model.json> [--output <new-model.json>]
   hydirctl vm-profile <linked-elf> <profile.json>
   hydirctl vm-explore <linked-elf> <profile.json>
+  hydirctl frida-worker <status|install>
   hydirctl replay init <linked-elf> [--output <input.json>]
   hydirctl replay verify <linked-elf> <input.json>
   hydirctl replay <linked-elf> <input.json> [--output <report.json>]
@@ -260,6 +262,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             frida_seed::run(&args[2..])?
         }
         Some("observe") => frida::run(&args)?,
+        Some("frida-worker") => frida_worker::run(&args[1..])?,
         Some("compare-executions") => compare::run(&args[1..])?,
         Some("ghidra-project") if args.len() == 4 && args[1] == "save" => {
             let binary = read_binary(&args[2])?;
@@ -2048,6 +2051,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let bubblewrap_isolation_ready =
                 bwrap_version.is_some() && probe_bubblewrap_isolation();
             let replay_ready = bubblewrap_isolation_ready;
+            let frida_runtime = frida_worker::status();
             let capture_ready = replay_ready && gdb_version.is_some();
             let snapshot_solve_ready =
                 capture_ready && triton_helper_available && triton_module_version.is_some();
@@ -2099,7 +2103,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     "native_replay_scope": "local Linux x86-64 Bubblewrap replay with private network namespace, bounded argv/stdin/files, exact exit/output goals and explicit setup/timeout/output-limit failures; Ubuntu 24.04 smoke gate passed",
                     "bubblewrap_installed": bwrap_version.is_some(),
                     "frida_observer_helper": frida_helper.display().to_string(),
-                    "frida_observation_ready": bubblewrap_isolation_ready && frida::helper_ready(&frida_helper),
+                    "frida_observation_ready": frida_runtime.ready,
+                    "frida_runtime": frida_runtime,
                     "frida_observation_scope": "InputSpec-bound Linux x86-64 ELF paths with byte-checked block/call witnesses; no process exit-code claim or static CFG-completeness claim",
                     "bubblewrap_isolation_ready": bubblewrap_isolation_ready,
                     "bubblewrap_version": bwrap_version,

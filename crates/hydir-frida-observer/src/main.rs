@@ -8,6 +8,17 @@ fn main() {
 
 #[cfg(all(target_os = "linux", feature = "frida-runtime"))]
 fn run() -> Result<(), String> {
+    let worker_args: Vec<_> = std::env::args().skip(1).collect();
+    match worker_args.as_slice() {
+        [option] if option == "--worker-doctor" => return hydir_frida_observer::worker::doctor(),
+        [option, token] if option == "--request" => {
+            return hydir_frida_observer::worker::request(token);
+        }
+        [option, token] if option == "--cancel" => {
+            return hydir_frida_observer::worker::cancel(token);
+        }
+        _ => {}
+    }
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("--doctor") {
         if args.next().is_some() {
