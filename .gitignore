@@ -21,9 +21,9 @@ __pycache__/
 *.egg-info/
 .venv/
 /node_modules/
-/.codex-pptx-build/
-/.codex-ref-render/
-/.codex-reference.*
+/.*-pptx-build/
+/.*-ref-render/
+/.*-reference.*
 /.worktrees/
 /.vscode/
 /integrations/ghidra/HydIR/.gradle/

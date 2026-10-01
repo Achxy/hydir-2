@@ -978,7 +978,7 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tests/fixtures/ghidra_prototype_dwarf_v2.json"
             )),
-            "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f",
+            "7d9b81be8caadbca522b8fc5c1d89b0c2650e8902791e8d777b3c8c87ed4ed09",
         )
         .unwrap();
         let mut model = init_model(bytes).unwrap();
@@ -1012,7 +1012,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/ghidra_prototype.elf"
         ));
-        let digest = "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f";
+        let digest = "7d9b81be8caadbca522b8fc5c1d89b0c2650e8902791e8d777b3c8c87ed4ed09";
         let mut snapshot = parse_ghidra_snapshot(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -1183,7 +1183,7 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tests/fixtures/ghidra_prototype_high_v2.json"
             )),
-            "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f",
+            "7d9b81be8caadbca522b8fc5c1d89b0c2650e8902791e8d777b3c8c87ed4ed09",
         )
         .unwrap();
         let mut model = init_model(bytes).unwrap();
@@ -1292,7 +1292,7 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tests/fixtures/ghidra_prototype_high_v2.json"
             )),
-            "9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f",
+            "7d9b81be8caadbca522b8fc5c1d89b0c2650e8902791e8d777b3c8c87ed4ed09",
         )
         .unwrap();
         let mut model = init_model(bytes).unwrap();

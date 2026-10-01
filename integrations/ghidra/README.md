@@ -175,7 +175,7 @@ produced from `tests/fixtures/ghidra_prototype.c` with Clang 22.1.8:
 clang -target x86_64-unknown-linux-gnu -g -O1 -fno-omit-frame-pointer -nostdlib -fuse-ld=lld '-Wl,-e,_start' '-Wl,--build-id=none' -o tests\fixtures\ghidra_prototype.elf tests\fixtures\ghidra_prototype.c
 ```
 
-The ELF SHA-256 is `9234e3336c9439dc9da001709156cd48f5bf1aedb4725a0534144a909acac61f`.
+The ELF SHA-256 is `7d9b81be8caadbca522b8fc5c1d89b0c2650e8902791e8d777b3c8c87ed4ed09`.
 `slice` follows a bounded backward chain of P-code value dependencies and
 reports constants, entry values, control merges, memory, and opaque effects as
 boundaries. It keeps source operation addresses and never marks a path proven.
