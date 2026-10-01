@@ -4,7 +4,7 @@ Thanks for helping improve HydIR. We welcome bug fixes, analysis improvements, t
 
 ## Questions and feature ideas
 
-Start with the [README](README.md), [design notes](DESIGN.md), and component documentation. Search [existing issues](https://github.com/Achxy/hydir-2/issues) before opening a new one.
+Start with the [README](README.md) and component documentation. Search [existing issues](https://github.com/Achxy/hydir-2/issues) before opening a new one.
 
 For questions, explain what you are trying to do and where you got stuck. For enhancements, describe the use case, current limitations, proposed behavior, and alternatives you considered. Discuss larger changes in an issue before investing in implementation.
 
