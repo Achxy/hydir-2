@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use HydIR in your work, please cite it using this metadata."
+type: software
+title: "HydIR: Ghidra-backed and native binary lifting, analysis, and decompilation in Rust"
+authors:
+  - family-names: Jayadevan
+    given-names: Achyuth
+  - family-names: U
+    given-names: Siddharth
+version: 0.1.0
+repository-code: "https://github.com/Achxy/hydir-2"
+url: "https://hydir.wiki/"
+license: AGPL-3.0-only
