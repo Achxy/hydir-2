@@ -93,3 +93,14 @@
   .equation, figure, pre { break-inside: avoid; }
   .equation-scroll { overflow: visible; }
 }
+
+/* Interactive examples must shrink with the reading column. */
+.lab,.pcode-visual,.lesson-map,.load-inputs > div,.lab label { min-width:0; }
+.lab input,.lab select,.lab button,.pcode-visual button { max-width:100%; }
+@media (max-width:38rem) {
+  .lab,.pcode-visual,.lesson-map { padding:.75rem; }
+  .lab-controls > label { flex:1 1 8rem; }
+  .lab-controls select { width:100%; }
+  #pcode-test-lab input { width:100%; }
+  .lab button,.pcode-visual button { white-space:normal; }
+}
