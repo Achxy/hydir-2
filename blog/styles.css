@@ -221,3 +221,11 @@ p { margin-block: 10px; }
 pre { padding: 12px; }
 @media (max-width: 819px) { body { padding: 0; } .site-main { padding: 14px; } .site-header { padding: 12px; } .site-footer { padding: 12px 14px; } }
 @media (max-width: 560px) { .doc-toc ul { columns: 1; } }
+
+/* Homepage archive rows follow the compact, text-first V8 index. */
+.home-page .post-list li { padding: 5px 0; }
+.home-page .post-list li > a { display: inline; }
+.home-page .post-meta { display: inline-flex; margin-left: 12px; gap: 8px; }
+@media (max-width: 560px) {
+  .home-page .post-meta { display: flex; margin-left: 0; }
+}
